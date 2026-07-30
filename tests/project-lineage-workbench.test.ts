@@ -6,6 +6,7 @@ import type {
 import {
   completedLineageProjection,
   creationSourcesFromSelection,
+  lineageCardDragAllowed,
   lineageCameraFrame,
   lineageFocusBehavior,
   lineageFitScale,
@@ -20,8 +21,12 @@ import {
   lineageMovePayload,
   lineageProjectContainerBox,
   lineageRequestedFocusBox,
+  lineageEntitiesInSelection,
+  lineageLassoSelectionState,
+  lineageSelectionBox,
   lineageShouldFocusOnDoubleClick,
   lineageStructuralEntityIds,
+  lineageViewportPointerIntent,
   lineageVirtualExpansionPlan,
   lineageVisibleStageIdsByProject,
   lineageZoomLabel,
@@ -217,6 +222,99 @@ describe("Project Lineage card-plus intent", () => {
     expect(index.size).toBe(50);
     expect([...index.values()].reduce((sum, ids) => sum + ids.length, 0)).toBe(999);
     expect(index.get("project-49")).not.toContain("stage-999");
+  });
+
+  it("normalizes reverse lasso drags and selects every intersecting card", () => {
+    const nodes = [
+      node("first", "cycle", 20, 30),
+      node("edge", "cycle", 300, 30),
+      node("outside", "cycle", 580, 30),
+    ];
+    const layout = new Map(nodes.map((item) => [
+      item.entityId,
+      { x: item.x, y: item.y },
+    ]));
+    const selection = lineageSelectionBox(
+      { x: 300, y: 158 },
+      { x: 10, y: 20 },
+    );
+
+    expect(selection).toEqual({ x: 10, y: 20, right: 300, bottom: 158 });
+    expect(lineageEntitiesInSelection(nodes, layout, selection))
+      .toEqual(["first", "edge"]);
+  });
+
+  it("applies replace, Shift-add, blank-click and canceled lasso selection semantics", () => {
+    expect(lineageLassoSelectionState(
+      ["before"],
+      "relation-before",
+      ["hit-a", "hit-b"],
+      "replace",
+    )).toEqual({
+      entityIds: ["hit-a", "hit-b"],
+      relationId: null,
+    });
+    expect(lineageLassoSelectionState(
+      ["before"],
+      "relation-before",
+      ["hit-a", "before"],
+      "add",
+    )).toEqual({
+      entityIds: ["before", "hit-a"],
+      relationId: null,
+    });
+    expect(lineageLassoSelectionState(
+      ["before"],
+      "relation-before",
+      [],
+      "clear",
+    )).toEqual({
+      entityIds: [],
+      relationId: null,
+    });
+    expect(lineageLassoSelectionState(
+      ["before"],
+      "relation-before",
+      ["ignored"],
+      "cancel",
+    )).toEqual({
+      entityIds: ["before"],
+      relationId: "relation-before",
+    });
+  });
+
+  it("gives Space-left and middle-button pan priority on card surfaces", () => {
+    expect(lineageViewportPointerIntent(0, true, "card")).toBe("pan");
+    expect(lineageViewportPointerIntent(1, false, "card")).toBe("pan");
+    expect(lineageViewportPointerIntent(0, false, "card")).toBe("defer");
+    expect(lineageViewportPointerIntent(0, false, "blank")).toBe("lasso");
+    expect(lineageViewportPointerIntent(0, true, "button")).toBe("defer");
+    expect(lineageViewportPointerIntent(1, false, "edge")).toBe("defer");
+    expect(lineageViewportPointerIntent(0, false, "project-header")).toBe("defer");
+    expect(lineageCardDragAllowed(0, false, false, false)).toBe(true);
+    expect(lineageCardDragAllowed(0, true, false, false)).toBe(false);
+    expect(lineageCardDragAllowed(1, false, false, false)).toBe(false);
+    expect(lineageCardDragAllowed(0, false, true, false)).toBe(false);
+    expect(lineageCardDragAllowed(0, false, false, true)).toBe(false);
+  });
+
+  it("keeps lasso hit testing linear for a large graph", () => {
+    const nodes = Array.from({ length: 20_000 }, (_, index) =>
+      node(`stage-${index}`, "cycle", (index % 200) * 280, Math.floor(index / 200) * 160));
+    const layout = new Map(nodes.map((item) => [
+      item.entityId,
+      { x: item.x, y: item.y },
+    ]));
+    const selection = lineageSelectionBox(
+      { x: 0, y: 0 },
+      { x: 5_000, y: 2_000 },
+    );
+    const startedAt = performance.now();
+    const selected = lineageEntitiesInSelection(nodes, layout, selection);
+    const elapsed = performance.now() - startedAt;
+
+    expect(selected).toHaveLength(234);
+    expect(elapsed).toBeLessThan(250);
   });
 
   it("keeps negative Canvas coordinates when the virtual origin expands left or up", () => {

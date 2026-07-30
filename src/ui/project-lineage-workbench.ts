@@ -66,6 +66,8 @@ interface WorkbenchOptions {
     allowedTargetIds: string[],
   ) => void;
   onEditProjectColor: (projectId: string, color: string) => void;
+  onEditProjectStatus: (projectId: string) => void;
+  onEditCycleStatus: (cycleId: string) => void;
   onToggleCompletedCollapse: (projectId: string, collapsed: boolean) => void;
   onExpandCompletedProjects: (projectIds: string[]) => void;
   onAutoLayout: () => void;
@@ -314,6 +316,94 @@ export function lineageShouldFocusOnDoubleClick(target: EventTarget | null): boo
   return typeof closest !== "function" || !closest.call(target, "button");
 }
 
+export interface LineageSelectionBox extends LineagePoint {
+  right: number;
+  bottom: number;
+}
+
+export interface LineageLassoSelectionState {
+  entityIds: string[];
+  relationId: string | null;
+}
+
+export type LineagePointerSurface =
+  "blank" | "card" | "project-header" | "edge" | "button";
+
+export function lineageViewportPointerIntent(
+  button: number,
+  spaceHeld: boolean,
+  surface: LineagePointerSurface,
+): "pan" | "lasso" | "defer" {
+  const panRequested = button === 1 || (button === 0 && spaceHeld);
+  if (panRequested) {
+    return surface === "button" || surface === "edge" ? "defer" : "pan";
+  }
+  return button === 0 && surface === "blank" ? "lasso" : "defer";
+}
+
+export function lineageCardDragAllowed(
+  button: number,
+  spaceHeld: boolean,
+  insideButton: boolean,
+  collapseHead: boolean,
+): boolean {
+  return button === 0 && !spaceHeld && !insideButton && !collapseHead;
+}
+
+export function lineageLassoSelectionState(
+  baseEntityIds: Iterable<string>,
+  baseRelationId: string | null,
+  hitEntityIds: Iterable<string>,
+  mode: "replace" | "add" | "clear" | "cancel",
+): LineageLassoSelectionState {
+  if (mode === "cancel") {
+    return {
+      entityIds: [...new Set(baseEntityIds)],
+      relationId: baseRelationId,
+    };
+  }
+  if (mode === "clear") return { entityIds: [], relationId: null };
+  const entityIds = mode === "add"
+    ? new Set(baseEntityIds)
+    : new Set<string>();
+  for (const entityId of hitEntityIds) entityIds.add(entityId);
+  return { entityIds: [...entityIds], relationId: null };
+}
+
+export function lineageSelectionBox(
+  start: LineagePoint,
+  end: LineagePoint,
+): LineageSelectionBox {
+  return {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    right: Math.max(start.x, end.x),
+    bottom: Math.max(start.y, end.y),
+  };
+}
+
+export function lineageEntitiesInSelection(
+  nodes: ProjectWorkspaceCanvasNode[],
+  layout: ReadonlyMap<string, LineagePoint>,
+  selection: LineageSelectionBox,
+): string[] {
+  const selected: string[] = [];
+  for (const node of nodes) {
+    const point = layout.get(node.entityId);
+    if (!point) continue;
+    const box = lineageGraphBox(node, point);
+    if (
+      box.x <= selection.right &&
+      box.right >= selection.x &&
+      box.y <= selection.bottom &&
+      box.bottom >= selection.y
+    ) {
+      selected.push(node.entityId);
+    }
+  }
+  return selected;
+}
+
 export function lineageRequestedFocusBox<T>(
   requestedFocusId: string | undefined,
   focusedStageBox: T | undefined,
@@ -548,6 +638,17 @@ export class ProjectLineageWorkbench {
   private pan:
     | { pointerId: number; x: number; y: number; left: number; top: number }
     | null = null;
+  private lasso:
+    | {
+        pointerId: number;
+        start: LineagePoint;
+        baseSelection: Set<string>;
+        baseRelationId: string | null;
+        additive: boolean;
+        moved: boolean;
+        overlay: HTMLElement;
+      }
+    | null = null;
   private spaceHeld = false;
   private destroyed = false;
   private movePending = false;
@@ -589,6 +690,8 @@ export class ProjectLineageWorkbench {
     this.destroyed = true;
     this.moveVersion += 1;
     this.selected.clear();
+    this.lasso?.overlay.remove();
+    this.lasso = null;
     if (this.programmaticScrollTimer !== null) {
       window.clearTimeout(this.programmaticScrollTimer);
       this.programmaticScrollTimer = null;
@@ -830,10 +933,14 @@ export class ProjectLineageWorkbench {
         }
       | null = null;
     card.addEventListener("pointerdown", (event) => {
-      if (this.destroyed || this.movePending || event.button !== 0 || this.spaceHeld) return;
+      if (this.destroyed || this.movePending) return;
       const target = event.target instanceof Element ? event.target : null;
-      if (target?.closest("button")) return;
-      if (this.collapseCountByHead.has(node.entityId)) return;
+      if (!lineageCardDragAllowed(
+        event.button,
+        this.spaceHeld,
+        Boolean(target?.closest("button")),
+        this.collapseCountByHead.has(node.entityId),
+      )) return;
       event.preventDefault();
       if (event.metaKey || event.ctrlKey || event.shiftKey) {
         if (this.selected.has(node.entityId)) this.selected.delete(node.entityId);
@@ -980,10 +1087,17 @@ export class ProjectLineageWorkbench {
       open.createSpan({ cls: "helix-lineage-project-container-swatch" });
       open.createSpan({ text: project.title });
       open.addEventListener("click", () => this.options.onOpenNote(project.notePath));
-      header.createSpan({
+      const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
         text: projectStatusLabel(project.status),
+        attr: {
+          "aria-label": `修改 ${project.title} 的项目状态，当前${
+            projectStatusLabel(project.status)
+          }`,
+          title: "修改项目状态",
+        },
       });
+      status.addEventListener("click", () => this.options.onEditProjectStatus(project.id));
       header.createSpan({
         cls: "helix-lineage-project-container-count",
         text: `${project.cycles.length} 阶段`,
@@ -1075,20 +1189,44 @@ export class ProjectLineageWorkbench {
     });
     const meta = card.createDiv({ cls: "helix-lineage-card-meta" });
     if (node.kind === "project") {
-      meta.createSpan({
-        cls: `is-project is-${owner.status}`,
+      const status = meta.createEl("button", {
+        cls: `helix-lineage-status-button is-project is-${owner.status}`,
         text: projectStatusLabel(owner.status),
+        attr: {
+          "aria-label": `修改 ${owner.title} 的项目状态，当前${
+            projectStatusLabel(owner.status)
+          }`,
+          title: "修改项目状态",
+        },
+      });
+      status.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.options.onEditProjectStatus(owner.id);
       });
       meta.createSpan({ text: `${owner.cycles.length} 个阶段` });
     } else {
       const cycle = owner.cycles.find((item) => item.id === node.entityId)!;
-      const status = meta.createSpan({
-        cls: `is-${cycle.status}`,
+      const status = meta.createEl("button", {
+        cls: `helix-lineage-status-button is-${cycle.status}`,
         text: cycle.status === "active"
           ? "进行中"
           : cycle.status === "closed"
             ? "已完成"
             : "计划中",
+        attr: {
+          "aria-label": `修改 ${cycle.title} 的阶段状态，当前${
+            cycle.status === "active"
+              ? "进行中"
+              : cycle.status === "closed"
+                ? "已完成"
+                : "计划中"
+          }`,
+          title: "修改阶段状态",
+        },
+      });
+      status.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.options.onEditCycleStatus(cycle.id);
       });
       if (cycle.status === "closed") {
         const check = status.createSpan({ cls: "helix-lineage-complete-check" });
@@ -1497,6 +1635,11 @@ export class ProjectLineageWorkbench {
         for (const node of this.structuralNodes()) this.selected.add(node.entityId);
         this.updateSelection();
       } else if (event.key === "Escape") {
+        if (this.lasso) {
+          event.preventDefault();
+          this.cancelLasso(viewport);
+          return;
+        }
         this.selected.clear();
         this.selectedRelationId = null;
         this.updateSelection();
@@ -1522,12 +1665,23 @@ export class ProjectLineageWorkbench {
     });
     viewport.addEventListener("pointerdown", (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (target?.closest(
-        ".helix-lineage-card, .helix-lineage-edge, .helix-lineage-edge-label, .helix-lineage-project-container-header, button",
-      )) {
-        return;
-      }
-      if (event.button === 1 || (event.button === 0 && this.spaceHeld)) {
+      const surface: LineagePointerSurface = target?.closest("button")
+        ? "button"
+        : target?.closest(".helix-lineage-edge, .helix-lineage-edge-label")
+          ? "edge"
+          : target?.closest(".helix-lineage-card")
+            ? "card"
+            : target?.closest(".helix-lineage-project-container-header")
+              ? "project-header"
+              : "blank";
+      const intent = lineageViewportPointerIntent(
+        event.button,
+        this.spaceHeld,
+        surface,
+      );
+      if (intent === "pan") {
+        event.preventDefault();
+        viewport.focus({ preventScroll: true });
         this.pan = {
           pointerId: event.pointerId,
           x: event.clientX,
@@ -1537,27 +1691,151 @@ export class ProjectLineageWorkbench {
         };
         viewport.setPointerCapture(event.pointerId);
         viewport.addClass("is-panning");
-      } else if (event.button === 0) {
-        this.selected.clear();
+        return;
+      }
+      if (intent === "lasso") {
+        event.preventDefault();
+        viewport.focus({ preventScroll: true });
+        const start = this.viewportLogicalPoint(event, viewport);
+        const overlay = this.surface?.createDiv({ cls: "helix-lineage-lasso" });
+        if (!overlay) return;
+        overlay.style.left = `${start.x}px`;
+        overlay.style.top = `${start.y}px`;
+        overlay.style.width = "0";
+        overlay.style.height = "0";
+        this.lasso = {
+          pointerId: event.pointerId,
+          start,
+          baseSelection: new Set(this.selected),
+          baseRelationId: this.selectedRelationId,
+          additive: event.shiftKey,
+          moved: false,
+          overlay,
+        };
         this.selectedRelationId = null;
-        this.updateSelection();
         this.renderEdges();
         this.updateRelationPanel();
+        viewport.setPointerCapture(event.pointerId);
+        viewport.addClass("is-lassoing");
       }
     });
     viewport.addEventListener("pointermove", (event) => {
-      if (!this.pan || this.pan.pointerId !== event.pointerId) return;
-      viewport.scrollLeft = this.pan.left - (event.clientX - this.pan.x);
-      viewport.scrollTop = this.pan.top - (event.clientY - this.pan.y);
+      if (this.pan?.pointerId === event.pointerId) {
+        viewport.scrollLeft = this.pan.left - (event.clientX - this.pan.x);
+        viewport.scrollTop = this.pan.top - (event.clientY - this.pan.y);
+        return;
+      }
+      if (this.lasso?.pointerId === event.pointerId) {
+        this.updateLasso(event, viewport);
+      }
     });
-    const finish = (event: PointerEvent): void => {
+    const finishPan = (event: PointerEvent): void => {
       if (!this.pan || this.pan.pointerId !== event.pointerId) return;
       this.pan = null;
       if (viewport.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
       viewport.removeClass("is-panning");
     };
-    viewport.addEventListener("pointerup", finish);
-    viewport.addEventListener("pointercancel", finish);
+    viewport.addEventListener("pointerup", (event) => {
+      finishPan(event);
+      this.finishLasso(event, viewport);
+    });
+    viewport.addEventListener("pointercancel", (event) => {
+      finishPan(event);
+      if (this.lasso?.pointerId === event.pointerId) this.cancelLasso(viewport);
+    });
+    viewport.addEventListener("lostpointercapture", (event) => {
+      if (this.pan?.pointerId === event.pointerId) {
+        this.pan = null;
+        viewport.removeClass("is-panning");
+      }
+      if (this.lasso?.pointerId === event.pointerId) this.cancelLasso(viewport);
+    });
+  }
+
+  private viewportLogicalPoint(
+    event: Pick<PointerEvent, "clientX" | "clientY">,
+    viewport: HTMLElement,
+  ): LineagePoint {
+    const rect = viewport.getBoundingClientRect();
+    return {
+      x: (viewport.scrollLeft + event.clientX - rect.left) /
+        Math.max(MIN_FIT_ZOOM, this.zoom),
+      y: (viewport.scrollTop + event.clientY - rect.top) /
+        Math.max(MIN_FIT_ZOOM, this.zoom),
+    };
+  }
+
+  private updateLasso(event: PointerEvent, viewport: HTMLElement): void {
+    const lasso = this.lasso;
+    if (!lasso || lasso.pointerId !== event.pointerId) return;
+    const current = this.viewportLogicalPoint(event, viewport);
+    const screenDistance = (
+      Math.abs(current.x - lasso.start.x) +
+      Math.abs(current.y - lasso.start.y)
+    ) * this.zoom;
+    if (screenDistance > 4) lasso.moved = true;
+    if (!lasso.moved) return;
+    const box = lineageSelectionBox(lasso.start, current);
+    lasso.overlay.style.left = `${box.x}px`;
+    lasso.overlay.style.top = `${box.y}px`;
+    lasso.overlay.style.width = `${box.right - box.x}px`;
+    lasso.overlay.style.height = `${box.bottom - box.y}px`;
+    const next = lineageLassoSelectionState(
+      lasso.baseSelection,
+      lasso.baseRelationId,
+      lineageEntitiesInSelection(
+      this.structuralNodes(),
+      this.layout,
+      box,
+      ),
+      lasso.additive ? "add" : "replace",
+    );
+    this.applyLassoSelectionState(next);
+  }
+
+  private finishLasso(event: PointerEvent, viewport: HTMLElement): void {
+    const lasso = this.lasso;
+    if (!lasso || lasso.pointerId !== event.pointerId) return;
+    this.lasso = null;
+    lasso.overlay.remove();
+    viewport.removeClass("is-lassoing");
+    if (viewport.hasPointerCapture(event.pointerId)) {
+      viewport.releasePointerCapture(event.pointerId);
+    }
+    if (!lasso.moved) {
+      this.applyLassoSelectionState(lineageLassoSelectionState(
+        lasso.baseSelection,
+        lasso.baseRelationId,
+        [],
+        lasso.additive ? "cancel" : "clear",
+      ));
+    }
+  }
+
+  private cancelLasso(viewport: HTMLElement): void {
+    const lasso = this.lasso;
+    if (!lasso) return;
+    this.lasso = null;
+    lasso.overlay.remove();
+    viewport.removeClass("is-lassoing");
+    if (viewport.hasPointerCapture(lasso.pointerId)) {
+      viewport.releasePointerCapture(lasso.pointerId);
+    }
+    this.applyLassoSelectionState(lineageLassoSelectionState(
+      lasso.baseSelection,
+      lasso.baseRelationId,
+      [],
+      "cancel",
+    ));
+  }
+
+  private applyLassoSelectionState(state: LineageLassoSelectionState): void {
+    this.selected.clear();
+    for (const entityId of state.entityIds) this.selected.add(entityId);
+    this.selectedRelationId = state.relationId;
+    this.updateSelection();
+    this.renderEdges();
+    this.updateRelationPanel();
   }
 
   private renderZoomControls(root: HTMLElement): void {

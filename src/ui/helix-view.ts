@@ -39,6 +39,8 @@ import type { HelixRuntimeState } from "../services/helix-service";
 import { HelixService } from "../services/helix-service";
 import type {
   ProjectConnectionPlan,
+  ProjectWorkspaceCycleStatus,
+  ProjectWorkspaceProjectStatus,
   ProjectWorkspaceService,
   ProjectWorkspaceSnapshot,
 } from "../services/project-workspace";
@@ -71,6 +73,26 @@ const NAV: Array<{ id: Section; label: string; icon: IconName }> = [
   { id: "analytics", label: "分析", icon: "chart-no-axes-combined" },
   { id: "challenges", label: "挑战", icon: "trophy" },
   { id: "conflicts", label: "冲突", icon: "git-compare-arrows" },
+];
+
+const PROJECT_STATUS_OPTIONS: Array<{
+  value: ProjectWorkspaceProjectStatus;
+  label: string;
+}> = [
+  { value: "planned", label: "计划中" },
+  { value: "active", label: "进行中" },
+  { value: "paused", label: "已暂停" },
+  { value: "completed", label: "已完成" },
+  { value: "archived", label: "已归档" },
+];
+
+const CYCLE_STATUS_OPTIONS: Array<{
+  value: ProjectWorkspaceCycleStatus;
+  label: string;
+}> = [
+  { value: "planned", label: "计划中" },
+  { value: "active", label: "进行中" },
+  { value: "closed", label: "已完成" },
 ];
 
 const SAMPLE_PROJECTS: DidaProject[] = [
@@ -864,6 +886,48 @@ export class HelixView extends ItemView {
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
+      onEditProjectStatus: (projectId) => {
+        const project = workspace.projects.find((candidate) => candidate.id === projectId);
+        if (!project) return;
+        void this.actions.projectWorkspace.prepareProjectStatusUpdate(projectId)
+          .then((plan) => {
+            new WorkspaceStatusModal(
+              this.app,
+              "修改项目状态",
+              project.title,
+              plan.currentStatus,
+              PROJECT_STATUS_OPTIONS,
+              async (status) => {
+                await this.actions.projectWorkspace.updateProjectStatus(plan, status);
+                await this.render();
+              },
+            ).open();
+          })
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      onEditCycleStatus: (cycleId) => {
+        const cycle = workspace.projects
+          .flatMap((project) => project.cycles)
+          .find((candidate) => candidate.id === cycleId);
+        if (!cycle) return;
+        void this.actions.projectWorkspace.prepareCycleStatusUpdate(cycleId)
+          .then((plan) => {
+            new WorkspaceStatusModal(
+              this.app,
+              "修改阶段状态",
+              `阶段 ${cycle.sequence} · ${cycle.title}`,
+              plan.currentStatus,
+              CYCLE_STATUS_OPTIONS,
+              async (status) => {
+                await this.actions.projectWorkspace.updateCycleStatus(plan, status);
+                await this.render();
+              },
+            ).open();
+          })
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
       onToggleCompletedCollapse: (projectId, collapsed) => {
         void this.actions.projectWorkspace.setCompletedProjectCollapsed(projectId, collapsed)
           .then(() => this.render())
@@ -1519,6 +1583,65 @@ export class HelixView extends ItemView {
     const observer = new ResizeObserver(() => chart.resize());
     observer.observe(element);
     this.chartObservers.push(observer);
+  }
+}
+
+class WorkspaceStatusModal<T extends string> extends Modal {
+  private selected: T;
+
+  constructor(
+    app: HelixView["app"],
+    private readonly heading: string,
+    private readonly entityLabel: string,
+    private readonly current: T,
+    private readonly options: Array<{ value: T; label: string }>,
+    private readonly submit: (status: T) => Promise<void>,
+  ) {
+    super(app);
+    this.selected = current;
+  }
+
+  onOpen(): void {
+    this.setTitle(this.heading);
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-entity",
+      text: this.entityLabel,
+    });
+    let save!: HTMLButtonElement;
+    new Setting(this.contentEl)
+      .setName("状态")
+      .addDropdown((dropdown) => {
+        for (const option of this.options) {
+          dropdown.addOption(option.value, option.label);
+        }
+        dropdown.setValue(this.current);
+        dropdown.onChange((value) => {
+          this.selected = value as T;
+          save.disabled = this.selected === this.current;
+        });
+        dropdown.selectEl.setAttribute("aria-label", `${this.entityLabel} 的状态`);
+      });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" })
+      .addEventListener("click", () => this.close());
+    save = actions.createEl("button", {
+      cls: "mod-cta",
+      text: "保存状态",
+    });
+    save.disabled = true;
+    save.addEventListener("click", () => {
+      save.disabled = true;
+      void this.submit(this.selected)
+        .then(() => this.close())
+        .catch((error) => {
+          save.disabled = this.selected === this.current;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 

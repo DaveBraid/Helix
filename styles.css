@@ -2360,8 +2360,19 @@
 
 .helix-lineage-project-container-status {
   padding: 2px 6px;
+  border: 0;
   border-radius: 999px;
+  box-shadow: none;
+  color: var(--text-muted);
   background: color-mix(in srgb, var(--helix-project-color, #5870a8) 9%, transparent);
+  font-family: inherit;
+  line-height: 1.25;
+}
+
+.helix-lineage-project-container-status:hover,
+.helix-lineage-project-container-status:focus-visible {
+  color: var(--text-normal);
+  background: color-mix(in srgb, var(--helix-project-color, #5870a8) 17%, transparent);
 }
 
 .helix-lineage-project-container-completed {
@@ -2470,6 +2481,16 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, #2f9b67 28%, transparent);
 }
 .helix-lineage-card.is-selected { border-color: var(--interactive-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 34%, transparent), 0 7px 20px rgba(0, 0, 0, .1); }
+.helix-lineage-viewport.is-lassoing { cursor: crosshair; }
+.helix-lineage-lasso {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 82%, white 18%);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--interactive-accent) 14%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--background-primary) 45%, transparent);
+}
 .helix-lineage-card.is-operation-focus {
   animation: helix-lineage-card-focus 1.55s ease-out;
 }
@@ -2496,12 +2517,27 @@
 .helix-lineage-card-title:hover { color: var(--link-color); text-decoration: underline; }
 .helix-lineage-card-meta,
 .helix-lineage-card-relations { display: flex; align-items: center; gap: 7px; color: var(--text-muted); font-size: 9px; }
-.helix-lineage-card-meta span:first-child { padding: 3px 6px; border-radius: 999px; color: var(--helix-relation-merge); background: color-mix(in srgb, var(--helix-relation-merge) 12%, transparent); }
-.helix-lineage-card-meta span.is-project { color: var(--helix-relation-inherit); background: color-mix(in srgb, var(--helix-relation-inherit) 12%, transparent); }
-.helix-lineage-card-meta span.is-project.is-paused { color: var(--helix-warning-ink); background: color-mix(in srgb, var(--helix-warning-ink) 14%, transparent); }
-.helix-lineage-card-meta span.is-project.is-completed { color: var(--helix-success-ink); background: color-mix(in srgb, var(--helix-success-ink) 14%, transparent); }
-.helix-lineage-card-meta span.is-project.is-archived { color: var(--text-muted); background: var(--background-secondary); }
-.helix-lineage-card-meta span.is-closed {
+.helix-lineage-status-button {
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 999px;
+  box-shadow: none;
+  color: var(--helix-relation-merge);
+  background: color-mix(in srgb, var(--helix-relation-merge) 12%, transparent);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.25;
+}
+.helix-lineage-status-button:hover,
+.helix-lineage-status-button:focus-visible {
+  color: var(--text-normal);
+  background: color-mix(in srgb, var(--interactive-accent) 17%, transparent);
+}
+.helix-lineage-status-button.is-project { color: var(--helix-relation-inherit); background: color-mix(in srgb, var(--helix-relation-inherit) 12%, transparent); }
+.helix-lineage-status-button.is-project.is-paused { color: var(--helix-warning-ink); background: color-mix(in srgb, var(--helix-warning-ink) 14%, transparent); }
+.helix-lineage-status-button.is-project.is-completed { color: var(--helix-success-ink); background: color-mix(in srgb, var(--helix-success-ink) 14%, transparent); }
+.helix-lineage-status-button.is-project.is-archived { color: var(--text-muted); background: var(--background-secondary); }
+.helix-lineage-status-button.is-closed {
   display: inline-flex;
   align-items: center;
   gap: 4px;

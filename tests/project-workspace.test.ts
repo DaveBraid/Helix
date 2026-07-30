@@ -133,6 +133,84 @@ describe("ProjectWorkspaceService", () => {
       .rejects.toThrow(/conflict/);
   });
 
+  it("updates project and stage status only in managed Markdown fields", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const projectPath = "Helix/Projects/Alpha/Project.md";
+    const cyclePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(projectPath, repo.take(projectPath)!.replace(
+      "helix-status: active",
+      "helix-status: active\ncustom-owner: user",
+    ));
+    repo.set(cyclePath, `${repo.take(cyclePath)!}\n用户正文保留`);
+
+    const projectPlan = await service.prepareProjectStatusUpdate("project-1");
+    const cyclePlan = await service.prepareCycleStatusUpdate("cycle-1");
+    await service.updateProjectStatus(projectPlan, "paused");
+    await service.updateCycleStatus(cyclePlan, "closed");
+
+    expect((await repo.read(projectPath))?.content).toContain("helix-status: \"paused\"");
+    expect((await repo.read(projectPath))?.content).toContain("custom-owner: user");
+    expect((await repo.read(cyclePath))?.content).toContain("helix-status: \"closed\"");
+    expect((await repo.read(cyclePath))?.content).toContain("用户正文保留");
+    expect((await service.snapshot()).projects[0]).toMatchObject({
+      status: "paused",
+      cycles: [expect.objectContaining({ status: "closed" })],
+    });
+
+    await service.ensureCanvas();
+    expect(repo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "project-node",
+        text: expect.stringContaining("已暂停"),
+      }),
+      expect.objectContaining({
+        id: "cycle-node",
+        text: expect.stringContaining("已关闭"),
+      }),
+    ]));
+    await expect(service.updateProjectStatus(projectPlan, "invalid" as never))
+      .rejects.toThrow(/项目状态无效/);
+    await expect(service.updateCycleStatus(cyclePlan, "invalid" as never))
+      .rejects.toThrow(/阶段状态无效/);
+  });
+
+  it("rejects stale status dialogs and Markdown identity replacement without writing", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const projectPath = "Helix/Projects/Alpha/Project.md";
+    const cyclePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const projectPlan = await service.prepareProjectStatusUpdate("project-1");
+    const cyclePlan = await service.prepareCycleStatusUpdate("cycle-1");
+
+    repo.set(projectPath, repo.take(projectPath)!.replace(
+      "helix-status: active",
+      "helix-status: completed",
+    ));
+    await expect(service.updateProjectStatus(projectPlan, "paused"))
+      .rejects.toThrow(/确认期间已经变化/);
+    expect((await repo.read(projectPath))?.content).toContain("helix-status: completed");
+    expect((await repo.read(projectPath))?.content).not.toContain("helix-status: \"paused\"");
+
+    repo.set(cyclePath, [
+      "---",
+      "helix-kind: helix-stage",
+      "helix-id: unrelated-stage",
+      "helix-project-id: project-1",
+      "helix-sequence: 1",
+      "helix-status: active",
+      "---",
+      "# 无关阶段",
+    ].join("\n"));
+    const replacement = await repo.read(cyclePath);
+    await expect(service.updateCycleStatus({
+      ...cyclePlan,
+      revisionHash: replacement!.hash,
+    }, "closed")).rejects.toThrow(/确认期间已经变化/);
+    expect((await repo.read(cyclePath))?.content).toContain("helix-id: unrelated-stage");
+    expect((await repo.read(cyclePath))?.content).not.toContain("helix-status: \"closed\"");
+  });
+
   it("adds a physical edge, normalizes the complete graph and rejects stale plans", async () => {
     const repo = baseRepository();
     repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));

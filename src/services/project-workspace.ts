@@ -75,13 +75,34 @@ export interface ProjectWorkspaceCycle {
   title: string;
   notePath: string;
   sequence: number;
-  status: "planned" | "active" | "closed";
+  status: ProjectWorkspaceCycleStatus;
+}
+
+export type ProjectWorkspaceCycleStatus = "planned" | "active" | "closed";
+export type ProjectWorkspaceProjectStatus =
+  "planned" | "active" | "paused" | "completed" | "archived";
+
+export interface ProjectWorkspaceProjectStatusUpdatePlan {
+  kind: "project";
+  entityId: string;
+  notePath: string;
+  revisionHash: string;
+  currentStatus: ProjectWorkspaceProjectStatus;
+}
+
+export interface ProjectWorkspaceCycleStatusUpdatePlan {
+  kind: "cycle";
+  entityId: string;
+  projectId: string;
+  notePath: string;
+  revisionHash: string;
+  currentStatus: ProjectWorkspaceCycleStatus;
 }
 
 export interface ProjectWorkspaceProject {
   id: string;
   title: string;
-  status: "planned" | "active" | "paused" | "completed" | "archived";
+  status: ProjectWorkspaceProjectStatus;
   notePath: string;
   didaProjectId?: string;
   color?: string;
@@ -817,6 +838,135 @@ export class ProjectWorkspaceService {
       revision,
       patchManagedFrontmatter(revision.content, {
         "helix-color": normalizedColor,
+        "helix-updated": new Date().toISOString(),
+      }),
+      () => this.assertActive(generation),
+    );
+    return this.snapshot();
+  }
+
+  async prepareProjectStatusUpdate(
+    projectId: string,
+  ): Promise<ProjectWorkspaceProjectStatusUpdatePlan> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("找不到需要修改状态的项目");
+    const revision = await this.repository.read(project.notePath);
+    if (!revision) throw new Error("项目 Markdown 已不存在");
+    this.assertActive(generation);
+    const frontmatter = frontmatterFromContent(revision.content);
+    if (
+      frontmatter?.["helix-kind"] !== "helix-project" ||
+      frontmatter["helix-id"] !== project.id ||
+      frontmatter["helix-status"] !== project.status
+    ) {
+      throw new Error("项目 Markdown 身份或状态已变化，请重新打开状态编辑");
+    }
+    return {
+      kind: "project",
+      entityId: project.id,
+      notePath: project.notePath,
+      revisionHash: revision.hash,
+      currentStatus: project.status,
+    };
+  }
+
+  async updateProjectStatus(
+    plan: ProjectWorkspaceProjectStatusUpdatePlan,
+    status: ProjectWorkspaceProjectStatus,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    if (!["planned", "active", "paused", "completed", "archived"].includes(status)) {
+      throw new Error("项目状态无效");
+    }
+    const generation = this.beginOperation();
+    const revision = await this.repository.read(plan.notePath);
+    if (!revision) throw new Error("项目 Markdown 已不存在");
+    const frontmatter = frontmatterFromContent(revision.content);
+    if (
+      plan.kind !== "project" ||
+      revision.hash !== plan.revisionHash ||
+      frontmatter?.["helix-kind"] !== "helix-project" ||
+      frontmatter["helix-id"] !== plan.entityId ||
+      frontmatter["helix-status"] !== plan.currentStatus
+    ) {
+      throw new Error("项目 Markdown 在状态确认期间已经变化，请重新打开状态编辑");
+    }
+    this.assertActive(generation);
+    await this.repository.compareAndWrite(
+      revision,
+      patchManagedFrontmatter(revision.content, {
+        "helix-status": status,
+        "helix-updated": new Date().toISOString(),
+      }),
+      () => this.assertActive(generation),
+    );
+    return this.snapshot();
+  }
+
+  async prepareCycleStatusUpdate(
+    cycleId: string,
+  ): Promise<ProjectWorkspaceCycleStatusUpdatePlan> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const owner = snapshot.projects.find((project) =>
+      project.cycles.some((candidate) => candidate.id === cycleId));
+    const cycle = owner?.cycles.find((candidate) => candidate.id === cycleId);
+    if (!owner || !cycle) throw new Error("找不到需要修改状态的阶段");
+    const revision = await this.repository.read(cycle.notePath);
+    if (!revision) throw new Error("阶段 Markdown 已不存在");
+    this.assertActive(generation);
+    const frontmatter = frontmatterFromContent(revision.content);
+    if (
+      (
+        frontmatter?.["helix-kind"] !== "helix-stage" &&
+        frontmatter?.["helix-kind"] !== "helix-cycle"
+      ) ||
+      frontmatter["helix-id"] !== cycle.id ||
+      frontmatter["helix-project-id"] !== owner.id ||
+      frontmatter["helix-status"] !== cycle.status
+    ) {
+      throw new Error("阶段 Markdown 身份、所属项目或状态已变化，请重新打开状态编辑");
+    }
+    return {
+      kind: "cycle",
+      entityId: cycle.id,
+      projectId: owner.id,
+      notePath: cycle.notePath,
+      revisionHash: revision.hash,
+      currentStatus: cycle.status,
+    };
+  }
+
+  async updateCycleStatus(
+    plan: ProjectWorkspaceCycleStatusUpdatePlan,
+    status: ProjectWorkspaceCycleStatus,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    if (!["planned", "active", "closed"].includes(status)) {
+      throw new Error("阶段状态无效");
+    }
+    const generation = this.beginOperation();
+    const revision = await this.repository.read(plan.notePath);
+    if (!revision) throw new Error("阶段 Markdown 已不存在");
+    const frontmatter = frontmatterFromContent(revision.content);
+    if (
+      plan.kind !== "cycle" ||
+      revision.hash !== plan.revisionHash ||
+      (
+        frontmatter?.["helix-kind"] !== "helix-stage" &&
+        frontmatter?.["helix-kind"] !== "helix-cycle"
+      ) ||
+      frontmatter["helix-id"] !== plan.entityId ||
+      frontmatter["helix-project-id"] !== plan.projectId ||
+      frontmatter["helix-status"] !== plan.currentStatus
+    ) {
+      throw new Error("阶段 Markdown 在状态确认期间已经变化，请重新打开状态编辑");
+    }
+    this.assertActive(generation);
+    await this.repository.compareAndWrite(
+      revision,
+      patchManagedFrontmatter(revision.content, {
+        "helix-status": status,
         "helix-updated": new Date().toISOString(),
       }),
       () => this.assertActive(generation),

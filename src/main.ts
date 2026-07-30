@@ -30,6 +30,7 @@ import { ProjectWorkspaceService } from "./services/project-workspace";
 import type {
   ProjectWorkspaceMigrationItem,
   ProjectWorkspaceProject,
+  StageDeletionPlan,
 } from "./services/project-workspace";
 import { HelixDataStore } from "./storage/data-store";
 import {
@@ -73,6 +74,26 @@ export default class HelixPlugin extends Plugin {
     const data = await this.store.load();
     this.settings = data.settings;
     this.recoveryMode = data.recoveryIssues.length > 0;
+    if (this.recoveryMode) {
+      this.projectWorkspace.freezePendingStageDeletion(
+        "Helix data.json 处于只读恢复模式，阶段删除事务不会自动执行，项目写入已冻结",
+      );
+    } else {
+      try {
+        const recovered = await this.projectWorkspace.recoverPendingStageDeletion();
+        if (recovered !== "none") {
+          new Notice(`Helix 已恢复未完成的阶段删除事务：${recovered}`);
+        }
+      } catch (error) {
+        const message =
+          `Helix 阶段删除事务需要人工检查：${
+            error instanceof Error ? error.message : String(error)
+          }`;
+        this.projectWorkspace.freezePendingStageDeletion(message);
+        this.recoveryMode = true;
+        new Notice(message, 0);
+      }
+    }
     this.service = new HelixService(this.store, this.secrets);
     await this.service.initialize();
     if (!this.recoveryMode) await this.recoverClosedReviewEvents();
@@ -231,10 +252,10 @@ export default class HelixPlugin extends Plugin {
     new ProjectPromptModal(
       this.app,
       this.service.snapshot().projects,
-      async (title, didaProjectId) => {
+      async (title, didaProjectId, color) => {
         this.assertWritable();
         await this.withProjectMutation(() =>
-          this.projectWorkspace.createProject(title, didaProjectId));
+          this.projectWorkspace.createProject(title, didaProjectId, color));
         await this.service.refreshPersistedEvents();
         new Notice("项目和阶段 1 已加入当前工作区");
       },
@@ -303,8 +324,11 @@ export default class HelixPlugin extends Plugin {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能删除阶段", 8_000);
       return;
     }
-    void this.projectWorkspace.snapshot()
-      .then((snapshot) => {
+    void Promise.all([
+      this.projectWorkspace.snapshot(),
+      this.projectWorkspace.planCycleDeletion(cycleId),
+    ])
+      .then(([snapshot, plan]) => {
         const owner = snapshot.projects.find((project) =>
           project.cycles.some((cycle) => cycle.id === cycleId));
         const cycle = owner?.cycles.find((candidate) => candidate.id === cycleId);
@@ -315,11 +339,19 @@ export default class HelixPlugin extends Plugin {
           snapshot.projects,
           cycle,
           snapshot.relations,
-          async () => {
+          plan,
+          async (bridge, confirmCrossProject) => {
             this.assertWritable();
             await this.withProjectMutation(() =>
-              this.projectWorkspace.deleteCycle(cycle.id));
-            new Notice("阶段笔记已移入废纸篓，Canvas 节点与相关关系已删除");
+              this.projectWorkspace.deleteCycle(plan, {
+                bridge,
+                confirmCrossProject,
+              }));
+            new Notice(
+              bridge
+                ? "阶段已删除，前后关系已桥接并整理"
+                : "阶段已删除，未自动桥接前后关系",
+            );
           },
         ).open();
       })
@@ -562,11 +594,16 @@ export default class HelixPlugin extends Plugin {
 class ProjectPromptModal extends Modal {
   private title = "";
   private didaProjectId = "";
+  private color = "#5870A8";
 
   constructor(
     app: HelixPlugin["app"],
     private readonly projects: Array<{ id: string; name: string }>,
-    private readonly submit: (title: string, didaProjectId?: string) => Promise<void>,
+    private readonly submit: (
+      title: string,
+      didaProjectId?: string,
+      color?: string,
+    ) => Promise<void>,
   ) {
     super(app);
   }
@@ -591,6 +628,15 @@ class ProjectPromptModal extends Modal {
           this.didaProjectId = value;
         });
       });
+    new Setting(this.contentEl)
+      .setName("项目颜色")
+      .setDesc("用于项目卡片左侧的低调渐变，可随时修改。")
+      .addColorPicker((picker) => {
+        picker.setValue(this.color);
+        picker.onChange((value) => {
+          this.color = value.toUpperCase();
+        });
+      });
     const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
     const cancel = actions.createEl("button", { text: "取消" });
     cancel.addEventListener("click", () => this.close());
@@ -602,7 +648,7 @@ class ProjectPromptModal extends Modal {
         return;
       }
       confirm.disabled = true;
-      void this.submit(title, this.didaProjectId || undefined)
+      void this.submit(title, this.didaProjectId || undefined, this.color)
         .then(() => this.close())
         .catch((error) => {
           confirm.disabled = false;
@@ -747,6 +793,8 @@ class CyclePromptModal extends Modal {
 
 class DeleteCycleModal extends Modal {
   private confirmed = false;
+  private bridge = true;
+  private crossProjectConfirmed = false;
 
   constructor(
     app: HelixPlugin["app"],
@@ -754,7 +802,11 @@ class DeleteCycleModal extends Modal {
     private readonly projects: ProjectWorkspaceProject[],
     private readonly cycle: ProjectWorkspaceProject["cycles"][number],
     private readonly relations: CycleRelation[],
-    private readonly submit: () => Promise<void>,
+    private readonly plan: StageDeletionPlan,
+    private readonly submit: (
+      bridge: boolean,
+      confirmCrossProject: boolean,
+    ) => Promise<void>,
   ) {
     super(app);
   }
@@ -766,61 +818,63 @@ class DeleteCycleModal extends Modal {
     });
     this.contentEl.createEl("p", {
       cls: "helix-modal-note",
-      text: "阶段 Markdown 将移入 Obsidian 废纸篓；Canvas 节点及所有入边、出边会一并删除。其他阶段笔记不会改写。",
+      text: "阶段 Markdown 将移入 Obsidian 废纸篓；其他阶段笔记不会改写。",
     });
-    const fullyRemovedRelations = this.relations.filter((relation) =>
-      relation.toCycleId === this.cycle.id ||
-      (
-        relation.kind !== "merge" &&
-        relation.fromCycleIds.includes(this.cycle.id)
-      ));
-    const normalized = normalizedBranchesAfterRemoving(
-      this.relations,
-      fullyRemovedRelations,
+    const newEdges = this.plan.bridgeCandidates.filter((candidate) => !candidate.existing);
+    const reusedEdges = this.plan.bridgeCandidates.filter((candidate) => candidate.existing);
+    const crossProjectEdges = this.plan.bridgeCandidates.filter(
+      (candidate) => candidate.crossProject,
     );
-    if (normalized.length > 0) {
-      this.contentEl.createEl("p", {
-        cls: "helix-modal-note is-warning",
-        text: `删除后，${normalized.map((relation) =>
-          this.cycleLabel(relation.toCycleId)).join("、")}的剩余分支关系将改为继承。`,
-      });
-    }
-    const changedMerges = this.relations.flatMap((relation) => {
-      if (
-        relation.kind !== "merge" ||
-        relation.toCycleId === this.cycle.id ||
-        !relation.fromCycleIds.includes(this.cycle.id)
-      ) {
-        return [];
-      }
-      const remainingCount = relation.fromCycleIds.length - 1;
-      const remainingSource = relation.fromCycleIds.find(
-        (sourceId) => sourceId !== this.cycle.id,
-      );
-      const nextKind = remainingCount === 1 &&
-        remainingSource &&
-        this.relations.some((candidate) =>
-          candidate !== relation &&
-          candidate.toCycleId !== this.cycle.id &&
-          candidate.fromCycleIds.includes(remainingSource))
-        ? "branch"
-        : "inherit";
-      return [{
-        target: this.cycleLabel(relation.toCycleId),
-        remainingCount,
-        nextKind,
-      }];
+    this.bridge = !this.plan.bridgeLimitExceeded;
+    const impactSummary = this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
     });
-    for (const change of changedMerges) {
-      this.contentEl.createEl("p", {
-        cls: "helix-modal-note is-warning",
-        text: change.remainingCount === 1
-          ? `删除后，${change.target}的合并关系将改为${
-            change.nextKind === "branch" ? "分支" : "继承"
-          }。`
-          : `删除后，${change.target}的合并来源将缩减为 ${change.remainingCount} 个。`,
-      });
+    const impactDetails = this.contentEl.createDiv({
+      cls: "helix-deletion-impact-details",
+    });
+    if (newEdges.length > 0) {
+      const details = this.contentEl.createEl("details");
+      details.createEl("summary", { text: "查看桥接关系" });
+      const list = details.createEl("ul");
+      for (const edge of this.plan.bridgeCandidates) {
+        list.createEl("li", {
+          text: `${this.cycleLabel(edge.fromCycleId)} → ${this.cycleLabel(edge.toCycleId)}${
+            edge.existing ? "（已存在）" : ""
+          }${edge.crossProject ? "（跨项目）" : ""}`,
+        });
+      }
     }
+    new Setting(this.contentEl)
+      .setName("删除后衔接前后阶段")
+      .setDesc(
+        this.plan.bridgeLimitExceeded
+          ? "候选新增边超过 24 条，已禁止一键桥接；删除后请手动连接。"
+          : "默认保留路径连续性；关闭后只移除节点及相邻关系。",
+      )
+      .addToggle((toggle) => {
+        toggle.setValue(!this.plan.bridgeLimitExceeded);
+        toggle.setDisabled(this.plan.bridgeLimitExceeded);
+        toggle.onChange((value) => {
+          this.bridge = value;
+          crossConfirmation.toggleClass("is-hidden", !value || crossProjectEdges.length === 0);
+          this.renderImpact(impactSummary, impactDetails, newEdges.length, reusedEdges.length);
+          this.updateRemoveButton(remove);
+        });
+      });
+    const crossConfirmation = this.contentEl.createEl("label", {
+      cls: `helix-branch-confirm${
+        crossProjectEdges.length === 0 || !this.bridge ? " is-hidden" : ""
+      }`,
+    });
+    const crossCheckbox = crossConfirmation.createEl("input", { type: "checkbox" });
+    crossConfirmation.createSpan({
+      text: `我确认新增或复用 ${crossProjectEdges.length} 条跨项目桥接`,
+    });
+    crossCheckbox.addEventListener("change", () => {
+      this.crossProjectConfirmed = crossCheckbox.checked;
+      this.updateRemoveButton(remove);
+    });
+    this.renderImpact(impactSummary, impactDetails, newEdges.length, reusedEdges.length);
     const confirmation = this.contentEl.createEl("label", {
       cls: "helix-branch-confirm",
     });
@@ -835,18 +889,59 @@ class DeleteCycleModal extends Modal {
     remove.disabled = true;
     checkbox.addEventListener("change", () => {
       this.confirmed = checkbox.checked;
-      remove.disabled = !this.confirmed;
+      this.updateRemoveButton(remove);
     });
     remove.addEventListener("click", () => {
       if (!this.confirmed) return;
       remove.disabled = true;
-      void this.submit()
+      void this.submit(this.bridge, this.crossProjectConfirmed)
         .then(() => this.close())
         .catch((error) => {
           remove.disabled = false;
           new Notice(error instanceof Error ? error.message : String(error), 8_000);
         });
     });
+  }
+
+  private updateRemoveButton(button: HTMLButtonElement): void {
+    const needsCrossProject = this.bridge &&
+      this.plan.bridgeCandidates.some((candidate) => candidate.crossProject);
+    button.disabled = !this.confirmed ||
+      (needsCrossProject && !this.crossProjectConfirmed);
+  }
+
+  private renderImpact(
+    summary: HTMLElement,
+    details: HTMLElement,
+    newEdgeCount: number,
+    reusedEdgeCount: number,
+  ): void {
+    const impact = this.bridge
+      ? this.plan.impacts.bridge
+      : this.plan.impacts.noBridge;
+    summary.textContent = this.bridge
+      ? `桥接：新增 ${newEdgeCount} 条、复用 ${reusedEdgeCount} 条；${
+          impact.relabeledEdges.length
+        } 条已有边重标，整理 ${impact.affectedNodeCount} 个节点。`
+      : `不桥接：只删除节点及相邻边；${impact.relabeledEdges.length} 条已有边重标，整理 ${
+          impact.affectedNodeCount
+        } 个节点。`;
+    details.empty();
+    if (impact.relabeledEdges.length === 0) return;
+    const disclosure = details.createEl("details");
+    disclosure.createEl("summary", {
+      text: `查看 ${impact.relabeledEdges.length} 条关系类型变化`,
+    });
+    const list = disclosure.createEl("ul");
+    for (const edge of impact.relabeledEdges) {
+      list.createEl("li", {
+        text: `${this.cycleLabel(edge.fromCycleId)} → ${
+          this.cycleLabel(edge.toCycleId)
+        }：${CYCLE_RELATION_LABELS[edge.before]} → ${
+          CYCLE_RELATION_LABELS[edge.after]
+        }（${edge.edgeId}）`,
+      });
+    }
   }
 
   onClose(): void {
@@ -863,7 +958,6 @@ class DeleteCycleModal extends Modal {
 }
 
 class RelationPromptModal extends Modal {
-  private kind: CycleRelationKind;
   private selected: Set<string>;
   private picker: Setting | null = null;
   private crossProjectConfirmed = false;
@@ -883,7 +977,6 @@ class RelationPromptModal extends Modal {
     private readonly remove: () => Promise<void>,
   ) {
     super(app);
-    this.kind = relation.kind;
     this.selected = new Set(relation.fromCycleIds);
   }
 
@@ -896,22 +989,8 @@ class RelationPromptModal extends Modal {
         ? `${target.project.title} / 阶段 ${target.cycle.sequence} · ${target.cycle.title}`
         : this.relation.toCycleId);
     new Setting(this.contentEl)
-      .setName("关系类型")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("inherit", "继承")
-          .addOption("branch", "分支")
-          .addOption("merge", "合并")
-          .setValue(this.kind)
-          .onChange((value) => {
-            this.kind = value as CycleRelationKind;
-            if (this.kind !== "merge" && this.selected.size > 1) {
-              this.selected.clear();
-            }
-            this.resetCrossProjectConfirmation();
-            this.renderPicker();
-          }),
-      );
+      .setName("关系类型由拓扑自动判定")
+      .setDesc("一个目标有多个前置时为合并；一个来源有多个后继时为分支；其余为继承。");
     this.picker = new Setting(this.contentEl);
     this.renderPicker();
     const crossProject = this.contentEl.createEl("label", {
@@ -963,12 +1042,8 @@ class RelationPromptModal extends Modal {
     const save = actions.createEl("button", { cls: "mod-cta", text: "保存关系" });
     save.addEventListener("click", () => {
       const ids = [...this.selected];
-      if (this.kind !== "merge" && ids.length !== 1) {
-        new Notice("继承或分支必须选择 1 个前置阶段");
-        return;
-      }
-      if (this.kind === "merge" && ids.length < 2) {
-        new Notice("合并至少需要 2 个前置阶段");
+      if (ids.length < 1) {
+        new Notice("至少选择 1 个前置阶段");
         return;
       }
       if (this.isCrossProject() && !this.crossProjectConfirmed) {
@@ -976,7 +1051,8 @@ class RelationPromptModal extends Modal {
         return;
       }
       save.disabled = true;
-      void this.submit(this.kind, ids, this.crossProjectConfirmed)
+      const physicalKind: CycleRelationKind = ids.length >= 2 ? "merge" : "inherit";
+      void this.submit(physicalKind, ids, this.crossProjectConfirmed)
         .then(() => this.close())
         .catch((error) => {
           save.disabled = false;
@@ -990,25 +1066,20 @@ class RelationPromptModal extends Modal {
     this.picker.settingEl.empty();
     const picker = this.picker.settingEl.createDiv({ cls: "helix-cycle-picker" });
     picker.createEl("strong", {
-      text: this.kind === "merge" ? "选择前置阶段（至少两个）" : "选择前置阶段",
+      text: "选择前置阶段",
     });
     for (const project of this.projects) {
       for (const cycle of project.cycles) {
         if (cycle.id === this.relation.toCycleId) continue;
         const row = picker.createEl("label");
         const input = row.createEl("input", {
-          type: this.kind === "merge" ? "checkbox" : "radio",
+          type: "checkbox",
           attr: { name: "helix-relation-predecessor" },
         });
         input.checked = this.selected.has(cycle.id);
         input.addEventListener("change", () => {
-          if (this.kind === "merge") {
-            if (input.checked) this.selected.add(cycle.id);
-            else this.selected.delete(cycle.id);
-          } else {
-            this.selected.clear();
-            if (input.checked) this.selected.add(cycle.id);
-          }
+          if (input.checked) this.selected.add(cycle.id);
+          else this.selected.delete(cycle.id);
           this.resetCrossProjectConfirmation();
         });
         row.createSpan({

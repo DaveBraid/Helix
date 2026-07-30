@@ -12,13 +12,20 @@ export function patchManagedFrontmatter(
     if (!key.startsWith("helix-")) {
       throw new Error(`拒绝修改非 Helix 属性：${key}`);
     }
-    const encoded = encodeYamlInline(value);
     const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const indices = lines.flatMap((line, index) =>
       new RegExp(`^${escaped}\\s*:`).test(line) ? [index] : [],
     );
     if (indices.length > 1) throw new Error(`重复的受管属性：${key}`);
     const index = indices[0];
+    if (value === undefined) {
+      if (index === undefined) continue;
+      let end = index + 1;
+      while (end < lines.length && /^[ \t]+/.test(lines[end] ?? "")) end += 1;
+      lines.splice(index, end - index);
+      continue;
+    }
+    const encoded = encodeYamlInline(value);
     if (index === undefined) {
       lines.push(`${key}: ${encoded}`);
       continue;

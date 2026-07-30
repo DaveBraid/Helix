@@ -30,4 +30,11 @@ describe("managed frontmatter patching", () => {
     const source = "---\nhelix-kind: helix-project\nhelix-parents: []\nhelix-parents:\n  - duplicate\n---\n";
     expect(() => patchManagedFrontmatter(source, { "helix-parents": [] })).toThrow(/重复/);
   });
+
+  it("removes an optional managed property when its value is undefined", () => {
+    const source = "---\nhelix-kind: helix-project\nhelix-color: \"#5870A8\"\nuser-field: keep\n---\n";
+    const next = patchManagedFrontmatter(source, { "helix-color": undefined });
+    expect(next).not.toContain("helix-color");
+    expect(next).toContain("user-field: keep");
+  });
 });

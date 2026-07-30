@@ -9,6 +9,7 @@ export interface ProjectFrontmatter {
   "helix-id": string;
   "helix-status": HelixProject["status"];
   "helix-area"?: string;
+  "helix-color"?: string;
   "helix-dida-project-id"?: string;
   "helix-parents"?: string[];
   "helix-active-cycle"?: string;
@@ -32,12 +33,14 @@ export function projectTemplate(input: {
   title: string;
   createdAt: string;
   didaProjectId?: string;
+  color?: string;
 }): string {
   return `---
 helix-kind: ${PROJECT_KIND}
 helix-id: ${input.id}
 helix-status: active
 ${input.didaProjectId ? `helix-dida-project-id: ${input.didaProjectId}\n` : ""}
+${input.color ? `helix-color: "${input.color}"\n` : ""}
 helix-created: ${input.createdAt}
 helix-updated: ${input.createdAt}
 ---

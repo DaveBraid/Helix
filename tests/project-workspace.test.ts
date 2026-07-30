@@ -5,6 +5,7 @@ import { ProjectWorkspaceService } from "../src/services/project-workspace";
 import type { VaultRevision } from "../src/storage/vault-repository";
 
 const CANVAS = "Helix/Project Lineage.canvas";
+const DELETE_JOURNAL = "Helix/.transactions/stage-delete.json";
 
 describe("ProjectWorkspaceService", () => {
   it("uses stable IDs to repair renamed paths and writes real text-card summaries", async () => {
@@ -105,6 +106,132 @@ describe("ProjectWorkspaceService", () => {
         expect.objectContaining({ id: "cycle-node", x: 0, y: 300 }),
       ],
     });
+
+    const bounded = baseRepository();
+    const boundedBefore = (await bounded.read(CANVAS))!.content;
+    await expect(workspace(bounded).moveCanvasNodes([
+      { nodeId: "cycle-node", x: 1_000_001, y: 0 },
+    ])).rejects.toThrow(/移动计划无效/);
+    expect((await bounded.read(CANVAS))!.content).toBe(boundedBefore);
+  });
+
+  it("stores a normalized project color in Markdown and detects competing edits", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    await service.updateProjectColor("project-1", "#4d8275");
+    expect((await repo.read("Helix/Projects/Alpha/Project.md"))?.content)
+      .toContain('helix-color: "#4D8275"');
+    expect((await service.snapshot()).projects[0]?.color).toBe("#4D8275");
+    await expect(service.updateProjectColor("project-1", "green"))
+      .rejects.toThrow(/#RRGGBB/);
+
+    repo.beforeCompare = () => {
+      const path = "Helix/Projects/Alpha/Project.md";
+      repo.set(path, `${repo.take(path)}\nuser edit`);
+    };
+    await expect(service.updateProjectColor("project-1", "#5870A8"))
+      .rejects.toThrow(/conflict/);
+  });
+
+  it("adds a physical edge, normalizes the complete graph and rejects stale plans", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    repo.set("Helix/Projects/Alpha/Cycle-03.md", cycle("cycle-3", "project-1", 3));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300),
+      card("cycle-3-node", "cycle", "project-1", "cycle-3", 520, 600),
+    );
+    canvas.edges.push({
+      id: "edge-1",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      helixManaged: true,
+      helixRelation: "inherit",
+      label: "继承",
+      custom: "keep",
+    });
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const plan = await service.planConnection("cycle-1", "cycle-3");
+    expect(plan).toMatchObject({
+      affectedNodeCount: 3,
+      relabeledEdgeCount: 1,
+      source: {
+        projectTitle: "Alpha",
+        cycleTitle: "阶段标题 1",
+        sequence: 1,
+      },
+      target: {
+        projectTitle: "Alpha",
+        cycleTitle: "阶段标题 3",
+        sequence: 3,
+      },
+    });
+    const beforeTamper = (await repo.read(CANVAS))!.content;
+    await expect(service.connectCycles({
+      ...plan,
+      affectedNodeCount: plan.affectedNodeCount + 1,
+    })).rejects.toThrow(/计划已经变化/);
+    expect((await repo.read(CANVAS))!.content).toBe(beforeTamper);
+    await service.connectCycles(plan);
+    expect(repo.json(CANVAS).edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "edge-1",
+        helixRelation: "branch",
+        custom: "keep",
+      }),
+      expect.objectContaining({ helixRelation: "branch" }),
+    ]));
+    await expect(service.connectCycles(plan)).rejects.toThrow(/已经变化/);
+  });
+
+  it("persists completed-project collapse without changing physical nodes or edges", async () => {
+    const repo = baseRepository();
+    const before = repo.json(CANVAS);
+    await workspace(repo).setCompletedProjectCollapsed("project-1", true);
+    const after = repo.json(CANVAS);
+    expect(after.helixCompletedCollapse).toEqual({
+      version: 1,
+      projectIds: ["project-1"],
+    });
+    expect(after.nodes).toEqual(before.nodes);
+    expect(after.edges).toEqual(before.edges);
+  });
+
+  it("expands multiple completed projects in one Canvas CAS", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Beta/Project.md", project("project-2", "Beta"));
+    repo.set("Helix/Projects/Beta/Stage-01.md", cycle("cycle-beta", "project-2", 1));
+    const canvas = repo.json(CANVAS);
+    canvas.helixCompletedCollapse = {
+      version: 1,
+      projectIds: ["project-1", "project-2"],
+    };
+    canvas.nodes.push(
+      {
+        ...card("project-2-node", "project", "project-2", undefined, 0, 900),
+        helixFilePath: "Helix/Projects/Beta/Project.md",
+        text: "[[Helix/Projects/Beta/Project|Beta]]\n\n项目",
+      },
+      {
+        ...card("cycle-beta-node", "cycle", "project-2", "cycle-beta", 520, 900),
+        helixProjectId: "project-2",
+        helixFilePath: "Helix/Projects/Beta/Stage-01.md",
+        text: "[[Helix/Projects/Beta/Stage-01|阶段标题 1]]\n\n进行中",
+      },
+    );
+    repo.set(CANVAS, JSON.stringify(canvas));
+
+    await workspace(repo).setCompletedProjectsCollapsed(
+      ["project-1", "project-2"],
+      false,
+    );
+
+    expect(repo.json(CANVAS).helixCompletedCollapse).toEqual({
+      version: 1,
+      projectIds: [],
+    });
   });
 
   it("rolls back project files on failure and rejects duplicate Dida mappings before writing", async () => {
@@ -137,6 +264,71 @@ describe("ProjectWorkspaceService", () => {
       helixFilePath: stagePath,
     }));
     expect((await service.snapshot()).projects).toHaveLength(2);
+  });
+
+  it("lays out a newly created project without moving or overlapping existing cards", async () => {
+    const repo = baseRepository();
+    const before: Array<{ id: unknown; x: unknown; y: unknown }> =
+      repo.json(CANVAS).nodes.map((node: Record<string, unknown>) => ({
+      id: node.id,
+      x: node.x,
+      y: node.y,
+    }));
+
+    const created = await workspace(repo).createProject("布局验证");
+    const nodes = repo.json(CANVAS).nodes;
+
+    expect(nodes.filter((node: Record<string, unknown>) =>
+      before.some((item) => item.id === node.id)).map(
+      (node: Record<string, unknown>) => ({ id: node.id, x: node.x, y: node.y }),
+    )).toEqual(before);
+    const boxes = nodes.map((node: Record<string, unknown>) => ({
+      id: node.id as string,
+      x: node.x as number,
+      y: node.y as number,
+    }));
+    for (let left = 0; left < boxes.length; left += 1) {
+      for (let right = left + 1; right < boxes.length; right += 1) {
+        expect(
+          Math.abs(boxes[left]!.x - boxes[right]!.x) < 328 &&
+          Math.abs(boxes[left]!.y - boxes[right]!.y) < 164,
+        ).toBe(false);
+      }
+    }
+    expect(nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ helixProjectId: created.id, x: 0 }),
+      expect.objectContaining({ helixStageId: created.cycles[0]!.id, x: 408 }),
+    ]));
+  });
+
+  it("preserves acknowledged legacy derives-from edges during normalized writes", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+    const legacy = {
+      id: "legacy-derives",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      label: "derives-from",
+      helixManaged: true,
+      helixRelation: "derives-from",
+      custom: { keep: true },
+    };
+    canvas.edges.push(legacy);
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const migration = await service.snapshot();
+    await service.acknowledgeLegacyMigration(
+      migration.migrationItems.map((item) => item.id),
+    );
+
+    const plan = await service.planConnection("cycle-1", "cycle-2");
+    await service.connectCycles(plan);
+
+    expect(repo.json(CANVAS).edges.find(
+      (edge: { id: string }) => edge.id === legacy.id,
+    )).toEqual(legacy);
   });
 
   it("converts only the exact managed inheritance edge when creating a branch", async () => {
@@ -236,8 +428,8 @@ describe("ProjectWorkspaceService", () => {
     ]));
     expect(outgoing).toHaveLength(2);
     expect(repo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ helixStageId: first.id, x: 520, y: 300 }),
-      expect.objectContaining({ helixStageId: second.id, x: 520, y: 600 }),
+      expect.objectContaining({ helixStageId: first.id, x: 816, y: 0 }),
+      expect.objectContaining({ helixStageId: second.id, x: 816, y: 200 }),
     ]));
   });
 
@@ -345,8 +537,8 @@ describe("ProjectWorkspaceService", () => {
     );
     expect(repo.json(CANVAS).nodes).toContainEqual(expect.objectContaining({
       helixStageId: merged.id,
-      x: 520,
-      y: 450,
+      x: 816,
+      y: 200,
     }));
   });
 
@@ -447,8 +639,8 @@ describe("ProjectWorkspaceService", () => {
       (node: Record<string, unknown>) => node.helixNodeKind === "stage",
     );
     expect(stages).toEqual([
-      expect.objectContaining({ x: 520, y: 300 }),
-      expect.objectContaining({ x: 520, y: 600 }),
+      expect.objectContaining({ x: 816, y: 0 }),
+      expect.objectContaining({ x: 816, y: 200 }),
     ]);
   });
 
@@ -463,8 +655,8 @@ describe("ProjectWorkspaceService", () => {
     );
     expect(repo.json(CANVAS).nodes).toContainEqual(expect.objectContaining({
       helixStageId: expect.any(String),
-      x: 520,
-      y: 300,
+      x: 816,
+      y: 0,
     }));
     await expect(service.createCycle(
       "project-1",
@@ -495,6 +687,7 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({ id: "cycle-2-node" }),
     );
     expect(repo.json(CANVAS).edges).toHaveLength(0);
+    expect(await repo.read(DELETE_JOURNAL)).toBeNull();
     await expect(workspace(baseRepository()).deleteCycle("cycle-1"))
       .rejects.toThrow(/至少需要保留一个阶段/);
 
@@ -526,6 +719,163 @@ describe("ProjectWorkspaceService", () => {
     expect(rollbackRepo.json(CANVAS)).toEqual(expectedCanvasAfterRepair);
   });
 
+  it("bridges predecessors to successors when deleting a middle stage", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    repo.set("Helix/Projects/Alpha/Cycle-03.md", cycle("cycle-3", "project-1", 3));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300),
+      card("cycle-3-node", "cycle", "project-1", "cycle-3", 1040, 300),
+    );
+    canvas.edges.push(
+      {
+        id: "edge-12",
+        fromNode: "cycle-node",
+        toNode: "cycle-2-node",
+        helixManaged: true,
+        helixRelation: "inherit",
+        label: "继承",
+      },
+      {
+        id: "edge-23",
+        fromNode: "cycle-2-node",
+        toNode: "cycle-3-node",
+        helixManaged: true,
+        helixRelation: "inherit",
+        label: "继承",
+      },
+    );
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const plan = await service.planCycleDeletion("cycle-2");
+    expect(plan.bridgeCandidates).toEqual([{
+      fromCycleId: "cycle-1",
+      toCycleId: "cycle-3",
+      existing: false,
+      crossProject: false,
+    }]);
+    await service.deleteCycle(plan, { bridge: true });
+    expect(repo.json(CANVAS).edges).toEqual([
+      expect.objectContaining({
+        fromNode: "cycle-node",
+        toNode: "cycle-3-node",
+        helixRelation: "inherit",
+      }),
+    ]);
+  });
+
+  it("previews and applies no-bridge branch degradation with exact edge identity", async () => {
+    const repo = baseRepository();
+    for (const sequence of [2, 3, 4]) {
+      repo.set(
+        `Helix/Projects/Alpha/Cycle-0${sequence}.md`,
+        cycle(`cycle-${sequence}`, "project-1", sequence),
+      );
+    }
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 816, 0),
+      card("cycle-3-node", "cycle", "project-1", "cycle-3", 816, 200),
+      card("cycle-4-node", "cycle", "project-1", "cycle-4", 1224, 0),
+    );
+    canvas.edges.push(
+      {
+        id: "edge-pv",
+        fromNode: "cycle-node",
+        toNode: "cycle-2-node",
+        helixManaged: true,
+        helixRelation: "branch",
+        label: "分支",
+      },
+      {
+        id: "edge-px",
+        fromNode: "cycle-node",
+        toNode: "cycle-3-node",
+        helixManaged: true,
+        helixRelation: "branch",
+        label: "分支",
+      },
+      {
+        id: "edge-vs",
+        fromNode: "cycle-2-node",
+        toNode: "cycle-4-node",
+        helixManaged: true,
+        helixRelation: "inherit",
+        label: "继承",
+      },
+    );
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const plan = await service.planCycleDeletion("cycle-2");
+
+    expect(plan.impacts.bridge.relabeledEdges).toEqual([]);
+    expect(plan.impacts.noBridge.relabeledEdges).toEqual([{
+      edgeId: "edge-px",
+      fromCycleId: "cycle-1",
+      toCycleId: "cycle-3",
+      before: "branch",
+      after: "inherit",
+    }]);
+
+    await service.deleteCycle(plan, { bridge: false });
+
+    expect(repo.json(CANVAS).edges).toEqual([
+      expect.objectContaining({
+        id: "edge-px",
+        helixRelation: "inherit",
+        label: "继承",
+      }),
+    ]);
+  });
+
+  it("reflows the surviving component when deleting a root or leaf stage", async () => {
+    const rootRepo = linearRepository();
+    const rootCanvas = rootRepo.json(CANVAS);
+    rootCanvas.nodes.find((node: { id: string }) => node.id === "cycle-node").y = 5_000;
+    rootRepo.set(CANVAS, JSON.stringify(rootCanvas));
+    const rootService = workspace(rootRepo);
+    const rootPlan = await rootService.planCycleDeletion("cycle-1");
+    expect(rootPlan.impacts.bridge.affectedCycleIds).toEqual(["cycle-2", "cycle-3"]);
+    await rootService.deleteCycle(rootPlan);
+    expect(rootRepo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "project-node", y: 0 }),
+      expect.objectContaining({ id: "cycle-2-node", x: 408 }),
+      expect.objectContaining({ id: "cycle-3-node", x: 816 }),
+    ]));
+
+    const leafRepo = linearRepository();
+    const leafService = workspace(leafRepo);
+    const leafPlan = await leafService.planCycleDeletion("cycle-3");
+    expect(leafPlan.impacts.bridge.affectedCycleIds).toEqual(["cycle-1", "cycle-2"]);
+    await leafService.deleteCycle(leafPlan);
+    expect(leafRepo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "cycle-node", x: 408 }),
+      expect.objectContaining({ id: "cycle-2-node", x: 816 }),
+    ]));
+  });
+
+  it("rejects a tampered deletion plan before writing", async () => {
+    const repo = linearRepository();
+    const service = workspace(repo);
+    const plan = await service.planCycleDeletion("cycle-2");
+    const before = (await repo.read(CANVAS))!.content;
+
+    await expect(service.deleteCycle({
+      ...plan,
+      impacts: {
+        ...plan.impacts,
+        bridge: {
+          ...plan.impacts.bridge,
+          affectedNodeCount: plan.impacts.bridge.affectedNodeCount + 1,
+        },
+      },
+    })).rejects.toThrow(/计划已经变化/);
+
+    expect((await repo.read(CANVAS))!.content).toBe(before);
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+  });
+
   it("changes a two-source merge to inheritance when one source is deleted", async () => {
     const repo = baseRepository();
     repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
@@ -543,7 +893,7 @@ describe("ProjectWorkspaceService", () => {
         label: "合并",
         helixManaged: true,
         helixRelation: "merge",
-        helixMergeGroupId: "merge-group",
+        helixMergeGroupId: "helix-merge-cycle-4",
       },
       {
         id: "merge-b",
@@ -552,7 +902,7 @@ describe("ProjectWorkspaceService", () => {
         label: "合并",
         helixManaged: true,
         helixRelation: "merge",
-        helixMergeGroupId: "merge-group",
+        helixMergeGroupId: "helix-merge-cycle-4",
       },
     );
     repo.set(CANVAS, JSON.stringify(canvas));
@@ -613,12 +963,12 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({
         id: "merge-1",
         helixRelation: "merge",
-        helixMergeGroupId: "merge-group",
+        helixMergeGroupId: "helix-merge-cycle-4",
       }),
       expect.objectContaining({
         id: "merge-3",
         helixRelation: "merge",
-        helixMergeGroupId: "merge-group",
+        helixMergeGroupId: "helix-merge-cycle-4",
       }),
     ]);
     expect((await workspace(repo).snapshot()).relations).toEqual([
@@ -749,8 +1099,8 @@ describe("ProjectWorkspaceService", () => {
     ]));
     expect(next.nodes).toContainEqual(expect.objectContaining({
       helixStageId: created.id,
-      x: 520,
-      y: 750,
+      x: 816,
+      y: 200,
     }));
     await expect(workspace(repo).snapshot()).resolves.toMatchObject({
       relations: expect.arrayContaining([
@@ -787,6 +1137,180 @@ describe("ProjectWorkspaceService", () => {
 
     expect(repo.json(CANVAS)).toEqual(expectedCanvas);
     expect(await repo.read("Helix/Projects/Alpha/已重命名.md")).not.toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).toBeNull();
+  });
+
+  it("resumes a journaled deletion after Canvas committed but Markdown remains", async () => {
+    const repo = deletionRecoveryRepository();
+    const before = (await repo.read(CANVAS))!;
+    const afterContent = deletedCycleCanvasContent(before.content);
+    repo.set(CANVAS, afterContent);
+    repo.set(
+      DELETE_JOURNAL,
+      deletionJournal(before, afterContent),
+    );
+
+    await expect(workspace(repo).recoverPendingStageDeletion())
+      .resolves.toBe("completed");
+
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).toBeNull();
+    expect(repo.json(CANVAS).nodes).not.toContainEqual(
+      expect.objectContaining({ id: "cycle-2-node" }),
+    );
+  });
+
+  it("rolls a journaled Canvas deletion back when the stage changed", async () => {
+    const repo = deletionRecoveryRepository();
+    const before = (await repo.read(CANVAS))!;
+    const afterContent = deletedCycleCanvasContent(before.content);
+    repo.set(CANVAS, afterContent);
+    repo.set(
+      "Helix/Projects/Alpha/Cycle-02.md",
+      `${cycle("cycle-2", "project-1", 2)}\n用户并发修改\n`,
+    );
+    repo.set(
+      DELETE_JOURNAL,
+      deletionJournal(before, afterContent),
+    );
+
+    await expect(workspace(repo).recoverPendingStageDeletion())
+      .resolves.toBe("rolled-back");
+
+    expect((await repo.read(CANVAS))!.content).toBe(before.content);
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).toBeNull();
+  });
+
+  it("freezes an unrecoverable journal when Canvas is neither before nor after", async () => {
+    const repo = deletionRecoveryRepository();
+    const before = (await repo.read(CANVAS))!;
+    const afterContent = deletedCycleCanvasContent(before.content);
+    repo.set(
+      DELETE_JOURNAL,
+      deletionJournal(before, afterContent),
+    );
+    repo.set(CANVAS, JSON.stringify({ ...repo.json(CANVAS), external: true }));
+
+    const service = workspace(repo);
+    await expect(service.recoverPendingStageDeletion())
+      .rejects.toThrow(/其他修改覆盖/);
+    expect(await repo.read(DELETE_JOURNAL)).not.toBeNull();
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+    await expect(service.snapshot()).rejects.toThrow(/人工检查/);
+  });
+
+  it.each(["before", "after"] as const)(
+    "freezes when an unrelated Markdown occupies the original path with Canvas=$value",
+    async (value) => {
+      const repo = deletionRecoveryRepository();
+      const before = (await repo.read(CANVAS))!;
+      const afterContent = deletedCycleCanvasContent(before.content);
+      repo.set(DELETE_JOURNAL, deletionJournal(before, afterContent));
+      repo.set(
+        "Helix/Projects/Alpha/Cycle-02.md",
+        "---\ntitle: unrelated\n---\n\n# 无关笔记\n",
+      );
+      if (value === "after") repo.set(CANVAS, afterContent);
+      const service = workspace(repo);
+
+      await expect(service.recoverPendingStageDeletion())
+        .rejects.toThrow(/无关 Markdown 占用/);
+
+      expect(await repo.read(DELETE_JOURNAL)).not.toBeNull();
+      expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+      expect((await repo.read(CANVAS))!.content)
+        .toBe(value === "after" ? afterContent : before.content);
+      await expect(service.snapshot()).rejects.toThrow(/人工检查/);
+    },
+  );
+
+  it("freezes after a committed deletion when journal cleanup fails", async () => {
+    const repo = deletionRecoveryRepository();
+    repo.failTrashPath = DELETE_JOURNAL;
+    const service = workspace(repo);
+
+    await expect(service.deleteCycle("cycle-2"))
+      .rejects.toThrow(/日志清理失败/);
+
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).not.toBeNull();
+    expect(repo.json(CANVAS).nodes).not.toContainEqual(
+      expect.objectContaining({ id: "cycle-2-node" }),
+    );
+    await expect(service.snapshot()).rejects.toThrow(/冻结|事务日志已保留/);
+  });
+
+  it("does not touch Canvas or Markdown when the journal disappears before write", async () => {
+    const repo = deletionRecoveryRepository();
+    const service = workspace(repo);
+    await service.ensureCanvas();
+    const beforeCanvas = (await repo.read(CANVAS))!.content;
+    repo.beforeRead = (path) => {
+      if (path === DELETE_JOURNAL) repo.take(path);
+    };
+
+    await expect(service.deleteCycle("cycle-2"))
+      .rejects.toThrow(/日志/);
+
+    expect((await repo.read(CANVAS))!.content).toBe(beforeCanvas);
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+    await expect(service.snapshot()).rejects.toThrow(/写入已冻结/);
+  });
+
+  it("does not recover a pending deletion after read-only mode freezes the workspace", async () => {
+    const repo = deletionRecoveryRepository();
+    const before = (await repo.read(CANVAS))!;
+    const afterContent = deletedCycleCanvasContent(before.content);
+    repo.set(CANVAS, afterContent);
+    repo.set(DELETE_JOURNAL, deletionJournal(before, afterContent));
+    const service = workspace(repo);
+    service.freezePendingStageDeletion(
+      "Helix data.json 处于只读恢复模式，项目写入已冻结",
+    );
+
+    await expect(service.recoverPendingStageDeletion())
+      .rejects.toThrow(/只读恢复模式/);
+
+    expect((await repo.read(CANVAS))!.content).toBe(afterContent);
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).not.toBeNull();
+  });
+
+  it("cancels an in-flight Canvas write when recovery freezes the workspace", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    await service.ensureCanvas();
+    const before = (await repo.read(CANVAS))!.content;
+    repo.beforeCompare = () => {
+      service.freezePendingStageDeletion("人工检查：冻结在途写入");
+    };
+
+    await expect(service.moveCanvasNode("cycle-node", 900, 900))
+      .rejects.toThrow(/取消迟到写入/);
+
+    expect((await repo.read(CANVAS))!.content).toBe(before);
+  });
+
+  it("rechecks the journal after Canvas commit and before trashing Markdown", async () => {
+    const repo = deletionRecoveryRepository();
+    const service = workspace(repo);
+    await service.ensureCanvas();
+    let journalReads = 0;
+    repo.beforeRead = (path) => {
+      if (path !== DELETE_JOURNAL) return;
+      journalReads += 1;
+      if (journalReads === 2) repo.take(path);
+    };
+
+    await expect(service.deleteCycle("cycle-2"))
+      .rejects.toThrow(/日志/);
+
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+    expect(repo.json(CANVAS).nodes).not.toContainEqual(
+      expect.objectContaining({ id: "cycle-2-node" }),
+    );
+    await expect(service.snapshot()).rejects.toThrow(/冻结|事务日志已保留/);
   });
 
   it("keeps stage numbering monotonic after the highest stage is deleted", async () => {
@@ -942,6 +1466,82 @@ function workspace(repo: MemoryRepository): ProjectWorkspaceService {
     () => "Helix",
     () => CANVAS,
   );
+}
+
+function deletionRecoveryRepository(): MemoryRepository {
+  const repo = baseRepository();
+  repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+  const canvas = repo.json(CANVAS);
+  canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+  canvas.edges.push({
+    id: "managed-edge",
+    fromNode: "cycle-node",
+    toNode: "cycle-2-node",
+    label: "继承",
+    helixManaged: true,
+    helixRelation: "inherit",
+  });
+  repo.set(CANVAS, JSON.stringify(canvas));
+  return repo;
+}
+
+function linearRepository(): MemoryRepository {
+  const repo = baseRepository();
+  repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+  repo.set("Helix/Projects/Alpha/Cycle-03.md", cycle("cycle-3", "project-1", 3));
+  const canvas = repo.json(CANVAS);
+  canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").x = 408;
+  canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").y = 0;
+  canvas.nodes.push(
+    card("cycle-2-node", "cycle", "project-1", "cycle-2", 816, 0),
+    card("cycle-3-node", "cycle", "project-1", "cycle-3", 1224, 0),
+  );
+  canvas.edges.push(
+    {
+      id: "edge-12",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      helixManaged: true,
+      helixRelation: "inherit",
+      label: "继承",
+    },
+    {
+      id: "edge-23",
+      fromNode: "cycle-2-node",
+      toNode: "cycle-3-node",
+      helixManaged: true,
+      helixRelation: "inherit",
+      label: "继承",
+    },
+  );
+  repo.set(CANVAS, JSON.stringify(canvas));
+  return repo;
+}
+
+function deletedCycleCanvasContent(beforeContent: string): string {
+  const canvas = JSON.parse(beforeContent);
+  canvas.nodes = canvas.nodes.filter((node: { id: string }) =>
+    node.id !== "cycle-2-node");
+  canvas.edges = canvas.edges.filter((edge: { id: string }) =>
+    edge.id !== "managed-edge");
+  return JSON.stringify(canvas, null, 2);
+}
+
+function deletionJournal(before: VaultRevision, afterContent: string): string {
+  const stageContent = cycle("cycle-2", "project-1", 2);
+  return JSON.stringify({
+    version: 1,
+    operation: "delete-stage",
+    createdAt: "2026-07-30T00:00:00.000Z",
+    stageId: "cycle-2",
+    stagePath: "Helix/Projects/Alpha/Cycle-02.md",
+    stageHash: stableHash(stageContent),
+    canvasPath: CANVAS,
+    canvasBeforeHash: before.hash,
+    canvasBeforeContent: before.content,
+    canvasAfterHash: stableHash(afterContent),
+    canvasAfterContent: afterContent,
+  }, null, 2);
 }
 
 function baseRepository(didaProjectId?: string): MemoryRepository {

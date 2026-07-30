@@ -1,6 +1,23 @@
 import { describe, expect, it } from "vitest";
-import type { ProjectWorkspaceCanvasNode } from "../src/services/project-workspace";
-import { creationSourcesFromSelection } from "../src/ui/project-lineage-workbench";
+import type {
+  ProjectWorkspaceCanvasNode,
+  ProjectWorkspaceSnapshot,
+} from "../src/services/project-workspace";
+import {
+  completedLineageProjection,
+  creationSourcesFromSelection,
+  lineageFitScale,
+  lineageConnectionDropTarget,
+  lineageClampedZoom,
+  lineageConnectionTargetIds,
+  lineageGraphBox,
+  lineageGraphEdgeAnchors,
+  lineageMovePayload,
+  lineageStructuralEntityIds,
+  lineageVirtualExpansionPlan,
+  lineageZoomLabel,
+  projectedLineageRelations,
+} from "../src/ui/project-lineage-workbench";
 
 describe("Project Lineage card-plus intent", () => {
   const nodes = [
@@ -37,7 +54,224 @@ describe("Project Lineage card-plus intent", () => {
       currentLayout,
     )).toEqual(["lower", "upper"]);
   });
+
+  it("uses one compact geometry contract regardless of native Canvas size", () => {
+    const compactNative = { ...node("compact", "cycle", 0, 0), width: 120, height: 80 };
+    const largeNative = { ...node("large", "cycle", 0, 0), width: 960, height: 720 };
+    const point = { x: 40, y: 60 };
+
+    expect(lineageGraphBox(compactNative, point)).toEqual({
+      x: 40,
+      y: 60,
+      width: 248,
+      height: 128,
+      right: 288,
+      bottom: 188,
+      centerY: 124,
+    });
+    expect(lineageGraphBox(largeNative, point))
+      .toEqual(lineageGraphBox(compactNative, point));
+    expect(lineageGraphEdgeAnchors(
+      compactNative,
+      point,
+      largeNative,
+      { x: 500, y: 200 },
+    )).toEqual({
+      start: { x: 288, y: 124 },
+      end: { x: 500, y: 264 },
+    });
+  });
+
+  it("creates move payloads with coordinates only and preserves native dimensions", () => {
+    const canvasNode = { ...node("move", "cycle", 0, 0), width: 960, height: 720 };
+    const move = lineageMovePayload(
+      canvasNode,
+      { x: 300, y: 220 },
+      { x: 64, y: 40 },
+    );
+
+    expect(move).toEqual({
+      nodeId: "move-node",
+      x: 236,
+      y: 180,
+    });
+    expect(Object.keys(move).sort()).toEqual(["nodeId", "x", "y"]);
+    expect({ width: canvasNode.width, height: canvasNode.height })
+      .toEqual({ width: 960, height: 720 });
+  });
+
+  it("keeps negative Canvas coordinates when the virtual origin expands left or up", () => {
+    expect(lineageMovePayload(
+      node("negative", "cycle", 0, 0),
+      { x: 16, y: 24 },
+      { x: 2400, y: 1800 },
+    )).toEqual({
+      nodeId: "negative-node",
+      x: -2384,
+      y: -1776,
+    });
+  });
+
+  it("fits graphs far larger than four viewports without the normal zoom floor", () => {
+    expect(lineageFitScale(800, 600, 10_000, 8_000)).toBeCloseTo(0.069, 3);
+    expect(lineageFitScale(800, 600, 2_000_000, 2_000_000))
+      .toBeCloseTo(0.000276, 6);
+    expect(lineageZoomLabel(0.0004)).toBe("<0.1%");
+    expect(lineageZoomLabel(0.00276)).toBe("0.28%");
+    expect(lineageZoomLabel(0.4)).toBe("40%");
+    expect(lineageClampedZoom(0.0004 / 1.2)).toBeLessThan(0.0004);
+    expect(lineageClampedZoom(0.0004 * 1.2)).toBeCloseTo(0.00048);
+    expect(lineageClampedZoom(0.0004 * Math.exp(0.2))).toBeLessThan(0.001);
+  });
+
+  it("keeps folded members out of keyboard targets and expands every folded edge endpoint", () => {
+    const snapshot = foldedSnapshot();
+    const projection = completedLineageProjection(snapshot);
+
+    expect([...projection.hiddenByCollapseHead.keys()].sort()).toEqual(["a2", "b2"]);
+    expect([...projection.collapseCountByHead.keys()].sort()).toEqual(["a1", "b1"]);
+    expect(lineageConnectionTargetIds(snapshot, "visible", projection))
+      .toEqual(["visible-2"]);
+    expect(lineageStructuralEntityIds(snapshot, projection))
+      .toEqual(["visible", "visible-2"]);
+    expect(creationSourcesFromSelection(
+      "visible",
+      lineageStructuralEntityIds(snapshot, projection),
+      snapshot.canvasNodes,
+    )).toEqual(["visible", "visible-2"]);
+
+    const relations = projectedLineageRelations(snapshot, projection);
+    expect(relations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sourceId: "a1",
+        targetId: "b1",
+        aggregate: true,
+        foldedProjectIds: ["project-a", "project-b"],
+      }),
+      expect.objectContaining({
+        sourceId: "visible",
+        targetId: "b1",
+        aggregate: true,
+        foldedProjectIds: ["project-b"],
+      }),
+      expect.objectContaining({
+        sourceId: "a1",
+        targetId: "visible-2",
+        aggregate: true,
+        foldedProjectIds: ["project-a"],
+      }),
+    ]));
+  });
+
+  it("never submits canceled or blank connector drags", () => {
+    expect(lineageConnectionDropTarget(true, true, "target")).toBeUndefined();
+    expect(lineageConnectionDropTarget(true, false)).toBeUndefined();
+    expect(lineageConnectionDropTarget(false, false, "target")).toBeUndefined();
+    expect(lineageConnectionDropTarget(true, false, "target")).toBe("target");
+  });
+
+  it("expands the virtual plane independently in all four directions", () => {
+    expect(lineageVirtualExpansionPlan({
+      scrollLeft: 100,
+      scrollTop: 100,
+      clientWidth: 800,
+      clientHeight: 600,
+      scrollWidth: 8_000,
+      scrollHeight: 8_000,
+    })).toEqual({
+      shiftX: 1_800,
+      shiftY: 1_800,
+      growRightBy: 0,
+      growBottomBy: 0,
+    });
+    expect(lineageVirtualExpansionPlan({
+      scrollLeft: 7_300,
+      scrollTop: 7_500,
+      clientWidth: 800,
+      clientHeight: 600,
+      scrollWidth: 8_000,
+      scrollHeight: 8_000,
+    })).toEqual({
+      shiftX: 0,
+      shiftY: 0,
+      growRightBy: 1_800,
+      growBottomBy: 1_800,
+    });
+    const raw = { x: -1_200, y: -900 };
+    const offset = { x: 2_400, y: 2_400 };
+    const screen = { x: raw.x + offset.x, y: raw.y + offset.y };
+    const shift = { x: 1_800, y: 1_800 };
+    expect({
+      x: screen.x + shift.x - (offset.x + shift.x),
+      y: screen.y + shift.y - (offset.y + shift.y),
+    }).toEqual(raw);
+
+    const lowZoom = lineageVirtualExpansionPlan({
+      scrollLeft: 100,
+      scrollTop: 100,
+      clientWidth: 800,
+      clientHeight: 600,
+      scrollWidth: 800,
+      scrollHeight: 600,
+    }, 0.0004);
+    expect(lowZoom.shiftX * 0.0004).toBe(1_800);
+    expect(lowZoom.shiftY * 0.0004).toBe(1_800);
+    expect(lowZoom.growRightBy * 0.0004).toBe(1_800);
+    expect(lowZoom.growBottomBy * 0.0004).toBe(1_800);
+    expect(100 + lowZoom.shiftX * 0.0004).toBeGreaterThan(320);
+  });
 });
+
+function foldedSnapshot(): ProjectWorkspaceSnapshot {
+  const project = (
+    id: string,
+    cycleIds: string[],
+  ): ProjectWorkspaceSnapshot["projects"][number] => ({
+    id,
+    title: id,
+    status: "active",
+    notePath: `${id}.md`,
+    cycles: cycleIds.map((cycleId, index) => ({
+      id: cycleId,
+      title: cycleId,
+      notePath: `${cycleId}.md`,
+      sequence: index + 1,
+      status: cycleId.startsWith("visible") ? "active" : "closed",
+    })),
+  });
+  const canvasNodes = ["a1", "a2", "b1", "b2", "visible", "visible-2"].map(
+    (id, index) => ({
+      ...node(id, "cycle", index * 300, 0),
+      projectId: id.startsWith("a")
+        ? "project-a"
+        : id.startsWith("b")
+          ? "project-b"
+          : "project-visible",
+    }),
+  );
+  return {
+    canvasPath: "Project Lineage.canvas",
+    canvasRevisionHash: "hash",
+    projects: [
+      project("project-a", ["a1", "a2"]),
+      project("project-b", ["b1", "b2"]),
+      project("project-visible", ["visible", "visible-2"]),
+    ],
+    nextStageSequenceByProject: {},
+    relations: [
+      { id: "aa", kind: "inherit", fromCycleIds: ["a1"], toCycleId: "a2" },
+      { id: "bb", kind: "inherit", fromCycleIds: ["b1"], toCycleId: "b2" },
+      { id: "ab", kind: "inherit", fromCycleIds: ["a2"], toCycleId: "b2" },
+      { id: "visible-b", kind: "inherit", fromCycleIds: ["visible"], toCycleId: "b2" },
+      { id: "a-visible", kind: "inherit", fromCycleIds: ["a2"], toCycleId: "visible-2" },
+    ],
+    migrationWarnings: [],
+    migrationItems: [],
+    migrationRequired: false,
+    canvasNodes,
+    collapsedCompletedProjectIds: ["project-a", "project-b"],
+  };
+}
 
 function node(
   entityId: string,

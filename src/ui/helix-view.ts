@@ -37,6 +37,7 @@ import {
 import type { HelixRuntimeState } from "../services/helix-service";
 import { HelixService } from "../services/helix-service";
 import type {
+  ProjectConnectionPlan,
   ProjectWorkspaceService,
   ProjectWorkspaceSnapshot,
 } from "../services/project-workspace";
@@ -86,7 +87,7 @@ export class HelixView extends ItemView {
   private section: Section = "today";
   private expandedInProgress = false;
   private taskFilter: "all" | "today" | "in-progress" | "completed" = "all";
-  private selectedProjectId: string | null = null;
+  private selectedProjectId: string | null | undefined;
   private projectLineageMode: ProjectLineageViewMode = "graph";
   private projectWorkbench: ProjectLineageWorkbench | null = null;
   private renderToken = 0;
@@ -760,8 +761,13 @@ export class HelixView extends ItemView {
       return;
     }
 
-    if (!this.selectedProjectId ||
-      !workspace.projects.some((project) => project.id === this.selectedProjectId)) {
+    if (
+      this.selectedProjectId === undefined ||
+      (
+        this.selectedProjectId !== null &&
+        !workspace.projects.some((project) => project.id === this.selectedProjectId)
+      )
+    ) {
       this.selectedProjectId = workspace.projects[0]!.id;
     }
     this.projectWorkbench = new ProjectLineageWorkbench({
@@ -787,10 +793,67 @@ export class HelixView extends ItemView {
         await this.actions.projectWorkspace.moveCanvasNodes(moves);
       },
       onManageRelation: (relationId) => this.actions.manageRelation(relationId),
+      onConnectCycles: (sourceCycleId, targetCycleId) =>
+        void this.openConnection(sourceCycleId, targetCycleId),
+      onChooseConnectionTarget: (sourceCycleId, allowedTargetIds) => {
+        new ConnectionTargetModal(
+          this.app,
+          workspace,
+          sourceCycleId,
+          allowedTargetIds,
+          (targetCycleId) => void this.openConnection(sourceCycleId, targetCycleId),
+        ).open();
+      },
+      onEditProjectColor: (projectId, color) => {
+        void this.actions.projectWorkspace.updateProjectColor(projectId, color)
+          .then(() => this.render())
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      onToggleCompletedCollapse: (projectId, collapsed) => {
+        void this.actions.projectWorkspace.setCompletedProjectCollapsed(projectId, collapsed)
+          .then(() => this.render())
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      onExpandCompletedProjects: (projectIds) => {
+        void this.actions.projectWorkspace.setCompletedProjectsCollapsed(projectIds, false)
+          .then(() => this.render())
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      onAutoLayout: () => {
+        void this.actions.projectWorkspace.autoLayoutCanvas()
+          .then(() => this.render())
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
       onError: (error) =>
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
     this.projectWorkbench.render(content);
+  }
+
+  private async openConnection(sourceCycleId: string, targetCycleId: string): Promise<void> {
+    try {
+      const plan = await this.actions.projectWorkspace.planConnection(
+        sourceCycleId,
+        targetCycleId,
+      );
+      new ConnectionConfirmModal(
+        this.app,
+        plan,
+        async (confirmCrossProject) => {
+          await this.actions.projectWorkspace.connectCycles(plan, {
+            confirmCrossProject,
+          });
+          new Notice("阶段连接已建立，受影响分支已自动整理");
+          await this.render();
+        },
+      ).open();
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error), 8_000);
+    }
   }
 
   private renderReviews(content: HTMLElement): void {
@@ -1363,6 +1426,135 @@ export class HelixView extends ItemView {
     const observer = new ResizeObserver(() => chart.resize());
     observer.observe(element);
     this.chartObservers.push(observer);
+  }
+}
+
+class ConnectionTargetModal extends Modal {
+  private targetId = "";
+
+  constructor(
+    app: HelixView["app"],
+    private readonly snapshot: ProjectWorkspaceSnapshot,
+    private readonly sourceId: string,
+    private readonly allowedTargetIds: string[],
+    private readonly submit: (targetId: string) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("连接到已有阶段");
+    const source = this.stageLabel(this.sourceId);
+    this.contentEl.createEl("p", { text: `来源：${source}` });
+    new Setting(this.contentEl)
+      .setName("目标阶段")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", "选择目标阶段");
+        const allowed = new Set(this.allowedTargetIds);
+        for (const project of this.snapshot.projects) {
+          for (const cycle of project.cycles) {
+            if (cycle.id === this.sourceId || !allowed.has(cycle.id)) continue;
+            dropdown.addOption(
+              cycle.id,
+              `${project.title} / 阶段 ${cycle.sequence} · ${cycle.title}`,
+            );
+          }
+        }
+        dropdown.onChange((value) => {
+          this.targetId = value;
+        });
+      });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" })
+      .addEventListener("click", () => this.close());
+    const connect = actions.createEl("button", { cls: "mod-cta", text: "预览连接" });
+    connect.addEventListener("click", () => {
+      if (!this.targetId) {
+        new Notice("请选择目标阶段");
+        return;
+      }
+      this.close();
+      this.submit(this.targetId);
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+
+  private stageLabel(id: string): string {
+    for (const project of this.snapshot.projects) {
+      const cycle = project.cycles.find((candidate) => candidate.id === id);
+      if (cycle) return `${project.title} / 阶段 ${cycle.sequence} · ${cycle.title}`;
+    }
+    return id;
+  }
+}
+
+class ConnectionConfirmModal extends Modal {
+  private crossProjectConfirmed = false;
+
+  constructor(
+    app: HelixView["app"],
+    private readonly plan: ProjectConnectionPlan,
+    private readonly submit: (confirmCrossProject: boolean) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("确认阶段连接");
+    this.contentEl.createEl("p", {
+      text: `来源：${this.stageLabel(this.plan.source)}`,
+    });
+    this.contentEl.createEl("p", {
+      text: `目标：${this.stageLabel(this.plan.target)}`,
+    });
+    this.contentEl.createEl("p", {
+      text: `将新增 1 条有向边，并整理受影响的 ${this.plan.affectedNodeCount} 个节点。`,
+    });
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: this.plan.relabeledEdgeCount > 0
+        ? `完整拓扑重算后，会有 ${this.plan.relabeledEdgeCount} 条已有边改为继承、分支或合并。`
+        : "已有边的关系类型不会变化。",
+    });
+    if (this.plan.crossProject) {
+      const confirmation = this.contentEl.createEl("label", {
+        cls: "helix-branch-confirm",
+      });
+      const checkbox = confirmation.createEl("input", { type: "checkbox" });
+      confirmation.createSpan({ text: "我确认建立跨项目阶段关系" });
+      checkbox.addEventListener("change", () => {
+        this.crossProjectConfirmed = checkbox.checked;
+        confirm.disabled = !this.crossProjectConfirmed;
+      });
+    }
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" })
+      .addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", {
+      cls: "mod-cta",
+      text: "建立连接",
+    });
+    confirm.disabled = this.plan.crossProject;
+    confirm.addEventListener("click", () => {
+      confirm.disabled = true;
+      void this.submit(this.crossProjectConfirmed)
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled = this.plan.crossProject && !this.crossProjectConfirmed;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+
+  private stageLabel(stage: ProjectConnectionPlan["source"]): string {
+    return `${stage.projectTitle} / 阶段 ${stage.sequence} · ${stage.cycleTitle}`;
   }
 }
 

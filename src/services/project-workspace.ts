@@ -9,6 +9,13 @@ import {
   type CycleRelationKind,
 } from "../domain/cycle-graph";
 import { cycleTemplate, projectTemplate } from "../domain/projects";
+import {
+  affectedWeakComponent,
+  normalizeProjectGraph,
+  planDeletionBridges,
+  planProjectGraphLayout,
+  type ProjectGraphEdge,
+} from "../domain/project-graph";
 import { assertProjectMappingsUnique } from "../domain/project-mapping";
 import { stableHash } from "../domain/stable";
 import { patchManagedFrontmatter } from "../storage/frontmatter";
@@ -42,6 +49,10 @@ interface CanvasDocument {
   nodes: CanvasNode[];
   edges: CanvasEdge[];
   helixStageSequences?: Record<string, number>;
+  helixCompletedCollapse?: {
+    version: 1;
+    projectIds: string[];
+  };
   helixMigration?: {
     version: 2;
     legacyPreserved: true;
@@ -73,6 +84,7 @@ export interface ProjectWorkspaceProject {
   status: "planned" | "active" | "paused" | "completed" | "archived";
   notePath: string;
   didaProjectId?: string;
+  color?: string;
   cycles: ProjectWorkspaceCycle[];
 }
 
@@ -105,6 +117,56 @@ export interface ProjectWorkspaceSnapshot {
   migrationItems: ProjectWorkspaceMigrationItem[];
   migrationRequired: boolean;
   canvasNodes: ProjectWorkspaceCanvasNode[];
+  collapsedCompletedProjectIds: string[];
+}
+
+export interface ProjectConnectionPlan {
+  canvasRevisionHash: string;
+  sourceCycleId: string;
+  targetCycleId: string;
+  source: {
+    projectId: string;
+    projectTitle: string;
+    cycleTitle: string;
+    sequence: number;
+  };
+  target: {
+    projectId: string;
+    projectTitle: string;
+    cycleTitle: string;
+    sequence: number;
+  };
+  crossProject: boolean;
+  affectedNodeCount: number;
+  relabeledEdgeCount: number;
+}
+
+export interface StageDeletionPlan {
+  canvasRevisionHash: string;
+  cycleId: string;
+  bridgeCandidates: Array<{
+    fromCycleId: string;
+    toCycleId: string;
+    existing: boolean;
+    crossProject: boolean;
+  }>;
+  impacts: {
+    bridge: StageDeletionImpact;
+    noBridge: StageDeletionImpact;
+  };
+  bridgeLimitExceeded: boolean;
+}
+
+export interface StageDeletionImpact {
+  affectedNodeCount: number;
+  affectedCycleIds: string[];
+  relabeledEdges: Array<{
+    edgeId: string;
+    fromCycleId: string;
+    toCycleId: string;
+    before: CycleRelationKind;
+    after: CycleRelationKind;
+  }>;
 }
 
 interface CycleCreationOptions {
@@ -119,9 +181,30 @@ interface ExpectedAutoStageIntent {
   convertedInheritanceRelationIds: string[];
 }
 
+interface StageDeletionJournal {
+  version: 1;
+  operation: "delete-stage";
+  createdAt: string;
+  stageId: string;
+  stagePath: string;
+  stageHash: string;
+  canvasPath: string;
+  canvasBeforeHash: string;
+  canvasBeforeContent: string;
+  canvasAfterHash: string;
+  canvasAfterContent: string;
+}
+
+export type StageDeletionRecoveryResult =
+  | "none"
+  | "aborted"
+  | "completed"
+  | "rolled-back";
+
 export class ProjectWorkspaceService {
   private disposed = false;
   private generation = 0;
+  private recoveryIssue: string | null = null;
 
   constructor(
     private readonly app: App,
@@ -137,12 +220,95 @@ export class ProjectWorkspaceService {
 
   private beginOperation(): number {
     if (this.disposed) throw new Error("Helix 项目工作区已卸载");
+    if (this.recoveryIssue) throw new Error(this.recoveryIssue);
     return this.generation;
   }
 
+  freezePendingStageDeletion(message: string): void {
+    this.recoveryIssue = message;
+    this.generation += 1;
+  }
+
   private assertActive(generation: number): void {
-    if (this.disposed || generation !== this.generation) {
+    if (this.disposed || this.recoveryIssue || generation !== this.generation) {
       throw new Error("Helix 项目工作区已卸载，已取消迟到写入");
+    }
+  }
+
+  async recoverPendingStageDeletion(): Promise<StageDeletionRecoveryResult> {
+    const generation = this.beginOperation();
+    try {
+      const journalRevision = await this.repository.read(this.stageDeletionJournalPath());
+      if (!journalRevision) return "none";
+      const journal = this.parseStageDeletionJournal(journalRevision.content);
+      const canvasRevision = await this.repository.read(journal.canvasPath);
+      if (!canvasRevision) {
+        throw new Error("阶段删除事务无法恢复：项目 Canvas 已不存在");
+      }
+      const matchingStages = await this.findStageRevisions(journal.stageId);
+      if (matchingStages.length > 1) {
+        throw new Error("阶段删除事务无法恢复：发现重复的阶段身份");
+      }
+      const matchingStage = matchingStages[0];
+      const originalPathRevision = await this.repository.read(journal.stagePath);
+      if (!matchingStage && originalPathRevision) {
+        throw new Error(
+          "阶段删除事务无法恢复：原路径已被无关 Markdown 占用，已保留日志并冻结项目写入",
+        );
+      }
+
+      if (canvasRevision.hash === journal.canvasBeforeHash) {
+        if (!matchingStage) {
+          await this.assertStageDeletionJournalCurrent(journalRevision);
+          this.assertActive(generation);
+          await this.repository.compareAndWrite(
+            canvasRevision,
+            journal.canvasAfterContent,
+            () => this.assertActive(generation),
+          );
+          await this.finishStageDeletionJournal(journalRevision, generation);
+          return "completed";
+        }
+        await this.finishStageDeletionJournal(journalRevision, generation);
+        return "aborted";
+      }
+
+      if (canvasRevision.hash !== journal.canvasAfterHash) {
+        throw new Error("阶段删除事务无法恢复：Canvas 已被其他修改覆盖，请手动检查");
+      }
+
+      if (
+        matchingStage?.path === journal.stagePath &&
+        matchingStage.hash === journal.stageHash
+      ) {
+        await this.assertStageDeletionJournalCurrent(journalRevision);
+        await this.repository.trashIfUnchanged(
+          matchingStage,
+          () => this.assertActive(generation),
+          { requireExisting: true },
+        );
+        await this.finishStageDeletionJournal(journalRevision, generation);
+        return "completed";
+      }
+
+      if (!matchingStage) {
+        await this.finishStageDeletionJournal(journalRevision, generation);
+        return "completed";
+      }
+
+      await this.assertStageDeletionJournalCurrent(journalRevision);
+      this.assertActive(generation);
+      await this.repository.compareAndWrite(
+        canvasRevision,
+        journal.canvasBeforeContent,
+        () => this.assertActive(generation),
+      );
+      await this.finishStageDeletionJournal(journalRevision, generation);
+      return "rolled-back";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.freezePendingStageDeletion(`阶段删除事务需要人工检查：${message}`);
+      throw error;
     }
   }
 
@@ -171,6 +337,7 @@ export class ProjectWorkspaceService {
         title: heading || file.parent?.name || file.basename,
         status: status as ProjectWorkspaceProject["status"],
         notePath: file.path,
+        color: parseProjectColor(frontmatter["helix-color"], file.path),
         didaProjectId:
           typeof frontmatter["helix-dida-project-id"] === "string" &&
           frontmatter["helix-dida-project-id"].trim()
@@ -495,6 +662,10 @@ export class ProjectWorkspaceService {
       migrationItems: pendingMigrationItems,
       migrationRequired: pendingMigrationItems.length > 0,
       canvasNodes,
+      collapsedCompletedProjectIds: validatedCompletedCollapse(
+        canvas.document,
+        new Set(projects.map((project) => project.id)),
+      ),
     };
   }
 
@@ -628,6 +799,235 @@ export class ProjectWorkspaceService {
     return this.moveCanvasNodes([{ nodeId, x, y }]);
   }
 
+  async updateProjectColor(
+    projectId: string,
+    color?: string,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("找不到需要设置颜色的项目");
+    const normalizedColor = normalizeProjectColor(color);
+    const revision = await this.repository.read(project.notePath);
+    if (!revision) throw new Error("项目 Markdown 已不存在");
+    this.assertActive(generation);
+    await this.repository.compareAndWrite(
+      revision,
+      patchManagedFrontmatter(revision.content, {
+        "helix-color": normalizedColor,
+        "helix-updated": new Date().toISOString(),
+      }),
+      () => this.assertActive(generation),
+    );
+    return this.snapshot();
+  }
+
+  async setCompletedProjectCollapsed(
+    projectId: string,
+    collapsed: boolean,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    return this.setCompletedProjectsCollapsed([projectId], collapsed);
+  }
+
+  async setCompletedProjectsCollapsed(
+    projectIds: string[],
+    collapsed: boolean,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const requested = [...new Set(projectIds)];
+    const known = new Set(snapshot.projects.map((project) => project.id));
+    if (requested.length === 0 || requested.some((projectId) => !known.has(projectId))) {
+      throw new Error("找不到需要折叠的项目");
+    }
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision) throw new Error("项目 Canvas 不存在");
+    if (canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在折叠确认期间已经变化，请重试");
+    }
+    const current = new Set(snapshot.collapsedCompletedProjectIds);
+    for (const projectId of requested) {
+      if (collapsed) current.add(projectId);
+      else current.delete(projectId);
+    }
+    canvas.document.helixCompletedCollapse = {
+      version: 1,
+      projectIds: [...current].sort(),
+    };
+    this.assertActive(generation);
+    await this.writeCanvas(canvas, generation);
+    return this.snapshot();
+  }
+
+  async planConnection(
+    sourceCycleId: string,
+    targetCycleId: string,
+  ): Promise<ProjectConnectionPlan> {
+    const snapshot = await this.ensureCanvas();
+    const cycleIds = snapshot.projects.flatMap((project) =>
+      project.cycles.map((cycle) => cycle.id));
+    if (!cycleIds.includes(sourceCycleId) || !cycleIds.includes(targetCycleId)) {
+      throw new Error("只能连接两个阶段节点");
+    }
+    if (sourceCycleId === targetCycleId) throw new Error("阶段不能连接到自身");
+    const canvas = await this.readCanvas();
+    const physical = physicalManagedEdges(canvas.document);
+    if (physical.some((edge) =>
+      edge.fromCycleId === sourceCycleId && edge.toCycleId === targetCycleId)) {
+      throw new Error("这两个阶段已经连接");
+    }
+    const before = normalizeProjectGraph(cycleIds, physical);
+    const candidate = [
+      ...physical,
+      {
+        id: `helix-stage-edge-${crypto.randomUUID()}`,
+        fromCycleId: sourceCycleId,
+        toCycleId: targetCycleId,
+      },
+    ];
+    const after = normalizeProjectGraph(cycleIds, candidate);
+    const owner = cycleOwnerMap(snapshot.projects);
+    const source = stageDescriptor(snapshot.projects, sourceCycleId);
+    const target = stageDescriptor(snapshot.projects, targetCycleId);
+    return {
+      canvasRevisionHash: snapshot.canvasRevisionHash ?? "",
+      sourceCycleId,
+      targetCycleId,
+      source,
+      target,
+      crossProject: owner.get(sourceCycleId) !== owner.get(targetCycleId),
+      affectedNodeCount: affectedWeakComponent(
+        [sourceCycleId, targetCycleId],
+        candidate,
+      ).size,
+      relabeledEdgeCount: countRelabeledEdges(before, after),
+    };
+  }
+
+  async connectCycles(
+    plan: ProjectConnectionPlan,
+    options: { confirmCrossProject?: boolean } = {},
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const current = await this.snapshot();
+    if (current.canvasRevisionHash !== plan.canvasRevisionHash) {
+      throw new Error("Canvas 在连接确认期间已经变化，本次操作未写入");
+    }
+    const canonicalPlan = await this.planConnection(
+      plan.sourceCycleId,
+      plan.targetCycleId,
+    );
+    if (!sameConnectionPlan(plan, canonicalPlan)) {
+      throw new Error("阶段连接计划已经变化，本次操作未写入");
+    }
+    if (canonicalPlan.crossProject && !options.confirmCrossProject) {
+      throw new Error("跨项目阶段关系必须明确确认");
+    }
+    const snapshot = await this.snapshot();
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision || canvas.revision.hash !== canonicalPlan.canvasRevisionHash ||
+      snapshot.canvasRevisionHash !== canonicalPlan.canvasRevisionHash) {
+      throw new Error("Canvas 在连接确认期间已经变化，本次操作未写入");
+    }
+    const cycleIds = snapshot.projects.flatMap((project) =>
+      project.cycles.map((cycle) => cycle.id));
+    const physical = physicalManagedEdges(canvas.document);
+    if (physical.some((edge) =>
+      edge.fromCycleId === canonicalPlan.sourceCycleId &&
+      edge.toCycleId === canonicalPlan.targetCycleId)) {
+      return snapshot;
+    }
+    physical.push({
+      id: `helix-stage-edge-${crypto.randomUUID()}`,
+      fromCycleId: canonicalPlan.sourceCycleId,
+      toCycleId: canonicalPlan.targetCycleId,
+    });
+    const normalized = normalizeProjectGraph(cycleIds, physical);
+    applyNormalizedManagedEdges(canvas.document, normalized.edges);
+    const affected = affectedWeakComponent(
+      [canonicalPlan.sourceCycleId, canonicalPlan.targetCycleId],
+      physical,
+    );
+    applyManagedLayout(canvas.document, snapshot, physical, affected);
+    this.assertActive(generation);
+    await this.writeCanvas(canvas, generation);
+    return this.snapshot();
+  }
+
+  async autoLayoutCanvas(): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const snapshot = await this.ensureCanvas();
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision || canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在整理前已经变化，请重试");
+    }
+    const physical = physicalManagedEdges(canvas.document);
+    applyManagedLayout(canvas.document, snapshot, physical);
+    this.assertActive(generation);
+    await this.writeCanvas(canvas, generation);
+    return this.snapshot();
+  }
+
+  async planCycleDeletion(cycleId: string): Promise<StageDeletionPlan> {
+    const snapshot = await this.ensureCanvas();
+    const owner = snapshot.projects.find((project) =>
+      project.cycles.some((cycle) => cycle.id === cycleId));
+    if (!owner) throw new Error("找不到需要删除的阶段");
+    if (owner.cycles.length === 1) throw new Error("项目至少需要保留一个阶段");
+    const canvas = await this.readCanvas();
+    const physical = physicalManagedEdges(canvas.document);
+    const predecessors = physical
+      .filter((edge) => edge.toCycleId === cycleId)
+      .map((edge) => edge.fromCycleId);
+    const successors = physical
+      .filter((edge) => edge.fromCycleId === cycleId)
+      .map((edge) => edge.toCycleId);
+    const ownerByCycle = cycleOwnerMap(snapshot.projects);
+    const bridgeCandidates = planDeletionBridges(cycleId, physical, ownerByCycle);
+    const remainingIds = snapshot.projects.flatMap((project) =>
+      project.cycles.filter((cycle) => cycle.id !== cycleId).map((cycle) => cycle.id));
+    const before = normalizeProjectGraph(
+      snapshot.projects.flatMap((project) => project.cycles.map((cycle) => cycle.id)),
+      physical,
+    );
+    const remainingPhysical = physical.filter((edge) =>
+      edge.fromCycleId !== cycleId && edge.toCycleId !== cycleId);
+    const impact = (bridge: boolean): StageDeletionImpact => {
+      const nextPhysical = remainingPhysical.map((edge) => ({ ...edge }));
+      if (bridge) {
+        for (const candidate of bridgeCandidates) {
+          if (!candidate.existing) {
+            nextPhysical.push({
+              id: `preview:${candidate.fromCycleId}:${candidate.toCycleId}`,
+              fromCycleId: candidate.fromCycleId,
+              toCycleId: candidate.toCycleId,
+            });
+          }
+        }
+      }
+      const after = normalizeProjectGraph(remainingIds, nextPhysical);
+      const affected = affectedWeakComponent(
+        [...predecessors, ...successors],
+        nextPhysical,
+      );
+      return {
+        affectedNodeCount: affected.size,
+        affectedCycleIds: [...affected].sort(),
+        relabeledEdges: relabeledEdges(before, after),
+      };
+    };
+    return {
+      canvasRevisionHash: snapshot.canvasRevisionHash ?? "",
+      cycleId,
+      bridgeCandidates,
+      impacts: {
+        bridge: impact(true),
+        noBridge: impact(false),
+      },
+      bridgeLimitExceeded: bridgeCandidates.filter((candidate) => !candidate.existing).length > 24,
+    };
+  }
+
   async moveCanvasNodes(
     moves: ProjectWorkspaceNodeMove[],
   ): Promise<ProjectWorkspaceSnapshot> {
@@ -639,7 +1039,9 @@ export class ProjectWorkspaceService {
         !move.nodeId ||
         nodeIds.has(move.nodeId) ||
         !Number.isFinite(move.x) ||
-        !Number.isFinite(move.y)
+        !Number.isFinite(move.y) ||
+        Math.abs(move.x) > 1_000_000 ||
+        Math.abs(move.y) > 1_000_000
       ) {
         throw new Error("Canvas 卡片移动计划无效");
       }
@@ -683,9 +1085,38 @@ export class ProjectWorkspaceService {
     return this.mutateRelation(relationId, null);
   }
 
-  async deleteCycle(cycleId: string): Promise<ProjectWorkspaceSnapshot> {
+  async deleteCycle(
+    planOrCycleId: StageDeletionPlan | string,
+    options: { bridge?: boolean; confirmCrossProject?: boolean } = {},
+  ): Promise<ProjectWorkspaceSnapshot> {
     const generation = this.beginOperation();
+    const plan = typeof planOrCycleId === "string"
+      ? await this.planCycleDeletion(planOrCycleId)
+      : planOrCycleId;
+    const cycleId = plan.cycleId;
+    const current = await this.snapshot();
+    if (current.canvasRevisionHash !== plan.canvasRevisionHash) {
+      throw new Error("Canvas 在删除确认期间已经变化，本次操作未写入");
+    }
+    const canonicalPlan = await this.planCycleDeletion(cycleId);
+    if (!sameDeletionPlan(plan, canonicalPlan)) {
+      throw new Error("阶段删除计划已经变化，本次操作未写入");
+    }
+    const bridge = options.bridge ?? true;
+    if (bridge && canonicalPlan.bridgeLimitExceeded) {
+      throw new Error("桥接关系超过 24 条，请选择不桥接后再手动连线");
+    }
+    if (
+      bridge &&
+      canonicalPlan.bridgeCandidates.some((candidate) => candidate.crossProject) &&
+      !options.confirmCrossProject
+    ) {
+      throw new Error("删除后的跨项目桥接必须明确确认");
+    }
     const snapshot = await this.ensureCanvas();
+    if (snapshot.canvasRevisionHash !== canonicalPlan.canvasRevisionHash) {
+      throw new Error("Canvas 在删除确认期间已经变化，本次操作未写入");
+    }
     const owner = snapshot.projects.find((project) =>
       project.cycles.some((cycle) => cycle.id === cycleId));
     const cycle = owner?.cycles.find((candidate) => candidate.id === cycleId);
@@ -696,124 +1127,87 @@ export class ProjectWorkspaceService {
     const cycleRevision = await this.repository.read(cycle.notePath);
     if (!cycleRevision) throw new Error("阶段 Markdown 已不存在");
 
-    const removedRelations: CycleRelation[] = [];
-    const mergeRelationConversions: Array<{
-      relation: CycleRelation;
-      kind: "inherit" | "branch";
-    }> = [];
-    const nextRelations = snapshot.relations.flatMap((relation) => {
-      if (relation.toCycleId === cycleId) {
-        removedRelations.push(relation);
-        return [];
-      }
-      if (!relation.fromCycleIds.includes(cycleId)) return [relation];
-      if (relation.kind !== "merge") {
-        removedRelations.push(relation);
-        return [];
-      }
-      const remainingSources = relation.fromCycleIds.filter(
-        (sourceId) => sourceId !== cycleId,
-      );
-      if (remainingSources.length >= 2) {
-        return [{ ...relation, fromCycleIds: remainingSources }];
-      }
-      if (remainingSources.length === 1) {
-        const remainingSource = remainingSources[0]!;
-        const hasOtherSurvivingOutgoing = snapshot.relations.some((candidate) =>
-          candidate !== relation &&
-          candidate.toCycleId !== cycleId &&
-          candidate.fromCycleIds.includes(remainingSource));
-        const nextKind: "branch" | "inherit" =
-          hasOtherSurvivingOutgoing ? "branch" : "inherit";
-        mergeRelationConversions.push({ relation, kind: nextKind });
-        return [{
-          ...relation,
-          kind: nextKind,
-          fromCycleIds: remainingSources,
-        }];
-      }
-      removedRelations.push(relation);
-      return [];
-    });
-    const normalizedRelationIds = new Set<string>();
-    for (const sourceId of new Set(
-      removedRelations.flatMap((relation) => relation.fromCycleIds),
-    )) {
-      if (sourceId === cycleId) continue;
-      const outgoing = nextRelations.filter((relation) =>
-        relation.fromCycleIds.includes(sourceId));
-      if (outgoing.length === 1 && outgoing[0]!.kind === "branch") {
-        outgoing[0]!.kind = "inherit";
-        normalizedRelationIds.add(outgoing[0]!.id);
-      }
-    }
-    validateCycleGraph(
-      snapshot.projects
-        .flatMap((project) => project.cycles)
-        .filter((candidate) => candidate.id !== cycleId)
-        .map((candidate) => candidate.id),
-      nextRelations,
-    );
-
     const canvas = await this.readCanvas(false, generation);
-    if (!canvas.revision) throw new Error("项目 Canvas 不存在");
+    if (!canvas.revision || canvas.revision.hash !== canonicalPlan.canvasRevisionHash) {
+      throw new Error("Canvas 在删除确认期间已经变化，本次操作未写入");
+    }
     const node = canvas.document.nodes.find((candidate) =>
       candidate.helixManaged === true && managedStageId(candidate) === cycleId);
     if (!node) throw new Error("Canvas 中找不到需要删除的阶段节点");
-    const stageIdByNodeId = new Map(
-      canvas.document.nodes.flatMap((candidate) => {
-        const stageId = managedStageId(candidate);
-        return stageId ? [[candidate.id, stageId] as const] : [];
-      }),
-    );
-    const removedManagedEdgeIds = new Set(
-      canvas.document.edges.flatMap((edge) => {
-        if (edge.helixManaged !== true) return [];
-        const kind = cycleRelationKindFromLabel(edge.helixRelation);
-        const targetStageId = stageIdByNodeId.get(edge.toNode);
-        const shouldRemove = removedRelations.some((relation) =>
-          relation.kind === "merge"
-            ? kind === "merge" && targetStageId === relation.toCycleId
-            : edge.id === relation.id);
-        return shouldRemove ? [edge.id] : [];
-      }),
-    );
+    const physical = physicalManagedEdges(canvas.document).filter((edge) =>
+      edge.fromCycleId !== cycleId && edge.toCycleId !== cycleId);
+    if (bridge) {
+      for (const candidate of canonicalPlan.bridgeCandidates) {
+        if (candidate.existing || physical.some((edge) =>
+          edge.fromCycleId === candidate.fromCycleId &&
+          edge.toCycleId === candidate.toCycleId)) continue;
+        physical.push({
+          id: `helix-stage-edge-${crypto.randomUUID()}`,
+          fromCycleId: candidate.fromCycleId,
+          toCycleId: candidate.toCycleId,
+        });
+      }
+    }
+    const remainingCycleIds = snapshot.projects.flatMap((project) =>
+      project.cycles.filter((candidate) => candidate.id !== cycleId)
+        .map((candidate) => candidate.id));
+    const normalized = normalizeProjectGraph(remainingCycleIds, physical);
     canvas.document.nodes = canvas.document.nodes.filter((candidate) => candidate.id !== node.id);
     canvas.document.edges = canvas.document.edges.filter((edge) =>
-      edge.fromNode !== node.id &&
-      edge.toNode !== node.id &&
-      !removedManagedEdgeIds.has(edge.id));
-    for (const conversion of mergeRelationConversions) {
-      const remainingSourceId = conversion.relation.fromCycleIds.find(
-        (sourceId) => sourceId !== cycleId,
-      );
-      const edge = canvas.document.edges.find((candidate) =>
-        candidate.helixManaged === true &&
-        cycleRelationKindFromLabel(candidate.helixRelation) === "merge" &&
-        stageIdByNodeId.get(candidate.fromNode) === remainingSourceId &&
-        stageIdByNodeId.get(candidate.toNode) === conversion.relation.toCycleId);
-      if (!edge) throw new Error("Canvas 中找不到需要转换的剩余合并边");
-      edge.helixRelation = conversion.kind;
-      edge.label = CYCLE_RELATION_LABELS[conversion.kind];
-      delete edge.helixMergeGroupId;
-    }
-    for (const relationId of normalizedRelationIds) {
-      const edge = canvas.document.edges.find((candidate) =>
-        candidate.helixManaged === true && candidate.id === relationId);
-      if (!edge) throw new Error("Canvas 中找不到需要降为继承的剩余分支");
-      edge.helixRelation = "inherit";
-      edge.label = CYCLE_RELATION_LABELS.inherit;
-      delete edge.helixMergeGroupId;
-    }
+      edge.fromNode !== node.id && edge.toNode !== node.id);
+    applyNormalizedManagedEdges(canvas.document, normalized.edges);
+    const selectedImpact = bridge
+      ? canonicalPlan.impacts.bridge
+      : canonicalPlan.impacts.noBridge;
+    const affected = affectedWeakComponent(selectedImpact.affectedCycleIds, physical);
+    const layoutSnapshot: ProjectWorkspaceSnapshot = {
+      ...snapshot,
+      projects: snapshot.projects.map((project) =>
+        project.id === owner.id
+          ? {
+              ...project,
+              cycles: project.cycles.filter((candidate) => candidate.id !== cycleId),
+            }
+          : project),
+      canvasNodes: snapshot.canvasNodes.filter((candidate) =>
+        candidate.entityId !== cycleId),
+    };
+    applyManagedLayout(canvas.document, layoutSnapshot, physical, affected);
 
     const nextCanvasContent = JSON.stringify(canvas.document, null, 2);
+    const journal: StageDeletionJournal = {
+      version: 1,
+      operation: "delete-stage",
+      createdAt: new Date().toISOString(),
+      stageId: cycleId,
+      stagePath: cycleRevision.path,
+      stageHash: cycleRevision.hash,
+      canvasPath: canvas.revision.path,
+      canvasBeforeHash: canvas.revision.hash,
+      canvasBeforeContent: canvas.revision.content,
+      canvasAfterHash: stableHash(nextCanvasContent),
+      canvasAfterContent: nextCanvasContent,
+    };
     this.assertActive(generation);
-    const writtenCanvas = await this.repository.compareAndWrite(
-      canvas.revision,
-      nextCanvasContent,
+    const journalRevision = await this.repository.create(
+      this.stageDeletionJournalPath(),
+      JSON.stringify(journal, null, 2),
       () => this.assertActive(generation),
     );
+    let writtenCanvas: VaultRevision;
     try {
+      await this.assertStageDeletionJournalCurrent(journalRevision);
+      writtenCanvas = await this.repository.compareAndWrite(
+        canvas.revision,
+        nextCanvasContent,
+        () => this.assertActive(generation),
+      );
+    } catch (error) {
+      await this.finishStageDeletionJournal(journalRevision, generation);
+      throw error;
+    }
+    try {
+      await this.assertStageDeletionJournalCurrent(journalRevision);
       await this.repository.trashIfUnchanged(
         cycleRevision,
         () => this.assertActive(generation),
@@ -827,17 +1221,117 @@ export class ProjectWorkspaceService {
           () => this.assertActive(generation),
         );
       } catch (rollbackError) {
-        throw new Error(
-          `阶段删除未完成，且 Canvas 回滚遇到竞争。Markdown 仍保留，请手动检查：${
+        const message =
+          `阶段删除未完成，且 Canvas 回滚遇到竞争。事务日志已保留，重启时会冻结或恢复；Markdown 仍保留，请手动检查：${
             rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
-          }`,
-        );
+          }`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
       }
+      await this.finishStageDeletionJournal(journalRevision, generation);
       throw new Error(
         `阶段未删除，Canvas 已回滚：${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    await this.finishStageDeletionJournal(journalRevision, generation);
     return this.snapshot();
+  }
+
+  private stageDeletionJournalPath(): string {
+    return normalizePath(`${this.rootFolder()}/.transactions/stage-delete.json`);
+  }
+
+  private parseStageDeletionJournal(content: string): StageDeletionJournal {
+    let value: unknown;
+    try {
+      value = JSON.parse(content);
+    } catch {
+      throw new Error("阶段删除事务日志损坏：不是有效 JSON");
+    }
+    if (!value || typeof value !== "object") {
+      throw new Error("阶段删除事务日志损坏：根结构无效");
+    }
+    const journal = value as Partial<StageDeletionJournal>;
+    const strings = [
+      journal.createdAt,
+      journal.stageId,
+      journal.stagePath,
+      journal.stageHash,
+      journal.canvasPath,
+      journal.canvasBeforeHash,
+      journal.canvasBeforeContent,
+      journal.canvasAfterHash,
+      journal.canvasAfterContent,
+    ];
+    if (
+      journal.version !== 1 ||
+      journal.operation !== "delete-stage" ||
+      strings.some((entry) => typeof entry !== "string" || !entry)
+    ) {
+      throw new Error("阶段删除事务日志损坏：字段不完整");
+    }
+    const parsed = journal as StageDeletionJournal;
+    const root = `${normalizePath(this.rootFolder())}/`;
+    if (
+      normalizePath(parsed.stagePath) !== parsed.stagePath ||
+      !parsed.stagePath.startsWith(root) ||
+      !parsed.stagePath.endsWith(".md") ||
+      parsed.canvasPath !== normalizePath(this.canvasPath()) ||
+      stableHash(parsed.canvasBeforeContent) !== parsed.canvasBeforeHash ||
+      stableHash(parsed.canvasAfterContent) !== parsed.canvasAfterHash
+    ) {
+      throw new Error("阶段删除事务日志损坏：路径或内容哈希无效");
+    }
+    return parsed;
+  }
+
+  private async findStageRevisions(stageId: string): Promise<VaultRevision[]> {
+    const revisions: VaultRevision[] = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const revision = await this.repository.read(file.path);
+      if (!revision) continue;
+      const frontmatter = frontmatterFromContent(revision.content);
+      if (
+        (frontmatter?.["helix-kind"] === "helix-stage" ||
+          frontmatter?.["helix-kind"] === "helix-cycle") &&
+        frontmatter["helix-id"] === stageId
+      ) {
+        revisions.push(revision);
+      }
+    }
+    return revisions;
+  }
+
+  private async finishStageDeletionJournal(
+    revision: VaultRevision,
+    generation: number,
+  ): Promise<void> {
+    try {
+      await this.repository.trashIfUnchanged(
+        revision,
+        () => this.assertActive(generation),
+        { requireExisting: true },
+      );
+    } catch (error) {
+      const message =
+        `阶段删除事务日志清理失败，项目写入已冻结：${
+          error instanceof Error ? error.message : String(error)
+        }`;
+      this.freezePendingStageDeletion(message);
+      throw new Error(message);
+    }
+  }
+
+  private async assertStageDeletionJournalCurrent(
+    revision: VaultRevision,
+  ): Promise<void> {
+    const current = await this.repository.read(revision.path);
+    if (!current || current.hash !== revision.hash) {
+      const message =
+        "阶段删除事务日志在破坏性写入前发生变化，项目写入已冻结";
+      this.freezePendingStageDeletion(message);
+      throw new Error(message);
+    }
   }
 
   private async mutateRelation(
@@ -898,8 +1392,6 @@ export class ProjectWorkspaceService {
         normalizedRelationIds.add(outgoing[0]!.id);
       }
     }
-    validateCycleGraph(cycles.map((cycle) => cycle.id), nextRelations);
-
     const canvas = await this.readCanvas(false, generation);
     if (!canvas.revision) throw new Error("项目 Canvas 不存在");
     const nodeByCycle = new Map(
@@ -953,6 +1445,11 @@ export class ProjectWorkspaceService {
         });
       }
     }
+    const normalized = normalizeProjectGraph(
+      cycles.map((cycle) => cycle.id),
+      physicalManagedEdges(canvas.document),
+    );
+    applyNormalizedManagedEdges(canvas.document, normalized.edges);
     this.assertActive(generation);
     await this.writeCanvas(canvas, generation);
     return this.snapshot();
@@ -1047,9 +1544,11 @@ export class ProjectWorkspaceService {
   async createProject(
     title: string,
     didaProjectId?: string,
+    color?: string,
   ): Promise<ProjectWorkspaceProject> {
     const generation = this.beginOperation();
     const normalizedTitle = title.trim();
+    const normalizedColor = normalizeProjectColor(color);
     if (!normalizedTitle) throw new Error("请输入项目名称");
     assertSingleLineTitle(normalizedTitle, "项目名称");
     const folderName = sanitizeFileName(normalizedTitle);
@@ -1083,6 +1582,7 @@ export class ProjectWorkspaceService {
           title: normalizedTitle,
           createdAt: now,
           didaProjectId,
+          color: normalizedColor,
         }),
         () => this.assertActive(generation),
       ));
@@ -1104,6 +1604,7 @@ export class ProjectWorkspaceService {
         status: "active",
         notePath: projectPath,
         didaProjectId,
+        color: normalizedColor,
         cycles: [{
           id: cycleId,
           title: "项目启动",
@@ -1116,6 +1617,18 @@ export class ProjectWorkspaceService {
         ...before,
         projects: [...before.projects, plannedProject],
       });
+      const plannedProjects = [...before.projects, plannedProject];
+      const plannedSnapshot: ProjectWorkspaceSnapshot = {
+        ...before,
+        projects: plannedProjects,
+        canvasNodes: managedCanvasNodeViews(canvas.document, plannedProjects),
+      };
+      applyManagedLayout(
+        canvas.document,
+        plannedSnapshot,
+        physicalManagedEdges(canvas.document),
+        new Set([cycleId]),
+      );
       canvas.document.helixStageSequences = {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: 1,
@@ -1419,6 +1932,55 @@ export class ProjectWorkspaceService {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: specs.at(-1)!.sequence,
       };
+      const physical = physicalManagedEdges(canvas.document);
+      const normalized = normalizeProjectGraph(
+        [...allCycles.map((cycle) => cycle.id), ...specs.map((spec) => spec.id)],
+        physical,
+      );
+      applyNormalizedManagedEdges(canvas.document, normalized.edges);
+      const plannedProjects = snapshot.projects.map((candidate) =>
+        candidate.id !== projectId
+          ? candidate
+          : {
+              ...candidate,
+              cycles: [
+                ...candidate.cycles,
+                ...specs.map((spec) => ({
+                  id: spec.id,
+                  title: spec.stageTitle,
+                  notePath: spec.path,
+                  sequence: spec.sequence,
+                  status: "active" as const,
+                })),
+              ],
+            });
+      const plannedNodes = [
+        ...snapshot.canvasNodes,
+        ...specs.map((spec) => {
+          const node = canvas.document.nodes.find((candidate) =>
+            managedStageId(candidate) === spec.id);
+          if (!node) throw new Error("Canvas 中缺少新建阶段节点");
+          return canvasNodeView(node, {
+            entityId: spec.id,
+            projectId,
+            kind: "cycle",
+            notePath: spec.path,
+            title: spec.stageTitle,
+          });
+        }),
+      ];
+      const layoutSnapshot: ProjectWorkspaceSnapshot = {
+        ...snapshot,
+        projects: plannedProjects,
+        canvasNodes: plannedNodes,
+        relations: normalized.relations,
+      };
+      applyManagedLayout(
+        canvas.document,
+        layoutSnapshot,
+        physical,
+        affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
+      );
       this.assertActive(generation);
       await this.writeCanvas(canvas, generation);
       canvasWritten = true;
@@ -1538,6 +2100,269 @@ function sameStringSet(left: string[], right: string[]): boolean {
   const sortedLeft = [...left].sort();
   const sortedRight = [...right].sort();
   return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
+
+function normalizeProjectColor(value?: string): string | undefined {
+  const normalized = value?.trim().toUpperCase();
+  if (!normalized) return undefined;
+  if (!/^#[0-9A-F]{6}$/.test(normalized)) {
+    throw new Error("项目颜色必须是 #RRGGBB 格式");
+  }
+  return normalized;
+}
+
+function parseProjectColor(value: unknown, path: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error(`项目颜色格式无效：${path}`);
+  try {
+    return normalizeProjectColor(value);
+  } catch {
+    throw new Error(`项目颜色格式无效：${path}`);
+  }
+}
+
+function validatedCompletedCollapse(
+  document: CanvasDocument,
+  projectIds: ReadonlySet<string>,
+): string[] {
+  const value = document.helixCompletedCollapse;
+  if (value === undefined) return [];
+  if (
+    !value ||
+    value.version !== 1 ||
+    !Array.isArray(value.projectIds) ||
+    value.projectIds.some((id) => typeof id !== "string" || !projectIds.has(id))
+  ) {
+    throw new Error("Canvas 已完成阶段折叠状态无效");
+  }
+  return [...new Set(value.projectIds)].sort();
+}
+
+function cycleOwnerMap(
+  projects: ProjectWorkspaceProject[],
+): Map<string, string> {
+  return new Map(projects.flatMap((project) =>
+    project.cycles.map((cycle) => [cycle.id, project.id] as const)));
+}
+
+function physicalManagedEdges(document: CanvasDocument): ProjectGraphEdge[] {
+  const stageByNode = new Map(document.nodes.flatMap((node) => {
+    const stageId = managedStageId(node);
+    return stageId ? [[node.id, stageId] as const] : [];
+  }));
+  return document.edges.flatMap((edge) => {
+    if (edge.helixManaged !== true || isLegacyDerivesEdge(edge)) return [];
+    const fromCycleId = stageByNode.get(edge.fromNode);
+    const toCycleId = stageByNode.get(edge.toNode);
+    return fromCycleId && toCycleId
+      ? [{ id: edge.id, fromCycleId, toCycleId }]
+      : [];
+  });
+}
+
+function applyNormalizedManagedEdges(
+  document: CanvasDocument,
+  normalized: ReturnType<typeof normalizeProjectGraph>["edges"],
+): void {
+  const nodeByStage = new Map(document.nodes.flatMap((node) => {
+    const stageId = managedStageId(node);
+    return stageId ? [[stageId, node] as const] : [];
+  }));
+  const stageNodeIds = new Set([...nodeByStage.values()].map((node) => node.id));
+  const existing = new Map(document.edges
+    .filter((edge) => edge.helixManaged === true)
+    .map((edge) => [edge.id, edge]));
+  const next = normalized.map((edge) => {
+    const source = nodeByStage.get(edge.fromCycleId);
+    const target = nodeByStage.get(edge.toCycleId);
+    if (!source || !target) throw new Error("Canvas 中缺少关系阶段节点");
+    const preserved = existing.get(edge.id) ?? {
+      id: edge.id,
+      fromNode: source.id,
+      toNode: target.id,
+    };
+    preserved.fromNode = source.id;
+    preserved.toNode = target.id;
+    preserved.helixManaged = true;
+    preserved.helixRelation = edge.kind;
+    preserved.label = CYCLE_RELATION_LABELS[edge.kind];
+    if (edge.mergeGroupId) preserved.helixMergeGroupId = edge.mergeGroupId;
+    else delete preserved.helixMergeGroupId;
+    return preserved;
+  });
+  document.edges = [
+    ...document.edges.filter((edge) =>
+      edge.helixManaged !== true ||
+      isLegacyDerivesEdge(edge) ||
+      !stageNodeIds.has(edge.fromNode) ||
+      !stageNodeIds.has(edge.toNode)),
+    ...next,
+  ];
+}
+
+function isLegacyDerivesEdge(edge: CanvasEdge): boolean {
+  return edge.label === "derives-from" || edge.helixRelation === "derives-from";
+}
+
+function countRelabeledEdges(
+  before: ReturnType<typeof normalizeProjectGraph>,
+  after: ReturnType<typeof normalizeProjectGraph>,
+): number {
+  const beforeKind = new Map(before.edges.map((edge) => [edge.id, edge.kind]));
+  return after.edges.filter((edge) =>
+    beforeKind.has(edge.id) && beforeKind.get(edge.id) !== edge.kind).length;
+}
+
+function relabeledEdges(
+  before: ReturnType<typeof normalizeProjectGraph>,
+  after: ReturnType<typeof normalizeProjectGraph>,
+): StageDeletionImpact["relabeledEdges"] {
+  const beforeKind = new Map(before.edges.map((edge) => [edge.id, edge.kind]));
+  return after.edges.flatMap((edge) => {
+    const previous = beforeKind.get(edge.id);
+    return previous && previous !== edge.kind
+      ? [{
+          edgeId: edge.id,
+          fromCycleId: edge.fromCycleId,
+          toCycleId: edge.toCycleId,
+          before: previous,
+          after: edge.kind,
+        }]
+      : [];
+  }).sort((left, right) => left.edgeId.localeCompare(right.edgeId));
+}
+
+function sameConnectionPlan(
+  left: ProjectConnectionPlan,
+  right: ProjectConnectionPlan,
+): boolean {
+  return left.canvasRevisionHash === right.canvasRevisionHash &&
+    left.sourceCycleId === right.sourceCycleId &&
+    left.targetCycleId === right.targetCycleId &&
+    JSON.stringify(left.source) === JSON.stringify(right.source) &&
+    JSON.stringify(left.target) === JSON.stringify(right.target) &&
+    left.crossProject === right.crossProject &&
+    left.affectedNodeCount === right.affectedNodeCount &&
+    left.relabeledEdgeCount === right.relabeledEdgeCount;
+}
+
+function stageDescriptor(
+  projects: ProjectWorkspaceProject[],
+  stageId: string,
+): ProjectConnectionPlan["source"] {
+  for (const project of projects) {
+    const cycle = project.cycles.find((candidate) => candidate.id === stageId);
+    if (!cycle) continue;
+    return {
+      projectId: project.id,
+      projectTitle: project.title,
+      cycleTitle: cycle.title,
+      sequence: cycle.sequence,
+    };
+  }
+  throw new Error("找不到阶段说明");
+}
+
+function managedCanvasNodeViews(
+  document: CanvasDocument,
+  projects: ProjectWorkspaceProject[],
+): ProjectWorkspaceCanvasNode[] {
+  const projectById = new Map(projects.map((project) => [project.id, project]));
+  const stageById = new Map(projects.flatMap((project) =>
+    project.cycles.map((cycle) => [
+      cycle.id,
+      { cycle, projectId: project.id },
+    ] as const)));
+  return document.nodes.flatMap((node) => {
+    if (node.helixManaged !== true) return [];
+    if (
+      node.helixNodeKind === "project" &&
+      typeof node.helixProjectId === "string"
+    ) {
+      const project = projectById.get(node.helixProjectId);
+      return project
+        ? [canvasNodeView(node, {
+            entityId: project.id,
+            projectId: project.id,
+            kind: "project",
+            notePath: project.notePath,
+            title: project.title,
+          })]
+        : [];
+    }
+    const stageId = managedStageId(node);
+    const stage = stageId ? stageById.get(stageId) : undefined;
+    return stage
+      ? [canvasNodeView(node, {
+          entityId: stage.cycle.id,
+          projectId: stage.projectId,
+          kind: "cycle",
+          notePath: stage.cycle.notePath,
+          title: stage.cycle.title,
+        })]
+      : [];
+  });
+}
+
+function sameDeletionPlan(
+  left: StageDeletionPlan,
+  right: StageDeletionPlan,
+): boolean {
+  return left.canvasRevisionHash === right.canvasRevisionHash &&
+    left.cycleId === right.cycleId &&
+    left.bridgeLimitExceeded === right.bridgeLimitExceeded &&
+    JSON.stringify(left.impacts) === JSON.stringify(right.impacts) &&
+    JSON.stringify(left.bridgeCandidates) === JSON.stringify(right.bridgeCandidates);
+}
+
+function applyManagedLayout(
+  document: CanvasDocument,
+  snapshot: ProjectWorkspaceSnapshot,
+  edges: ProjectGraphEdge[],
+  scope?: ReadonlySet<string>,
+): void {
+  const viewByEntity = new Map(snapshot.canvasNodes.map((node) => [node.entityId, node]));
+  const layout = planProjectGraphLayout(
+    snapshot.projects.map((project) => {
+      const node = viewByEntity.get(project.id);
+      return { id: project.id, x: node?.x ?? 0, y: node?.y ?? 0 };
+    }),
+    snapshot.projects.flatMap((project) =>
+      project.cycles.map((cycle) => {
+        const node = viewByEntity.get(cycle.id);
+        return {
+          id: cycle.id,
+          projectId: project.id,
+          sequence: cycle.sequence,
+          x: node?.x ?? 0,
+          y: node?.y ?? 0,
+        };
+      })),
+    edges,
+    scope,
+  );
+  const position = new Map([
+    ...layout.projects.map((node) => [node.id, node] as const),
+    ...layout.stages.map((node) => [node.id, node] as const),
+  ]);
+  if ([...position.values()].some((node) =>
+    !Number.isFinite(node.x) ||
+    !Number.isFinite(node.y) ||
+    Math.abs(node.x) > 1_000_000 ||
+    Math.abs(node.y) > 1_000_000)) {
+    throw new Error("自动布局超出 Canvas 安全坐标范围，本次操作未写入");
+  }
+  for (const node of document.nodes) {
+    if (node.helixManaged !== true) continue;
+    const entityId = node.helixNodeKind === "project" &&
+      typeof node.helixProjectId === "string"
+      ? node.helixProjectId
+      : managedStageId(node);
+    const next = entityId ? position.get(entityId) : undefined;
+    if (!next) continue;
+    node.x = Math.round(next.x);
+    node.y = Math.round(next.y);
+  }
 }
 
 function projectStatusText(status: ProjectWorkspaceProject["status"]): string {

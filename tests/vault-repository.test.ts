@@ -46,4 +46,32 @@ describe("HelixVaultRepository", () => {
       actualHash: "<missing>",
     } satisfies Partial<VaultWriteConflictError>);
   });
+
+  it("recovers and removes an unchanged machine journal outside the TFile index", async () => {
+    let content: string | null = "{\"operation\":\"delete-stage\"}";
+    let fenced = false;
+    const repository = new HelixVaultRepository({
+      getAbstractFileByPath: () => null,
+      adapter: {
+        exists: async () => content !== null,
+        read: async () => {
+          if (content === null) throw new Error("missing");
+          return content;
+        },
+        remove: async () => {
+          expect(fenced).toBe(true);
+          content = null;
+        },
+      },
+    } as never);
+
+    const revision = await repository.read("Helix/.transactions/stage-delete.json");
+    expect(revision?.content).toBe("{\"operation\":\"delete-stage\"}");
+
+    await repository.trashIfUnchanged(revision!, () => {
+      fenced = true;
+    }, { requireExisting: true });
+
+    expect(await repository.read(revision!.path)).toBeNull();
+  });
 });

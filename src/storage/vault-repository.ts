@@ -24,8 +24,14 @@ export class HelixVaultRepository {
   async read(path: string): Promise<VaultRevision | null> {
     const normalized = normalizePath(path);
     const file = this.vault.getAbstractFileByPath(normalized);
-    if (!(file instanceof TFile)) return null;
-    const content = await this.vault.read(file);
+    let content: string;
+    if (file instanceof TFile) {
+      content = await this.vault.read(file);
+    } else {
+      const adapter = this.vault.adapter;
+      if (!adapter || !(await adapter.exists(normalized))) return null;
+      content = await adapter.read(normalized);
+    }
     return { path: normalized, content, hash: stableHash(content) };
   }
 
@@ -35,7 +41,10 @@ export class HelixVaultRepository {
     beforeWrite?: () => void,
   ): Promise<VaultRevision> {
     const normalized = normalizePath(path);
-    if (this.vault.getAbstractFileByPath(normalized)) {
+    if (
+      this.vault.getAbstractFileByPath(normalized) ||
+      (this.vault.adapter && await this.vault.adapter.exists(normalized))
+    ) {
       throw new Error(`目标已经存在：${normalized}`);
     }
     beforeWrite?.();
@@ -90,9 +99,14 @@ export class HelixVaultRepository {
       );
     }
     const file = this.vault.getAbstractFileByPath(revision.path);
-    if (!(file instanceof TFile)) throw new Error(`目标不是文件：${revision.path}`);
     beforeWrite?.();
-    await this.vault.trash(file, false);
+    if (file instanceof TFile) {
+      await this.vault.trash(file, false);
+    } else {
+      const adapter = this.vault.adapter;
+      if (!adapter) throw new Error(`目标不是文件：${revision.path}`);
+      await adapter.remove(revision.path);
+    }
   }
 
   private async ensureParent(path: string, beforeWrite?: () => void): Promise<void> {
@@ -101,7 +115,10 @@ export class HelixVaultRepository {
     let current = "";
     for (const segment of segments) {
       current = current ? `${current}/${segment}` : segment;
-      if (!this.vault.getAbstractFileByPath(current)) {
+      if (
+        !this.vault.getAbstractFileByPath(current) &&
+        !(this.vault.adapter && await this.vault.adapter.exists(current))
+      ) {
         beforeWrite?.();
         await this.vault.createFolder(current);
       }

@@ -1315,8 +1315,17 @@ export class ProjectWorkspaceService {
     generation: number,
   ): Promise<void> {
     try {
+      const current = await this.repository.read(revision.path);
+      if (!current) {
+        throw new Error("阶段删除事务日志在清理前已不存在");
+      }
+      const expectedJournal = this.parseStageDeletionJournal(revision.content);
+      const currentJournal = this.parseStageDeletionJournal(current.content);
+      if (stableHash(currentJournal) !== stableHash(expectedJournal)) {
+        throw new Error("阶段删除事务日志在清理前发生语义变化");
+      }
       await this.repository.trashIfUnchanged(
-        revision,
+        current,
         () => this.assertActive(generation),
         { requireExisting: true },
       );

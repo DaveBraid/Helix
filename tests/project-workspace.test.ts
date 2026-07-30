@@ -1300,6 +1300,44 @@ describe("ProjectWorkspaceService", () => {
     await expect(service.snapshot()).rejects.toThrow(/冻结|事务日志已保留/);
   });
 
+  it("accepts a semantics-preserving journal rewrite before cleanup", async () => {
+    const repo = deletionRecoveryRepository();
+    const service = workspace(repo);
+    repo.beforeTrash = (revision) => {
+      if (revision.path !== "Helix/Projects/Alpha/Cycle-02.md") return;
+      repo.set(DELETE_JOURNAL, JSON.stringify(repo.json(DELETE_JOURNAL)));
+    };
+
+    await expect(service.deleteCycle("cycle-2")).resolves.toBeDefined();
+
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).toBeNull();
+    expect(repo.json(CANVAS).nodes).not.toContainEqual(
+      expect.objectContaining({ id: "cycle-2-node" }),
+    );
+  });
+
+  it("retains and freezes a semantically changed journal before cleanup", async () => {
+    const repo = deletionRecoveryRepository();
+    const service = workspace(repo);
+    repo.beforeTrash = (revision) => {
+      if (revision.path !== "Helix/Projects/Alpha/Cycle-02.md") return;
+      const journal = repo.json(DELETE_JOURNAL);
+      journal.createdAt = "2099-01-01T00:00:00.000Z";
+      repo.set(DELETE_JOURNAL, JSON.stringify(journal));
+    };
+
+    await expect(service.deleteCycle("cycle-2"))
+      .rejects.toThrow(/事务日志清理失败|语义变化/);
+
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).toBeNull();
+    expect(await repo.read(DELETE_JOURNAL)).not.toBeNull();
+    expect(repo.json(CANVAS).nodes).not.toContainEqual(
+      expect.objectContaining({ id: "cycle-2-node" }),
+    );
+    await expect(service.snapshot()).rejects.toThrow(/冻结|语义变化/);
+  });
+
   it("does not touch Canvas or Markdown when the journal disappears before write", async () => {
     const repo = deletionRecoveryRepository();
     const service = workspace(repo);

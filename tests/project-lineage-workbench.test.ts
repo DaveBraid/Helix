@@ -9,12 +9,16 @@ import {
   lineageFitScale,
   lineageConnectionDropTarget,
   lineageClampedZoom,
+  lineageCenteredZoomPlan,
+  lineageCenteredPointPlan,
   lineageConnectionTargetIds,
   lineageGraphBox,
   lineageGraphEdgeAnchors,
   lineageMovePayload,
+  lineageProjectContainerBox,
   lineageStructuralEntityIds,
   lineageVirtualExpansionPlan,
+  lineageVisibleStageIdsByProject,
   lineageZoomLabel,
   projectedLineageRelations,
 } from "../src/ui/project-lineage-workbench";
@@ -100,6 +104,88 @@ describe("Project Lineage card-plus intent", () => {
       .toEqual({ width: 960, height: 720 });
   });
 
+  it("derives a project background container from stage cards, not the project node", () => {
+    const project = node("project", "project", -8_000, -8_000);
+    const first = node("first", "cycle", 40, 60);
+    const second = node("second", "cycle", 500, 200);
+    const layout = new Map([
+      ["project", { x: -8_000, y: -8_000 }],
+      ["first", { x: 40, y: 60 }],
+      ["second", { x: 500, y: 200 }],
+    ]);
+
+    expect(lineageProjectContainerBox(
+      "project",
+      [project, first, second],
+      layout,
+    )).toEqual({
+      x: 12,
+      y: 2,
+      width: 764,
+      height: 354,
+      right: 776,
+      bottom: 356,
+      centerX: 394,
+      centerY: 179,
+    });
+  });
+
+  it("preserves the raw logical center at every edge and extreme low zoom", () => {
+    for (const viewport of [
+      { scrollLeft: 0, scrollTop: 0, clientWidth: 800, clientHeight: 600 },
+      { scrollLeft: 9_200, scrollTop: 0, clientWidth: 800, clientHeight: 600 },
+      { scrollLeft: 0, scrollTop: 9_400, clientWidth: 800, clientHeight: 600 },
+      { scrollLeft: 9_200, scrollTop: 9_400, clientWidth: 800, clientHeight: 600 },
+    ]) {
+      const next = lineageCenteredZoomPlan(viewport, 1, 0.0004, 10_000, 10_000);
+      const beforeX = (viewport.scrollLeft + viewport.clientWidth / 2);
+      const beforeY = (viewport.scrollTop + viewport.clientHeight / 2);
+      const afterX = (next.left + viewport.clientWidth / 2) / 0.0004 -
+        next.shiftX;
+      const afterY = (next.top + viewport.clientHeight / 2) / 0.0004 -
+        next.shiftY;
+      expect(afterX).toBeCloseTo(beforeX, 6);
+      expect(afterY).toBeCloseTo(beforeY, 6);
+      expect(next.left).toBeGreaterThanOrEqual(399.999);
+      expect(next.top).toBeGreaterThanOrEqual(399.999);
+      expect(
+        (10_000 + next.shiftX + next.growRightBy) * 0.0004,
+      ).toBeGreaterThanOrEqual(next.left + viewport.clientWidth + 399.999);
+      expect(
+        (10_000 + next.shiftY + next.growBottomBy) * 0.0004,
+      ).toBeGreaterThanOrEqual(next.top + viewport.clientHeight + 399.999);
+    }
+  });
+
+  it("centers a structurally operated node in the viewport", () => {
+    expect(lineageCenteredPointPlan(
+      { x: 1_400, y: 900 },
+      0.5,
+      { clientWidth: 800, clientHeight: 600 },
+      8_000,
+      8_000,
+    )).toEqual({
+      shiftX: 200,
+      shiftY: 500,
+      growRightBy: 0,
+      growBottomBy: 0,
+      left: 400,
+      top: 400,
+    });
+  });
+
+  it("indexes a thousand visible stages once by project", () => {
+    const nodes = Array.from({ length: 1_000 }, (_, index) => ({
+      ...node(`stage-${index}`, "cycle", index * 10, index * 5),
+      projectId: `project-${index % 50}`,
+    }));
+    const hidden = new Map([["stage-999", "stage-949"]]);
+    const index = lineageVisibleStageIdsByProject(nodes, hidden);
+    expect(index.size).toBe(50);
+    expect([...index.values()].reduce((sum, ids) => sum + ids.length, 0)).toBe(999);
+    expect(index.get("project-49")).not.toContain("stage-999");
+  });
+
   it("keeps negative Canvas coordinates when the virtual origin expands left or up", () => {
     expect(lineageMovePayload(
       node("negative", "cycle", 0, 0),
@@ -161,6 +247,41 @@ describe("Project Lineage card-plus intent", () => {
         foldedProjectIds: ["project-a"],
       }),
     ]));
+  });
+
+  it("rejects a closed-component contraction that would create a projected diamond cycle", () => {
+    const snapshot: ProjectWorkspaceSnapshot = {
+      canvasPath: "Project Lineage.canvas",
+      canvasRevisionHash: "hash",
+      projects: [{
+        id: "project",
+        title: "Project",
+        status: "active",
+        notePath: "Project.md",
+        cycles: [
+          { id: "a", title: "a", notePath: "a.md", sequence: 1, status: "closed" },
+          { id: "x", title: "x", notePath: "x.md", sequence: 2, status: "active" },
+          { id: "b", title: "b", notePath: "b.md", sequence: 3, status: "closed" },
+        ],
+      }],
+      nextStageSequenceByProject: {},
+      relations: [
+        { id: "a-x", kind: "branch", fromCycleIds: ["a"], toCycleId: "x" },
+        { id: "merge-b", kind: "merge", fromCycleIds: ["a", "x"], toCycleId: "b" },
+      ],
+      migrationWarnings: [],
+      migrationItems: [],
+      migrationRequired: false,
+      canvasNodes: ["a", "x", "b"].map((id, index) => ({
+        ...node(id, "cycle", index * 300, 0),
+        projectId: "project",
+      })),
+      collapsedCompletedProjectIds: ["project"],
+    };
+    const projection = completedLineageProjection(snapshot);
+    expect(projection.hiddenByCollapseHead.size).toBe(0);
+    expect(projection.collapseHeadByMember.size).toBe(0);
+    expect(projection.collapseCountByHead.size).toBe(0);
   });
 
   it("never submits canceled or blank connector drags", () => {

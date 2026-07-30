@@ -45,6 +45,10 @@ const Y_GAP = 72;
 const CARD_WIDTH = 248;
 const CARD_HEIGHT = 128;
 const PROJECT_TO_STAGE_GAP = 160;
+const PROJECT_SIDE_PADDING = 28;
+const PROJECT_TOP_PADDING = 58;
+const PROJECT_BOTTOM_PADDING = 28;
+const PROJECT_LANE_GAP = 72;
 
 export function normalizeProjectGraph(
   cycleIds: Iterable<string>,
@@ -161,10 +165,30 @@ export function planProjectGraphLayout(
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
 ): ProjectGraphLayout {
-  const projectOrder = [...projects].sort((left, right) =>
-    left.y - right.y || left.x - right.x || left.id.localeCompare(right.id));
+  const stagesByProject = new Map<string, StageLayoutNode[]>();
+  for (const stage of stages) {
+    const group = stagesByProject.get(stage.projectId) ?? [];
+    group.push(stage);
+    stagesByProject.set(stage.projectId, group);
+  }
+  const projectOrder = [...projects].sort((left, right) => {
+    const leftStages = stagesByProject.get(left.id) ?? [];
+    const rightStages = stagesByProject.get(right.id) ?? [];
+    const leftY = leftStages.length > 0
+      ? Math.min(...leftStages.map((stage) => stage.y))
+      : 0;
+    const rightY = rightStages.length > 0
+      ? Math.min(...rightStages.map((stage) => stage.y))
+      : 0;
+    const leftX = leftStages.length > 0
+      ? Math.min(...leftStages.map((stage) => stage.x))
+      : 0;
+    const rightX = rightStages.length > 0
+      ? Math.min(...rightStages.map((stage) => stage.x))
+      : 0;
+    return leftY - rightY || leftX - rightX || left.id.localeCompare(right.id);
+  });
   const ownerRank = new Map(projectOrder.map((project, index) => [project.id, index]));
-  const stageById = new Map(stages.map((stage) => [stage.id, stage]));
   const incoming = new Map<string, string[]>();
   for (const edge of edges) {
     const list = incoming.get(edge.toCycleId) ?? [];
@@ -190,16 +214,41 @@ export function planProjectGraphLayout(
     depth(left.id) - depth(right.id) ||
     left.sequence - right.sequence ||
     left.id.localeCompare(right.id));
+  const rowsByProjectDepth = new Map<string, number>();
+  const laneRowsByProject = new Map<string, number>();
+  for (const stage of stages) {
+    const key = `${stage.projectId}\u0000${depth(stage.id)}`;
+    const rows = (rowsByProjectDepth.get(key) ?? 0) + 1;
+    rowsByProjectDepth.set(key, rows);
+    laneRowsByProject.set(
+      stage.projectId,
+      Math.max(laneRowsByProject.get(stage.projectId) ?? 0, rows),
+    );
+  }
+  const movingProjectIds = scope
+    ? new Set(stages.filter((stage) => scope.has(stage.id)).map((stage) => stage.projectId))
+    : new Set(projects.map((project) => project.id));
+  const effectiveScope = scope
+    ? new Set(stages
+      .filter((stage) => scope.has(stage.id))
+      .map((stage) => stage.id))
+    : undefined;
   const rowByProjectDepth = new Map<string, number>();
   const laneStart = new Map<string, number>();
-  let nextLaneY = 0;
-  for (const project of projectOrder) {
-    const count = Math.max(1, stages.filter((stage) => stage.projectId === project.id).length);
-    laneStart.set(project.id, nextLaneY);
-    nextLaneY += count * (CARD_HEIGHT + Y_GAP) + Y_GAP;
+  if (!scope) {
+    let nextLaneY = 0;
+    for (const project of projectOrder) {
+      const count = Math.max(1, laneRowsByProject.get(project.id) ?? 0);
+      laneStart.set(project.id, nextLaneY);
+      nextLaneY += count * (CARD_HEIGHT + Y_GAP) + PROJECT_LANE_GAP;
+    }
+  } else {
+    for (const projectId of movingProjectIds) {
+      laneStart.set(projectId, 0);
+    }
   }
   let nextStages = orderedStages.map((stage) => {
-    if (scope && !scope.has(stage.id)) return { ...stage };
+    if (effectiveScope && !effectiveScope.has(stage.id)) return { ...stage };
     const key = `${stage.projectId}\u0000${depth(stage.id)}`;
     const row = rowByProjectDepth.get(key) ?? 0;
     rowByProjectDepth.set(key, row + 1);
@@ -212,53 +261,75 @@ export function planProjectGraphLayout(
   });
   let nextProjects = projectOrder.map((project) => {
     const projectStages = nextStages.filter((stage) => stage.projectId === project.id);
-    if (scope && !projectStages.some((stage) => scope.has(stage.id))) return { ...project };
+    if (scope) return { ...project };
     const top = laneStart.get(project.id) ?? 0;
     const bottom = Math.max(top, ...projectStages.map((stage) => stage.y));
     return { ...project, x: 0, y: Math.round((top + bottom) / 2) };
   });
   if (scope) {
-    const movingProjectIds = new Set(nextStages
-      .filter((stage) => scope.has(stage.id))
-      .map((stage) => stage.projectId));
-    const movingBoxes = (): Array<{ x: number; y: number }> => [
-      ...nextProjects
-        .filter((project) => movingProjectIds.has(project.id))
-        .map(({ x, y }) => ({ x, y })),
-      ...nextStages
-        .filter((stage) => scope.has(stage.id))
-        .map(({ x, y }) => ({ x, y })),
-    ];
-    const fixedBoxes = [
-      ...nextProjects
-        .filter((project) => !movingProjectIds.has(project.id))
-        .map(({ x, y }) => ({ x, y })),
-      ...nextStages
-        .filter((stage) => !scope.has(stage.id))
-        .map(({ x, y }) => ({ x, y })),
-    ];
-    let shift = 0;
-    while (movingBoxes().some((moving) =>
-      fixedBoxes.some((fixed) =>
-        boxesOverlap({ ...moving, y: moving.y + shift }, fixed)))) {
-      shift += CARD_HEIGHT + Y_GAP;
-    }
-    if (shift > 0) {
-      nextStages = nextStages.map((stage) =>
-        scope.has(stage.id) ? { ...stage, y: stage.y + shift } : stage);
-      nextProjects = nextProjects.map((project) =>
-        movingProjectIds.has(project.id) ? { ...project, y: project.y + shift } : project);
+    const occupied = nextStages
+      .filter((stage) => !effectiveScope?.has(stage.id))
+      .flatMap((stage) => {
+        const box = projectStageContainerBox([stage]);
+        return box ? [box] : [];
+      });
+    for (const project of projectOrder.filter((item) => movingProjectIds.has(item.id))) {
+      const movingStages = nextStages.filter((stage) =>
+        stage.projectId === project.id && effectiveScope?.has(stage.id));
+      const original = projectStageContainerBox(movingStages);
+      if (!original) continue;
+      let shift = 0;
+      for (;;) {
+        const shifted = {
+          ...original,
+          y: original.y + shift,
+          bottom: original.bottom + shift,
+        };
+        const conflicts = occupied.filter((fixed) =>
+          containerBoxesOverlap(shifted, fixed));
+        if (conflicts.length === 0) {
+          occupied.push(shifted);
+          break;
+        }
+        shift = Math.max(
+          shift,
+          ...conflicts.map((fixed) =>
+            fixed.bottom + PROJECT_LANE_GAP - original.y),
+        );
+      }
+      if (shift > 0) {
+        nextStages = nextStages.map((stage) =>
+          stage.projectId === project.id && effectiveScope?.has(stage.id)
+            ? { ...stage, y: stage.y + shift }
+            : stage);
+      }
     }
   }
   return { projects: nextProjects, stages: nextStages };
 }
 
-function boxesOverlap(
-  left: { x: number; y: number },
-  right: { x: number; y: number },
+function projectStageContainerBox(
+  stages: StageLayoutNode[],
+): { x: number; y: number; right: number; bottom: number } | undefined {
+  if (stages.length === 0) return undefined;
+  return {
+    x: Math.min(...stages.map((stage) => stage.x)) - PROJECT_SIDE_PADDING,
+    y: Math.min(...stages.map((stage) => stage.y)) - PROJECT_TOP_PADDING,
+    right: Math.max(...stages.map((stage) => stage.x + CARD_WIDTH)) +
+      PROJECT_SIDE_PADDING,
+    bottom: Math.max(...stages.map((stage) => stage.y + CARD_HEIGHT)) +
+      PROJECT_BOTTOM_PADDING,
+  };
+}
+
+function containerBoxesOverlap(
+  left: { x: number; y: number; right: number; bottom: number },
+  right: { x: number; y: number; right: number; bottom: number },
 ): boolean {
-  return Math.abs(left.x - right.x) < CARD_WIDTH + X_GAP / 2 &&
-    Math.abs(left.y - right.y) < CARD_HEIGHT + Y_GAP / 2;
+  return left.x < right.right &&
+    left.right > right.x &&
+    left.y < right.bottom &&
+    left.bottom > right.y;
 }
 
 export function collapsedClosedComponents(
@@ -297,6 +368,46 @@ export function collapsedClosedComponents(
     });
   }
   return components;
+}
+
+export function projectedGraphIsAcyclic(
+  cycleIds: Iterable<string>,
+  edges: ProjectGraphEdge[],
+  representativeByNode: ReadonlyMap<string, string>,
+): boolean {
+  const representatives = new Set<string>();
+  for (const id of cycleIds) {
+    representatives.add(representativeByNode.get(id) ?? id);
+  }
+  const pairs = new Set<string>();
+  const outgoing = new Map<string, string[]>();
+  const indegree = new Map([...representatives].map((id) => [id, 0]));
+  for (const edge of edges) {
+    const from = representativeByNode.get(edge.fromCycleId) ?? edge.fromCycleId;
+    const to = representativeByNode.get(edge.toCycleId) ?? edge.toCycleId;
+    if (from === to) continue;
+    const pair = `${from}\u0000${to}`;
+    if (pairs.has(pair)) continue;
+    pairs.add(pair);
+    const targets = outgoing.get(from) ?? [];
+    targets.push(to);
+    outgoing.set(from, targets);
+    indegree.set(to, (indegree.get(to) ?? 0) + 1);
+  }
+  const queue = [...indegree]
+    .filter(([, value]) => value === 0)
+    .map(([id]) => id);
+  let visited = 0;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    visited += 1;
+    for (const target of outgoing.get(current) ?? []) {
+      const next = (indegree.get(target) ?? 0) - 1;
+      indegree.set(target, next);
+      if (next === 0) queue.push(target);
+    }
+  }
+  return visited === representatives.size;
 }
 
 function assertAcyclic(

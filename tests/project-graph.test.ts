@@ -5,6 +5,7 @@ import {
   normalizeProjectGraph,
   planDeletionBridges,
   planProjectGraphLayout,
+  projectedGraphIsAcyclic,
 } from "../src/domain/project-graph";
 
 describe("project graph normalization", () => {
@@ -120,6 +121,32 @@ describe("project graph presentation", () => {
     ]);
   });
 
+  it("does not contract completed stages across an active path into a visual cycle", () => {
+    expect(collapsedClosedComponents(
+      ["a", "b", "c"],
+      new Set(["a", "c"]),
+      [edge("ab", "a", "b"), edge("bc", "b", "c")],
+    )).toEqual([]);
+  });
+
+  it("detects a visual cycle introduced by contracting a closed diamond shortcut", () => {
+    const edges = [
+      edge("a-b", "a", "b"),
+      edge("a-x", "a", "x"),
+      edge("x-b", "x", "b"),
+    ];
+    expect(projectedGraphIsAcyclic(
+      ["a", "x", "b"],
+      edges,
+      new Map([["a", "a"], ["b", "a"]]),
+    )).toBe(false);
+    expect(projectedGraphIsAcyclic(
+      ["a", "x", "b"],
+      edges,
+      new Map(),
+    )).toBe(true);
+  });
+
   it("produces deterministic layers while leaving nodes outside scope untouched", () => {
     const projects = [
       { id: "p1", x: 99, y: 50 },
@@ -149,7 +176,7 @@ describe("project graph presentation", () => {
       .toBeGreaterThan(first.stages.find((stage) => stage.id === "a")!.x);
   });
 
-  it("shifts a scoped project and stage together away from fixed project cards", () => {
+  it("shifts only scoped stages away from fixed project cards", () => {
     const layout = planProjectGraphLayout(
       [
         { id: "fixed", x: 0, y: 0 },
@@ -162,10 +189,10 @@ describe("project graph presentation", () => {
       [],
       new Set(["moving-stage"]),
     );
-    const movingProject = layout.projects.find((project) => project.id === "moving")!;
     const movingStage = layout.stages.find((stage) => stage.id === "moving-stage")!;
-    expect(movingProject.y).toBe(movingStage.y);
-    expect(movingProject.y).toBeGreaterThan(128);
+    expect(movingStage.y).toBeGreaterThan(128);
+    expect(layout.projects.find((project) => project.id === "moving"))
+      .toEqual({ id: "moving", x: 520, y: 0 });
     expect(layout.projects.find((project) => project.id === "fixed"))
       .toEqual({ id: "fixed", x: 0, y: 0 });
     expect(layout.stages.find((stage) => stage.id === "fixed-stage"))
@@ -176,6 +203,79 @@ describe("project graph presentation", () => {
         x: 408,
         y: 0,
       });
+  });
+
+  it("orders visible project lanes from stage positions, never hidden project anchors", () => {
+    const layout = planProjectGraphLayout(
+      [
+        { id: "first", x: 0, y: 90_000 },
+        { id: "second", x: 0, y: -90_000 },
+      ],
+      [
+        { id: "first-stage", projectId: "first", sequence: 1, x: 200, y: 0 },
+        { id: "second-stage", projectId: "second", sequence: 1, x: 200, y: 500 },
+      ],
+      [],
+    );
+    expect(layout.stages.find((stage) => stage.id === "first-stage")!.y)
+      .toBeLessThan(layout.stages.find((stage) => stage.id === "second-stage")!.y);
+  });
+
+  it("sizes project lanes by the busiest depth row instead of total stage count", () => {
+    const layout = planProjectGraphLayout(
+      [
+        { id: "wide", x: 0, y: 0 },
+        { id: "next", x: 0, y: 2_000 },
+      ],
+      [
+        { id: "a", projectId: "wide", sequence: 1, x: 0, y: 0 },
+        { id: "b", projectId: "wide", sequence: 2, x: 0, y: 1 },
+        { id: "c", projectId: "wide", sequence: 3, x: 0, y: 2 },
+        { id: "d", projectId: "wide", sequence: 4, x: 0, y: 3 },
+        { id: "e", projectId: "wide", sequence: 5, x: 0, y: 4 },
+        { id: "f", projectId: "wide", sequence: 6, x: 0, y: 5 },
+        { id: "g", projectId: "next", sequence: 1, x: 0, y: 2_000 },
+      ],
+      [
+        edge("ad", "a", "d"),
+        edge("be", "b", "e"),
+        edge("cf", "c", "f"),
+      ],
+    );
+    expect(layout.stages.find((stage) => stage.id === "g")?.y).toBe(672);
+  });
+
+  it("keeps a disconnected component in the same project byte-for-byte still", () => {
+    const layout = planProjectGraphLayout(
+      [
+        { id: "project", x: 91, y: 73 },
+      ],
+      [
+        { id: "a", projectId: "project", sequence: 1, x: 40, y: 30 },
+        { id: "b", projectId: "project", sequence: 2, x: 80, y: 60 },
+        { id: "c", projectId: "project", sequence: 3, x: 1_200, y: 900 },
+        { id: "d", projectId: "project", sequence: 4, x: 1_600, y: 930 },
+      ],
+      [edge("ab", "a", "b"), edge("cd", "c", "d")],
+      new Set(["a", "b"]),
+    );
+    expect(layout.stages.find((stage) => stage.id === "c")).toEqual({
+      id: "c",
+      projectId: "project",
+      sequence: 3,
+      x: 1_200,
+      y: 900,
+    });
+    expect(layout.stages.find((stage) => stage.id === "d")).toEqual({
+      id: "d",
+      projectId: "project",
+      sequence: 4,
+      x: 1_600,
+      y: 930,
+    });
+    expect(layout.projects[0]).toEqual({ id: "project", x: 91, y: 73 });
+    expect(layout.stages.find((stage) => stage.id === "b")?.x)
+      .toBeGreaterThan(layout.stages.find((stage) => stage.id === "a")!.x);
   });
 });
 

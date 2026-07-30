@@ -15,6 +15,7 @@ import {
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { DidaProject, DidaTask } from "../domain/entities";
+import { CYCLE_RELATION_LABELS } from "../domain/cycle-graph";
 import type { HelixEvent } from "../domain/events";
 import { aggregateAnalytics } from "../domain/analytics";
 import { localDateKey, localDateKeyFromInstant } from "../domain/local-date";
@@ -47,6 +48,7 @@ import { analyticsChartSeries } from "./chart-series";
 import { inProgressPresentation } from "./in-progress-presentation";
 import {
   ProjectLineageWorkbench,
+  type LineageCamera,
   type ProjectLineageViewMode,
 } from "./project-lineage-workbench";
 
@@ -90,6 +92,10 @@ export class HelixView extends ItemView {
   private selectedProjectId: string | null | undefined;
   private projectLineageMode: ProjectLineageViewMode = "graph";
   private projectWorkbench: ProjectLineageWorkbench | null = null;
+  private lineageCamera: LineageCamera | undefined;
+  private lineageFocusRequest: { entityId: string; generation: number } | null = null;
+  private viewGeneration = 0;
+  private closed = true;
   private renderToken = 0;
   private heatmapMetric: HeatmapMetric = "tasks";
   private heatmapMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
@@ -106,10 +112,17 @@ export class HelixView extends ItemView {
     private readonly store: HelixDataStore,
     private readonly actions: {
       openReview: (period: "daily" | "weekly" | "monthly" | "yearly") => Promise<void>;
-      createProject: () => void;
-      createCycle: (projectId: string, sourceCycleIds: string[]) => void;
-      deleteCycle: (cycleId: string) => void;
-      manageRelation: (relationId: string) => void;
+      createProject: (onCreated?: (projectId: string) => void) => void;
+      createCycle: (
+        projectId: string,
+        sourceCycleIds: string[],
+        onCreated?: (cycleId: string) => void,
+      ) => void;
+      deleteCycle: (cycleId: string, onDeleted?: (focusEntityId: string) => void) => void;
+      manageRelation: (
+        relationId: string,
+        onChanged?: (focusEntityId: string) => void,
+      ) => void;
       openProjectFile: (path: string) => Promise<void>;
       projectWorkspace: ProjectWorkspaceService;
       reviewLegacyMigration: () => void;
@@ -131,6 +144,8 @@ export class HelixView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    this.closed = false;
+    this.viewGeneration += 1;
     this.contentEl.addClass("helix-root");
     this.unsubscribe = this.service.subscribe((state) => {
       this.state = state;
@@ -139,16 +154,23 @@ export class HelixView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.closed = true;
+    this.viewGeneration += 1;
     this.renderToken += 1;
     this.unsubscribe?.();
+    this.lineageFocusRequest = null;
+    this.lineageCamera = undefined;
     this.projectWorkbench?.destroy();
     this.projectWorkbench = null;
     this.disposeCharts();
   }
 
   private async render(): Promise<void> {
-    if (!this.state) return;
+    if (!this.state || this.closed) return;
     const token = ++this.renderToken;
+    if (this.section === "projects") {
+      this.lineageCamera = this.projectWorkbench?.camera() ?? this.lineageCamera;
+    }
     this.projectWorkbench?.destroy();
     this.projectWorkbench = null;
     this.disposeCharts();
@@ -770,38 +792,67 @@ export class HelixView extends ItemView {
     ) {
       this.selectedProjectId = workspace.projects[0]!.id;
     }
+    const lifecycleGeneration = this.viewGeneration;
+    const focusEntityId = this.currentLineageFocusId();
     this.projectWorkbench = new ProjectLineageWorkbench({
       snapshot: workspace,
       selectedProjectId: this.selectedProjectId,
       mode: this.projectLineageMode,
+      initialCamera: this.lineageCamera,
+      onFocusApplied: (entityId) =>
+        this.acknowledgeLineageFocus(entityId, lifecycleGeneration),
       onModeChange: (mode) => {
         this.projectLineageMode = mode;
         void this.render();
       },
       onSelectProject: (projectId) => {
         this.selectedProjectId = projectId;
-        void this.render();
+        if (projectId) this.requestLineageFocus(projectId, lifecycleGeneration);
+        else void this.render();
       },
-      onCreateProject: () => this.actions.createProject(),
+      focusEntityId,
+      onCreateProject: () => this.actions.createProject(
+        (projectId) => this.requestLineageFocus(projectId, lifecycleGeneration),
+      ),
       onCreateCycle: (projectId, sourceCycleIds) =>
-        this.actions.createCycle(projectId, sourceCycleIds),
-      onDeleteCycle: (cycleId) => this.actions.deleteCycle(cycleId),
+        this.actions.createCycle(
+          projectId,
+          sourceCycleIds,
+          (cycleId) => this.requestLineageFocus(cycleId, lifecycleGeneration),
+        ),
+      onDeleteCycle: (cycleId) => this.actions.deleteCycle(
+        cycleId,
+        (nextFocusEntityId) =>
+          this.requestLineageFocus(nextFocusEntityId, lifecycleGeneration),
+      ),
       onOpenNote: (path) => {
         void this.actions.openProjectFile(path);
       },
       onMoveNodes: async (moves) => {
         await this.actions.projectWorkspace.moveCanvasNodes(moves);
       },
-      onManageRelation: (relationId) => this.actions.manageRelation(relationId),
+      onManageRelation: (relationId) => this.actions.manageRelation(
+        relationId,
+        (nextFocusEntityId) =>
+          this.requestLineageFocus(nextFocusEntityId, lifecycleGeneration),
+      ),
       onConnectCycles: (sourceCycleId, targetCycleId) =>
-        void this.openConnection(sourceCycleId, targetCycleId),
+        void this.openConnection(
+          sourceCycleId,
+          targetCycleId,
+          lifecycleGeneration,
+        ),
       onChooseConnectionTarget: (sourceCycleId, allowedTargetIds) => {
         new ConnectionTargetModal(
           this.app,
           workspace,
           sourceCycleId,
           allowedTargetIds,
-          (targetCycleId) => void this.openConnection(sourceCycleId, targetCycleId),
+          (targetCycleId) => void this.openConnection(
+            sourceCycleId,
+            targetCycleId,
+            lifecycleGeneration,
+          ),
         ).open();
       },
       onEditProjectColor: (projectId, color) => {
@@ -834,7 +885,11 @@ export class HelixView extends ItemView {
     this.projectWorkbench.render(content);
   }
 
-  private async openConnection(sourceCycleId: string, targetCycleId: string): Promise<void> {
+  private async openConnection(
+    sourceCycleId: string,
+    targetCycleId: string,
+    lifecycleGeneration = this.viewGeneration,
+  ): Promise<void> {
     try {
       const plan = await this.actions.projectWorkspace.planConnection(
         sourceCycleId,
@@ -847,13 +902,48 @@ export class HelixView extends ItemView {
           await this.actions.projectWorkspace.connectCycles(plan, {
             confirmCrossProject,
           });
+          this.requestLineageFocus(sourceCycleId, lifecycleGeneration);
           new Notice("阶段连接已建立，受影响分支已自动整理");
-          await this.render();
         },
       ).open();
     } catch (error) {
       new Notice(error instanceof Error ? error.message : String(error), 8_000);
     }
+  }
+
+  private requestLineageFocus(
+    entityId: string,
+    lifecycleGeneration = this.viewGeneration,
+  ): void {
+    if (this.closed || lifecycleGeneration !== this.viewGeneration) return;
+    this.lineageFocusRequest = {
+      entityId,
+      generation: lifecycleGeneration,
+    };
+    if (this.section === "projects") void this.render();
+  }
+
+  private currentLineageFocusId(): string | undefined {
+    const request = this.lineageFocusRequest;
+    if (
+      !request ||
+      this.closed ||
+      request.generation !== this.viewGeneration
+    ) return undefined;
+    return request.entityId;
+  }
+
+  private acknowledgeLineageFocus(
+    entityId: string,
+    lifecycleGeneration: number,
+  ): void {
+    const request = this.lineageFocusRequest;
+    if (
+      !request ||
+      request.entityId !== entityId ||
+      request.generation !== lifecycleGeneration
+    ) return;
+    this.lineageFocusRequest = null;
   }
 
   private renderReviews(content: HTMLElement): void {
@@ -1512,6 +1602,14 @@ class ConnectionConfirmModal extends Modal {
     });
     this.contentEl.createEl("p", {
       text: `将新增 1 条有向边，并整理受影响的 ${this.plan.affectedNodeCount} 个节点。`,
+    });
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: `目标当前已有 ${this.plan.targetInboundCount} 条入边；连接后共有 ${
+        this.plan.targetInboundCount + 1
+      } 条入边，新增关系将按${
+        CYCLE_RELATION_LABELS[this.plan.resultKind]
+      }显示。`,
     });
     this.contentEl.createEl("p", {
       cls: "helix-modal-note",

@@ -157,6 +157,8 @@ describe("ProjectWorkspaceService", () => {
     expect(plan).toMatchObject({
       affectedNodeCount: 3,
       relabeledEdgeCount: 1,
+      targetInboundCount: 0,
+      resultKind: "branch",
       source: {
         projectTitle: "Alpha",
         cycleTitle: "阶段标题 1",
@@ -173,6 +175,10 @@ describe("ProjectWorkspaceService", () => {
       ...plan,
       affectedNodeCount: plan.affectedNodeCount + 1,
     })).rejects.toThrow(/计划已经变化/);
+    await expect(service.connectCycles({
+      ...plan,
+      resultKind: "merge",
+    })).rejects.toThrow(/计划已经变化/);
     expect((await repo.read(CANVAS))!.content).toBe(beforeTamper);
     await service.connectCycles(plan);
     expect(repo.json(CANVAS).edges).toEqual(expect.arrayContaining([
@@ -184,6 +190,57 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({ helixRelation: "branch" }),
     ]));
     await expect(service.connectCycles(plan)).rejects.toThrow(/已经变化/);
+  });
+
+  it("allows a target stage to accept multiple inbound edges and becomes a merge", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    repo.set("Helix/Projects/Alpha/Cycle-03.md", cycle("cycle-3", "project-1", 3));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300),
+      card("cycle-3-node", "cycle", "project-1", "cycle-3", 920, 300),
+    );
+    canvas.edges.push({
+      id: "edge-1-to-3",
+      fromNode: "cycle-node",
+      toNode: "cycle-3-node",
+      helixManaged: true,
+      helixRelation: "inherit",
+      label: "继承",
+    });
+    repo.set(CANVAS, JSON.stringify(canvas));
+
+    const service = workspace(repo);
+    const plan = await service.planConnection("cycle-2", "cycle-3");
+    expect(plan.targetCycleId).toBe("cycle-3");
+    expect(plan.relabeledEdgeCount).toBe(1);
+    expect(plan.targetInboundCount).toBe(1);
+    expect(plan.resultKind).toBe("merge");
+    await service.connectCycles(plan);
+
+    const snapshot = await service.snapshot();
+    expect(snapshot.relations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "merge",
+        fromCycleIds: ["cycle-1", "cycle-2"],
+        toCycleId: "cycle-3",
+      }),
+    ]));
+    const inbound = repo.json(CANVAS).edges.filter(
+      (edge: Record<string, unknown>) => edge.toNode === "cycle-3-node",
+    );
+    expect(inbound).toHaveLength(2);
+    expect(inbound).toEqual([
+      expect.objectContaining({
+        helixRelation: "merge",
+        helixMergeGroupId: "helix-merge-cycle-3",
+      }),
+      expect.objectContaining({
+        helixRelation: "merge",
+        helixMergeGroupId: "helix-merge-cycle-3",
+      }),
+    ]);
   });
 
   it("persists completed-project collapse without changing physical nodes or edges", async () => {
@@ -282,11 +339,14 @@ describe("ProjectWorkspaceService", () => {
       before.some((item) => item.id === node.id)).map(
       (node: Record<string, unknown>) => ({ id: node.id, x: node.x, y: node.y }),
     )).toEqual(before);
-    const boxes = nodes.map((node: Record<string, unknown>) => ({
-      id: node.id as string,
-      x: node.x as number,
-      y: node.y as number,
-    }));
+    const boxes = nodes
+      .filter((node: Record<string, unknown>) =>
+        node.helixNodeKind === "cycle" || node.helixNodeKind === "stage")
+      .map((node: Record<string, unknown>) => ({
+        id: node.id as string,
+        x: node.x as number,
+        y: node.y as number,
+      }));
     for (let left = 0; left < boxes.length; left += 1) {
       for (let right = left + 1; right < boxes.length; right += 1) {
         expect(
@@ -296,7 +356,6 @@ describe("ProjectWorkspaceService", () => {
       }
     }
     expect(nodes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ helixProjectId: created.id, x: 0 }),
       expect.objectContaining({ helixStageId: created.cycles[0]!.id, x: 408 }),
     ]));
   });

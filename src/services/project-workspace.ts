@@ -139,6 +139,8 @@ export interface ProjectConnectionPlan {
   crossProject: boolean;
   affectedNodeCount: number;
   relabeledEdgeCount: number;
+  targetInboundCount: number;
+  resultKind: CycleRelationKind;
 }
 
 export interface StageDeletionPlan {
@@ -889,6 +891,9 @@ export class ProjectWorkspaceService {
     const owner = cycleOwnerMap(snapshot.projects);
     const source = stageDescriptor(snapshot.projects, sourceCycleId);
     const target = stageDescriptor(snapshot.projects, targetCycleId);
+    const addedEdge = after.edges.find((edge) =>
+      edge.fromCycleId === sourceCycleId && edge.toCycleId === targetCycleId);
+    if (!addedEdge) throw new Error("无法确认新增阶段关系的显示类型");
     return {
       canvasRevisionHash: snapshot.canvasRevisionHash ?? "",
       sourceCycleId,
@@ -901,6 +906,9 @@ export class ProjectWorkspaceService {
         candidate,
       ).size,
       relabeledEdgeCount: countRelabeledEdges(before, after),
+      targetInboundCount: physical.filter((edge) =>
+        edge.toCycleId === targetCycleId).length,
+      resultKind: addedEdge.kind,
     };
   }
 
@@ -2243,7 +2251,9 @@ function sameConnectionPlan(
     JSON.stringify(left.target) === JSON.stringify(right.target) &&
     left.crossProject === right.crossProject &&
     left.affectedNodeCount === right.affectedNodeCount &&
-    left.relabeledEdgeCount === right.relabeledEdgeCount;
+    left.relabeledEdgeCount === right.relabeledEdgeCount &&
+    left.targetInboundCount === right.targetInboundCount &&
+    left.resultKind === right.resultKind;
 }
 
 function stageDescriptor(

@@ -5,6 +5,7 @@ import {
 } from "../domain/cycle-graph";
 import {
   collapsedClosedComponents,
+  projectedGraphIsAcyclic,
   type ProjectGraphEdge,
 } from "../domain/project-graph";
 import type {
@@ -29,9 +30,27 @@ interface LineageGraphBox extends LineagePoint {
   centerY: number;
 }
 
+export interface LineageProjectContainerBox extends LineagePoint {
+  width: number;
+  height: number;
+  right: number;
+  bottom: number;
+  centerX: number;
+  centerY: number;
+}
+
+export interface LineageCamera {
+  zoom: number;
+  rawCenterX: number;
+  rawCenterY: number;
+}
+
 interface WorkbenchOptions {
   snapshot: ProjectWorkspaceSnapshot;
   selectedProjectId: string | null;
+  focusEntityId?: string;
+  initialCamera?: LineageCamera;
+  onFocusApplied?: (entityId: string) => void;
   mode: ProjectLineageViewMode;
   onModeChange: (mode: ProjectLineageViewMode) => void;
   onSelectProject: (projectId: string | null) => void;
@@ -59,8 +78,12 @@ const MAX_ZOOM = 2.5;
 const MIN_FIT_ZOOM = 0.0001;
 const GRAPH_CARD_WIDTH = 248;
 const GRAPH_CARD_HEIGHT = 128;
+const PROJECT_CONTAINER_SIDE_PADDING = 28;
+const PROJECT_CONTAINER_TOP_PADDING = 58;
+const PROJECT_CONTAINER_BOTTOM_PADDING = 28;
 const VIRTUAL_MARGIN = 2400;
 const VIRTUAL_EXPAND = 1800;
+const VIEWPORT_SAFE_MARGIN = 400;
 
 export function lineageGraphBox(
   _node: Pick<ProjectWorkspaceCanvasNode, "width" | "height">,
@@ -101,6 +124,132 @@ export function lineageMovePayload(
     x: point.x - canvasOffset.x,
     y: point.y - canvasOffset.y,
   };
+}
+
+export function lineageProjectContainerBox(
+  projectId: string,
+  nodes: ProjectWorkspaceCanvasNode[],
+  layout: ReadonlyMap<string, LineagePoint>,
+): LineageProjectContainerBox | undefined {
+  const boxes = nodes.flatMap((node) => {
+    if (node.kind !== "cycle" || node.projectId !== projectId) return [];
+    const point = layout.get(node.entityId);
+    return point ? [lineageGraphBox(node, point)] : [];
+  });
+  if (boxes.length === 0) return undefined;
+  const x = Math.min(...boxes.map((box) => box.x)) - PROJECT_CONTAINER_SIDE_PADDING;
+  const y = Math.min(...boxes.map((box) => box.y)) - PROJECT_CONTAINER_TOP_PADDING;
+  const right = Math.max(...boxes.map((box) => box.right)) +
+    PROJECT_CONTAINER_SIDE_PADDING;
+  const bottom = Math.max(...boxes.map((box) => box.bottom)) +
+    PROJECT_CONTAINER_BOTTOM_PADDING;
+  return {
+    x,
+    y,
+    width: right - x,
+    height: bottom - y,
+    right,
+    bottom,
+    centerX: (x + right) / 2,
+    centerY: (y + bottom) / 2,
+  };
+}
+
+export interface LineageViewportPlan {
+  shiftX: number;
+  shiftY: number;
+  growRightBy: number;
+  growBottomBy: number;
+  left: number;
+  top: number;
+}
+
+export function lineageCenteredZoomPlan(
+  viewport: {
+    scrollLeft: number;
+    scrollTop: number;
+    clientWidth: number;
+    clientHeight: number;
+  },
+  previousZoom: number,
+  nextZoom: number,
+  logicalWidth: number,
+  logicalHeight: number,
+): LineageViewportPlan {
+  const safePrevious = Math.max(MIN_FIT_ZOOM, previousZoom);
+  const safeNext = Math.max(MIN_FIT_ZOOM, nextZoom);
+  const centerX = (viewport.scrollLeft + viewport.clientWidth / 2) / safePrevious;
+  const centerY = (viewport.scrollTop + viewport.clientHeight / 2) / safePrevious;
+  const unshiftedLeft = centerX * safeNext - viewport.clientWidth / 2;
+  const unshiftedTop = centerY * safeNext - viewport.clientHeight / 2;
+  const shiftX = Math.max(0, (VIEWPORT_SAFE_MARGIN - unshiftedLeft) / safeNext);
+  const shiftY = Math.max(0, (VIEWPORT_SAFE_MARGIN - unshiftedTop) / safeNext);
+  const left = (centerX + shiftX) * safeNext - viewport.clientWidth / 2;
+  const top = (centerY + shiftY) * safeNext - viewport.clientHeight / 2;
+  const shiftedWidth = logicalWidth + shiftX;
+  const shiftedHeight = logicalHeight + shiftY;
+  return {
+    shiftX,
+    shiftY,
+    growRightBy: Math.max(
+      0,
+      (left + viewport.clientWidth + VIEWPORT_SAFE_MARGIN) / safeNext -
+        shiftedWidth,
+    ),
+    growBottomBy: Math.max(
+      0,
+      (top + viewport.clientHeight + VIEWPORT_SAFE_MARGIN) / safeNext -
+        shiftedHeight,
+    ),
+    left,
+    top,
+  };
+}
+
+export function lineageCenteredPointPlan(
+  point: LineagePoint,
+  zoom: number,
+  viewport: { clientWidth: number; clientHeight: number },
+  logicalWidth: number,
+  logicalHeight: number,
+): LineageViewportPlan {
+  const safeZoom = Math.max(MIN_FIT_ZOOM, zoom);
+  const unshiftedLeft = point.x * safeZoom - viewport.clientWidth / 2;
+  const unshiftedTop = point.y * safeZoom - viewport.clientHeight / 2;
+  const shiftX = Math.max(0, (VIEWPORT_SAFE_MARGIN - unshiftedLeft) / safeZoom);
+  const shiftY = Math.max(0, (VIEWPORT_SAFE_MARGIN - unshiftedTop) / safeZoom);
+  const left = (point.x + shiftX) * safeZoom - viewport.clientWidth / 2;
+  const top = (point.y + shiftY) * safeZoom - viewport.clientHeight / 2;
+  return {
+    shiftX,
+    shiftY,
+    growRightBy: Math.max(
+      0,
+      (left + viewport.clientWidth + VIEWPORT_SAFE_MARGIN) / safeZoom -
+        (logicalWidth + shiftX),
+    ),
+    growBottomBy: Math.max(
+      0,
+      (top + viewport.clientHeight + VIEWPORT_SAFE_MARGIN) / safeZoom -
+        (logicalHeight + shiftY),
+    ),
+    left,
+    top,
+  };
+}
+
+export function lineageVisibleStageIdsByProject(
+  nodes: ProjectWorkspaceCanvasNode[],
+  hiddenByCollapseHead: ReadonlyMap<string, string>,
+): Map<string, string[]> {
+  const result = new Map<string, string[]>();
+  for (const node of nodes) {
+    if (node.kind !== "cycle" || hiddenByCollapseHead.has(node.entityId)) continue;
+    const group = result.get(node.projectId) ?? [];
+    group.push(node.entityId);
+    result.set(node.projectId, group);
+  }
+  return result;
 }
 
 export function lineageFitScale(
@@ -208,7 +357,10 @@ export function completedLineageProjection(
   const collapseCountByHead = new Map<string, number>();
   const collapsed = new Set(snapshot.collapsedCompletedProjectIds);
   const physical = physicalEdgesFromSnapshot(snapshot);
-  for (const project of snapshot.projects) {
+  const cycleIds = snapshot.projects.flatMap((project) =>
+    project.cycles.map((cycle) => cycle.id));
+  for (const project of [...snapshot.projects].sort((left, right) =>
+    left.id.localeCompare(right.id))) {
     if (!collapsed.has(project.id)) continue;
     const components = collapsedClosedComponents(
       project.cycles.map((cycle) => cycle.id),
@@ -217,7 +369,11 @@ export function completedLineageProjection(
         .map((cycle) => cycle.id)),
       physical,
     );
-    for (const component of components) {
+    for (const component of components.sort((left, right) =>
+      left.headId.localeCompare(right.headId))) {
+      const tentative = new Map(collapseHeadByMember);
+      for (const id of component.memberIds) tentative.set(id, component.headId);
+      if (!projectedGraphIsAcyclic(cycleIds, physical, tentative)) continue;
       collapseCountByHead.set(component.headId, component.memberIds.length);
       for (const id of component.memberIds) {
         collapseHeadByMember.set(id, component.headId);
@@ -304,6 +460,7 @@ export function lineageStructuralEntityIds(
 ): string[] {
   return snapshot.canvasNodes
     .filter((node) =>
+      node.kind === "cycle" &&
       !projection.hiddenByCollapseHead.has(node.entityId) &&
       !projection.collapseCountByHead.has(node.entityId))
     .map((node) => node.entityId);
@@ -317,12 +474,15 @@ export class ProjectLineageWorkbench {
   private readonly hiddenByCollapseHead = new Map<string, string>();
   private readonly collapseHeadByMember = new Map<string, string>();
   private readonly collapseCountByHead = new Map<string, number>();
+  private readonly visibleStageIdsByProject = new Map<string, string[]>();
   private readonly markerId = `helix-lineage-arrow-${crypto.randomUUID()}`;
   private zoom = 1;
   private viewport: HTMLElement | null = null;
   private plane: HTMLElement | null = null;
   private surface: HTMLElement | null = null;
   private svg: SVGSVGElement | null = null;
+  private projectLayer: HTMLElement | null = null;
+  private projectHeaderLayer: HTMLElement | null = null;
   private nodeLayer: HTMLElement | null = null;
   private relationPanel: HTMLElement | null = null;
   private selectedRelationId: string | null = null;
@@ -340,6 +500,10 @@ export class ProjectLineageWorkbench {
     | null = null;
   private suppressConnectorClick = false;
   private connectionPreview: { sourceId: string; point: LineagePoint } | null = null;
+  private suppressVirtualExpansion = false;
+  private programmaticScrollTimer: number | null = null;
+  private programmaticScrollFrame: number | null = null;
+  private pendingCamera: LineageCamera | null = null;
 
   constructor(private readonly options: WorkbenchOptions) {
     const minimumX = Math.min(0, ...options.snapshot.canvasNodes.map((node) => node.x));
@@ -356,12 +520,42 @@ export class ProjectLineageWorkbench {
       });
     }
     this.prepareCompletedProjection();
+    for (const [projectId, entityIds] of lineageVisibleStageIdsByProject(
+      options.snapshot.canvasNodes,
+      this.hiddenByCollapseHead,
+    )) {
+      this.visibleStageIdsByProject.set(projectId, entityIds);
+    }
   }
 
   destroy(): void {
     this.destroyed = true;
     this.moveVersion += 1;
     this.selected.clear();
+    if (this.programmaticScrollTimer !== null) {
+      window.clearTimeout(this.programmaticScrollTimer);
+      this.programmaticScrollTimer = null;
+    }
+    if (this.programmaticScrollFrame !== null) {
+      window.cancelAnimationFrame(this.programmaticScrollFrame);
+      this.programmaticScrollFrame = null;
+    }
+  }
+
+  camera(): LineageCamera | undefined {
+    if (this.pendingCamera) return { ...this.pendingCamera };
+    if (!this.viewport) return this.options.initialCamera
+      ? { ...this.options.initialCamera }
+      : undefined;
+    return {
+      zoom: this.zoom,
+      rawCenterX: (
+        this.viewport.scrollLeft + this.viewport.clientWidth / 2
+      ) / Math.max(MIN_FIT_ZOOM, this.zoom) - this.canvasOffset.x,
+      rawCenterY: (
+        this.viewport.scrollTop + this.viewport.clientHeight / 2
+      ) / Math.max(MIN_FIT_ZOOM, this.zoom) - this.canvasOffset.y,
+    };
   }
 
   render(parent: HTMLElement): void {
@@ -404,9 +598,15 @@ export class ProjectLineageWorkbench {
     const actions = toolbar.createDiv({ cls: "helix-lineage-toolbar-actions" });
     const selectedProject = this.options.snapshot.projects.find((project) =>
       project.id === this.options.selectedProjectId);
-    if (selectedProject && this.hasCollapsibleCompleted(selectedProject)) {
-      const collapsed = this.options.snapshot.collapsedCompletedProjectIds
-        .includes(selectedProject.id);
+    const selectedCollapsed = selectedProject
+      ? this.options.snapshot.collapsedCompletedProjectIds.includes(selectedProject.id)
+      : false;
+    if (
+      this.options.mode !== "graph" &&
+      selectedProject &&
+      (selectedCollapsed || this.hasCollapsibleCompleted(selectedProject))
+    ) {
+      const collapsed = selectedCollapsed;
       const fold = actions.createEl("button", {
         cls: "helix-secondary-button",
         text: collapsed ? "展开已完成" : "折叠已完成",
@@ -429,26 +629,40 @@ export class ProjectLineageWorkbench {
 
   private renderProjectStrip(parent: HTMLElement): void {
     const strip = parent.createDiv({ cls: "helix-lineage-project-strip" });
-    const all = strip.createEl("button", {
-      cls: this.options.selectedProjectId === null ? "is-active" : "",
+    const allChoice = strip.createDiv({
+      cls: `helix-lineage-project-choice is-all${
+        this.options.selectedProjectId === null ? " is-active" : ""
+      }`,
     });
-    all.createSpan({ text: "全部项目" });
-    all.createEl("small", { text: `${this.options.snapshot.projects.length} 个项目` });
+    const allSwatch = allChoice.createSpan({
+      cls: "helix-lineage-project-all-swatch",
+      attr: { "aria-hidden": "true" },
+    });
+    setIcon(allSwatch, "layers-3");
+    const all = allChoice.createEl("button", {
+      attr: {
+        "aria-pressed": String(this.options.selectedProjectId === null),
+        "aria-label": `全部项目，${this.options.snapshot.projects.length} 个项目`,
+      },
+    });
+    all.createSpan({ cls: "helix-lineage-project-name", text: "全部项目" });
+    all.createEl("small", {
+      text: `${this.options.snapshot.projects.length} 个项目`,
+    });
     all.addEventListener("click", () => this.options.onSelectProject(null));
     for (const project of this.options.snapshot.projects) {
-      const item = strip.createDiv({ cls: "helix-lineage-project-choice" });
+      const item = strip.createDiv({
+        cls: `helix-lineage-project-choice${
+          project.id === this.options.selectedProjectId ? " is-active" : ""
+        }`,
+      });
       item.style.setProperty("--helix-project-color", this.projectColor(project));
-      const button = item.createEl("button", {
-        cls: project.id === this.options.selectedProjectId ? "is-active" : "",
+      const palette = item.createSpan({
+        cls: "helix-lineage-project-palette",
+        attr: { title: "设置项目颜色" },
       });
-      button.createSpan({ text: project.title });
-      button.createEl("small", {
-        text: `${projectStatusLabel(project.status)} · ${
-          project.cycles.filter((cycle) => cycle.status === "active").length
-        } 个进行中阶段`,
-      });
-      button.addEventListener("click", () => this.options.onSelectProject(project.id));
-      const color = item.createEl("input", {
+      setIcon(palette, "palette");
+      const color = palette.createEl("input", {
         cls: "helix-lineage-project-color",
         type: "color",
         attr: {
@@ -460,6 +674,21 @@ export class ProjectLineageWorkbench {
       color.value = this.projectColor(project);
       color.addEventListener("change", () =>
         this.options.onEditProjectColor(project.id, color.value));
+      const button = item.createEl("button", {
+        attr: {
+          "aria-pressed": String(project.id === this.options.selectedProjectId),
+          "aria-label": `${project.title}，${projectStatusLabel(project.status)}，${
+            project.cycles.filter((cycle) => cycle.status === "active").length
+          } 个进行中阶段`,
+        },
+      });
+      button.createSpan({ cls: "helix-lineage-project-name", text: project.title });
+      button.createEl("small", {
+        text: `${projectStatusLabel(project.status)} · ${
+          project.cycles.filter((cycle) => cycle.status === "active").length
+        } 个进行中阶段`,
+      });
+      button.addEventListener("click", () => this.options.onSelectProject(project.id));
     }
   }
 
@@ -474,18 +703,25 @@ export class ProjectLineageWorkbench {
     const bounds = this.measure();
     this.width = bounds.width;
     this.height = bounds.height;
+    const projectLayer = surface.createDiv({ cls: "helix-lineage-project-layer" });
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.classList.add("helix-lineage-edges");
     surface.appendChild(svg);
     const layer = surface.createDiv({ cls: "helix-lineage-node-layer" });
+    const projectHeaderLayer = surface.createDiv({
+      cls: "helix-lineage-project-header-layer",
+    });
     this.viewport = viewport;
     this.plane = plane;
     this.surface = surface;
     this.svg = svg;
+    this.projectLayer = projectLayer;
+    this.projectHeaderLayer = projectHeaderLayer;
     this.nodeLayer = layer;
     this.applyScale();
+    this.renderProjectContainers();
     this.renderEdges();
-    for (const node of this.visibleNodes()) this.renderGraphCard(node);
+    for (const node of this.visibleStageNodes()) this.renderGraphCard(node);
     this.bindNavigation(viewport);
     this.renderZoomControls(root);
     this.relationPanel = root.createDiv({ cls: "helix-lineage-relation-panel" });
@@ -498,7 +734,7 @@ export class ProjectLineageWorkbench {
     const point = this.layout.get(node.entityId);
     if (!point) return;
     const card = this.nodeLayer.createDiv({
-      cls: `helix-lineage-card is-${node.kind}${
+      cls: `helix-lineage-card is-graph is-${node.kind}${
         node.projectId === this.options.selectedProjectId ? " is-current-project" : ""
       }${this.options.selectedProjectId &&
         node.projectId !== this.options.selectedProjectId ? " is-other-project" : ""}${
@@ -586,6 +822,9 @@ export class ProjectLineageWorkbench {
         item.el.addClass("is-dragging");
         this.ensureBounds(next, item.node);
       }
+      this.updateProjectContainerGeometry(
+        new Set(drag.starts.map((item) => item.node.projectId)),
+      );
       this.renderEdges();
     });
     const finish = (event: PointerEvent): void => {
@@ -612,6 +851,9 @@ export class ProjectLineageWorkbench {
           item.el.style.left = `${item.point.x}px`;
           item.el.style.top = `${item.point.y}px`;
         }
+        this.updateProjectContainerGeometry(
+          new Set(completed.starts.map((item) => item.node.projectId)),
+        );
         this.renderEdges();
         this.options.onError(error);
       });
@@ -627,11 +869,121 @@ export class ProjectLineageWorkbench {
         item.el.style.left = `${item.point.x}px`;
         item.el.style.top = `${item.point.y}px`;
       }
+      this.updateProjectContainerGeometry(
+        new Set(canceled.starts.map((item) => item.node.projectId)),
+      );
       this.renderEdges();
     };
     card.addEventListener("pointerup", finish);
     card.addEventListener("pointercancel", cancelMove);
     card.addEventListener("lostpointercapture", cancelMove);
+  }
+
+  private renderProjectContainers(): void {
+    if (!this.projectLayer || !this.projectHeaderLayer) return;
+    this.projectLayer.empty();
+    this.projectHeaderLayer.empty();
+    for (const project of this.options.snapshot.projects) {
+      const box = this.projectContainerBox(project.id);
+      if (!box) continue;
+      const collapsed = this.options.snapshot.collapsedCompletedProjectIds
+        .includes(project.id);
+      const container = this.projectLayer.createDiv({
+        cls: `helix-lineage-project-container${
+          project.id === this.options.selectedProjectId ? " is-current-project" : ""
+        }${this.options.selectedProjectId &&
+          project.id !== this.options.selectedProjectId ? " is-other-project" : ""}${
+          collapsed ? " is-collapsed" : ""
+        }`,
+        attr: { "data-project-id": project.id },
+      });
+      container.style.setProperty("--helix-project-color", this.projectColor(project));
+      this.applyProjectContainerBox(container, box);
+      const header = this.projectHeaderLayer.createDiv({
+        cls: `helix-lineage-project-container-header${
+          project.id === this.options.selectedProjectId ? " is-current-project" : ""
+        }${this.options.selectedProjectId &&
+          project.id !== this.options.selectedProjectId ? " is-other-project" : ""}`,
+        attr: { "data-project-id": project.id },
+      });
+      header.style.setProperty("--helix-project-color", this.projectColor(project));
+      this.applyProjectHeaderBox(header, box);
+      const open = header.createEl("button", {
+        cls: "helix-lineage-project-container-title",
+        attr: { "aria-label": `打开项目 ${project.title}` },
+      });
+      open.createSpan({ cls: "helix-lineage-project-container-swatch" });
+      open.createSpan({ text: project.title });
+      open.addEventListener("click", () => this.options.onOpenNote(project.notePath));
+      header.createSpan({
+        cls: `helix-lineage-project-container-status is-${project.status}`,
+        text: projectStatusLabel(project.status),
+      });
+      header.createSpan({
+        cls: "helix-lineage-project-container-count",
+        text: `${project.cycles.length} 阶段`,
+      });
+      const completedCount = project.cycles.filter((cycle) => cycle.status === "closed").length;
+      if (completedCount > 0) {
+        header.createSpan({
+          cls: "helix-lineage-project-container-completed",
+          text: `${completedCount} 已完成`,
+        });
+      }
+      if (collapsed || this.hasCollapsibleCompleted(project)) {
+        const fold = header.createEl("button", {
+          cls: "helix-lineage-project-container-fold",
+          attr: {
+            "aria-label": `${collapsed ? "展开" : "折叠"} ${project.title} 的已完成阶段`,
+            title: collapsed ? "展开已完成阶段" : "折叠已完成阶段",
+          },
+        });
+        setIcon(fold, collapsed ? "unfold-vertical" : "fold-vertical");
+        fold.createSpan({ text: collapsed ? "展开已完成" : "折叠已完成" });
+        fold.addEventListener("click", () =>
+          this.options.onToggleCompletedCollapse(project.id, !collapsed));
+      }
+    }
+  }
+
+  private updateProjectContainerGeometry(projectIds?: Iterable<string>): void {
+    if (!this.projectLayer || !this.projectHeaderLayer) return;
+    const requested = projectIds
+      ? new Set(projectIds)
+      : new Set(this.options.snapshot.projects.map((project) => project.id));
+    for (const project of this.options.snapshot.projects) {
+      if (!requested.has(project.id)) continue;
+      const container = this.projectLayer.querySelector<HTMLElement>(
+        `.helix-lineage-project-container[data-project-id="${CSS.escape(project.id)}"]`,
+      );
+      const header = this.projectHeaderLayer.querySelector<HTMLElement>(
+        `.helix-lineage-project-container-header[data-project-id="${
+          CSS.escape(project.id)
+        }"]`,
+      );
+      const box = this.projectContainerBox(project.id);
+      if (container && box) this.applyProjectContainerBox(container, box);
+      if (header && box) this.applyProjectHeaderBox(header, box);
+    }
+  }
+
+  private applyProjectContainerBox(
+    container: HTMLElement,
+    box: LineageProjectContainerBox,
+  ): void {
+    container.style.left = `${box.x}px`;
+    container.style.top = `${box.y}px`;
+    container.style.width = `${box.width}px`;
+    container.style.height = `${box.height}px`;
+  }
+
+  private applyProjectHeaderBox(
+    header: HTMLElement,
+    box: LineageProjectContainerBox,
+  ): void {
+    header.style.left = `${box.x + 14}px`;
+    header.style.top = `${box.y + 10}px`;
+    header.style.maxWidth = `${Math.max(120, box.width - 28)}px`;
   }
 
   private fillCard(
@@ -1098,12 +1450,16 @@ export class ProjectLineageWorkbench {
     viewport.addEventListener("wheel", (event) => {
       if (!event.metaKey && !event.ctrlKey && !this.spaceHeld) return;
       event.preventDefault();
-      this.setZoom(this.zoom * Math.exp(-event.deltaY * 0.002));
+      this.setZoom(this.zoom * Math.exp(-event.deltaY * 0.002), true);
     }, { passive: false });
-    viewport.addEventListener("scroll", () => this.expandVirtualPlane());
+    viewport.addEventListener("scroll", () => {
+      if (!this.suppressVirtualExpansion) this.expandVirtualPlane();
+    });
     viewport.addEventListener("pointerdown", (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (target?.closest(".helix-lineage-card, .helix-lineage-edge, .helix-lineage-edge-label, button")) {
+      if (target?.closest(
+        ".helix-lineage-card, .helix-lineage-edge, .helix-lineage-edge-label, .helix-lineage-project-container-header, button",
+      )) {
         return;
       }
       if (event.button === 1 || (event.button === 0 && this.spaceHeld)) {
@@ -1146,19 +1502,48 @@ export class ProjectLineageWorkbench {
       setIcon(element, icon);
       element.addEventListener("click", action);
     };
-    button("minus", "缩小", () => this.setZoom(this.zoom / 1.2));
+    button("minus", "缩小", () => this.setZoom(this.zoom / 1.2, true));
     const label = controls.createEl("button", {
       cls: "helix-lineage-zoom-label",
       text: "100%",
       attr: { "aria-label": "重置缩放" },
     });
-    label.addEventListener("click", () => this.setZoom(1));
-    button("plus", "放大", () => this.setZoom(this.zoom * 1.2));
+    label.addEventListener("click", () => this.setZoom(1, true));
+    button("plus", "放大", () => this.setZoom(this.zoom * 1.2, true));
     button("maximize", "适应全部卡片", () => this.zoomToFit());
   }
 
-  private setZoom(value: number): void {
-    this.zoom = lineageClampedZoom(value);
+  private setZoom(value: number, preserveViewportCenter = false): void {
+    const previousZoom = this.zoom;
+    const nextZoom = lineageClampedZoom(value);
+    const viewport = this.viewport;
+    if (preserveViewportCenter && viewport) {
+      const rawCenterX = (
+        viewport.scrollLeft + viewport.clientWidth / 2
+      ) / Math.max(MIN_FIT_ZOOM, previousZoom) - this.canvasOffset.x;
+      const rawCenterY = (
+        viewport.scrollTop + viewport.clientHeight / 2
+      ) / Math.max(MIN_FIT_ZOOM, previousZoom) - this.canvasOffset.y;
+      const plan = lineageCenteredZoomPlan(
+        viewport,
+        previousZoom,
+        nextZoom,
+        this.width,
+        this.height,
+      );
+      this.beginProgrammaticScroll({
+        zoom: nextZoom,
+        rawCenterX,
+        rawCenterY,
+      });
+      this.applyViewportPlanGeometry(plan);
+      this.zoom = nextZoom;
+      this.applyScale();
+      viewport.scrollTo({ left: plan.left, top: plan.top, behavior: "auto" });
+      this.scheduleProgrammaticScrollEnd(48);
+      return;
+    }
+    this.zoom = nextZoom;
     this.applyScale();
   }
 
@@ -1171,11 +1556,12 @@ export class ProjectLineageWorkbench {
       bounds.width,
       bounds.height,
     );
-    this.setZoom(scale);
-    this.viewport.scrollTo({
-      left: Math.max(0, bounds.x * this.zoom - 24),
-      top: Math.max(0, bounds.y * this.zoom - 24),
-    });
+    this.zoom = scale;
+    this.applyScale();
+    this.centerPlanePoint({
+      x: bounds.x + bounds.width / 2,
+      y: bounds.y + bounds.height / 2,
+    }, "auto");
   }
 
   private applyScale(): void {
@@ -1189,6 +1575,126 @@ export class ProjectLineageWorkbench {
     const label = this.surface.closest(".helix-lineage-graph")
       ?.querySelector<HTMLElement>(".helix-lineage-zoom-label");
     if (label) label.textContent = lineageZoomLabel(this.zoom);
+  }
+
+  private applyViewportPlanGeometry(plan: LineageViewportPlan): void {
+    if (plan.shiftX || plan.shiftY) {
+      for (const point of this.layout.values()) {
+        point.x += plan.shiftX;
+        point.y += plan.shiftY;
+      }
+      this.canvasOffset.x += plan.shiftX;
+      this.canvasOffset.y += plan.shiftY;
+      this.width += plan.shiftX;
+      this.height += plan.shiftY;
+      if (this.nodeLayer) {
+        for (const card of this.nodeLayer.querySelectorAll<HTMLElement>(
+          ".helix-lineage-card[data-entity-id]",
+        )) {
+          const point = card.dataset.entityId
+            ? this.layout.get(card.dataset.entityId)
+            : undefined;
+          if (!point) continue;
+          card.style.left = `${point.x}px`;
+          card.style.top = `${point.y}px`;
+        }
+      }
+      this.updateProjectContainerGeometry();
+    }
+    this.width += plan.growRightBy;
+    this.height += plan.growBottomBy;
+    if (
+      plan.shiftX ||
+      plan.shiftY ||
+      plan.growRightBy ||
+      plan.growBottomBy
+    ) this.renderEdges();
+  }
+
+  private beginProgrammaticScroll(camera: LineageCamera): void {
+    if (this.programmaticScrollTimer !== null) {
+      window.clearTimeout(this.programmaticScrollTimer);
+      this.programmaticScrollTimer = null;
+    }
+    if (this.programmaticScrollFrame !== null) {
+      window.cancelAnimationFrame(this.programmaticScrollFrame);
+      this.programmaticScrollFrame = null;
+    }
+    this.suppressVirtualExpansion = true;
+    this.pendingCamera = camera;
+  }
+
+  private scheduleProgrammaticScrollEnd(delay: number): void {
+    this.programmaticScrollTimer = window.setTimeout(() => {
+      this.programmaticScrollTimer = null;
+      this.endProgrammaticScroll();
+    }, delay);
+  }
+
+  private endProgrammaticScroll(): void {
+    this.pendingCamera = null;
+    this.suppressVirtualExpansion = false;
+    this.programmaticScrollFrame = null;
+    this.expandVirtualPlane();
+  }
+
+  private animateViewportScroll(
+    left: number,
+    top: number,
+    duration = 420,
+  ): void {
+    const viewport = this.viewport;
+    if (!viewport) return;
+    const startLeft = viewport.scrollLeft;
+    const startTop = viewport.scrollTop;
+    const startTime = performance.now();
+    const step = (now: number): void => {
+      if (this.destroyed || !this.viewport) return;
+      const progress = Math.min(1, Math.max(0, (now - startTime) / duration));
+      const eased = 1 - (1 - progress) ** 3;
+      this.viewport.scrollLeft = startLeft + (left - startLeft) * eased;
+      this.viewport.scrollTop = startTop + (top - startTop) * eased;
+      if (progress < 1) {
+        this.programmaticScrollFrame = window.requestAnimationFrame(step);
+      } else {
+        this.viewport.scrollLeft = left;
+        this.viewport.scrollTop = top;
+        this.endProgrammaticScroll();
+      }
+    };
+    this.programmaticScrollFrame = window.requestAnimationFrame(step);
+  }
+
+  private centerPlanePoint(
+    point: LineagePoint,
+    behavior: ScrollBehavior,
+    rawPoint: LineagePoint = {
+      x: point.x - this.canvasOffset.x,
+      y: point.y - this.canvasOffset.y,
+    },
+  ): void {
+    const viewport = this.viewport;
+    if (!viewport) return;
+    const plan = lineageCenteredPointPlan(
+      point,
+      this.zoom,
+      viewport,
+      this.width,
+      this.height,
+    );
+    this.beginProgrammaticScroll({
+      zoom: this.zoom,
+      rawCenterX: rawPoint.x,
+      rawCenterY: rawPoint.y,
+    });
+    this.applyViewportPlanGeometry(plan);
+    this.applyScale();
+    if (behavior === "smooth") {
+      this.animateViewportScroll(plan.left, plan.top);
+    } else {
+      viewport.scrollTo({ left: plan.left, top: plan.top, behavior: "auto" });
+      this.scheduleProgrammaticScrollEnd(48);
+    }
   }
 
   private updateSelection(): void {
@@ -1207,10 +1713,9 @@ export class ProjectLineageWorkbench {
   private measure(): { width: number; height: number } {
     let width = VIRTUAL_MARGIN * 2;
     let height = VIRTUAL_MARGIN * 2;
-    for (const [entityId, point] of this.layout) {
-      const node = this.nodeByEntity.get(entityId);
-      if (!node) continue;
-      const box = lineageGraphBox(node, point);
+    for (const project of this.options.snapshot.projects) {
+      const box = this.projectContainerBox(project.id);
+      if (!box) continue;
       width = Math.max(width, box.right + VIRTUAL_MARGIN);
       height = Math.max(height, box.bottom + VIRTUAL_MARGIN);
     }
@@ -1287,13 +1792,17 @@ export class ProjectLineageWorkbench {
   }
 
   private hasCollapsibleCompleted(project: ProjectWorkspaceProject): boolean {
-    return collapsedClosedComponents(
-      project.cycles.map((cycle) => cycle.id),
-      new Set(project.cycles
-        .filter((cycle) => cycle.status === "closed")
-        .map((cycle) => cycle.id)),
-      this.physicalEdges(),
-    ).length > 0;
+    const projection = completedLineageProjection({
+      ...this.options.snapshot,
+      collapsedCompletedProjectIds: [
+        ...new Set([
+          ...this.options.snapshot.collapsedCompletedProjectIds,
+          project.id,
+        ]),
+      ],
+    });
+    return project.cycles.some((cycle) =>
+      projection.collapseCountByHead.has(cycle.id));
   }
 
   private physicalEdges(): ProjectGraphEdge[] {
@@ -1308,6 +1817,19 @@ export class ProjectLineageWorkbench {
   private visibleNodes(): ProjectWorkspaceCanvasNode[] {
     return this.options.snapshot.canvasNodes.filter((node) =>
       !this.hiddenByCollapseHead.has(node.entityId));
+  }
+
+  private visibleStageNodes(): ProjectWorkspaceCanvasNode[] {
+    return this.visibleNodes().filter((node) => node.kind === "cycle");
+  }
+
+  private projectContainerBox(projectId: string): LineageProjectContainerBox | undefined {
+    const nodes = (this.visibleStageIdsByProject.get(projectId) ?? [])
+      .flatMap((entityId) => {
+        const node = this.nodeByEntity.get(entityId);
+        return node ? [node] : [];
+      });
+    return lineageProjectContainerBox(projectId, nodes, this.layout);
   }
 
   private structuralNodes(): ProjectWorkspaceCanvasNode[] {
@@ -1374,9 +1896,9 @@ export class ProjectLineageWorkbench {
   }
 
   private contentBounds(): { x: number; y: number; width: number; height: number } {
-    const boxes = this.visibleNodes().flatMap((node) => {
-      const point = this.layout.get(node.entityId);
-      return point ? [lineageGraphBox(node, point)] : [];
+    const boxes = this.options.snapshot.projects.flatMap((project) => {
+      const box = this.projectContainerBox(project.id);
+      return box ? [box] : [];
     });
     if (boxes.length === 0) return { x: 0, y: 0, width: 1, height: 1 };
     const left = Math.min(...boxes.map((box) => box.x));
@@ -1388,63 +1910,112 @@ export class ProjectLineageWorkbench {
 
   private centerInitialContent(): void {
     if (!this.viewport || this.destroyed) return;
-    const selected = this.options.snapshot.canvasNodes.find((node) =>
-      node.entityId === this.options.selectedProjectId);
-    const point = selected ? this.layout.get(selected.entityId) : undefined;
+    const requestedFocusId = this.options.focusEntityId;
+    const resolvedFocusId = requestedFocusId
+      ? this.hiddenByCollapseHead.get(requestedFocusId) ?? requestedFocusId
+      : undefined;
     const bounds = this.contentBounds();
-    this.viewport.scrollLeft = Math.max(
-      0,
-      ((point?.x ?? bounds.x) * this.zoom) - this.viewport.clientWidth * 0.18,
-    );
-    this.viewport.scrollTop = Math.max(
-      0,
-      ((point?.y ?? bounds.y) * this.zoom) - this.viewport.clientHeight * 0.35,
-    );
+    const focusedNode = resolvedFocusId
+      ? this.nodeByEntity.get(resolvedFocusId)
+      : undefined;
+    const focusedPoint = focusedNode?.kind === "cycle"
+      ? this.layout.get(focusedNode.entityId)
+      : undefined;
+    const focusedStageBox = focusedNode && focusedPoint
+      ? lineageGraphBox(focusedNode, focusedPoint)
+      : undefined;
+    const focusedProjectBox = !focusedStageBox && resolvedFocusId
+      ? this.projectContainerBox(resolvedFocusId)
+      : undefined;
+    const focusedBox = focusedStageBox ?? focusedProjectBox;
+    if (!focusedBox && !requestedFocusId && this.options.initialCamera) {
+      this.zoom = lineageClampedZoom(this.options.initialCamera.zoom);
+      this.applyScale();
+      this.centerPlanePoint({
+        x: this.options.initialCamera.rawCenterX + this.canvasOffset.x,
+        y: this.options.initialCamera.rawCenterY + this.canvasOffset.y,
+      }, "auto", {
+        x: this.options.initialCamera.rawCenterX,
+        y: this.options.initialCamera.rawCenterY,
+      });
+      return;
+    }
+    const selected = !focusedBox && this.options.selectedProjectId
+      ? this.projectContainerBox(this.options.selectedProjectId)
+      : undefined;
+    if (focusedProjectBox) {
+      this.zoom = lineageFitScale(
+        this.viewport.clientWidth,
+        this.viewport.clientHeight,
+        focusedProjectBox.width,
+        focusedProjectBox.height,
+      );
+      this.applyScale();
+    }
+    const center = {
+      x: focusedBox
+        ? focusedBox.x + focusedBox.width / 2
+        : selected?.centerX ?? bounds.x + bounds.width / 2,
+      y: focusedBox
+        ? focusedBox.y + focusedBox.height / 2
+        : selected?.centerY ?? bounds.y + bounds.height / 2,
+    };
+    const reducedMotion = typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    this.centerPlanePoint(center, focusedBox && !reducedMotion ? "smooth" : "auto");
+    if (requestedFocusId) this.options.onFocusApplied?.(requestedFocusId);
+    if (focusedNode?.kind === "cycle") {
+      const card = this.nodeLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-card[data-entity-id="${CSS.escape(focusedNode.entityId)}"]`,
+      );
+      card?.addClass("is-operation-focus");
+      if (card) window.setTimeout(() => card.removeClass("is-operation-focus"), 1_600);
+    } else if (resolvedFocusId) {
+      const container = this.projectLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-project-container[data-project-id="${
+          CSS.escape(resolvedFocusId)
+        }"]`,
+      );
+      const header = this.projectHeaderLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-project-container-header[data-project-id="${
+          CSS.escape(resolvedFocusId)
+        }"]`,
+      );
+      container?.addClass("is-operation-focus");
+      header?.addClass("is-operation-focus");
+      if (container || header) {
+        window.setTimeout(() => {
+          container?.removeClass("is-operation-focus");
+          header?.removeClass("is-operation-focus");
+        }, 1_600);
+      }
+    }
   }
 
   private expandVirtualPlane(): void {
     const viewport = this.viewport;
-    if (!viewport || this.destroyed) return;
+    if (!viewport || this.destroyed || this.suppressVirtualExpansion) return;
     const {
       shiftX,
       shiftY,
       growRightBy,
       growBottomBy,
     } = lineageVirtualExpansionPlan(viewport, this.zoom);
+    if (!shiftX && !shiftY && !growRightBy && !growBottomBy) return;
+    const previousLeft = viewport.scrollLeft;
+    const previousTop = viewport.scrollTop;
+    this.applyViewportPlanGeometry({
+      shiftX,
+      shiftY,
+      growRightBy,
+      growBottomBy,
+      left: 0,
+      top: 0,
+    });
+    this.applyScale();
     if (shiftX || shiftY) {
-      for (const point of this.layout.values()) {
-        point.x += shiftX;
-        point.y += shiftY;
-      }
-      this.canvasOffset.x += shiftX;
-      this.canvasOffset.y += shiftY;
-      this.width += shiftX;
-      this.height += shiftY;
-      if (this.nodeLayer) {
-        for (const card of this.nodeLayer.querySelectorAll<HTMLElement>(
-          ".helix-lineage-card[data-entity-id]",
-        )) {
-          const point = card.dataset.entityId
-            ? this.layout.get(card.dataset.entityId)
-            : undefined;
-          if (point) {
-            card.style.left = `${point.x}px`;
-            card.style.top = `${point.y}px`;
-          }
-        }
-      }
-      this.applyScale();
-      this.renderEdges();
-      viewport.scrollLeft += shiftX * this.zoom;
-      viewport.scrollTop += shiftY * this.zoom;
-    }
-    if (growRightBy) {
-      this.width += growRightBy;
-      this.applyScale();
-    }
-    if (growBottomBy) {
-      this.height += growBottomBy;
-      this.applyScale();
+      viewport.scrollLeft = previousLeft + shiftX * this.zoom;
+      viewport.scrollTop = previousTop + shiftY * this.zoom;
     }
   }
 

@@ -102,11 +102,12 @@ export default class HelixPlugin extends Plugin {
       HELIX_VIEW_TYPE,
       (leaf) => new HelixView(leaf, this.service, this.store, {
         openReview: (period) => this.openJournal(period),
-        createProject: () => this.showCreateProjectModal(),
-        createCycle: (projectId, sourceCycleIds) =>
-          this.showCreateCycleModal(projectId, sourceCycleIds),
-        deleteCycle: (cycleId) => this.showDeleteCycleModal(cycleId),
-        manageRelation: (relationId) => this.showManageRelationModal(relationId),
+        createProject: (onCreated) => this.showCreateProjectModal(onCreated),
+        createCycle: (projectId, sourceCycleIds, onCreated) =>
+          this.showCreateCycleModal(projectId, sourceCycleIds, onCreated),
+        deleteCycle: (cycleId, onDeleted) => this.showDeleteCycleModal(cycleId, onDeleted),
+        manageRelation: (relationId, onChanged) =>
+          this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
         reviewLegacyMigration: () => this.showLegacyMigrationModal(),
@@ -244,7 +245,7 @@ export default class HelixPlugin extends Plugin {
     await this.app.workspace.revealLeaf(leaf);
   }
 
-  private openProjectModal(): void {
+  private openProjectModal(onCreated?: (projectId: string) => void): void {
     if (this.recoveryMode) {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能创建项目", 8_000);
       return;
@@ -254,19 +255,24 @@ export default class HelixPlugin extends Plugin {
       this.service.snapshot().projects,
       async (title, didaProjectId, color) => {
         this.assertWritable();
-        await this.withProjectMutation(() =>
+        const created = await this.withProjectMutation(() =>
           this.projectWorkspace.createProject(title, didaProjectId, color));
+        onCreated?.(created.id);
         await this.service.refreshPersistedEvents();
         new Notice("项目和阶段 1 已加入当前工作区");
       },
     ).open();
   }
 
-  showCreateProjectModal(): void {
-    this.openProjectModal();
+  showCreateProjectModal(onCreated?: (projectId: string) => void): void {
+    this.openProjectModal(onCreated);
   }
 
-  private showCreateCycleModal(projectId: string, sourceCycleIds: string[]): void {
+  private showCreateCycleModal(
+    projectId: string,
+    sourceCycleIds: string[],
+    onCreated?: (cycleId: string) => void,
+  ): void {
     if (this.recoveryMode) {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能创建阶段", 8_000);
       return;
@@ -294,7 +300,7 @@ export default class HelixPlugin extends Plugin {
           snapshot.nextStageSequenceByProject[project.id]!,
           async (stageTitle, crossProjectConfirmed) => {
             this.assertWritable();
-            await this.withProjectMutation(() =>
+            const created = await this.withProjectMutation(() =>
               this.projectWorkspace.createCycle(
                 projectId,
                 "auto",
@@ -309,6 +315,7 @@ export default class HelixPlugin extends Plugin {
                   stageTitle,
                 },
               ));
+            onCreated?.(created.id);
             await this.service.refreshPersistedEvents();
             new Notice(`${CYCLE_RELATION_LABELS[intent.relation]}阶段已加入当前工作区`);
           },
@@ -319,7 +326,10 @@ export default class HelixPlugin extends Plugin {
       });
   }
 
-  private showDeleteCycleModal(cycleId: string): void {
+  private showDeleteCycleModal(
+    cycleId: string,
+    onDeleted?: (focusEntityId: string) => void,
+  ): void {
     if (this.recoveryMode) {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能删除阶段", 8_000);
       return;
@@ -347,6 +357,18 @@ export default class HelixPlugin extends Plugin {
                 bridge,
                 confirmCrossProject,
               }));
+            const focusEntityId = snapshot.relations
+              .filter((relation) =>
+                relation.fromCycleIds.includes(cycleId) ||
+                relation.toCycleId === cycleId)
+              .flatMap((relation) => [
+                ...(relation.toCycleId === cycleId ? relation.fromCycleIds : []),
+                ...(relation.fromCycleIds.includes(cycleId)
+                  ? [relation.toCycleId]
+                  : []),
+              ])
+              .find((candidate) => candidate !== cycleId) ?? owner.id;
+            onDeleted?.(focusEntityId);
             new Notice(
               bridge
                 ? "阶段已删除，前后关系已桥接并整理"
@@ -360,7 +382,10 @@ export default class HelixPlugin extends Plugin {
       });
   }
 
-  private showManageRelationModal(relationId: string): void {
+  private showManageRelationModal(
+    relationId: string,
+    onChanged?: (focusEntityId: string) => void,
+  ): void {
     if (this.recoveryMode) {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能修改关系", 8_000);
       return;
@@ -383,12 +408,14 @@ export default class HelixPlugin extends Plugin {
                 predecessorIds,
                 { confirmCrossProject: crossProjectConfirmed },
               ));
+            onChanged?.(relation.toCycleId);
             new Notice("阶段关系已更新");
           },
           async () => {
             this.assertWritable();
             await this.withProjectMutation(() =>
               this.projectWorkspace.deleteRelation(relation.id));
+            onChanged?.(relation.toCycleId);
             new Notice("阶段关系已删除");
           },
         ).open();

@@ -84,6 +84,7 @@ const PROJECT_CONTAINER_BOTTOM_PADDING = 28;
 const VIRTUAL_MARGIN = 2400;
 const VIRTUAL_EXPAND = 1800;
 const VIEWPORT_SAFE_MARGIN = 400;
+export const LINEAGE_ALL_PROJECTS_FOCUS_ID = "helix:all-projects";
 
 export function lineageGraphBox(
   _node: Pick<ProjectWorkspaceCanvasNode, "width" | "height">,
@@ -266,6 +267,62 @@ export function lineageFitScale(
       Math.max(1, viewportHeight - 48) / Math.max(1, contentHeight),
     ),
   );
+}
+
+export function lineageFocusScale(
+  viewportWidth: number,
+  viewportHeight: number,
+  contentWidth: number,
+  contentHeight: number,
+): number {
+  return lineageClampedZoom(Math.min(
+    Math.max(1, viewportWidth - 48) / Math.max(1, contentWidth),
+    Math.max(1, viewportHeight - 48) / Math.max(1, contentHeight),
+  ));
+}
+
+export function lineageCameraFrame(
+  startCenter: LineagePoint,
+  targetCenter: LineagePoint,
+  startZoom: number,
+  targetZoom: number,
+  progress: number,
+  viewport: { clientWidth: number; clientHeight: number },
+): { zoom: number; left: number; top: number } {
+  const normalized = Math.min(1, Math.max(0, progress));
+  const eased = 1 - (1 - normalized) ** 3;
+  const zoom = lineageClampedZoom(
+    startZoom + (targetZoom - startZoom) * eased,
+  );
+  const centerX = startCenter.x + (targetCenter.x - startCenter.x) * eased;
+  const centerY = startCenter.y + (targetCenter.y - startCenter.y) * eased;
+  return {
+    zoom,
+    left: centerX * zoom - viewport.clientWidth / 2,
+    top: centerY * zoom - viewport.clientHeight / 2,
+  };
+}
+
+export function lineageFocusBehavior(reducedMotion: boolean): ScrollBehavior {
+  return reducedMotion ? "auto" : "smooth";
+}
+
+export function lineageShouldFocusOnDoubleClick(target: EventTarget | null): boolean {
+  const closest = (
+    target as { closest?: (selector: string) => unknown } | null
+  )?.closest;
+  return typeof closest !== "function" || !closest.call(target, "button");
+}
+
+export function lineageRequestedFocusBox<T>(
+  requestedFocusId: string | undefined,
+  focusedStageBox: T | undefined,
+  focusedProjectBox: T | undefined,
+  contentBounds: T,
+): T | undefined {
+  return requestedFocusId === LINEAGE_ALL_PROJECTS_FOCUS_ID
+    ? contentBounds
+    : focusedStageBox ?? focusedProjectBox;
 }
 
 export function lineageZoomLabel(zoom: number): string {
@@ -743,6 +800,8 @@ export class ProjectLineageWorkbench {
       attr: {
         "data-entity-id": node.entityId,
         "aria-selected": "false",
+        "aria-label": `${node.title}，双击聚焦`,
+        title: `双击聚焦 ${node.title}`,
       },
     });
     card.style.setProperty("--helix-project-color", this.projectColor(
@@ -877,6 +936,12 @@ export class ProjectLineageWorkbench {
     card.addEventListener("pointerup", finish);
     card.addEventListener("pointercancel", cancelMove);
     card.addEventListener("lostpointercapture", cancelMove);
+    card.addEventListener("dblclick", (event) => {
+      if (!lineageShouldFocusOnDoubleClick(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this.focusGraphCard(node);
+    });
   }
 
   private renderProjectContainers(): void {
@@ -1638,31 +1703,118 @@ export class ProjectLineageWorkbench {
     this.expandVirtualPlane();
   }
 
-  private animateViewportScroll(
-    left: number,
-    top: number,
+  private animateViewportCamera(
+    targetZoom: number,
+    targetCenter: LineagePoint,
     duration = 420,
   ): void {
     const viewport = this.viewport;
     if (!viewport) return;
-    const startLeft = viewport.scrollLeft;
-    const startTop = viewport.scrollTop;
+    const startZoom = this.zoom;
+    const startCenter = {
+      x: (viewport.scrollLeft + viewport.clientWidth / 2) /
+        Math.max(MIN_FIT_ZOOM, startZoom),
+      y: (viewport.scrollTop + viewport.clientHeight / 2) /
+        Math.max(MIN_FIT_ZOOM, startZoom),
+    };
     const startTime = performance.now();
     const step = (now: number): void => {
       if (this.destroyed || !this.viewport) return;
-      const progress = Math.min(1, Math.max(0, (now - startTime) / duration));
-      const eased = 1 - (1 - progress) ** 3;
-      this.viewport.scrollLeft = startLeft + (left - startLeft) * eased;
-      this.viewport.scrollTop = startTop + (top - startTop) * eased;
-      if (progress < 1) {
+      const frame = lineageCameraFrame(
+        startCenter,
+        targetCenter,
+        startZoom,
+        targetZoom,
+        (now - startTime) / duration,
+        viewport,
+      );
+      this.zoom = frame.zoom;
+      this.applyScale();
+      viewport.scrollLeft = frame.left;
+      viewport.scrollTop = frame.top;
+      if (now - startTime < duration) {
         this.programmaticScrollFrame = window.requestAnimationFrame(step);
       } else {
-        this.viewport.scrollLeft = left;
-        this.viewport.scrollTop = top;
+        this.zoom = lineageClampedZoom(targetZoom);
+        this.applyScale();
+        viewport.scrollLeft = targetCenter.x * this.zoom -
+          viewport.clientWidth / 2;
+        viewport.scrollTop = targetCenter.y * this.zoom -
+          viewport.clientHeight / 2;
         this.endProgrammaticScroll();
       }
     };
     this.programmaticScrollFrame = window.requestAnimationFrame(step);
+  }
+
+  private focusPlaneBox(
+    box: { x: number; y: number; width: number; height: number },
+    targetZoom: number,
+    behavior: ScrollBehavior,
+    rawCenter: LineagePoint = {
+      x: box.x + box.width / 2 - this.canvasOffset.x,
+      y: box.y + box.height / 2 - this.canvasOffset.y,
+    },
+  ): void {
+    const viewport = this.viewport;
+    if (!viewport) return;
+    const center = {
+      x: box.x + box.width / 2,
+      y: box.y + box.height / 2,
+    };
+    const zoom = lineageClampedZoom(targetZoom);
+    const plan = lineageCenteredPointPlan(
+      center,
+      zoom,
+      viewport,
+      this.width,
+      this.height,
+    );
+    const startZoom = this.zoom;
+    const startLeft = viewport.scrollLeft;
+    const startTop = viewport.scrollTop;
+    this.beginProgrammaticScroll({
+      zoom,
+      rawCenterX: rawCenter.x,
+      rawCenterY: rawCenter.y,
+    });
+    this.applyViewportPlanGeometry(plan);
+    this.applyScale();
+    viewport.scrollLeft = startLeft + plan.shiftX * startZoom;
+    viewport.scrollTop = startTop + plan.shiftY * startZoom;
+    const shiftedCenter = {
+      x: center.x + plan.shiftX,
+      y: center.y + plan.shiftY,
+    };
+    if (behavior === "smooth") {
+      this.animateViewportCamera(zoom, shiftedCenter);
+    } else {
+      this.zoom = zoom;
+      this.applyScale();
+      viewport.scrollTo({ left: plan.left, top: plan.top, behavior: "auto" });
+      this.scheduleProgrammaticScrollEnd(48);
+    }
+  }
+
+  private focusGraphCard(node: ProjectWorkspaceCanvasNode): void {
+    const point = this.layout.get(node.entityId);
+    const viewport = this.viewport;
+    if (!point || !viewport) return;
+    const box = lineageGraphBox(node, point);
+    const targetZoom = lineageFocusScale(
+      viewport.clientWidth,
+      viewport.clientHeight,
+      box.width,
+      box.height,
+    );
+    const reducedMotion = typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    this.focusPlaneBox(box, targetZoom, lineageFocusBehavior(reducedMotion));
+    const card = this.nodeLayer?.querySelector<HTMLElement>(
+      `.helix-lineage-card[data-entity-id="${CSS.escape(node.entityId)}"]`,
+    );
+    card?.addClass("is-operation-focus");
+    if (card) window.setTimeout(() => card.removeClass("is-operation-focus"), 1_600);
   }
 
   private centerPlanePoint(
@@ -1673,28 +1825,12 @@ export class ProjectLineageWorkbench {
       y: point.y - this.canvasOffset.y,
     },
   ): void {
-    const viewport = this.viewport;
-    if (!viewport) return;
-    const plan = lineageCenteredPointPlan(
-      point,
+    this.focusPlaneBox(
+      { x: point.x, y: point.y, width: 0, height: 0 },
       this.zoom,
-      viewport,
-      this.width,
-      this.height,
+      behavior,
+      rawPoint,
     );
-    this.beginProgrammaticScroll({
-      zoom: this.zoom,
-      rawCenterX: rawPoint.x,
-      rawCenterY: rawPoint.y,
-    });
-    this.applyViewportPlanGeometry(plan);
-    this.applyScale();
-    if (behavior === "smooth") {
-      this.animateViewportScroll(plan.left, plan.top);
-    } else {
-      viewport.scrollTo({ left: plan.left, top: plan.top, behavior: "auto" });
-      this.scheduleProgrammaticScrollEnd(48);
-    }
   }
 
   private updateSelection(): void {
@@ -1911,9 +2047,21 @@ export class ProjectLineageWorkbench {
   private centerInitialContent(): void {
     if (!this.viewport || this.destroyed) return;
     const requestedFocusId = this.options.focusEntityId;
-    const resolvedFocusId = requestedFocusId
+    const focusAllProjects = requestedFocusId === LINEAGE_ALL_PROJECTS_FOCUS_ID;
+    const resolvedFocusId = requestedFocusId && !focusAllProjects
       ? this.hiddenByCollapseHead.get(requestedFocusId) ?? requestedFocusId
       : undefined;
+    if (this.options.initialCamera) {
+      this.zoom = lineageClampedZoom(this.options.initialCamera.zoom);
+      this.applyScale();
+      this.centerPlanePoint({
+        x: this.options.initialCamera.rawCenterX + this.canvasOffset.x,
+        y: this.options.initialCamera.rawCenterY + this.canvasOffset.y,
+      }, "auto", {
+        x: this.options.initialCamera.rawCenterX,
+        y: this.options.initialCamera.rawCenterY,
+      });
+    }
     const bounds = this.contentBounds();
     const focusedNode = resolvedFocusId
       ? this.nodeByEntity.get(resolvedFocusId)
@@ -1927,31 +2075,16 @@ export class ProjectLineageWorkbench {
     const focusedProjectBox = !focusedStageBox && resolvedFocusId
       ? this.projectContainerBox(resolvedFocusId)
       : undefined;
-    const focusedBox = focusedStageBox ?? focusedProjectBox;
-    if (!focusedBox && !requestedFocusId && this.options.initialCamera) {
-      this.zoom = lineageClampedZoom(this.options.initialCamera.zoom);
-      this.applyScale();
-      this.centerPlanePoint({
-        x: this.options.initialCamera.rawCenterX + this.canvasOffset.x,
-        y: this.options.initialCamera.rawCenterY + this.canvasOffset.y,
-      }, "auto", {
-        x: this.options.initialCamera.rawCenterX,
-        y: this.options.initialCamera.rawCenterY,
-      });
-      return;
-    }
+    const focusedBox = lineageRequestedFocusBox(
+      requestedFocusId,
+      focusedStageBox,
+      focusedProjectBox,
+      bounds,
+    );
+    if (!focusedBox && !requestedFocusId && this.options.initialCamera) return;
     const selected = !focusedBox && this.options.selectedProjectId
       ? this.projectContainerBox(this.options.selectedProjectId)
       : undefined;
-    if (focusedProjectBox) {
-      this.zoom = lineageFitScale(
-        this.viewport.clientWidth,
-        this.viewport.clientHeight,
-        focusedProjectBox.width,
-        focusedProjectBox.height,
-      );
-      this.applyScale();
-    }
     const center = {
       x: focusedBox
         ? focusedBox.x + focusedBox.width / 2
@@ -1962,7 +2095,23 @@ export class ProjectLineageWorkbench {
     };
     const reducedMotion = typeof window.matchMedia === "function" &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    this.centerPlanePoint(center, focusedBox && !reducedMotion ? "smooth" : "auto");
+    const targetZoom = focusedProjectBox || focusAllProjects
+      ? lineageFocusScale(
+        this.viewport.clientWidth,
+        this.viewport.clientHeight,
+        focusedBox?.width ?? bounds.width,
+        focusedBox?.height ?? bounds.height,
+      )
+      : this.zoom;
+    if (focusedBox) {
+      this.focusPlaneBox(
+        focusedBox,
+        targetZoom,
+        lineageFocusBehavior(reducedMotion),
+      );
+    } else {
+      this.centerPlanePoint(center, "auto");
+    }
     if (requestedFocusId) this.options.onFocusApplied?.(requestedFocusId);
     if (focusedNode?.kind === "cycle") {
       const card = this.nodeLayer?.querySelector<HTMLElement>(

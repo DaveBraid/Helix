@@ -6,7 +6,10 @@ import type {
 import {
   completedLineageProjection,
   creationSourcesFromSelection,
+  lineageCameraFrame,
+  lineageFocusBehavior,
   lineageFitScale,
+  lineageFocusScale,
   lineageConnectionDropTarget,
   lineageClampedZoom,
   lineageCenteredZoomPlan,
@@ -16,6 +19,8 @@ import {
   lineageGraphEdgeAnchors,
   lineageMovePayload,
   lineageProjectContainerBox,
+  lineageRequestedFocusBox,
+  lineageShouldFocusOnDoubleClick,
   lineageStructuralEntityIds,
   lineageVirtualExpansionPlan,
   lineageVisibleStageIdsByProject,
@@ -174,6 +179,34 @@ describe("Project Lineage card-plus intent", () => {
     });
   });
 
+  it("interpolates zoom and logical center in one camera animation", () => {
+    const viewport = { clientWidth: 800, clientHeight: 600 };
+    expect(lineageCameraFrame(
+      { x: 100, y: 200 },
+      { x: 900, y: 600 },
+      0.5,
+      1,
+      0,
+      viewport,
+    )).toEqual({ zoom: 0.5, left: -350, top: -200 });
+    expect(lineageCameraFrame(
+      { x: 100, y: 200 },
+      { x: 900, y: 600 },
+      0.5,
+      1,
+      0.5,
+      viewport,
+    )).toEqual({ zoom: 0.9375, left: 350, top: 215.625 });
+    expect(lineageCameraFrame(
+      { x: 100, y: 200 },
+      { x: 900, y: 600 },
+      0.5,
+      1,
+      1,
+      viewport,
+    )).toEqual({ zoom: 1, left: 500, top: 300 });
+  });
+
   it("indexes a thousand visible stages once by project", () => {
     const nodes = Array.from({ length: 1_000 }, (_, index) => ({
       ...node(`stage-${index}`, "cycle", index * 10, index * 5),
@@ -208,6 +241,39 @@ describe("Project Lineage card-plus intent", () => {
     expect(lineageClampedZoom(0.0004 / 1.2)).toBeLessThan(0.0004);
     expect(lineageClampedZoom(0.0004 * 1.2)).toBeCloseTo(0.00048);
     expect(lineageClampedZoom(0.0004 * Math.exp(0.2))).toBeLessThan(0.001);
+  });
+
+  it("lets explicit project and card focus zoom in as well as out", () => {
+    expect(lineageFocusScale(800, 600, 248, 128)).toBe(2.5);
+    expect(lineageFocusScale(800, 600, 1_600, 900)).toBeCloseTo(0.47, 2);
+  });
+
+  it("turns the reduced-motion preference into an immediate focus jump", () => {
+    expect(lineageFocusBehavior(false)).toBe("smooth");
+    expect(lineageFocusBehavior(true)).toBe("auto");
+  });
+
+  it("ignores card double-clicks that originate inside an action button", () => {
+    const cardBody = { closest: () => null } as unknown as EventTarget;
+    const cardButton = (
+      { closest: (selector: string) => selector === "button" }
+    ) as unknown as EventTarget;
+    expect(lineageShouldFocusOnDoubleClick(cardBody)).toBe(true);
+    expect(lineageShouldFocusOnDoubleClick(cardButton)).toBe(false);
+  });
+
+  it("resolves the all-projects request to global bounds", () => {
+    const stage = { x: 20, y: 30, width: 248, height: 128 };
+    const project = { x: 10, y: 20, width: 400, height: 260 };
+    const all = { x: -100, y: -80, width: 1_800, height: 900 };
+    expect(lineageRequestedFocusBox(
+      "helix:all-projects",
+      stage,
+      project,
+      all,
+    )).toBe(all);
+    expect(lineageRequestedFocusBox("project-1", undefined, project, all))
+      .toBe(project);
   });
 
   it("keeps folded members out of keyboard targets and expands every folded edge endpoint", () => {

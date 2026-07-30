@@ -47,6 +47,7 @@ import type { ResolutionChoice, SyncConflict } from "../sync/types";
 import { analyticsChartSeries } from "./chart-series";
 import { inProgressPresentation } from "./in-progress-presentation";
 import {
+  LINEAGE_ALL_PROJECTS_FOCUS_ID,
   ProjectLineageWorkbench,
   type LineageCamera,
   type ProjectLineageViewMode,
@@ -807,8 +808,10 @@ export class HelixView extends ItemView {
       },
       onSelectProject: (projectId) => {
         this.selectedProjectId = projectId;
-        if (projectId) this.requestLineageFocus(projectId, lifecycleGeneration);
-        else void this.render();
+        this.requestLineageFocus(
+          projectId ?? LINEAGE_ALL_PROJECTS_FOCUS_ID,
+          lifecycleGeneration,
+        );
       },
       focusEntityId,
       onCreateProject: () => this.actions.createProject(

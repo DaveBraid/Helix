@@ -1,0 +1,9 @@
+{
+  "id": "helix-productivity",
+  "name": "Helix",
+  "version": "0.1.0",
+  "minAppVersion": "1.12.2",
+  "description": "面向科研工作的任务、项目 Cycle、复盘、分析与挑战工作台。",
+  "author": "Ethan Lee",
+  "isDesktopOnly": true
+}

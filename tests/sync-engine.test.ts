@@ -1,0 +1,291 @@
+import { describe, expect, it } from "vitest";
+import type { DidaTask, EntityKind, EntitySnapshot } from "../src/domain/entities";
+import { createSnapshot } from "../src/sync/snapshots";
+import { SyncEngine } from "../src/sync/sync-engine";
+import type {
+  ConflictRepository,
+  RemoteEntityAdapter,
+  ResolutionAuditEntry,
+  SnapshotRepository,
+  SyncConflict,
+  SyncQueueOperation,
+} from "../src/sync/types";
+
+class MemoryRepository implements SnapshotRepository, ConflictRepository {
+  base: EntitySnapshot<unknown> | null = null;
+  local: EntitySnapshot<unknown> | null = null;
+  conflicts: SyncConflict[] = [];
+  audit: ResolutionAuditEntry[] = [];
+
+  async getBase<T>(_kind: EntityKind, _entityId: string): Promise<EntitySnapshot<T> | null> {
+    return this.base as EntitySnapshot<T> | null;
+  }
+  async getLocal<T>(_kind: EntityKind, _entityId: string): Promise<EntitySnapshot<T> | null> {
+    return this.local as EntitySnapshot<T> | null;
+  }
+  async saveBase<T>(snapshot: EntitySnapshot<T>): Promise<void> {
+    this.base = snapshot as EntitySnapshot<unknown>;
+  }
+  async saveLocal<T>(snapshot: EntitySnapshot<T>): Promise<void> {
+    this.local = snapshot as EntitySnapshot<unknown>;
+  }
+  async removeBase(): Promise<void> {
+    this.base = null;
+  }
+  async removeLocal(): Promise<void> {
+    this.local = null;
+  }
+  async list(): Promise<SyncConflict[]> {
+    return this.conflicts;
+  }
+  async get(conflictId: string): Promise<SyncConflict | null> {
+    return this.conflicts.find((conflict) => conflict.id === conflictId) ?? null;
+  }
+  async save(conflict: SyncConflict): Promise<void> {
+    const index = this.conflicts.findIndex((item) => item.id === conflict.id);
+    if (index < 0) this.conflicts.push(conflict);
+    else this.conflicts[index] = conflict;
+  }
+  async remove(conflictId: string): Promise<void> {
+    this.conflicts = this.conflicts.filter((conflict) => conflict.id !== conflictId);
+  }
+  async appendAudit(entry: ResolutionAuditEntry): Promise<void> {
+    this.audit.push(entry);
+  }
+}
+
+class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
+  readonly kind = "task" as const;
+  value: DidaTask | null;
+  getCount = 0;
+
+  constructor(value: DidaTask | null) {
+    this.value = value;
+  }
+  async get(): Promise<DidaTask | null> {
+    this.getCount += 1;
+    return this.value ? structuredClone(this.value) : null;
+  }
+  async create(value: DidaTask): Promise<DidaTask> {
+    this.value = { ...value, id: value.id || "restored" };
+    return structuredClone(this.value);
+  }
+  async update(_entityId: string, value: DidaTask): Promise<DidaTask> {
+    this.value = structuredClone(value);
+    return structuredClone(value);
+  }
+  async delete(): Promise<void> {
+    this.value = null;
+  }
+}
+
+function task(title: string): DidaTask {
+  return { id: "task-1", projectId: "project-1", title, status: 0 };
+}
+
+function operation(local: DidaTask, base: EntitySnapshot<DidaTask>): SyncQueueOperation<DidaTask> {
+  const now = "2026-07-30T00:00:00.000Z";
+  return {
+    id: "op-1",
+    kind: "task",
+    entityId: "task-1",
+    projectId: "project-1",
+    operation: "update",
+    createdAt: now,
+    updatedAt: now,
+    attempts: 0,
+    status: "pending",
+    base,
+    local: createSnapshot("task", "task-1", local, { capturedAt: now }),
+  };
+}
+
+describe("SyncEngine safety gates", () => {
+  it("pushes the queued local snapshot even when the repository now holds a resolved snapshot", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", task("previous-resolution"));
+    const adapter = new TaskAdapter(task("base"));
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+
+    const result = await engine.process(operation(task("queued-rename"), base));
+
+    expect(result.outcome).toBe("pushed");
+    expect(adapter.value?.title).toBe("queued-rename");
+    expect((repository.local?.value as DidaTask).title).toBe("queued-rename");
+  });
+
+  it("opens a conflict instead of writing when remote changes during preflight", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", task("local"));
+    const adapter = new TaskAdapter(task("base"));
+    const originalGet = adapter.get.bind(adapter);
+    adapter.get = async () => {
+      const value = await originalGet();
+      if (adapter.getCount === 1) adapter.value = task("changed-after-first-read");
+      return value;
+    };
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const result = await engine.process(operation(task("local"), base));
+    expect(result.outcome).toBe("conflict");
+    expect(adapter.value?.title).toBe("changed-after-first-read");
+    expect(repository.conflicts).toHaveLength(1);
+  });
+
+  it("requires an explicit whole-record choice for delete versus update", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", null as unknown as DidaTask);
+    const adapter = new TaskAdapter(task("remote-change"));
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const deleteOperation = { ...operation(task("base"), base), operation: "delete" as const };
+    const result = await engine.process(deleteOperation);
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    expect(result.conflict.fields).toMatchObject([{ path: "$", group: "deletion" }]);
+    await engine.choose(result.conflict.id, "$", "remote");
+    const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(applied.outcome).toBe("resolved");
+    expect(adapter.value?.title).toBe("remote-change");
+  });
+
+  it("removes base and local caches after explicitly resolving to deletion", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", null as unknown as DidaTask);
+    const adapter = new TaskAdapter(task("remote-change"));
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const result = await engine.process({
+      ...operation(task("base"), base),
+      operation: "delete",
+    });
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    await engine.choose(result.conflict.id, "$", "local");
+    const applied = await engine.applyConflict(result.conflict.id, {
+      projectId: "project-1",
+    });
+    expect(applied.outcome).toBe("resolved");
+    expect(applied.outcome === "resolved" && applied.snapshot.value).toBeNull();
+    expect(adapter.value).toBeNull();
+    expect(repository.base).toBeNull();
+    expect(repository.local).toBeNull();
+  });
+
+  it("recreates a locally chosen task after remote deletion and reports the new identity", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", task("local"));
+    const adapter = new TaskAdapter(null);
+    adapter.create = async (value) => {
+      adapter.value = { ...value, id: "task-restored" };
+      return structuredClone(adapter.value);
+    };
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const result = await engine.process(operation(task("local"), base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    await engine.choose(result.conflict.id, "$", "local");
+    const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(applied).toMatchObject({
+      outcome: "resolved",
+      previousEntityId: "task-1",
+      snapshot: { entityId: "task-restored" },
+    });
+    expect(repository.base?.entityId).toBe("task-restored");
+    expect(repository.local?.entityId).toBe("task-restored");
+  });
+
+  it("keeps a recreated conflict applying when create succeeds but verification is unknown", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", task("local"));
+    const adapter = new TaskAdapter(null);
+    let gets = 0;
+    adapter.get = async () => {
+      gets += 1;
+      if (gets <= 2) return null;
+      throw new Error("verification connection lost");
+    };
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const result = await engine.process(operation(task("local"), base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    await engine.choose(result.conflict.id, "$", "local");
+    await expect(
+      engine.applyConflict(result.conflict.id, { projectId: "project-1" }),
+    ).rejects.toMatchObject({
+      category: "unknown-outcome",
+      remoteOutcomeUnknown: true,
+    });
+  });
+
+  it("audits a chosen missing optional field after the verified remote write", async () => {
+    const baseTask = { ...task("base"), dueDate: "2026-08-01T00:00:00Z" };
+    const localTask = task("base");
+    const remoteTask = { ...baseTask, title: "remote title" };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const result = await engine.process(operation(localTask, base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    for (const field of result.conflict.fields) {
+      await engine.choose(
+        result.conflict.id,
+        field.path,
+        field.path === "dueDate" ? "local" : "remote",
+      );
+    }
+    const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(applied.outcome).toBe("resolved");
+    if (applied.outcome !== "resolved") throw new Error("expected resolved");
+    expect(applied.audit.choices.dueDate?.valueHash).toMatch(/^[0-9a-f]{64}$/);
+    expect((adapter.value as DidaTask).dueDate).toBeUndefined();
+  });
+});

@@ -1,0 +1,25 @@
+{
+  "name": "helix-productivity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "npm run typecheck && node esbuild.config.mjs production",
+    "release:check": "npm run build && node scripts/release-check.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "echarts": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.5",
+    "obsidian": "1.12.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

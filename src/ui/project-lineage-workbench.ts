@@ -74,7 +74,7 @@ interface WorkbenchOptions {
 
 const PADDING = 64;
 const GRID_SIZE = 28;
-const MAX_ZOOM = 2.5;
+const MAX_ZOOM = 1.2;
 const MIN_FIT_ZOOM = 0.0001;
 const GRAPH_CARD_WIDTH = 248;
 const GRAPH_CARD_HEIGHT = 128;

@@ -244,7 +244,7 @@ describe("Project Lineage card-plus intent", () => {
   });
 
   it("lets explicit project and card focus zoom in as well as out", () => {
-    expect(lineageFocusScale(800, 600, 248, 128)).toBe(2.5);
+    expect(lineageFocusScale(800, 600, 248, 128)).toBe(1.2);
     expect(lineageFocusScale(800, 600, 1_600, 900)).toBeCloseTo(0.47, 2);
   });
 

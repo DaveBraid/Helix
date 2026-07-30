@@ -41,55 +41,42 @@ export function aggregateAnalytics(
   const focusOccurrences = new Map<string, { date: string; minutes: number }>();
   for (const event of events) {
     const date = localDateKeyFromInstant(event.occurredAt);
-    const bucket = buckets.get(date);
-    if (!bucket) continue;
     const occurrence = `${event.entityId}:${event.occurrenceKey ?? date}`;
     if (event.type === "task-completed") {
       if (!completedOccurrences.has(occurrence)) {
         completedOccurrences.set(occurrence, date);
-        bucket.tasksCompleted += 1;
       }
     } else if (event.type === "task-reopened") {
-      const completedDate = completedOccurrences.get(occurrence);
-      if (completedDate) {
-        const completedBucket = buckets.get(completedDate);
-        if (completedBucket) {
-          completedBucket.tasksCompleted = Math.max(0, completedBucket.tasksCompleted - 1);
-        }
-        completedOccurrences.delete(occurrence);
-      }
+      completedOccurrences.delete(occurrence);
     } else if (event.type === "habit-checkin") {
       if (!habitOccurrences.has(occurrence)) {
         habitOccurrences.set(occurrence, date);
-        bucket.habitCheckins += 1;
       }
     } else if (event.type === "habit-unchecked") {
-      const checkinDate = habitOccurrences.get(occurrence);
-      if (checkinDate) {
-        const checkinBucket = buckets.get(checkinDate);
-        if (checkinBucket) {
-          checkinBucket.habitCheckins = Math.max(0, checkinBucket.habitCheckins - 1);
-        }
-        habitOccurrences.delete(occurrence);
-      }
+      habitOccurrences.delete(occurrence);
     } else if (event.type === "focus-completed") {
       if (!focusOccurrences.has(occurrence)) {
         const minutes = Math.max(0, event.minutes ?? 0);
         focusOccurrences.set(occurrence, { date, minutes });
-        bucket.focusMinutes += minutes;
       }
     } else if (event.type === "focus-deleted") {
-      const completed = focusOccurrences.get(occurrence);
-      if (completed) {
-        const completedBucket = buckets.get(completed.date);
-        if (completedBucket) {
-          completedBucket.focusMinutes = Math.max(0, completedBucket.focusMinutes - completed.minutes);
-        }
-        focusOccurrences.delete(occurrence);
-      }
+      focusOccurrences.delete(occurrence);
     } else if (event.type === "review-closed") {
-      bucket.reviewsClosed += 1;
+      const bucket = buckets.get(date);
+      if (bucket) bucket.reviewsClosed += 1;
     }
+  }
+  for (const date of completedOccurrences.values()) {
+    const bucket = buckets.get(date);
+    if (bucket) bucket.tasksCompleted += 1;
+  }
+  for (const date of habitOccurrences.values()) {
+    const bucket = buckets.get(date);
+    if (bucket) bucket.habitCheckins += 1;
+  }
+  for (const completed of focusOccurrences.values()) {
+    const bucket = buckets.get(completed.date);
+    if (bucket) bucket.focusMinutes += completed.minutes;
   }
   const daily = [...buckets.values()];
   for (const bucket of daily) {

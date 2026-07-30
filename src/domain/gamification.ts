@@ -26,6 +26,7 @@ const XP_BY_DIFFICULTY = [0, 10, 18, 30, 45, 65];
 export function deriveProgress(events: HelixEvent[]): PlayerProgress {
   const completedOccurrences = new Map<string, number>();
   const focusOccurrences = new Map<string, number>();
+  const rewardedChallenges = new Set<string>();
   let xp = 0;
   for (const event of [...events].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))) {
     const occurrence = `${event.entityId}:${event.occurrenceKey ?? localDateKeyFromInstant(event.occurredAt)}`;
@@ -59,8 +60,10 @@ export function deriveProgress(events: HelixEvent[]): PlayerProgress {
       const definition = frozenChallengeFromEvent(event);
       if (
         definition &&
+        !rewardedChallenges.has(event.entityId) &&
         challengeProgress(definition, events) >= definition.target
       ) {
+        rewardedChallenges.add(event.entityId);
         xp += definition.rewardXp;
       }
     }
@@ -197,37 +200,82 @@ export function challengeProgress(
   challenge: ChallengeDefinition,
   events: HelixEvent[],
 ): number {
+  return challengeContributions(challenge, events)
+    .reduce((sum, contribution) => sum + contribution.value, 0);
+}
+
+export interface ChallengeContribution {
+  label: string;
+  occurredAt: string;
+  entityId: string;
+  value: number;
+}
+
+export function challengeContributions(
+  challenge: ChallengeDefinition,
+  events: HelixEvent[],
+): ChallengeContribution[] {
   const ordered = [...events]
     .sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
   const inPeriod = ordered.filter(
     (event) => event.occurredAt >= challenge.startsAt && event.occurredAt <= challenge.endsAt,
   );
-  const tasks = new Set<string>();
-  const focus = new Map<string, number>();
+  const tasks = new Map<string, HelixEvent>();
+  const focus = new Map<string, HelixEvent>();
   for (const event of ordered) {
     const occurrence = `${event.entityId}:${event.occurrenceKey ?? localDateKeyFromInstant(event.occurredAt)}`;
     const eventInPeriod =
       event.occurredAt >= challenge.startsAt && event.occurredAt <= challenge.endsAt;
-    if (event.type === "task-completed" && eventInPeriod) tasks.add(occurrence);
+    if (event.type === "task-completed" && eventInPeriod) tasks.set(occurrence, event);
     else if (event.type === "task-reopened") tasks.delete(occurrence);
     else if (event.type === "focus-completed" && eventInPeriod) {
-      focus.set(occurrence, Math.max(0, event.minutes ?? 0));
+      focus.set(occurrence, event);
     }
     else if (event.type === "focus-deleted") focus.delete(occurrence);
   }
   if (challenge.metric === "focus-sessions") {
-    return [...focus.values()].filter((minutes) => minutes >= 25).length;
+    return [...focus.values()]
+      .filter((event) => Math.max(0, event.minutes ?? 0) >= 25)
+      .map((event) => ({
+        label: "有效专注",
+        occurredAt: event.occurredAt,
+        entityId: event.entityId,
+        value: 1,
+      }));
   }
   if (challenge.metric === "focus-minutes") {
-    return [...focus.values()].reduce((sum, minutes) => sum + minutes, 0);
+    return [...focus.values()].map((event) => ({
+      label: "专注分钟",
+      occurredAt: event.occurredAt,
+      entityId: event.entityId,
+      value: Math.max(0, event.minutes ?? 0),
+    }));
   }
   if (challenge.metric === "tasks") {
-    return tasks.size;
+    return [...tasks.values()].map((event) => ({
+      label: "完成任务",
+      occurredAt: event.occurredAt,
+      entityId: event.entityId,
+      value: 1,
+    }));
   }
   if (challenge.metric === "reviews") {
-    return inPeriod.filter((event) => event.type === "review-closed").length;
+    return inPeriod.filter((event) => event.type === "review-closed").map((event) => ({
+      label: "关闭复盘",
+      occurredAt: event.occurredAt,
+      entityId: event.entityId,
+      value: 1,
+    }));
   }
-  return new Set(inPeriod.map((event) => localDateKeyFromInstant(event.occurredAt))).size;
+  return [...new Map(inPeriod.map((event) => [
+    localDateKeyFromInstant(event.occurredAt),
+    event,
+  ])).entries()].map(([date, event]) => ({
+    label: "活跃日",
+    occurredAt: event.occurredAt,
+    entityId: date,
+    value: 1,
+  }));
 }
 
 function levelForXp(xp: number): number {

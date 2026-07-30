@@ -1,13 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { aggregateAnalytics } from "../src/domain/analytics";
-import {
-  adoptProjectLineageEdges,
-  upsertManagedEdge,
-  validateLineageCanvas,
-} from "../src/domain/canvas";
-import { assertDag, wouldCreateCycle } from "../src/domain/dag";
 import { deterministicEventId, EventLedger, type HelixEvent } from "../src/domain/events";
-import { challengeProgress, deriveProgress, rotatingChallenges } from "../src/domain/gamification";
+import {
+  challengeContributions,
+  challengeProgress,
+  deriveProgress,
+  rotatingChallenges,
+} from "../src/domain/gamification";
 import { InProgressRegistry } from "../src/domain/in-progress";
 import { journalPath, journalTemplate } from "../src/domain/journals";
 import { localDateKeyFromInstant } from "../src/domain/local-date";
@@ -29,91 +28,6 @@ describe("in progress registry", () => {
       "task-3",
     ]);
     expect(registry.list()).toHaveLength(4);
-  });
-});
-
-describe("project lineage", () => {
-  it("rejects cycles and preserves unknown canvas data", () => {
-    assertDag(["a", "b", "c"], [
-      { from: "a", to: "b" },
-      { from: "b", to: "c" },
-    ]);
-    expect(
-      wouldCreateCycle(
-        [
-          { from: "a", to: "b" },
-          { from: "b", to: "c" },
-        ],
-        { from: "c", to: "a" },
-      ),
-    ).toBe(true);
-    const document = {
-      custom: { preserved: true },
-      nodes: [
-        { id: "a", type: "file", x: 1, y: 2, width: 300, height: 200, file: "a.md", helixManaged: true, helixProjectId: "project-a" },
-        { id: "b", type: "file", x: 4, y: 5, width: 300, height: 200, file: "b.md", helixManaged: true, helixProjectId: "project-b" },
-      ],
-      edges: [{ id: "custom", fromNode: "a", toNode: "b", color: "1" }],
-    };
-    const next = upsertManagedEdge(document, {
-      id: "managed",
-      fromNode: "a",
-      toNode: "b",
-    });
-    validateLineageCanvas(next);
-    expect(next.custom).toEqual({ preserved: true });
-    expect(next.edges.find((edge) => edge.id === "custom")).toMatchObject({ color: "1" });
-    expect(next.edges.find((edge) => edge.id === "managed")).toMatchObject({
-      label: "derives-from",
-      helixManaged: true,
-    });
-  });
-
-  it("adopts an unlabeled edge drawn between Helix project nodes and rejects a cycle", () => {
-    const document = {
-      nodes: [
-        { id: "a", type: "file", x: 0, y: 0, width: 300, height: 200, helixManaged: true, helixProjectId: "project-a" },
-        { id: "b", type: "file", x: 400, y: 0, width: 300, height: 200, helixManaged: true, helixProjectId: "project-b" },
-      ],
-      edges: [{ id: "drawn", fromNode: "a", toNode: "b" }],
-    };
-    expect(adoptProjectLineageEdges(document).edges[0]).toMatchObject({
-      helixManaged: true,
-      label: "derives-from",
-    });
-    const recovered = adoptProjectLineageEdges({
-        ...document,
-        edges: [
-          ...document.edges,
-          { id: "cycle", fromNode: "b", toNode: "a" },
-        ],
-      });
-    expect(recovered.edges.map((edge) => edge.id)).toEqual(["drawn"]);
-  });
-
-  it("rejects an existing managed edge whose endpoint is missing", () => {
-    expect(() =>
-      validateLineageCanvas({
-        nodes: [
-          { id: "a", type: "file", x: 0, y: 0, width: 300, height: 200, helixManaged: true, helixProjectId: "project-a" },
-        ],
-        edges: [
-          { id: "dangling", fromNode: "a", toNode: "missing", helixManaged: true },
-        ],
-      }),
-    ).toThrow(/缺失或非 Helix/);
-  });
-
-  it("rejects duplicate project identities even when Canvas node IDs differ", () => {
-    expect(() =>
-      validateLineageCanvas({
-        nodes: [
-          { id: "a", type: "file", x: 0, y: 0, width: 300, height: 200, helixManaged: true, helixProjectId: "same" },
-          { id: "b", type: "file", x: 400, y: 0, width: 300, height: 200, helixManaged: true, helixProjectId: "same" },
-        ],
-        edges: [],
-      }),
-    ).toThrow(/重复 helixProjectId/);
   });
 });
 
@@ -256,6 +170,17 @@ describe("event analytics and rewards", () => {
     expect(deriveProgress([...completed, award]).xp).toBe(
       deriveProgress(completed).xp + challenge.rewardXp,
     );
+    expect(deriveProgress([
+      ...completed,
+      award,
+      {
+        ...award,
+        id: "duplicate-challenge-award",
+        occurredAt: new Date(
+          new Date(award.occurredAt).getTime() + 1_000,
+        ).toISOString(),
+      },
+    ]).xp).toBe(deriveProgress(completed).xp + challenge.rewardXp);
     const reopened: HelixEvent = {
       id: "challenge-reopen",
       type: "task-reopened",
@@ -268,9 +193,23 @@ describe("event analytics and rewards", () => {
     expect(challengeProgress(challenge, [...completed, reopened])).toBe(
       challenge.target - 1,
     );
+    expect(challengeContributions(challenge, [...completed, reopened])).toHaveLength(
+      challenge.target - 1,
+    );
     expect(deriveProgress([...completed, award, reopened]).xp).toBe(
       deriveProgress([...completed, reopened]).xp,
     );
+  });
+
+  it("projects reversals outside the requested month into the original heatmap", () => {
+    const events: HelixEvent[] = [
+      { id: "done", type: "task-completed", entityId: "task-1", occurrenceKey: "r1", occurredAt: "2026-07-30T08:00:00Z" },
+      { id: "reopen", type: "task-reopened", entityId: "task-1", occurrenceKey: "r1", occurredAt: "2026-08-02T08:00:00Z" },
+    ];
+    expect(aggregateAnalytics(events, {
+      from: "2026-07-01",
+      to: "2026-07-31",
+    }).totalTasks).toBe(0);
   });
 
   it("uses a deterministic full SHA-256 digest", () => {

@@ -12,7 +12,6 @@ describe("recoverable project creation identity", () => {
       title: "A/B",
       createdAt: "2026-07-30T00:00:00Z",
       didaProjectId: "dida-1",
-      activeCycleLink: "[[Cycle-01]]",
     });
     expect(() =>
       assertExistingProjectIdentity(content, { title: "A/B", didaProjectId: "dida-1" }, "Project.md"),

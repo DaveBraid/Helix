@@ -38,7 +38,8 @@ export class HelixVaultRepository {
     if (this.vault.getAbstractFileByPath(normalized)) {
       throw new Error(`目标已经存在：${normalized}`);
     }
-    await this.ensureParent(normalized);
+    beforeWrite?.();
+    await this.ensureParent(normalized, beforeWrite);
     beforeWrite?.();
     await this.vault.create(normalized, content);
     return { path: normalized, content, hash: stableHash(content) };
@@ -65,13 +66,43 @@ export class HelixVaultRepository {
     };
   }
 
-  private async ensureParent(path: string): Promise<void> {
+  async trashIfUnchanged(
+    revision: VaultRevision,
+    beforeWrite?: () => void,
+    options: { requireExisting?: boolean } = {},
+  ): Promise<void> {
+    const current = await this.read(revision.path);
+    if (!current) {
+      if (options.requireExisting) {
+        throw new VaultWriteConflictError(
+          revision.path,
+          revision.hash,
+          "<missing>",
+        );
+      }
+      return;
+    }
+    if (current.hash !== revision.hash) {
+      throw new VaultWriteConflictError(
+        revision.path,
+        revision.hash,
+        current.hash,
+      );
+    }
+    const file = this.vault.getAbstractFileByPath(revision.path);
+    if (!(file instanceof TFile)) throw new Error(`目标不是文件：${revision.path}`);
+    beforeWrite?.();
+    await this.vault.trash(file, false);
+  }
+
+  private async ensureParent(path: string, beforeWrite?: () => void): Promise<void> {
     const segments = path.split("/");
     segments.pop();
     let current = "";
     for (const segment of segments) {
       current = current ? `${current}/${segment}` : segment;
       if (!this.vault.getAbstractFileByPath(current)) {
+        beforeWrite?.();
         await this.vault.createFolder(current);
       }
     }

@@ -1,7 +1,8 @@
 import type { HelixCycle, HelixProject } from "./entities";
 
 export const PROJECT_KIND = "helix-project";
-export const CYCLE_KIND = "helix-cycle";
+export const STAGE_KIND = "helix-stage";
+export const LEGACY_CYCLE_KIND = "helix-cycle";
 
 export interface ProjectFrontmatter {
   "helix-kind": typeof PROJECT_KIND;
@@ -16,12 +17,12 @@ export interface ProjectFrontmatter {
 }
 
 export interface CycleFrontmatter {
-  "helix-kind": typeof CYCLE_KIND;
+  "helix-kind": typeof STAGE_KIND;
   "helix-id": string;
+  "helix-project-id": string;
   "helix-project": string;
   "helix-sequence": number;
   "helix-status": HelixCycle["status"];
-  "helix-predecessor"?: string;
   "helix-started"?: string;
   "helix-closed"?: string;
 }
@@ -31,15 +32,12 @@ export function projectTemplate(input: {
   title: string;
   createdAt: string;
   didaProjectId?: string;
-  activeCycleLink?: string;
 }): string {
   return `---
 helix-kind: ${PROJECT_KIND}
 helix-id: ${input.id}
 helix-status: active
 ${input.didaProjectId ? `helix-dida-project-id: ${input.didaProjectId}\n` : ""}
-helix-parents: []
-${input.activeCycleLink ? `helix-active-cycle: "${input.activeCycleLink}"\n` : ""}
 helix-created: ${input.createdAt}
 helix-updated: ${input.createdAt}
 ---
@@ -51,7 +49,7 @@ helix-updated: ${input.createdAt}
 
 ## 当前状态
 
-- 当前 Cycle：
+- 当前阶段：
 - 下一里程碑：
 - 主要风险：
 
@@ -62,23 +60,25 @@ helix-updated: ${input.createdAt}
 
 export function cycleTemplate(input: {
   id: string;
+  projectId?: string;
   projectLink: string;
   sequence: number;
   startedAt: string;
-  predecessorLink?: string;
   status?: HelixCycle["status"];
+  stageTitle?: string;
 }): string {
-  const padded = String(input.sequence).padStart(2, "0");
+  const stageTitle = input.stageTitle?.trim() || "未命名阶段";
   return `---
-helix-kind: ${CYCLE_KIND}
+helix-kind: ${STAGE_KIND}
 helix-id: ${input.id}
+${input.projectId ? `helix-project-id: ${input.projectId}\n` : ""}
 helix-project: "${input.projectLink}"
 helix-sequence: ${input.sequence}
 helix-status: ${input.status ?? "active"}
-${input.predecessorLink ? `helix-predecessor: "${input.predecessorLink}"\n` : ""}helix-started: ${input.startedAt}
+helix-started: ${input.startedAt}
 ---
 
-# Cycle ${padded}
+# 阶段 ${input.sequence} · ${stageTitle}
 
 > [!question] 本轮起因
 > 哪个观察、问题或上一轮结论触发了本轮？

@@ -12,12 +12,13 @@ import {
   journalPeriodBounds,
   journalTemplate,
 } from "./domain/journals";
-import { cycleTemplate, projectTemplate } from "./domain/projects";
 import {
-  assertExistingInitialCycleIdentity,
-  assertExistingProjectIdentity,
-} from "./domain/project-identity";
-import { assertUniqueDidaProjectMapping } from "./domain/project-mapping";
+  CYCLE_RELATION_LABELS,
+  stageCreationIntent,
+  type CycleRelation,
+  type CycleRelationKind,
+  type StageCreationIntent,
+} from "./domain/cycle-graph";
 import type { JournalPeriod } from "./domain/entities";
 import {
   deterministicEventId,
@@ -25,7 +26,11 @@ import {
 import { aggregateAnalytics } from "./domain/analytics";
 import { patchManagedFrontmatter } from "./storage/frontmatter";
 import { HelixService } from "./services/helix-service";
-import { LineageService } from "./services/lineage-service";
+import { ProjectWorkspaceService } from "./services/project-workspace";
+import type {
+  ProjectWorkspaceMigrationItem,
+  ProjectWorkspaceProject,
+} from "./services/project-workspace";
 import { HelixDataStore } from "./storage/data-store";
 import {
   beginDataGeneration,
@@ -37,8 +42,6 @@ import { HelixSecretStore } from "./storage/secrets";
 import { HelixVaultRepository } from "./storage/vault-repository";
 import { HELIX_VIEW_TYPE, HelixView } from "./ui/helix-view";
 import { HelixSettingTab } from "./ui/settings-tab";
-import { CancelableTimer } from "./services/cancelable-timer";
-import { lineageBatchDecision } from "./services/lineage-batch";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = { ...DEFAULT_SETTINGS };
@@ -46,28 +49,25 @@ export default class HelixPlugin extends Plugin {
   secrets!: HelixSecretStore;
   service!: HelixService;
   vaultRepository!: HelixVaultRepository;
-  lineageService!: LineageService;
+  projectWorkspace!: ProjectWorkspaceService;
   private syncIntervalId: number | null = null;
-  private lineageTimer = new CancelableTimer();
   private unloaded = false;
   private recoveryMode = false;
-  private knownProjectPaths = new Set<string>();
   private dataGeneration!: DataGeneration;
-  private pendingLineageCanvas = false;
-  private pendingLineageProjects = false;
+  private projectRefreshTimer: number | null = null;
+  private projectMutationDepth = 0;
+  private projectRefreshPending = false;
 
   async onload(): Promise<void> {
     this.unloaded = false;
-    this.pendingLineageCanvas = false;
-    this.pendingLineageProjects = false;
-    this.lineageTimer = new CancelableTimer();
     this.dataGeneration = beginDataGeneration();
     this.store = new HelixDataStore(this, this.dataGeneration);
     this.secrets = new HelixSecretStore(this.app);
     this.vaultRepository = new HelixVaultRepository(this.app.vault);
-    this.lineageService = new LineageService(
+    this.projectWorkspace = new ProjectWorkspaceService(
       this.app,
       this.vaultRepository,
+      () => this.settings.rootFolder,
       () => this.settings.lineageCanvasPath,
     );
     const data = await this.store.load();
@@ -76,21 +76,19 @@ export default class HelixPlugin extends Plugin {
     this.service = new HelixService(this.store, this.secrets);
     await this.service.initialize();
     if (!this.recoveryMode) await this.recoverClosedReviewEvents();
-    if (!this.recoveryMode) {
-      try {
-        this.lineageService.assertProjectIntegrity();
-        this.knownProjectPaths = new Set(this.lineageService.projectPaths());
-      } catch (error) {
-        await this.recordLineageConflict(error, "project-integrity");
-      }
-    }
 
     this.registerView(
       HELIX_VIEW_TYPE,
       (leaf) => new HelixView(leaf, this.service, this.store, {
         openReview: (period) => this.openJournal(period),
         createProject: () => this.showCreateProjectModal(),
-        resolveLineage: (choice) => this.resolveLineageConflict(choice),
+        createCycle: (projectId, sourceCycleIds) =>
+          this.showCreateCycleModal(projectId, sourceCycleIds),
+        deleteCycle: (cycleId) => this.showDeleteCycleModal(cycleId),
+        manageRelation: (relationId) => this.showManageRelationModal(relationId),
+        openProjectFile: (path) => this.openFile(path),
+        projectWorkspace: this.projectWorkspace,
+        reviewLegacyMigration: () => this.showLegacyMigrationModal(),
       }),
     );
     this.addRibbonIcon("orbit", "打开 Helix", () => void this.activateView());
@@ -150,92 +148,28 @@ export default class HelixPlugin extends Plugin {
         return true;
       },
     });
-    this.addCommand({
-      id: "open-lineage-canvas",
-      name: "打开项目继承 Canvas",
-      callback: () => void this.openLineageCanvas(),
-    });
-    this.addCommand({
-      id: "advance-active-cycle",
-      name: "关闭当前 Cycle 并创建下一轮",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        const isCycle =
-          !!file &&
-          this.app.metadataCache.getFileCache(file)?.frontmatter?.["helix-kind"] ===
-            "helix-cycle";
-        if (!isCycle) return false;
-        if (!checking && file) {
-          void this.advanceCycle(file).catch((error) => {
-            new Notice(error instanceof Error ? error.message : String(error), 8_000);
-          });
-        }
-        return true;
-      },
-    });
-    this.addCommand({
-      id: "rebuild-lineage-canvas",
-      name: "从项目笔记重建项目谱系 Canvas",
-      callback: () =>
-        void this.resolveLineageConflict("projects")
-          .then(() => this.openLineageCanvas())
-          .catch((error) => new Notice(error instanceof Error ? error.message : String(error))),
-    });
-    this.addCommand({
-      id: "apply-lineage-canvas",
-      name: "将项目谱系 Canvas 写回项目父级",
-      callback: () =>
-        void this.resolveLineageConflict("canvas")
-          .then(() => new Notice("项目谱系已写回项目笔记"))
-          .catch((error) => new Notice(error instanceof Error ? error.message : String(error))),
-    });
     this.addSettingTab(new HelixSettingTab(this.app, this));
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (this.lineageService.consumeSelfWrite(file.path)) return;
-        const isCanvas = file.path === normalizePath(this.settings.lineageCanvasPath);
-        const wasProject = this.knownProjectPaths.has(normalizePath(file.path));
-        const isProject = this.isHelixProjectFile(file);
-        if (isProject) this.knownProjectPaths.add(normalizePath(file.path));
-        else this.knownProjectPaths.delete(normalizePath(file.path));
-        if (isCanvas || isProject || wasProject) this.scheduleLineageSync(isCanvas);
+        if (this.isProjectWorkspaceFile(file.path)) this.scheduleProjectRefresh();
       }),
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
-        if (this.lineageService.consumeSelfWrite(file.path)) return;
-        const isCanvas = file.path === normalizePath(this.settings.lineageCanvasPath);
-        const isProject = this.isHelixProjectFile(file);
-        if (isProject) this.knownProjectPaths.add(normalizePath(file.path));
-        if (isCanvas || isProject) this.scheduleLineageSync(isCanvas);
+        if (this.isProjectWorkspaceFile(file.path)) this.scheduleProjectRefresh();
       }),
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        const isCanvas = file.path === normalizePath(this.settings.lineageCanvasPath);
-        const normalized = normalizePath(file.path);
-        const wasProject = this.knownProjectPaths.delete(normalized);
-        if (isCanvas || wasProject || this.isHelixProjectPath(file.path)) {
-          this.scheduleLineageSync(isCanvas);
-        }
+        if (this.isProjectWorkspaceFile(file.path)) this.scheduleProjectRefresh();
       }),
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (this.lineageService.consumeSelfWrite(file.path)) return;
-        const canvasPath = normalizePath(this.settings.lineageCanvasPath);
-        const touchesCanvas = oldPath === canvasPath || file.path === canvasPath;
-        const wasProject = this.knownProjectPaths.delete(normalizePath(oldPath));
-        const isProject = this.isHelixProjectFile(file);
-        if (isProject) this.knownProjectPaths.add(normalizePath(file.path));
         if (
-          touchesCanvas ||
-          wasProject ||
-          this.isHelixProjectPath(oldPath) ||
-          isProject
-        ) {
-          this.scheduleLineageSync(touchesCanvas);
-        }
+          this.isProjectWorkspaceFile(file.path) ||
+          this.isProjectWorkspaceFile(oldPath)
+        ) this.scheduleProjectRefresh();
       }),
     );
 
@@ -244,11 +178,12 @@ export default class HelixPlugin extends Plugin {
 
   onunload(): void {
     this.unloaded = true;
-    this.pendingLineageCanvas = false;
-    this.pendingLineageProjects = false;
-    this.lineageTimer.dispose();
-    this.lineageService?.dispose();
+    if (this.projectRefreshTimer !== null) {
+      window.clearTimeout(this.projectRefreshTimer);
+      this.projectRefreshTimer = null;
+    }
     this.service?.dispose();
+    this.projectWorkspace?.dispose();
     if (this.dataGeneration) invalidateDataGeneration(this.dataGeneration);
     this.store?.dispose();
     if (this.syncIntervalId !== null) {
@@ -298,64 +233,174 @@ export default class HelixPlugin extends Plugin {
       this.service.snapshot().projects,
       async (title, didaProjectId) => {
         this.assertWritable();
-        const now = new Date().toISOString();
-        const safeTitle = sanitizeFileName(title);
-        const folder = normalizePath(`${this.settings.rootFolder}/Projects/${safeTitle}`);
-        const path = `${folder}/Project.md`;
-        const cyclePath = `${folder}/Cycle-01.md`;
-        assertUniqueDidaProjectMapping(
-          this.app.vault.getMarkdownFiles().flatMap((file) => {
-            const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-            if (frontmatter?.["helix-kind"] !== "helix-project") return [];
-            return [{
-              path: file.path,
-              didaProjectId:
-                typeof frontmatter["helix-dida-project-id"] === "string"
-                  ? frontmatter["helix-dida-project-id"]
-                  : undefined,
-            }];
-          }),
-          didaProjectId,
-          path,
-        );
-        let revision = await this.vaultRepository.read(path);
-        if (revision) {
-          assertExistingProjectIdentity(revision.content, { title, didaProjectId }, path);
-        }
-        let cycle = await this.vaultRepository.read(cyclePath);
-        if (cycle) assertExistingInitialCycleIdentity(cycle.content, cyclePath);
-        else {
-          cycle = await this.vaultRepository.create(
-            cyclePath,
-            cycleTemplate({
-              id: crypto.randomUUID(),
-              projectLink: "[[Project]]",
-              sequence: 1,
-              startedAt: now,
-            }),
-          );
-        }
-        if (!revision) {
-          revision = await this.vaultRepository.create(
-            path,
-            projectTemplate({
-              id: crypto.randomUUID(),
-              title,
-              createdAt: now,
-              didaProjectId,
-              activeCycleLink: "[[Cycle-01]]",
-            }),
-          );
-        }
-        await this.openFile(revision.path);
-        this.scheduleLineageSync(false);
-        new Notice("项目与首个 Cycle 已创建。请在滴答项目映射后生成任务。");
+        await this.withProjectMutation(() =>
+          this.projectWorkspace.createProject(title, didaProjectId));
+        await this.service.refreshPersistedEvents();
+        new Notice("项目和阶段 1 已加入当前工作区");
       },
     ).open();
   }
 
   showCreateProjectModal(): void {
     this.openProjectModal();
+  }
+
+  private showCreateCycleModal(projectId: string, sourceCycleIds: string[]): void {
+    if (this.recoveryMode) {
+      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能创建阶段", 8_000);
+      return;
+    }
+    void this.projectWorkspace.snapshot()
+      .then((snapshot) => {
+        const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+        if (!project) throw new Error("找不到项目");
+        const intent = stageCreationIntent(sourceCycleIds, snapshot.relations);
+        const sourceCycles = intent.predecessorIds.map((sourceId) => {
+          const owner = snapshot.projects.find((candidate) =>
+            candidate.cycles.some((cycle) => cycle.id === sourceId));
+          const cycle = owner?.cycles.find((candidate) => candidate.id === sourceId);
+          if (!owner || !cycle) throw new Error("找不到来源阶段");
+          return { project: owner, cycle };
+        });
+        const crossProject = sourceCycles.some((source) =>
+          source.project.id !== project.id);
+        new CyclePromptModal(
+          this.app,
+          project,
+          sourceCycles,
+          intent,
+          crossProject,
+          snapshot.nextStageSequenceByProject[project.id]!,
+          async (stageTitle, crossProjectConfirmed) => {
+            this.assertWritable();
+            await this.withProjectMutation(() =>
+              this.projectWorkspace.createCycle(
+                projectId,
+                "auto",
+                intent.predecessorIds,
+                {
+                  confirmCrossProject: crossProjectConfirmed,
+                  expectedAutoIntent: {
+                    relation: intent.relation,
+                    convertedInheritanceRelationIds:
+                      intent.convertedInheritanceRelationIds,
+                  },
+                  stageTitle,
+                },
+              ));
+            await this.service.refreshPersistedEvents();
+            new Notice(`${CYCLE_RELATION_LABELS[intent.relation]}阶段已加入当前工作区`);
+          },
+        ).open();
+      })
+      .catch((error) => {
+        new Notice(error instanceof Error ? error.message : String(error), 8_000);
+      });
+  }
+
+  private showDeleteCycleModal(cycleId: string): void {
+    if (this.recoveryMode) {
+      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能删除阶段", 8_000);
+      return;
+    }
+    void this.projectWorkspace.snapshot()
+      .then((snapshot) => {
+        const owner = snapshot.projects.find((project) =>
+          project.cycles.some((cycle) => cycle.id === cycleId));
+        const cycle = owner?.cycles.find((candidate) => candidate.id === cycleId);
+        if (!owner || !cycle) throw new Error("找不到需要删除的阶段");
+        new DeleteCycleModal(
+          this.app,
+          owner,
+          snapshot.projects,
+          cycle,
+          snapshot.relations,
+          async () => {
+            this.assertWritable();
+            await this.withProjectMutation(() =>
+              this.projectWorkspace.deleteCycle(cycle.id));
+            new Notice("阶段笔记已移入废纸篓，Canvas 节点与相关关系已删除");
+          },
+        ).open();
+      })
+      .catch((error) => {
+        new Notice(error instanceof Error ? error.message : String(error), 8_000);
+      });
+  }
+
+  private showManageRelationModal(relationId: string): void {
+    if (this.recoveryMode) {
+      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能修改关系", 8_000);
+      return;
+    }
+    void this.projectWorkspace.snapshot()
+      .then((snapshot) => {
+        const relation = snapshot.relations.find((candidate) => candidate.id === relationId);
+        if (!relation) throw new Error("找不到需要管理的阶段关系");
+        new RelationPromptModal(
+          this.app,
+          relation,
+          snapshot.relations,
+          snapshot.projects,
+          async (kind, predecessorIds, crossProjectConfirmed) => {
+            this.assertWritable();
+            await this.withProjectMutation(() =>
+              this.projectWorkspace.replaceRelation(
+                relation.id,
+                kind,
+                predecessorIds,
+                { confirmCrossProject: crossProjectConfirmed },
+              ));
+            new Notice("阶段关系已更新");
+          },
+          async () => {
+            this.assertWritable();
+            await this.withProjectMutation(() =>
+              this.projectWorkspace.deleteRelation(relation.id));
+            new Notice("阶段关系已删除");
+          },
+        ).open();
+      })
+      .catch((error) => {
+        new Notice(error instanceof Error ? error.message : String(error), 8_000);
+      });
+  }
+
+  private showLegacyMigrationModal(): void {
+    void Promise.all([
+      this.projectWorkspace.snapshot(),
+      this.store.snapshot(),
+    ])
+      .then(([snapshot, persisted]) => {
+        if (!snapshot.migrationRequired) {
+          new Notice("没有待确认的旧项目数据");
+          return;
+        }
+        new LegacyMigrationModal(
+          this.app,
+          snapshot.migrationItems,
+          Boolean(persisted.lineageConflict),
+          async (ids, archiveLegacyConflict) => {
+            this.assertWritable();
+            await this.withProjectMutation(() =>
+              this.projectWorkspace.acknowledgeLegacyMigration(ids));
+            if (archiveLegacyConflict) {
+              await this.store.mutate((data) => {
+                data.lineageConflict = undefined;
+              });
+            }
+            await this.service.refreshPersistedEvents();
+            new Notice(
+              archiveLegacyConflict
+                ? "旧数据已确认，旧版谱系冲突已归档"
+                : "旧数据已确认，阶段节点身份已升级",
+            );
+          },
+        ).open();
+      })
+      .catch((error) => {
+        new Notice(error instanceof Error ? error.message : String(error), 8_000);
+      });
   }
 
   private async openJournal(period: JournalPeriod): Promise<void> {
@@ -397,104 +442,6 @@ export default class HelixPlugin extends Plugin {
       );
     }
     await this.openFile(path);
-  }
-
-  private async openLineageCanvas(): Promise<void> {
-    const path = normalizePath(this.settings.lineageCanvasPath);
-    if (!(await this.vaultRepository.read(path))) {
-      this.assertWritable();
-      await this.vaultRepository.create(path, JSON.stringify({ nodes: [], edges: [] }, null, 2));
-    }
-    await this.openFile(path);
-  }
-
-  private async advanceCycle(file: TFile): Promise<void> {
-    this.assertWritable();
-    const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    const currentStatus = frontmatter?.["helix-status"];
-    if (currentStatus !== "active" && currentStatus !== "closed") {
-      throw new Error("只有 active 或推进中断后的 closed Cycle 可以推进到下一轮");
-    }
-    if (!frontmatter) throw new Error("当前 Cycle 缺少 Helix 元数据");
-    const sequence = Number(frontmatter["helix-sequence"]);
-    const cycleId = String(frontmatter["helix-id"] ?? "");
-    if (!Number.isInteger(sequence) || sequence < 1 || !cycleId) {
-      throw new Error("当前 Cycle 的 Helix 元数据不完整");
-    }
-    const folder = file.parent?.path;
-    if (!folder) throw new Error("Cycle 必须位于项目文件夹内");
-    const nextSequence = sequence + 1;
-    const nextName = `Cycle-${String(nextSequence).padStart(2, "0")}.md`;
-    const nextPath = normalizePath(`${folder}/${nextName}`);
-    const now = String(frontmatter["helix-closed"] ?? new Date().toISOString());
-    let nextRevision = await this.vaultRepository.read(nextPath);
-    if (nextRevision) {
-      assertHelixKind(nextRevision.content, "helix-cycle", nextPath);
-      const nextSequenceMatch = /^helix-sequence:\s*(\d+)\s*$/m.exec(nextRevision.content);
-      const predecessorMatch = /^helix-predecessor:\s*"?([^"\r\n]+)"?\s*$/m.exec(nextRevision.content);
-      if (
-        Number(nextSequenceMatch?.[1]) !== nextSequence ||
-        predecessorMatch?.[1] !== `[[${file.basename}]]`
-      ) {
-        throw new Error(`下一轮文件与当前 Cycle 不匹配，拒绝覆盖：${nextPath}`);
-      }
-    } else {
-      nextRevision = await this.vaultRepository.create(
-        nextPath,
-        cycleTemplate({
-          id: crypto.randomUUID(),
-          projectLink: String(frontmatter["helix-project"] ?? "[[Project]]"),
-          sequence: nextSequence,
-          startedAt: now,
-          predecessorLink: `[[${file.basename}]]`,
-          status: "planned",
-        }),
-      );
-    }
-    const current = await this.vaultRepository.read(file.path);
-    if (!current) throw new Error("当前 Cycle 在推进过程中被删除");
-    if (currentStatus === "active") {
-      await this.vaultRepository.compareAndWrite(
-        current,
-        patchManagedFrontmatter(current.content, {
-          "helix-status": "closed",
-          "helix-closed": now,
-        }),
-      );
-    }
-    const projectPath = normalizePath(`${folder}/Project.md`);
-    const project = await this.vaultRepository.read(projectPath);
-    if (project) {
-      await this.vaultRepository.compareAndWrite(
-        project,
-        patchManagedFrontmatter(project.content, {
-          "helix-active-cycle": `[[${nextName.replace(/\.md$/, "")}]]`,
-          "helix-updated": now,
-        }),
-      );
-    }
-    const activeNext = /^helix-status:\s*"?active"?\s*$/m.test(nextRevision.content)
-      ? nextRevision
-      : await this.vaultRepository.compareAndWrite(
-          nextRevision,
-          patchManagedFrontmatter(nextRevision.content, {
-            "helix-status": "active",
-          }),
-        );
-    await this.service.appendLocalEvents([
-      {
-        id: deterministicEventId({
-          type: "cycle-closed",
-          entityId: cycleId,
-          occurredAt: now,
-        }),
-        type: "cycle-closed",
-        entityId: cycleId,
-        occurredAt: now,
-      },
-    ]);
-    await this.openFile(activeNext.path);
-    new Notice(`Cycle ${String(sequence).padStart(2, "0")} 已关闭，下一轮已创建`);
   }
 
   private async closeReview(file: TFile): Promise<void> {
@@ -552,98 +499,49 @@ export default class HelixPlugin extends Plugin {
     );
   }
 
-  private scheduleLineageSync(fromCanvas: boolean): void {
-    if (this.recoveryMode) return;
-    if (fromCanvas) this.pendingLineageCanvas = true;
-    else this.pendingLineageProjects = true;
-    this.lineageTimer.schedule(() => {
-      if (this.unloaded) return;
-      const applyCanvas = this.pendingLineageCanvas;
-      const rebuildProjects = this.pendingLineageProjects;
-      this.pendingLineageCanvas = false;
-      this.pendingLineageProjects = false;
-      const operation = async () => {
-        const decision = lineageBatchDecision(applyCanvas, rebuildProjects);
-        if (decision === "manual-conflict") {
-          await this.store.mutate((data) => {
-            data.lineageConflict ??= {
-              detectedAt: new Date().toISOString(),
-              canvasPath: normalizePath(this.settings.lineageCanvasPath),
-              kind: "lineage-concurrent",
-              message:
-                "Canvas 与项目笔记在同一窗口内都被修改。Helix 不会静默选择胜方，请检查两侧后明确选择。",
-            };
-          });
-          await this.service.refreshPersistedEvents();
-          new Notice(
-            "Canvas 与项目笔记在同一窗口内都被修改，Helix 已暂停谱系同步。请人工选择“将 Canvas 写回项目父级”或“从项目笔记重建 Canvas”。",
-            12_000,
-          );
-          return;
-        }
-        if ((await this.store.snapshot()).lineageConflict) return;
-        if (decision === "apply-canvas") await this.lineageService.applyCanvasToProjects();
-        if (decision === "rebuild-canvas") await this.lineageService.rebuildCanvasFromProjects();
-        this.knownProjectPaths = new Set(this.lineageService.projectPaths());
-      };
-      void operation().catch(async (error) => {
-        console.error("Helix lineage sync paused", error);
-        await this.recordLineageConflict(error, "lineage-write");
-        new Notice(
-          `Helix 项目谱系同步已暂停：${error instanceof Error ? error.message : String(error)}`,
-          10_000,
-        );
-      });
-    }, 750);
-  }
-
-  private async resolveLineageConflict(
-    choice: "canvas" | "projects",
-  ): Promise<void> {
-    this.assertWritable();
-    try {
-      if (choice === "canvas") await this.lineageService.applyCanvasToProjects();
-      else await this.lineageService.rebuildCanvasFromProjects();
-      this.knownProjectPaths = new Set(this.lineageService.projectPaths());
-      await this.store.mutate((data) => {
-        delete data.lineageConflict;
-      });
-      await this.service.refreshPersistedEvents();
-    } catch (error) {
-      await this.recordLineageConflict(error, "lineage-write");
-      throw error;
-    }
-  }
-
-  private async recordLineageConflict(
-    error: unknown,
-    kind: "project-integrity" | "lineage-write",
-  ): Promise<void> {
+  private scheduleProjectRefresh(): void {
     if (this.unloaded) return;
-    const message = error instanceof Error ? error.message : String(error);
-    await this.store.mutate((data) => {
-      data.lineageConflict = {
-        detectedAt: new Date().toISOString(),
-        canvasPath: normalizePath(this.settings.lineageCanvasPath),
-        kind,
-        message,
-      };
-    });
-    if (this.service) await this.service.refreshPersistedEvents();
-  }
-
-  private isHelixProjectFile(file: { path: string }): boolean {
-    if (file instanceof TFile) {
-      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-      if (frontmatter?.["helix-kind"] === "helix-project") return true;
+    if (this.projectMutationDepth > 0) {
+      this.projectRefreshPending = true;
+      return;
     }
-    return this.isHelixProjectPath(file.path);
+    if (this.projectRefreshTimer !== null) {
+      window.clearTimeout(this.projectRefreshTimer);
+    }
+    this.projectRefreshTimer = window.setTimeout(() => {
+      this.projectRefreshTimer = null;
+      if (!this.unloaded) void this.service.refreshPersistedEvents();
+    }, 200);
   }
 
-  private isHelixProjectPath(path: string): boolean {
+  private async withProjectMutation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.projectMutationDepth === 0 && this.projectRefreshTimer !== null) {
+      window.clearTimeout(this.projectRefreshTimer);
+      this.projectRefreshTimer = null;
+      this.projectRefreshPending = true;
+    }
+    this.projectMutationDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this.projectMutationDepth -= 1;
+      if (this.projectMutationDepth === 0 && this.projectRefreshPending) {
+        this.projectRefreshPending = false;
+        this.scheduleProjectRefresh();
+      }
+    }
+  }
+
+  private isProjectWorkspaceFile(path: string): boolean {
     const projectsRoot = normalizePath(`${this.settings.rootFolder}/Projects`);
     const normalized = normalizePath(path);
-    return normalized.startsWith(`${projectsRoot}/`) && normalized.endsWith("/Project.md");
+    return (
+      normalized === normalizePath(this.settings.lineageCanvasPath) ||
+      (
+        normalized.startsWith(`${projectsRoot}/`) &&
+        normalized.endsWith(".md")
+      )
+    );
   }
 
   private assertWritable(): void {
@@ -658,13 +556,6 @@ export default class HelixPlugin extends Plugin {
     if (!(file instanceof TFile)) throw new Error(`无法打开文件：${path}`);
     const leaf: WorkspaceLeaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(file);
-  }
-}
-
-function assertHelixKind(content: string, expected: string, path: string): void {
-  const match = /^helix-kind:\s*"?([^"\r\n]+)"?\s*$/m.exec(content);
-  if (match?.[1] !== expected) {
-    throw new Error(`已有文件不是 ${expected}，拒绝覆盖：${path}`);
   }
 }
 
@@ -684,7 +575,7 @@ class ProjectPromptModal extends Modal {
     this.setTitle("创建 Helix 项目");
     new Setting(this.contentEl)
       .setName("项目名称")
-      .setDesc("将创建稳定项目笔记和首个不可变 Cycle。")
+      .setDesc("将创建稳定项目笔记和首个阶段。")
       .addText((text) =>
         text.setPlaceholder("例如：强化学习论文实验").onChange((value) => {
           this.title = value;
@@ -703,7 +594,7 @@ class ProjectPromptModal extends Modal {
     const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
     const cancel = actions.createEl("button", { text: "取消" });
     cancel.addEventListener("click", () => this.close());
-    const confirm = actions.createEl("button", { cls: "mod-cta", text: "创建项目与 Cycle 01" });
+    const confirm = actions.createEl("button", { cls: "mod-cta", text: "创建项目与阶段 1" });
     confirm.addEventListener("click", () => {
       const title = this.title.trim();
       if (!title) {
@@ -725,8 +616,528 @@ class ProjectPromptModal extends Modal {
   }
 }
 
-function sanitizeFileName(value: string): string {
-  return value.replace(/[\\/:*?"<>|#^[\]]/g, "-").trim() || "未命名项目";
+class CyclePromptModal extends Modal {
+  private stageTitle = "";
+  private crossProjectConfirmed = false;
+  private titleInput: HTMLInputElement | null = null;
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly project: ProjectWorkspaceProject,
+    private readonly sources: Array<{
+      project: ProjectWorkspaceProject;
+      cycle: ProjectWorkspaceProject["cycles"][number];
+    }>,
+    private readonly intent: StageCreationIntent,
+    private readonly crossProject: boolean,
+    private readonly nextStageSequence: number,
+    private readonly submit: (
+      stageTitle: string,
+      crossProjectConfirmed: boolean,
+    ) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const singleSource = this.sources.length === 1 ? this.sources[0] : null;
+    this.setTitle(this.intent.relation === "merge"
+      ? `合并为 ${this.project.title} / 阶段 ${this.nextStageSequence}`
+      : `添加阶段 ${this.nextStageSequence} · ${singleSource?.cycle.title ?? this.project.title}`);
+    if (this.project.cycles.length === 0) {
+      this.contentEl.createDiv({
+        cls: "helix-modal-note",
+        text: "当前项目没有阶段，请先重新扫描或创建项目。",
+      });
+      return;
+    }
+    const relation = this.contentEl.createDiv({ cls: "helix-stage-intent" });
+    relation.createSpan({
+      cls: `helix-relation-chip is-${this.intent.relation}`,
+      text: CYCLE_RELATION_LABELS[this.intent.relation],
+    });
+    relation.createSpan({ text: this.intentSummary() });
+    new Setting(this.contentEl)
+      .setName("阶段标题")
+      .setDesc(`序号将自动生成为“阶段 ${this.nextStageSequence}”`)
+      .addText((text) => {
+        this.titleInput = text.inputEl;
+        text.setPlaceholder("例如：验证基线实验").onChange((value) => {
+          this.stageTitle = value;
+        });
+      });
+    if (this.crossProject) this.renderCrossProjectConfirmation();
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", {
+      cls: "mod-cta",
+      text: `创建阶段 ${this.nextStageSequence}`,
+    });
+    const submitStage = (): void => {
+      if (confirm.disabled) return;
+      const stageTitle = this.stageTitle.trim();
+      if (!stageTitle) {
+        new Notice("请输入阶段标题");
+        return;
+      }
+      if (this.crossProject && !this.crossProjectConfirmed) {
+        new Notice("跨项目关系需要明确确认");
+        return;
+      }
+      confirm.disabled = true;
+      void this.submit(stageTitle, this.crossProjectConfirmed)
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    };
+    confirm.addEventListener("click", submitStage);
+    this.titleInput?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      submitStage();
+    });
+    window.setTimeout(() => this.titleInput?.focus(), 0);
+  }
+
+  private renderCrossProjectConfirmation(): void {
+    const externalSources = this.sources
+      .filter(({ project }) => project.id !== this.project.id)
+      .map(({ project, cycle }) => `${project.title} / ${cycle.title}`)
+      .join("、");
+    const setting = new Setting(this.contentEl)
+      .setName("跨项目合并")
+      .setDesc(
+        `新阶段归属“${this.project.title}”，并引用：${externalSources}`,
+      );
+    setting.addToggle((toggle) =>
+      toggle.setValue(false).onChange((value) => {
+        this.crossProjectConfirmed = value;
+      }),
+    );
+  }
+
+  private intentSummary(): string {
+    const labels = this.sources.map(({ project, cycle }) =>
+      project.id === this.project.id
+        ? cycle.title
+        : `${project.title} / ${cycle.title}`);
+    if (this.intent.relation === "merge") {
+      const converted = this.sources
+        .filter(({ cycle }) =>
+          this.intent.convertedInheritanceSourceIds.includes(cycle.id))
+        .map(({ cycle }) => cycle.title);
+      return converted.length > 0
+        ? `${labels.join(" + ")}；${converted.join("、")}的已有后继同步改为分支`
+        : labels.join(" + ");
+    }
+    if (this.intent.relation === "branch") {
+      return this.intent.convertedInheritanceRelationIds.length > 0
+        ? `从 ${labels[0]} 新建分支，已有后继同步改为分支`
+        : `从 ${labels[0]} 新建分支`;
+    }
+    return `继承自 ${labels[0]}`;
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class DeleteCycleModal extends Modal {
+  private confirmed = false;
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly project: ProjectWorkspaceProject,
+    private readonly projects: ProjectWorkspaceProject[],
+    private readonly cycle: ProjectWorkspaceProject["cycles"][number],
+    private readonly relations: CycleRelation[],
+    private readonly submit: () => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle(`删除阶段 ${this.cycle.sequence}`);
+    this.contentEl.createEl("p", {
+      text: `${this.project.title} / ${this.cycle.title}`,
+    });
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: "阶段 Markdown 将移入 Obsidian 废纸篓；Canvas 节点及所有入边、出边会一并删除。其他阶段笔记不会改写。",
+    });
+    const fullyRemovedRelations = this.relations.filter((relation) =>
+      relation.toCycleId === this.cycle.id ||
+      (
+        relation.kind !== "merge" &&
+        relation.fromCycleIds.includes(this.cycle.id)
+      ));
+    const normalized = normalizedBranchesAfterRemoving(
+      this.relations,
+      fullyRemovedRelations,
+    );
+    if (normalized.length > 0) {
+      this.contentEl.createEl("p", {
+        cls: "helix-modal-note is-warning",
+        text: `删除后，${normalized.map((relation) =>
+          this.cycleLabel(relation.toCycleId)).join("、")}的剩余分支关系将改为继承。`,
+      });
+    }
+    const changedMerges = this.relations.flatMap((relation) => {
+      if (
+        relation.kind !== "merge" ||
+        relation.toCycleId === this.cycle.id ||
+        !relation.fromCycleIds.includes(this.cycle.id)
+      ) {
+        return [];
+      }
+      const remainingCount = relation.fromCycleIds.length - 1;
+      const remainingSource = relation.fromCycleIds.find(
+        (sourceId) => sourceId !== this.cycle.id,
+      );
+      const nextKind = remainingCount === 1 &&
+        remainingSource &&
+        this.relations.some((candidate) =>
+          candidate !== relation &&
+          candidate.toCycleId !== this.cycle.id &&
+          candidate.fromCycleIds.includes(remainingSource))
+        ? "branch"
+        : "inherit";
+      return [{
+        target: this.cycleLabel(relation.toCycleId),
+        remainingCount,
+        nextKind,
+      }];
+    });
+    for (const change of changedMerges) {
+      this.contentEl.createEl("p", {
+        cls: "helix-modal-note is-warning",
+        text: change.remainingCount === 1
+          ? `删除后，${change.target}的合并关系将改为${
+            change.nextKind === "branch" ? "分支" : "继承"
+          }。`
+          : `删除后，${change.target}的合并来源将缩减为 ${change.remainingCount} 个。`,
+      });
+    }
+    const confirmation = this.contentEl.createEl("label", {
+      cls: "helix-branch-confirm",
+    });
+    const checkbox = confirmation.createEl("input", { type: "checkbox" });
+    confirmation.createSpan({ text: "我确认删除这个阶段及其 Canvas 关系" });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const remove = actions.createEl("button", {
+      cls: "mod-warning",
+      text: "移入废纸篓",
+    });
+    remove.disabled = true;
+    checkbox.addEventListener("change", () => {
+      this.confirmed = checkbox.checked;
+      remove.disabled = !this.confirmed;
+    });
+    remove.addEventListener("click", () => {
+      if (!this.confirmed) return;
+      remove.disabled = true;
+      void this.submit()
+        .then(() => this.close())
+        .catch((error) => {
+          remove.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+
+  private cycleLabel(cycleId: string): string {
+    for (const project of this.projects) {
+      const cycle = project.cycles.find((candidate) => candidate.id === cycleId);
+      if (cycle) return `${project.title} / 阶段 ${cycle.sequence} · ${cycle.title}`;
+    }
+    return cycleId;
+  }
+}
+
+class RelationPromptModal extends Modal {
+  private kind: CycleRelationKind;
+  private selected: Set<string>;
+  private picker: Setting | null = null;
+  private crossProjectConfirmed = false;
+  private crossProjectCheckbox: HTMLInputElement | null = null;
+  private deleteArmed = false;
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly relation: CycleRelation,
+    private readonly relations: CycleRelation[],
+    private readonly projects: ProjectWorkspaceProject[],
+    private readonly submit: (
+      kind: CycleRelationKind,
+      predecessorIds: string[],
+      crossProjectConfirmed: boolean,
+    ) => Promise<void>,
+    private readonly remove: () => Promise<void>,
+  ) {
+    super(app);
+    this.kind = relation.kind;
+    this.selected = new Set(relation.fromCycleIds);
+  }
+
+  onOpen(): void {
+    this.setTitle("管理阶段关系");
+    const target = this.findCycle(this.relation.toCycleId);
+    new Setting(this.contentEl)
+      .setName("目标阶段")
+      .setDesc(target
+        ? `${target.project.title} / 阶段 ${target.cycle.sequence} · ${target.cycle.title}`
+        : this.relation.toCycleId);
+    new Setting(this.contentEl)
+      .setName("关系类型")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("inherit", "继承")
+          .addOption("branch", "分支")
+          .addOption("merge", "合并")
+          .setValue(this.kind)
+          .onChange((value) => {
+            this.kind = value as CycleRelationKind;
+            if (this.kind !== "merge" && this.selected.size > 1) {
+              this.selected.clear();
+            }
+            this.resetCrossProjectConfirmation();
+            this.renderPicker();
+          }),
+      );
+    this.picker = new Setting(this.contentEl);
+    this.renderPicker();
+    const crossProject = this.contentEl.createEl("label", {
+      cls: "helix-branch-confirm",
+    });
+    const crossCheckbox = crossProject.createEl("input", { type: "checkbox" });
+    this.crossProjectCheckbox = crossCheckbox;
+    crossCheckbox.checked = this.crossProjectConfirmed;
+    crossCheckbox.addEventListener("change", () => {
+      this.crossProjectConfirmed = crossCheckbox.checked;
+    });
+    crossProject.createSpan({
+      text: "我确认：允许从其他项目的阶段建立跨项目关系。",
+    });
+    const normalized = normalizedBranchesAfterRemoving(
+      this.relations,
+      [this.relation],
+    );
+    if (normalized.length > 0) {
+      this.contentEl.createEl("p", {
+        cls: "helix-modal-note is-warning",
+        text: `删除这组关系后，${normalized.map((candidate) =>
+          this.cycleLabel(candidate.toCycleId)).join("、")}的剩余分支关系将改为继承。`,
+      });
+    }
+
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const remove = actions.createEl("button", {
+      cls: "mod-warning",
+      text: "删除关系",
+    });
+    remove.addEventListener("click", () => {
+      if (!this.deleteArmed) {
+        this.deleteArmed = true;
+        remove.textContent = "再次点击确认删除";
+        return;
+      }
+      remove.disabled = true;
+      void this.remove()
+        .then(() => this.close())
+        .catch((error) => {
+          remove.disabled = false;
+          this.deleteArmed = false;
+          remove.textContent = "删除关系";
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const save = actions.createEl("button", { cls: "mod-cta", text: "保存关系" });
+    save.addEventListener("click", () => {
+      const ids = [...this.selected];
+      if (this.kind !== "merge" && ids.length !== 1) {
+        new Notice("继承或分支必须选择 1 个前置阶段");
+        return;
+      }
+      if (this.kind === "merge" && ids.length < 2) {
+        new Notice("合并至少需要 2 个前置阶段");
+        return;
+      }
+      if (this.isCrossProject() && !this.crossProjectConfirmed) {
+        new Notice("跨项目关系需要明确确认");
+        return;
+      }
+      save.disabled = true;
+      void this.submit(this.kind, ids, this.crossProjectConfirmed)
+        .then(() => this.close())
+        .catch((error) => {
+          save.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  private renderPicker(): void {
+    if (!this.picker) return;
+    this.picker.settingEl.empty();
+    const picker = this.picker.settingEl.createDiv({ cls: "helix-cycle-picker" });
+    picker.createEl("strong", {
+      text: this.kind === "merge" ? "选择前置阶段（至少两个）" : "选择前置阶段",
+    });
+    for (const project of this.projects) {
+      for (const cycle of project.cycles) {
+        if (cycle.id === this.relation.toCycleId) continue;
+        const row = picker.createEl("label");
+        const input = row.createEl("input", {
+          type: this.kind === "merge" ? "checkbox" : "radio",
+          attr: { name: "helix-relation-predecessor" },
+        });
+        input.checked = this.selected.has(cycle.id);
+        input.addEventListener("change", () => {
+          if (this.kind === "merge") {
+            if (input.checked) this.selected.add(cycle.id);
+            else this.selected.delete(cycle.id);
+          } else {
+            this.selected.clear();
+            if (input.checked) this.selected.add(cycle.id);
+          }
+          this.resetCrossProjectConfirmation();
+        });
+        row.createSpan({
+          text: `${project.title} / 阶段 ${cycle.sequence} · ${cycle.title}`,
+        });
+      }
+    }
+  }
+
+  private findCycle(id: string): {
+    project: ProjectWorkspaceProject;
+    cycle: ProjectWorkspaceProject["cycles"][number];
+  } | undefined {
+    for (const project of this.projects) {
+      const cycle = project.cycles.find((candidate) => candidate.id === id);
+      if (cycle) return { project, cycle };
+    }
+    return undefined;
+  }
+
+  private isCrossProject(): boolean {
+    const target = this.findCycle(this.relation.toCycleId);
+    if (!target) return false;
+    return [...this.selected].some((id) => this.findCycle(id)?.project.id !== target.project.id);
+  }
+
+  private resetCrossProjectConfirmation(): void {
+    this.crossProjectConfirmed = false;
+    if (this.crossProjectCheckbox) this.crossProjectCheckbox.checked = false;
+  }
+
+  private cycleLabel(cycleId: string): string {
+    const found = this.findCycle(cycleId);
+    return found
+      ? `${found.project.title} / 阶段 ${found.cycle.sequence} · ${found.cycle.title}`
+      : cycleId;
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+function normalizedBranchesAfterRemoving(
+  relations: CycleRelation[],
+  removedRelations: CycleRelation[],
+): CycleRelation[] {
+  const removedIds = new Set(removedRelations.map((relation) => relation.id));
+  const remaining = relations.filter((relation) => !removedIds.has(relation.id));
+  const normalized = new Map<string, CycleRelation>();
+  for (const sourceId of new Set(
+    removedRelations.flatMap((relation) => relation.fromCycleIds),
+  )) {
+    const outgoing = remaining.filter((relation) =>
+      relation.fromCycleIds.includes(sourceId));
+    if (outgoing.length === 1 && outgoing[0]!.kind === "branch") {
+      normalized.set(outgoing[0]!.id, outgoing[0]!);
+    }
+  }
+  return [...normalized.values()];
+}
+
+class LegacyMigrationModal extends Modal {
+  private readonly confirmed = new Set<string>();
+  private archiveLegacyConflict = false;
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly items: ProjectWorkspaceMigrationItem[],
+    private readonly hasLegacyConflict: boolean,
+    private readonly submit: (
+      confirmedIds: string[],
+      archiveLegacyConflict: boolean,
+    ) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("确认旧项目数据");
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: "逐项核对后勾选。旧关系字段和旧边只保留、不推断；同文件夹阶段只补充明确的项目 ID。",
+    });
+    const list = this.contentEl.createDiv({ cls: "helix-migration-list" });
+    for (const item of this.items) {
+      const row = list.createEl("label", { cls: "helix-migration-item" });
+      const checkbox = row.createEl("input", { type: "checkbox" });
+      const copy = row.createDiv();
+      copy.createEl("strong", { text: item.title });
+      copy.createEl("code", { text: item.sourcePath });
+      copy.createEl("span", { text: item.detail });
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) this.confirmed.add(item.id);
+        else this.confirmed.delete(item.id);
+        confirm.disabled = this.confirmed.size !== this.items.length;
+      });
+    }
+    if (this.hasLegacyConflict) {
+      const archive = this.contentEl.createEl("label", { cls: "helix-branch-confirm" });
+      const checkbox = archive.createEl("input", { type: "checkbox" });
+      checkbox.addEventListener("change", () => {
+        this.archiveLegacyConflict = checkbox.checked;
+      });
+      archive.createSpan({
+        text: "迁移成功后归档旧版谱系冲突记录（不删除 Markdown 或 Canvas 数据）",
+      });
+    }
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", {
+      cls: "mod-cta",
+      text: "保留旧数据并启用新工作区",
+    });
+    confirm.disabled = true;
+    confirm.addEventListener("click", () => {
+      confirm.disabled = true;
+      void this.submit([...this.confirmed], this.archiveLegacyConflict)
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
 }
 
 function formatDate(date: Date): string {

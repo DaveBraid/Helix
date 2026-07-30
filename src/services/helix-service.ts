@@ -1262,6 +1262,10 @@ function appendEarnedChallengeAwards(
   const events = ledger.list();
   for (const challenge of rotatingChallenges(new Date(occurredAt))) {
     if (challengeProgress(challenge, events) < challenge.target) continue;
+    if (events.some((event) =>
+      event.type === "challenge-completed" &&
+      event.entityId === challenge.id &&
+      event.occurrenceKey === challenge.id)) continue;
     ledger.append({
       id: deterministicEventId({
         type: "challenge-completed",

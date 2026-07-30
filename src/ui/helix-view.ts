@@ -3,40 +3,56 @@ import {
   Modal,
   Notice,
   Setting,
-  TFile,
   WorkspaceLeaf,
   setIcon,
   type IconName,
 } from "obsidian";
 import * as echarts from "echarts/core";
-import { BarChart, LineChart } from "echarts/charts";
+import { LineChart } from "echarts/charts";
 import {
   GridComponent,
   TooltipComponent,
-  VisualMapComponent,
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { DidaProject, DidaTask } from "../domain/entities";
+import type { HelixEvent } from "../domain/events";
 import { aggregateAnalytics } from "../domain/analytics";
 import { localDateKey, localDateKeyFromInstant } from "../domain/local-date";
 import {
+  challengeContributions,
   challengeProgress,
   deriveProgress,
   rotatingChallenges,
+  type ChallengeDefinition,
 } from "../domain/gamification";
+import {
+  buildYearHeatmap,
+  type HeatmapMetric,
+} from "../domain/month-heatmap";
+import {
+  assertTimeZone,
+  instantToWallDateTime,
+  wallDateTimeToInstant,
+} from "../domain/task-datetime";
 import type { HelixRuntimeState } from "../services/helix-service";
 import { HelixService } from "../services/helix-service";
+import type {
+  ProjectWorkspaceService,
+  ProjectWorkspaceSnapshot,
+} from "../services/project-workspace";
 import { HelixDataStore } from "../storage/data-store";
 import type { ResolutionChoice, SyncConflict } from "../sync/types";
 import { analyticsChartSeries } from "./chart-series";
 import { inProgressPresentation } from "./in-progress-presentation";
+import {
+  ProjectLineageWorkbench,
+  type ProjectLineageViewMode,
+} from "./project-lineage-workbench";
 
 echarts.use([
-  BarChart,
   LineChart,
   GridComponent,
   TooltipComponent,
-  VisualMapComponent,
   CanvasRenderer,
 ]);
 
@@ -70,7 +86,14 @@ export class HelixView extends ItemView {
   private section: Section = "today";
   private expandedInProgress = false;
   private taskFilter: "all" | "today" | "in-progress" | "completed" = "all";
-  private projectView: "board" | "list" = "board";
+  private selectedProjectId: string | null = null;
+  private projectLineageMode: ProjectLineageViewMode = "graph";
+  private projectWorkbench: ProjectLineageWorkbench | null = null;
+  private renderToken = 0;
+  private heatmapMetric: HeatmapMetric = "tasks";
+  private heatmapMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  private previewTasks = SAMPLE_TASKS.map((task) => ({ ...task }));
+  private previewInProgress = new Set(SAMPLE_TASKS.map((task) => task.id));
   private state: HelixRuntimeState | null = null;
   private unsubscribe: (() => void) | null = null;
   private charts: echarts.ECharts[] = [];
@@ -83,7 +106,12 @@ export class HelixView extends ItemView {
     private readonly actions: {
       openReview: (period: "daily" | "weekly" | "monthly" | "yearly") => Promise<void>;
       createProject: () => void;
-      resolveLineage: (choice: "canvas" | "projects") => Promise<void>;
+      createCycle: (projectId: string, sourceCycleIds: string[]) => void;
+      deleteCycle: (cycleId: string) => void;
+      manageRelation: (relationId: string) => void;
+      openProjectFile: (path: string) => Promise<void>;
+      projectWorkspace: ProjectWorkspaceService;
+      reviewLegacyMigration: () => void;
     },
   ) {
     super(leaf);
@@ -110,12 +138,18 @@ export class HelixView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.renderToken += 1;
     this.unsubscribe?.();
+    this.projectWorkbench?.destroy();
+    this.projectWorkbench = null;
     this.disposeCharts();
   }
 
   private async render(): Promise<void> {
     if (!this.state) return;
+    const token = ++this.renderToken;
+    this.projectWorkbench?.destroy();
+    this.projectWorkbench = null;
     this.disposeCharts();
     this.contentEl.empty();
     const shell = this.contentEl.createDiv({ cls: "helix-shell" });
@@ -123,13 +157,13 @@ export class HelixView extends ItemView {
     const main = shell.createDiv({ cls: "helix-main" });
     this.renderHeader(main);
     const content = main.createDiv({ cls: "helix-content" });
-    if (this.section === "today") await this.renderToday(content);
+    if (this.section === "today") await this.renderToday(content, token);
     else if (this.section === "tasks") this.renderTasks(content);
-    else if (this.section === "projects") this.renderProjects(content);
+    else if (this.section === "projects") await this.renderProjects(content, token);
     else if (this.section === "reviews") this.renderReviews(content);
     else if (this.section === "analytics") this.renderAnalytics(content);
     else if (this.section === "challenges") this.renderChallenges(content);
-    else await this.renderConflicts(content);
+    else await this.renderConflicts(content, token);
   }
 
   private renderSidebar(shell: HTMLElement): void {
@@ -218,18 +252,12 @@ export class HelixView extends ItemView {
     });
   }
 
-  private async renderToday(content: HTMLElement): Promise<void> {
+  private async renderToday(content: HTMLElement, token: number): Promise<void> {
     const state = this.displayState();
     const hero = content.createDiv({ cls: "helix-today-heading" });
     const copy = hero.createDiv();
     copy.createEl("p", { cls: "helix-eyebrow", text: formatFullDate(new Date()) });
     copy.createEl("h2", { text: "早上好，今天推进什么？" });
-    copy.createEl("p", {
-      cls: "helix-muted",
-      text: this.state?.connected
-        ? "把注意力留给正在发生的工作。"
-        : "连接滴答后，这里会展示你的真实任务和项目。",
-    });
     const score = hero.createDiv({ cls: "helix-score" });
     const today = localDateKey(new Date());
     const activity = aggregateAnalytics(this.state?.events ?? [], {
@@ -250,6 +278,7 @@ export class HelixView extends ItemView {
     this.renderWeeklyOverview(lower);
     this.renderWeeklyChallengeCard(lower);
     const conflicts = await this.store.list();
+    if (token !== this.renderToken) return;
     if (conflicts.length > 0) {
       const warning = content.createDiv({ cls: "helix-card helix-conflict-warning" });
       const icon = warning.createSpan();
@@ -270,14 +299,6 @@ export class HelixView extends ItemView {
     projects: DidaProject[],
   ): void {
     const card = parent.createDiv({ cls: "helix-card helix-in-progress" });
-    const header = card.createDiv({ cls: "helix-section-header" });
-    const title = header.createDiv();
-    title.createEl("h3", { text: "正在进行" });
-    title.createEl("p", {
-      text: this.state?.demoMode
-        ? "演示条目；连接后只显示由 Helix 独立标记的任务"
-        : "由 Helix 独立标记，不会污染滴答标签",
-    });
     const allRealItems = this.service.visibleInProgress(true);
     const realPresentation = inProgressPresentation(
       allRealItems,
@@ -287,27 +308,50 @@ export class HelixView extends ItemView {
     const items = realItems.length > 0
       ? realItems
       : this.state?.demoMode
-        ? tasks.slice(0, this.expandedInProgress ? tasks.length : 3).map((task) => ({
-          task,
-          project: projects.find((project) => project.id === task.projectId),
-        }))
+        ? tasks
+          .filter((task) => this.previewInProgress.has(task.id))
+          .slice(0, this.expandedInProgress ? tasks.length : 3)
+          .map((task) => ({
+            task,
+            project: projects.find((project) => project.id === task.projectId),
+          }))
         : [];
-    if (items.length === 0) {
-      card.createDiv({ cls: "helix-empty", text: "还没有标记正在进行的任务。" });
-      return;
-    }
-    const list = card.createDiv({ cls: "helix-task-list" });
-    for (const item of items) this.renderTaskRow(list, item.task, item.project, true);
-    if ((this.state?.demoMode && tasks.length > 3) || realPresentation.canExpand) {
-      const expand = card.createEl("button", {
-        cls: "helix-link-button",
-        text: this.expandedInProgress ? "收起" : "展开全部",
+    const totalItems = realItems.length > 0
+      ? allRealItems.length
+      : this.state?.demoMode
+        ? tasks.filter((task) => this.previewInProgress.has(task.id)).length
+        : 0;
+    const canExpand = totalItems > 3;
+    const listId = "helix-in-progress-list";
+    const header = card.createDiv({ cls: "helix-section-header" });
+    header.createEl("h3", { text: "正在进行" });
+    if (canExpand) {
+      const disclosure = header.createEl("button", {
+        cls: "helix-disclosure",
+        attr: {
+          "aria-expanded": String(this.expandedInProgress),
+          "aria-controls": listId,
+        },
       });
-      expand.addEventListener("click", () => {
+      disclosure.createSpan({
+        text: this.expandedInProgress ? "收起" : `查看全部 ${totalItems} 项`,
+      });
+      const icon = disclosure.createSpan();
+      setIcon(icon, this.expandedInProgress ? "chevron-up" : "chevron-down");
+      disclosure.addEventListener("click", () => {
         this.expandedInProgress = !this.expandedInProgress;
         void this.render();
       });
     }
+    if (items.length === 0) {
+      card.createDiv({ cls: "helix-empty", text: "还没有标记正在进行的任务。" });
+      return;
+    }
+    const list = card.createDiv({
+      cls: "helix-task-list",
+      attr: { id: listId },
+    });
+    for (const item of items) this.renderTaskRow(list, item.task, item.project, true);
   }
 
   private renderTodayTasks(parent: HTMLElement, tasks: DidaTask[], projects: DidaProject[]): void {
@@ -383,9 +427,38 @@ export class HelixView extends ItemView {
         ).open();
       });
     } else {
-      action.disabled = true;
-      edit.disabled = true;
-      check.disabled = true;
+      check.addEventListener("click", () => {
+        this.previewTasks = this.previewTasks.map((candidate) =>
+          candidate.id === task.id
+            ? {
+              ...candidate,
+              status: 2,
+              completedTime: new Date().toISOString(),
+            }
+            : candidate,
+        );
+        this.previewInProgress.delete(task.id);
+        void this.render();
+      });
+      action.addEventListener("click", () => {
+        if (this.previewInProgress.has(task.id)) this.previewInProgress.delete(task.id);
+        else this.previewInProgress.add(task.id);
+        void this.render();
+      });
+      edit.addEventListener("click", () => {
+        new TaskEditModal(
+          this.app,
+          task,
+          SAMPLE_PROJECTS,
+          async (updated) => {
+            this.previewTasks = this.previewTasks.map((candidate) =>
+              candidate.id === updated.id ? updated : candidate,
+            );
+            await this.render();
+          },
+          true,
+        ).open();
+      });
     }
     if (task.status === 2) check.disabled = true;
   }
@@ -422,8 +495,11 @@ export class HelixView extends ItemView {
       text: "查看挑战详情",
     });
     detail.addEventListener("click", () => {
-      this.section = "challenges";
-      void this.render();
+      new ChallengeDetailModal(
+        this.app,
+        challenge,
+        this.state?.events ?? [],
+      ).open();
     });
   }
 
@@ -550,25 +626,47 @@ export class HelixView extends ItemView {
 
   private renderTasks(content: HTMLElement): void {
     const { tasks, projects } = this.displayState();
-    this.renderPageIntro(content, "任务总览", "滴答清单是任务事实源；Helix 负责项目语境、进行中标记和冲突控制。");
-    if (this.state?.connected && this.state.projects.length > 0) {
+    this.renderPageTitle(content, "任务总览");
+    const canCompose = projects.length > 0 &&
+      (this.state?.connected || this.state?.demoMode);
+    if (canCompose) {
       const composer = content.createDiv({ cls: "helix-card helix-task-composer" });
       const input = composer.createEl("input", {
         type: "text",
-        placeholder: "快速创建滴答任务…",
+        placeholder: this.state?.demoMode ? "新建预览任务…" : "新建滴答任务…",
         attr: { "aria-label": "任务标题" },
       });
-      const select = composer.createEl("select", { attr: { "aria-label": "所属项目" } });
-      for (const project of this.state.projects) {
+      const select = composer.createEl("select", { attr: { "aria-label": "滴答清单" } });
+      for (const project of projects) {
         select.createEl("option", { text: project.name, value: project.id });
       }
       const submit = composer.createEl("button", {
         cls: "helix-primary-button",
-        text: "加入同步队列",
+        text: this.state?.demoMode ? "添加" : "加入同步队列",
       });
       const create = (): void => {
+        const title = input.value.trim();
+        if (!title) {
+          new Notice("任务标题不能为空");
+          return;
+        }
+        if (this.state?.demoMode) {
+          this.previewTasks = [
+            ...this.previewTasks,
+            {
+              id: `sample-${crypto.randomUUID()}`,
+              projectId: select.value,
+              title,
+              status: 0,
+              priority: 0,
+            },
+          ];
+          input.value = "";
+          void this.render();
+          return;
+        }
         submit.disabled = true;
-        void this.service.createTask(input.value, select.value)
+        void this.service.createTask(title, select.value)
           .then(() => {
             input.value = "";
             new Notice("任务已安全写入同步队列");
@@ -607,74 +705,96 @@ export class HelixView extends ItemView {
     }
   }
 
-  private renderProjects(content: HTMLElement): void {
-    const { projects: remoteProjects, tasks } = this.displayState();
-    const intro = content.createDiv({ cls: "helix-page-intro helix-page-intro-actions" });
-    const copy = intro.createDiv();
-    copy.createEl("h2", { text: "项目组合" });
-    copy.createEl("p", { text: "每个稳定项目维护不可变 Cycle 记录；项目继承关系写入全局 Canvas 并保持 DAG。" });
-    const create = intro.createEl("button", {
-      cls: "helix-primary-button",
-      text: "创建项目与 Cycle 01",
-    });
-    create.addEventListener("click", () => this.actions.createProject());
-    const localProjects = this.localProjects();
-    const projects = localProjects.length > 0
-      ? localProjects
-      : this.state?.demoMode
-        ? remoteProjects.map((project) => ({
-            id: project.id,
-            title: project.name,
-            didaProjectId: project.id,
-            activeCycle: "Cycle 01",
-            file: null,
-          }))
-        : [];
-    const controls = content.createDiv({ cls: "helix-filter-row" });
-    for (const [id, label] of [["board", "看板"], ["list", "列表"]] as const) {
-      const button = controls.createEl("button", {
-        text: label,
-        cls: this.projectView === id ? "is-active" : "",
-      });
-      button.addEventListener("click", () => {
-        this.projectView = id;
-        void this.render();
-      });
-    }
-    const grid = content.createDiv({
-      cls: `helix-project-grid${this.projectView === "list" ? " is-list" : ""}`,
-    });
-    if (projects.length === 0) {
-      grid.createDiv({
-        cls: "helix-card helix-empty",
-        text: "尚未创建 Helix 项目。点击上方按钮生成稳定项目笔记和首个 Cycle。",
-      });
-    }
-    for (const project of projects) {
-      const card = grid.createDiv({ cls: "helix-card helix-project-card" });
-      const accent = card.createDiv({ cls: "helix-project-accent" });
-      const remote = remoteProjects.find((candidate) => candidate.id === project.didaProjectId);
-      accent.style.backgroundColor = remote?.color ?? "#4f6ce1";
-      card.createEl("h3", { text: project.title });
-      card.createEl("p", {
-        text: project.didaProjectId
-          ? `${tasks.filter((task) => task.projectId === project.didaProjectId && task.status !== 2).length} 个开放任务`
-          : "尚未映射滴答清单",
-      });
-      const footer = card.createDiv({ cls: "helix-project-footer" });
-      footer.createSpan({ text: project.activeCycle ?? "Cycle 尚未关联" });
-      const icon = footer.createSpan();
-      setIcon(icon, "arrow-up-right");
-      if (project.file) {
-        card.addEventListener("click", () => {
-          void this.app.workspace.getLeaf("tab").openFile(project.file!);
-        });
+  private async renderProjects(content: HTMLElement, token: number): Promise<void> {
+    let workspace: ProjectWorkspaceSnapshot;
+    try {
+      workspace = await this.actions.projectWorkspace.snapshot();
+      if (!workspace.migrationRequired) {
+        workspace = await this.actions.projectWorkspace.ensureCanvas();
       }
+    } catch (error) {
+      if (token !== this.renderToken) return;
+      this.renderPageTitle(content, "项目");
+      content.createDiv({
+        cls: "helix-card helix-error-card",
+        text: error instanceof Error ? error.message : String(error),
+      });
+      return;
     }
+    if (token !== this.renderToken) return;
+    if (workspace.migrationRequired) {
+      const migration = content.createDiv({ cls: "helix-card helix-migration-card" });
+      const migrationIcon = migration.createSpan();
+      setIcon(migrationIcon, "triangle-alert");
+      const migrationCopy = migration.createDiv();
+      migrationCopy.createEl("strong", { text: "检测到旧项目谱系，未自动转换" });
+      migrationCopy.createEl("p", {
+        text: workspace.migrationRequired
+          ? `${workspace.migrationItems.length} 项旧数据需要逐项确认。`
+          : "旧数据已保留；关系未自动推断。",
+      });
+      const details = migration.createEl("details");
+      details.createEl("summary", { text: "查看待迁移项" });
+      const list = details.createEl("ul");
+      for (const warning of workspace.migrationWarnings) {
+        list.createEl("li", { text: warning });
+      }
+      const review = migration.createEl("button", {
+        cls: "helix-primary-button",
+        text: "逐项预览并确认",
+      });
+      review.addEventListener("click", () => this.actions.reviewLegacyMigration());
+      return;
+    }
+
+    if (workspace.projects.length === 0) {
+      const empty = content.createDiv({ cls: "helix-card helix-project-empty" });
+      const emptyIcon = empty.createDiv();
+      setIcon(emptyIcon, "layout-dashboard");
+      empty.createEl("h3", { text: "从第一个项目开始" });
+      const emptyAction = empty.createEl("button", {
+        cls: "helix-primary-button",
+        text: "新建项目并加入 Canvas",
+      });
+      emptyAction.addEventListener("click", () => this.actions.createProject());
+      return;
+    }
+
+    if (!this.selectedProjectId ||
+      !workspace.projects.some((project) => project.id === this.selectedProjectId)) {
+      this.selectedProjectId = workspace.projects[0]!.id;
+    }
+    this.projectWorkbench = new ProjectLineageWorkbench({
+      snapshot: workspace,
+      selectedProjectId: this.selectedProjectId,
+      mode: this.projectLineageMode,
+      onModeChange: (mode) => {
+        this.projectLineageMode = mode;
+        void this.render();
+      },
+      onSelectProject: (projectId) => {
+        this.selectedProjectId = projectId;
+        void this.render();
+      },
+      onCreateProject: () => this.actions.createProject(),
+      onCreateCycle: (projectId, sourceCycleIds) =>
+        this.actions.createCycle(projectId, sourceCycleIds),
+      onDeleteCycle: (cycleId) => this.actions.deleteCycle(cycleId),
+      onOpenNote: (path) => {
+        void this.actions.openProjectFile(path);
+      },
+      onMoveNodes: async (moves) => {
+        await this.actions.projectWorkspace.moveCanvasNodes(moves);
+      },
+      onManageRelation: (relationId) => this.actions.manageRelation(relationId),
+      onError: (error) =>
+        new Notice(error instanceof Error ? error.message : String(error), 8_000),
+    });
+    this.projectWorkbench.render(content);
   }
 
   private renderReviews(content: HTMLElement): void {
-    this.renderPageIntro(content, "周期复盘", "以日记为最小记录单位，用固定问题降低启动成本，并把任务和项目证据带回复盘。");
+    this.renderPageTitle(content, "周期复盘");
     const grid = content.createDiv({ cls: "helix-review-grid" });
     const cards = [
       ["daily", "日记", "今天完成了什么？哪些证据改变了项目判断？", "今日"],
@@ -699,7 +819,7 @@ export class HelixView extends ItemView {
   }
 
   private renderAnalytics(content: HTMLElement): void {
-    this.renderPageIntro(content, "数据分析", "指标由不可变事件账本重算；重复完成不会重复计分，重新打开会撤销奖励。");
+    this.renderPageTitle(content, "数据分析");
     const to = localDateKey(new Date());
     const fromDate = new Date();
     fromDate.setDate(fromDate.getDate() - 13);
@@ -726,14 +846,11 @@ export class HelixView extends ItemView {
     trendCard.createEl("h3", { text: "近 14 日完成趋势" });
     const trend = trendCard.createDiv({ cls: "helix-chart" });
     this.mountTrendChart(trend, chartSeries.trend);
-    const heatCard = chartGrid.createDiv({ cls: "helix-card helix-chart-card" });
-    heatCard.createEl("h3", { text: "本周活跃热度" });
-    const bars = heatCard.createDiv({ cls: "helix-chart" });
-    this.mountActivityChart(bars, chartSeries.week);
+    this.renderMonthHeatmap(chartGrid);
   }
 
   private renderChallenges(content: HTMLElement): void {
-    this.renderPageIntro(content, "挑战", "默认采用正向激励；挑战按周、月确定性轮换，规则版本固定，避免同步设备间漂移。");
+    this.renderPageTitle(content, "挑战");
     const showcase = content.createDiv({ cls: "helix-challenge-showcase" });
     this.renderWeeklyChallengeCard(showcase);
     this.renderMonthlyChallengeCard(showcase);
@@ -741,7 +858,7 @@ export class HelixView extends ItemView {
     side.createEl("h3", { text: "成就陈列" });
     const unlocked = new Set(deriveProgress(this.state?.events ?? []).badges);
     for (const [iconName, badge, title, desc] of [
-      ["git-branch", "完成首轮迭代", "迭代者", "关闭首个项目 Cycle"],
+      ["git-branch", "完成首轮迭代", "迭代者", "关闭首个项目阶段"],
       ["notebook-pen", "复盘节律", "复盘节律", "累计关闭 7 次复盘"],
       ["brain", "千分钟专注", "千分钟专注", "累计专注达到 1,000 分钟"],
     ] as const) {
@@ -755,6 +872,108 @@ export class HelixView extends ItemView {
       copy.createEl("strong", { text: title });
       copy.createEl("p", { text: isUnlocked ? `${desc} · 已解锁` : `${desc} · 未解锁` });
     }
+  }
+
+  private renderMonthHeatmap(parent: HTMLElement): void {
+    const year = this.heatmapMonth.getFullYear();
+    const first = new Date(year, 0, 1);
+    const last = new Date(year, 11, 31);
+    const summary = aggregateAnalytics(this.state?.events ?? [], {
+      from: localDateKey(first),
+      to: localDateKey(last),
+    });
+    const heatmap = buildYearHeatmap(summary.daily, year, this.heatmapMetric);
+    const card = parent.createDiv({ cls: "helix-card helix-heatmap-card" });
+    const header = card.createDiv({ cls: "helix-heatmap-header" });
+    const heading = header.createDiv();
+    heading.createEl("h3", { text: "年度记录" });
+    heading.createSpan({
+      text: `${year} 年 · ${heatmap.total} ${
+        this.heatmapMetric === "tasks" ? "个任务" : "次打卡"
+      }`,
+    });
+    const controls = header.createDiv({ cls: "helix-heatmap-controls" });
+    const previous = controls.createEl("button", {
+      attr: { "aria-label": "上一年", title: "上一年" },
+    });
+    setIcon(previous, "chevron-left");
+    previous.addEventListener("click", () => {
+      this.heatmapMonth = new Date(year - 1, 0, 1);
+      void this.render();
+    });
+    const current = controls.createEl("button", { text: "今年" });
+    current.addEventListener("click", () => {
+      const now = new Date();
+      this.heatmapMonth = new Date(now.getFullYear(), 0, 1);
+      void this.render();
+    });
+    const next = controls.createEl("button", {
+      attr: { "aria-label": "下一年", title: "下一年" },
+    });
+    setIcon(next, "chevron-right");
+    next.addEventListener("click", () => {
+      this.heatmapMonth = new Date(year + 1, 0, 1);
+      void this.render();
+    });
+    const metric = controls.createEl("select", {
+      attr: { "aria-label": "热力图指标" },
+    });
+    metric.createEl("option", { text: "任务完成", value: "tasks" });
+    metric.createEl("option", { text: "习惯打卡", value: "habits" });
+    metric.value = this.heatmapMetric;
+    metric.addEventListener("change", () => {
+      this.heatmapMetric = metric.value as HeatmapMetric;
+      void this.render();
+    });
+
+    const scroll = card.createDiv({ cls: "helix-heatmap-scroll" });
+    const yearGrid = scroll.createDiv({ cls: "helix-heatmap-year" });
+    heatmap.months.forEach((monthHeatmap, monthIndex) => {
+      const month = yearGrid.createDiv({
+        cls: "helix-heatmap-month",
+        attr: {
+          role: "group",
+          "aria-label": `${monthIndex + 1} 月，共 ${monthHeatmap.total} ${
+            this.heatmapMetric === "tasks" ? "个完成任务" : "次习惯打卡"
+          }`,
+        },
+      });
+      month.createEl("h4", {
+        text: `${monthIndex + 1}月`,
+      });
+      const weeks = month.createDiv({ cls: "helix-heatmap-month-weeks" });
+      for (let weekIndex = 0; weekIndex < 6; weekIndex += 1) {
+        const column = weeks.createDiv({ cls: "helix-heatmap-week" });
+        const week = monthHeatmap.weeks[weekIndex]!;
+        for (let weekday = 0; weekday < 7; weekday += 1) {
+          const day = week[weekday];
+          if (!day) {
+            column.createSpan({
+              cls: "helix-heatmap-day is-placeholder",
+              attr: { "aria-hidden": "true" },
+            });
+            continue;
+          }
+          const label = `${day.date}：${day.value} ${
+            this.heatmapMetric === "tasks" ? "个完成任务" : "次习惯打卡"
+          }`;
+          column.createSpan({
+            cls: `helix-heatmap-day is-level-${day.intensity}`,
+            attr: {
+              "aria-label": label,
+              title: label,
+              role: "img",
+            },
+          });
+        }
+      }
+    });
+    const legend = card.createDiv({ cls: "helix-heatmap-legend" });
+    legend.createSpan({ text: "少" });
+    for (let level = 0; level <= 4; level += 1) {
+      legend.createSpan({ cls: `helix-heatmap-day is-level-${level}` });
+    }
+    legend.createSpan({ text: "多" });
   }
 
   private renderMonthlyChallengeCard(parent: HTMLElement): void {
@@ -774,69 +993,45 @@ export class HelixView extends ItemView {
       cls: "helix-monthly-progress-copy",
       text: `${current} / ${challenge.target} · ${daysRemaining(challenge.endsAt)}`,
     });
+    const detail = card.createEl("button", {
+      cls: "helix-secondary-button helix-monthly-detail",
+      text: "查看详情",
+    });
+    detail.addEventListener("click", () => {
+      new ChallengeDetailModal(
+        this.app,
+        challenge,
+        this.state?.events ?? [],
+      ).open();
+    });
   }
 
-  private async renderConflicts(content: HTMLElement): Promise<void> {
-    this.renderPageIntro(content, "冲突中心", "Base、本地和远端逐字段并排；所有竞争字段必须由你明确选择，应用前还会重新读取远端。");
-    const conflicts = await this.store.list();
-    const persisted = await this.store.snapshot();
-    const queue = await this.service.listQueue();
+  private async renderConflicts(content: HTMLElement, token: number): Promise<void> {
+    this.renderPageTitle(content, "冲突中心");
+    content.createDiv({
+      cls: "helix-safety-note",
+      text: "竞争字段必须逐项选择；应用前会再次读取远端。",
+    });
+    const [conflicts, persisted, queue] = await Promise.all([
+      this.store.list(),
+      this.store.snapshot(),
+      this.service.listQueue(),
+    ]);
+    if (token !== this.renderToken) return;
     if (persisted.lineageConflict) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
-      const resolvable = persisted.lineageConflict.kind === undefined ||
-        persisted.lineageConflict.kind === "lineage-concurrent";
       card.createEl("span", {
         cls: "helix-chip is-danger",
-        text: resolvable ? "谱系双侧竞争" : "谱系写入已冻结",
+        text: "旧版谱系同步已冻结",
       });
       card.createEl("h3", {
-        text: resolvable ? "Canvas 与项目笔记都发生了修改" : "项目谱系需要人工修复",
+        text: "请先核对旧项目谱系",
       });
       card.createEl("p", {
         text: persisted.lineageConflict.message ??
-          (resolvable
-            ? "Helix 已暂停自动谱系写入，不会静默选择胜方。请检查两侧内容后明确选择一次。"
-            : "Helix 已暂停自动谱系写入。请按提示修复项目笔记或 Canvas 后再重试。"),
+          "新版项目工作区不会在 Canvas 与 Markdown 间自动选边或写回。旧数据会保留，迁移必须在项目页逐项确认。",
       });
-      if (!resolvable) {
-        card.createEl("code", { text: persisted.lineageConflict.canvasPath });
-        const retry = card.createEl("button", {
-          cls: "helix-secondary-button",
-          text: "我已修复，重新验证并重建 Canvas",
-        });
-        retry.addEventListener("click", () => {
-          retry.disabled = true;
-          void this.actions.resolveLineage("projects")
-            .then(() => this.render())
-            .catch((error) => {
-              retry.disabled = false;
-              new Notice(error instanceof Error ? error.message : String(error), 8_000);
-            });
-        });
-      } else {
-      const actions = card.createDiv({ cls: "helix-reconciliation-actions" });
-      const canvas = actions.createEl("button", {
-        cls: "helix-primary-button",
-        text: "以 Canvas 为准",
-      });
-      const projects = actions.createEl("button", {
-        cls: "helix-secondary-button",
-        text: "以项目笔记为准",
-      });
-      const resolve = (choice: "canvas" | "projects") => {
-        canvas.disabled = true;
-        projects.disabled = true;
-        void this.actions.resolveLineage(choice)
-          .then(() => this.render())
-          .catch((error) => {
-            canvas.disabled = false;
-            projects.disabled = false;
-            new Notice(error instanceof Error ? error.message : String(error), 8_000);
-          });
-      };
-      canvas.addEventListener("click", () => resolve("canvas"));
-      projects.addEventListener("click", () => resolve("projects"));
-      }
+      card.createEl("code", { text: persisted.lineageConflict.canvasPath });
     }
     for (const issue of this.state?.recoveryIssues ?? []) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
@@ -1102,15 +1297,14 @@ export class HelixView extends ItemView {
     });
   }
 
-  private renderPageIntro(content: HTMLElement, title: string, description: string): void {
+  private renderPageTitle(content: HTMLElement, title: string): void {
     const intro = content.createDiv({ cls: "helix-page-intro" });
     intro.createEl("h2", { text: title });
-    intro.createEl("p", { text: description });
   }
 
   private displayState(): { projects: DidaProject[]; tasks: DidaTask[] } {
     const projects = this.state?.demoMode ? SAMPLE_PROJECTS : this.state?.projects ?? [];
-    const tasks = this.state?.demoMode ? SAMPLE_TASKS : this.state?.tasks ?? [];
+    const tasks = this.state?.demoMode ? this.previewTasks : this.state?.tasks ?? [];
     return { projects, tasks };
   }
 
@@ -1141,34 +1335,6 @@ export class HelixView extends ItemView {
     );
   }
 
-  private localProjects(): Array<{
-    id: string;
-    title: string;
-    didaProjectId?: string;
-    activeCycle?: string;
-    file: TFile | null;
-  }> {
-    return this.app.vault.getMarkdownFiles().flatMap((file) => {
-      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-      if (frontmatter?.["helix-kind"] !== "helix-project") return [];
-      const id = frontmatter["helix-id"];
-      if (typeof id !== "string") return [];
-      return [{
-        id,
-        title: file.parent?.name ?? file.basename,
-        didaProjectId:
-          typeof frontmatter["helix-dida-project-id"] === "string"
-            ? frontmatter["helix-dida-project-id"]
-            : undefined,
-        activeCycle:
-          typeof frontmatter["helix-active-cycle"] === "string"
-            ? frontmatter["helix-active-cycle"].replace(/\[\[|\]\]/g, "")
-            : undefined,
-        file,
-      }];
-    });
-  }
-
   private mountTrendChart(
     element: HTMLElement,
     points: Array<{ label: string; value: number }>,
@@ -1181,22 +1347,6 @@ export class HelixView extends ItemView {
       yAxis: { type: "value", splitLine: { lineStyle: { color: "#eef0f4" } } },
       tooltip: { trigger: "axis" },
       series: [{ type: "line", smooth: 0.35, symbol: "circle", symbolSize: 6, data: points.map((point) => point.value), lineStyle: { color: "#4967de", width: 3 }, itemStyle: { color: "#4967de" }, areaStyle: { color: "rgba(73,103,222,.12)" } }],
-    });
-    this.charts.push(chart);
-    this.observeChart(element, chart);
-  }
-
-  private mountActivityChart(
-    element: HTMLElement,
-    points: Array<{ label: string; value: number }>,
-  ): void {
-    const chart = echarts.init(element, undefined, { renderer: "canvas" });
-    chart.setOption({
-      grid: { left: 34, right: 14, top: 18, bottom: 26 },
-      xAxis: { type: "category", data: points.map((point) => point.label), axisTick: { show: false }, axisLine: { show: false } },
-      yAxis: { type: "value", show: false, max: 12 },
-      tooltip: { trigger: "axis" },
-      series: [{ type: "bar", data: points.map((point) => point.value), barWidth: 20, itemStyle: { color: "#2aa37d", borderRadius: [6, 6, 0, 0] } }],
     });
     this.charts.push(chart);
     this.observeChart(element, chart);
@@ -1296,23 +1446,53 @@ function taskDateKey(value: string | null | undefined): string | undefined {
   }
 }
 
+function safeTaskTimeZone(value: string | undefined): string {
+  for (const candidate of [
+    value,
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    "UTC",
+  ]) {
+    if (!candidate) continue;
+    try {
+      assertTimeZone(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return "UTC";
+}
+
 class TaskEditModal extends Modal {
   private title: string;
   private projectId: string;
+  private content: string;
+  private startDate: string;
+  private dueDate: string;
+  private isAllDay: boolean;
+  private timeZone: string;
+  private priority: number;
 
   constructor(
     app: HelixView["app"],
     private readonly task: DidaTask,
     private readonly projects: DidaProject[],
     private readonly submit: (task: DidaTask) => Promise<void>,
+    private readonly preview = false,
   ) {
     super(app);
     this.title = task.title;
     this.projectId = task.projectId;
+    this.content = task.content ?? task.desc ?? "";
+    this.timeZone = safeTaskTimeZone(task.timeZone);
+    this.startDate = instantToWallDateTime(task.startDate, this.timeZone);
+    this.dueDate = instantToWallDateTime(task.dueDate, this.timeZone);
+    this.isAllDay = task.isAllDay ?? false;
+    this.priority = task.priority ?? 0;
   }
 
   onOpen(): void {
-    this.setTitle("编辑滴答任务");
+    this.setTitle(this.preview ? "编辑预览任务" : "编辑滴答任务");
     new Setting(this.contentEl)
       .setName("任务标题")
       .addText((text) =>
@@ -1321,8 +1501,14 @@ class TaskEditModal extends Modal {
         }),
       );
     new Setting(this.contentEl)
-      .setName("所属项目")
-      .setDesc("修改后会按移动→更新→完成的幂等顺序同步。")
+      .setName("内容")
+      .addTextArea((text) =>
+        text.setValue(this.content).onChange((value) => {
+          this.content = value;
+        }),
+      );
+    new Setting(this.contentEl)
+      .setName("滴答清单")
       .addDropdown((dropdown) => {
         for (const project of this.projects) dropdown.addOption(project.id, project.name);
         if (!this.projects.some((project) => project.id === this.projectId)) {
@@ -1332,17 +1518,92 @@ class TaskEditModal extends Modal {
           this.projectId = value;
         });
       });
+    new Setting(this.contentEl)
+      .setName("开始时间")
+      .addText((text) => {
+        text.inputEl.type = "datetime-local";
+        text.setValue(this.startDate).onChange((value) => {
+          this.startDate = value;
+        });
+      });
+    new Setting(this.contentEl)
+      .setName("截止时间")
+      .addText((text) => {
+        text.inputEl.type = "datetime-local";
+        text.setValue(this.dueDate).onChange((value) => {
+          this.dueDate = value;
+        });
+      });
+    new Setting(this.contentEl)
+      .setName("全天")
+      .addToggle((toggle) =>
+        toggle.setValue(this.isAllDay).onChange((value) => {
+          this.isAllDay = value;
+        }),
+      );
+    new Setting(this.contentEl)
+      .setName("时区")
+      .addText((text) =>
+        text.setValue(this.timeZone).onChange((value) => {
+          this.timeZone = value;
+        }),
+      );
+    new Setting(this.contentEl)
+      .setName("优先级")
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("0", "无")
+          .addOption("1", "低")
+          .addOption("3", "中")
+          .addOption("5", "高")
+          .setValue(String(this.priority))
+          .onChange((value) => {
+            this.priority = Number(value);
+          });
+      });
     const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
     actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
-    const save = actions.createEl("button", { cls: "mod-cta", text: "保存并同步" });
+    const save = actions.createEl("button", {
+      cls: "mod-cta",
+      text: this.preview ? "保存预览" : "保存并同步",
+    });
     save.addEventListener("click", () => {
       const title = this.title.trim();
       if (!title) {
         new Notice("任务标题不能为空");
         return;
       }
+      const timeZone = this.timeZone.trim();
+      if (!timeZone) {
+        new Notice("时区不能为空");
+        return;
+      }
+      let startDate: string | null;
+      let dueDate: string | null;
+      try {
+        assertTimeZone(timeZone);
+        startDate = wallDateTimeToInstant(this.startDate, timeZone);
+        dueDate = wallDateTimeToInstant(this.dueDate, timeZone);
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (startDate && dueDate && Date.parse(startDate) > Date.parse(dueDate)) {
+        new Notice("截止时间不能早于开始时间");
+        return;
+      }
       save.disabled = true;
-      void this.submit({ ...this.task, title, projectId: this.projectId })
+      void this.submit({
+        ...this.task,
+        title,
+        projectId: this.projectId,
+        content: this.content,
+        startDate,
+        dueDate,
+        isAllDay: this.isAllDay,
+        timeZone,
+        priority: this.priority,
+      })
         .then(() => this.close())
         .catch((error) => {
           save.disabled = false;
@@ -1354,4 +1615,101 @@ class TaskEditModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+class ChallengeDetailModal extends Modal {
+  constructor(
+    app: HelixView["app"],
+    private readonly challenge: ChallengeDefinition,
+    private readonly events: HelixEvent[],
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle(this.challenge.title);
+    const current = challengeProgress(this.challenge, this.events);
+    const remaining = Math.max(0, this.challenge.target - current);
+    const claimed = this.events.some(
+      (event) =>
+        event.type === "challenge-completed" &&
+        event.entityId === this.challenge.id,
+    );
+    const summary = this.contentEl.createDiv({ cls: "helix-challenge-detail-summary" });
+    summary.createDiv({ text: this.challenge.description });
+    const metrics = summary.createDiv({ cls: "helix-challenge-detail-metrics" });
+    for (const [label, value] of [
+      ["当前进度", `${current} / ${this.challenge.target}`],
+      ["还差", String(remaining)],
+      ["奖励", `${this.challenge.rewardXp} XP`],
+      ["状态", claimed ? "已领取" : current >= this.challenge.target ? "待领取" : "进行中"],
+    ]) {
+      const item = metrics.createDiv();
+      item.createSpan({ text: label });
+      item.createEl("strong", { text: value });
+    }
+    const rules = this.contentEl.createDiv({ cls: "helix-challenge-detail-section" });
+    rules.createEl("h3", { text: "规则" });
+    rules.createEl("dl").append(
+      detailPair("指标", challengeMetricLabel(this.challenge.metric)),
+      detailPair("开始", formatDateTime(this.challenge.startsAt)),
+      detailPair("结束", formatDateTime(this.challenge.endsAt)),
+      detailPair("撤销", "任务重开、习惯撤销或专注删除会同步扣回进度"),
+    );
+    const contributions = challengeContributions(this.challenge, this.events);
+    const contributionSection = this.contentEl.createDiv({
+      cls: "helix-challenge-detail-section",
+    });
+    contributionSection.createEl("h3", { text: "贡献明细" });
+    if (contributions.length === 0) {
+      contributionSection.createDiv({
+        cls: "helix-empty",
+        text: "当前周期还没有计入这项挑战的记录。",
+      });
+    } else {
+      const list = contributionSection.createDiv({
+        cls: "helix-challenge-contribution-list",
+      });
+      for (const contribution of contributions.slice(0, 30)) {
+        const row = list.createDiv({ cls: "helix-challenge-contribution" });
+        const copy = row.createDiv();
+        copy.createEl("strong", { text: contribution.label });
+        copy.createSpan({ text: `${formatDateTime(contribution.occurredAt)} · ${contribution.entityId}` });
+        row.createSpan({
+          text: `+${contribution.value}`,
+        });
+      }
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+function detailPair(label: string, value: string): HTMLElement {
+  const item = document.createElement("div");
+  item.createEl("dt", { text: label });
+  item.createEl("dd", { text: value });
+  return item;
+}
+
+function challengeMetricLabel(metric: ChallengeDefinition["metric"]): string {
+  return {
+    "focus-sessions": "不少于 25 分钟的专注次数",
+    "focus-minutes": "有效专注分钟",
+    tasks: "完成任务数",
+    reviews: "关闭复盘数",
+    "active-days": "活跃天数",
+  }[metric];
+}
+
+function formatDateTime(value: string): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
 }

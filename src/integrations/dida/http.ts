@@ -30,8 +30,13 @@ export class ObsidianHttpTransport implements HttpTransport {
     return {
       status: response.status,
       headers: response.headers,
-      data: response.json as T,
+      data: readResponseData(response.text, () => response.json as T),
       text: response.text,
     };
   }
+}
+
+export function readResponseData<T>(text: string, readJson: () => T): T {
+  if (!text.trim()) return undefined as T;
+  return readJson();
 }

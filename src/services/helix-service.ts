@@ -11,6 +11,11 @@ import type {
 } from "../domain/entities";
 import { InProgressRegistry } from "../domain/in-progress";
 import {
+  DIDA_CONTRACT_PROBE_VERSION,
+  validateTaskScheduleWrite,
+  type TaskScheduleMode,
+} from "../domain/task-schedule";
+import {
   deterministicEventId,
   EventLedger,
   isHelixEvent,
@@ -26,6 +31,11 @@ import {
 } from "../integrations/dida/adapters";
 import { ObsidianHttpTransport } from "../integrations/dida/http";
 import { normalizeProject, normalizeTask } from "../integrations/dida/normalization";
+import {
+  DidaWriteContractRunner,
+  type DidaWriteContractProgress,
+  type DidaWriteContractReport,
+} from "../integrations/dida/write-contract";
 import { OfflineQueue } from "../sync/offline-queue";
 import { ingestRemoteRecords } from "../sync/remote-ingest";
 import { createSnapshot } from "../sync/snapshots";
@@ -44,6 +54,7 @@ import {
 } from "./task-operations";
 import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
+import { RemoteWriteGate } from "./remote-write-gate";
 import { claimNextQueueOperation } from "./queue-claim";
 import {
   claimConflictApplication,
@@ -61,6 +72,7 @@ export interface HelixRuntimeState {
   events: HelixEvent[];
   inProgress: InProgressEntry[];
   capabilities: DidaCapabilities | null;
+  taskScheduleMode: TaskScheduleMode;
   demoMode: boolean;
   lastSyncAt?: string;
   error?: string;
@@ -81,6 +93,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   events: [],
   inProgress: [],
   capabilities: null,
+  taskScheduleMode: "unknown",
   demoMode: false,
   attentionCount: 0,
   recoveryIssues: [],
@@ -96,15 +109,22 @@ export class HelixService {
   private state: HelixRuntimeState = { ...EMPTY_STATE };
   private readonly queueDrain = new SingleFlight();
   private readonly conflictApplications = new Map<string, Promise<void>>();
+  private readonly remoteWriteGate = new RemoteWriteGate();
+  private contractTestRunning = false;
+  private secretMutationAuthorized = false;
   private disposed = false;
 
   constructor(
     private readonly store: HelixDataStore,
-    secrets: HelixSecretStore,
+    private readonly secrets: HelixSecretStore,
   ) {
     this.api = new DidaApi(new ObsidianHttpTransport(), () => secrets.getDidaToken());
     this.habitService = new DidaHabitService(this.api);
     this.focusService = new DidaFocusService(this.api);
+    secrets.setMutationGuard?.(() =>
+      this.secretMutationAuthorized
+        ? null
+        : "API 口令只能通过 Helix 的授权切换流程修改");
   }
 
   async initialize(): Promise<void> {
@@ -120,11 +140,17 @@ export class HelixService {
       data = await this.store.snapshot();
     }
     this.taskEngine = new SyncEngine({
-      adapter: new DidaTaskAdapter(this.api),
+      adapter: new DidaTaskAdapter(this.api, () => this.state.taskScheduleMode),
       snapshots: this.store,
       conflicts: this.store,
       deviceId: data.deviceId,
       deferConflictFinalization: true,
+      validateWrite: (value, remoteBeforeWrite) =>
+        validateTaskScheduleWrite(
+          value,
+          this.state.taskScheduleMode,
+          remoteBeforeWrite,
+        ),
     });
     this.projectEngine = new SyncEngine({
       adapter: new DidaProjectAdapter(this.api),
@@ -150,6 +176,8 @@ export class HelixService {
         (data.lineageConflict ? 1 : 0),
       recoveryIssues: data.recoveryIssues,
       connected: false,
+      taskScheduleMode:
+        data.didaContractCapabilities?.taskScheduleMode ?? "unknown",
       demoMode:
         data.settings.showSampleDataWhenDisconnected &&
         cachedValues<DidaTask>(data, "task").length === 0,
@@ -173,8 +201,45 @@ export class HelixService {
     return () => this.listeners.delete(listener);
   }
 
+  async replaceDidaToken(token: string): Promise<void> {
+    const normalized = token.trim();
+    if (normalized.length < 10) throw new Error("API 口令长度异常");
+    await this.changeDidaAuthorization(() => this.secrets.setDidaToken(normalized));
+  }
+
+  async clearDidaToken(): Promise<void> {
+    await this.changeDidaAuthorization(() => this.secrets.clearDidaToken());
+  }
+
+  private async changeDidaAuthorization(mutateSecret: () => void): Promise<void> {
+    this.assertActive();
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("API 口令切换");
+    try {
+      await this.store.mutate((data) => {
+        delete data.didaContractCapabilities;
+      });
+      this.secretMutationAuthorized = true;
+      try {
+        mutateSecret();
+      } finally {
+        this.secretMutationAuthorized = false;
+      }
+      this.patch({
+        connected: false,
+        capabilities: null,
+        taskScheduleMode: "unknown",
+      });
+    } finally {
+      releaseExclusive();
+    }
+  }
+
   async sync(): Promise<void> {
     this.assertWritable();
+    await this.withAuthorizationLease(() => this.syncWithAuthorizationLease());
+  }
+
+  private async syncWithAuthorizationLease(): Promise<void> {
     if (this.state.loading) return;
     this.patch({ loading: true, error: undefined });
     try {
@@ -325,6 +390,10 @@ export class HelixService {
 
   async probeConnection(): Promise<DidaCapabilities> {
     this.assertActive();
+    return this.withAuthorizationLease(() => this.probeConnectionWithAuthorizationLease());
+  }
+
+  private async probeConnectionWithAuthorizationLease(): Promise<DidaCapabilities> {
     const capabilities = await this.api.probeCapabilities();
     if (capabilities.projects !== "available" || capabilities.tasks !== "available") {
       throw new Error(capabilities.errors.join("；") || "任务与项目接口不可用");
@@ -333,8 +402,51 @@ export class HelixService {
     return capabilities;
   }
 
+  async runDidaWriteContractTest(
+    onProgress?: (progress: DidaWriteContractProgress) => void,
+  ): Promise<DidaWriteContractReport> {
+    this.assertWritable();
+    if (this.state.loading) throw new Error("同步正在进行，请完成后再运行写入合同测试");
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答写入合同测试");
+    this.contractTestRunning = true;
+    this.patch({ loading: true, error: undefined });
+    try {
+      const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 });
+      const report = await new DidaWriteContractRunner(
+        contractApi,
+        undefined,
+        undefined,
+        undefined,
+        onProgress,
+      ).run();
+      if (report.taskScheduleMode !== "unknown") {
+        this.patch({ taskScheduleMode: report.taskScheduleMode });
+        await this.store.mutate((data) => {
+          data.didaContractCapabilities = {
+            probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+            taskScheduleMode: report.taskScheduleMode as Exclude<TaskScheduleMode, "unknown">,
+            verifiedAt: new Date().toISOString(),
+          };
+        });
+      }
+      return report;
+    } finally {
+      this.contractTestRunning = false;
+      releaseExclusive();
+      this.patch({ loading: false });
+    }
+  }
+
   async verifyRemoteTask(projectId: string, taskId: string): Promise<DidaTask> {
     this.assertActive();
+    return this.withAuthorizationLease(() =>
+      this.verifyRemoteTaskWithAuthorizationLease(projectId, taskId));
+  }
+
+  private async verifyRemoteTaskWithAuthorizationLease(
+    projectId: string,
+    taskId: string,
+  ): Promise<DidaTask> {
     const task = normalizeTask(await this.api.getTask(projectId, taskId));
     if (task.id !== taskId || task.projectId !== projectId) {
       throw new Error("滴答复读返回的任务身份或清单与待绑定目标不一致");
@@ -394,6 +506,18 @@ export class HelixService {
 
   async createTask(title: string, projectId: string): Promise<void> {
     this.assertWritable();
+    const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
+    try {
+      await this.createTaskWithAuthorizationLease(title, projectId);
+    } finally {
+      releaseAuthorizationLease();
+    }
+  }
+
+  private async createTaskWithAuthorizationLease(
+    title: string,
+    projectId: string,
+  ): Promise<void> {
     const normalized = title.trim();
     if (!normalized) throw new Error("任务标题不能为空");
     const now = new Date().toISOString();
@@ -450,6 +574,18 @@ export class HelixService {
     operationType: "update" | "complete" = "update",
   ): Promise<void> {
     this.assertWritable();
+    const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
+    try {
+      await this.queueTaskUpdateWithAuthorizationLease(task, operationType);
+    } finally {
+      releaseAuthorizationLease();
+    }
+  }
+
+  private async queueTaskUpdateWithAuthorizationLease(
+    task: DidaTask,
+    operationType: "update" | "complete",
+  ): Promise<void> {
     if (task.id.startsWith("local-")) {
       throw new Error("该任务尚未完成远端创建核对，暂不能继续修改");
     }
@@ -458,6 +594,7 @@ export class HelixService {
       | EntitySnapshot<DidaTask>
       | undefined;
     if (!base) throw new Error("任务缺少同步基线，请先完成一次同步");
+    validateTaskScheduleWrite(task, this.state.taskScheduleMode, base.value);
     const now = new Date().toISOString();
     const operation = buildTaskUpdateOperation(
       task,
@@ -537,6 +674,15 @@ export class HelixService {
     remoteId?: string,
   ): Promise<void> {
     this.assertWritable();
+    await this.withAuthorizationLease(() =>
+      this.resolveUnknownCreateWithAuthorizationLease(operationId, resolution, remoteId));
+  }
+
+  private async resolveUnknownCreateWithAuthorizationLease(
+    operationId: string,
+    resolution: "not-created" | "confirmed",
+    remoteId?: string,
+  ): Promise<void> {
     const data = await this.store.snapshot();
     const operation = data.queue.find((candidate) => candidate.id === operationId);
     if (!operation || operation.status !== "reconciliation" || operation.operation !== "create") {
@@ -603,6 +749,14 @@ export class HelixService {
     resolution: "continue" | "adopt-remote",
   ): Promise<void> {
     this.assertWritable();
+    await this.withAuthorizationLease(() =>
+      this.resolveUnknownWriteWithAuthorizationLease(operationId, resolution));
+  }
+
+  private async resolveUnknownWriteWithAuthorizationLease(
+    operationId: string,
+    resolution: "continue" | "adopt-remote",
+  ): Promise<void> {
     const data = await this.store.snapshot();
     const queue = new OfflineQueue(data.queue);
     const operation = queue.list().find((candidate) => candidate.id === operationId);
@@ -619,7 +773,7 @@ export class HelixService {
     }
     let adopted: EntitySnapshot<unknown> | null = null;
     if (operation.kind === "task") {
-      const adapter = new DidaTaskAdapter(this.api);
+      const adapter = new DidaTaskAdapter(this.api, () => this.state.taskScheduleMode);
       const desiredProjectId = (operation.local.value as Partial<DidaTask>).projectId;
       const remoteAtTarget = desiredProjectId
         ? await adapter.get(operation.entityId, { projectId: desiredProjectId })
@@ -668,6 +822,13 @@ export class HelixService {
 
   async retryFailedOperation(operationId: string): Promise<void> {
     this.assertWritable();
+    await this.withAuthorizationLease(() =>
+      this.retryFailedOperationWithAuthorizationLease(operationId));
+  }
+
+  private async retryFailedOperationWithAuthorizationLease(
+    operationId: string,
+  ): Promise<void> {
     await this.mutateQueue((queue) => queue.retryFailed(operationId));
     await this.drainQueue();
     await this.throwIfOperationNeedsAttention(operationId);
@@ -687,14 +848,6 @@ export class HelixService {
     }
     const engine = conflict.kind === "project" ? this.projectEngine : this.taskEngine;
     if (!engine) throw new Error("Helix 尚未初始化");
-    const selected = conflict.fields.find((field) => field.path === path);
-    if (selected?.group === "schedule" && choice !== "custom") {
-      let updated = conflict;
-      for (const field of conflict.fields.filter((candidate) => candidate.group === "schedule")) {
-        updated = await engine.choose(conflictId, field.path, choice, customValue);
-      }
-      return updated;
-    }
     return engine.choose(conflictId, path, choice, customValue);
   }
 
@@ -729,6 +882,14 @@ export class HelixService {
 
   async adoptAppliedConflict(conflictId: string, remoteEntityId?: string): Promise<void> {
     this.assertWritable();
+    await this.withAuthorizationLease(() =>
+      this.adoptAppliedConflictWithAuthorizationLease(conflictId, remoteEntityId));
+  }
+
+  private async adoptAppliedConflictWithAuthorizationLease(
+    conflictId: string,
+    remoteEntityId?: string,
+  ): Promise<void> {
     const conflict = await this.store.get(conflictId);
     if (!conflict || conflict.status !== "applying") {
       throw new Error("该冲突不在等待远端核对状态");
@@ -751,6 +912,15 @@ export class HelixService {
   }
 
   private async applyConflictOnce(conflictId: string): Promise<void> {
+    const releaseRemoteWrite = this.remoteWriteGate.enterShared();
+    try {
+      await this.applyConflictWithRemoteWrite(conflictId);
+    } finally {
+      releaseRemoteWrite();
+    }
+  }
+
+  private async applyConflictWithRemoteWrite(conflictId: string): Promise<void> {
     let previousStatus: SyncConflict["status"] = "open";
     await this.store.mutate((data) => {
       previousStatus = claimConflictApplication(data.conflicts, conflictId);
@@ -890,6 +1060,15 @@ export class HelixService {
   }
 
   private async runDrainQueue(): Promise<void> {
+    const releaseRemoteWrite = this.remoteWriteGate.enterShared();
+    try {
+      await this.runDrainQueueWithRemoteWrite();
+    } finally {
+      releaseRemoteWrite();
+    }
+  }
+
+  private async runDrainQueueWithRemoteWrite(): Promise<void> {
     while (true) {
       if (this.disposed) return;
       let operation: SyncQueueOperation | null = null;
@@ -1019,8 +1198,20 @@ export class HelixService {
 
   private assertWritable(): void {
     this.assertActive();
+    if (this.contractTestRunning) {
+      throw new Error("滴答写入合同测试正在运行，其他写入已暂时冻结");
+    }
     if (this.state.recoveryIssues.length > 0) {
       throw new Error("Helix 当前处于只读恢复模式，修复 data.json 前不能写入");
+    }
+  }
+
+  private async withAuthorizationLease<T>(operation: () => Promise<T>): Promise<T> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 }

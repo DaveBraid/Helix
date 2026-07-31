@@ -7,6 +7,9 @@ import {
 import { openInDefaultBrowser } from "./default-browser";
 
 export class HelixSettingTab extends PluginSettingTab {
+  private writeTestArmed = false;
+  private writeTestResult: string | null = null;
+
   constructor(app: App, private readonly plugin: HelixPlugin) {
     super(app, plugin);
   }
@@ -47,9 +50,9 @@ export class HelixSettingTab extends PluginSettingTab {
         });
       })
       .addButton((button) =>
-        button.setButtonText("保存").setCta().onClick(() => {
+        button.setButtonText("保存").setCta().onClick(async () => {
           try {
-            this.plugin.secrets.setDidaToken(token);
+            await this.plugin.service.replaceDidaToken(token);
             this.plugin.refreshAutoSync();
             token = "";
             new Notice("滴答 API 口令已保存到 SecretStorage");
@@ -60,11 +63,15 @@ export class HelixSettingTab extends PluginSettingTab {
         }),
       )
       .addButton((button) =>
-        button.setButtonText("清除").setWarning().onClick(() => {
-          this.plugin.secrets.clearDidaToken();
-          this.plugin.refreshAutoSync();
-          new Notice("滴答 API 口令已清除");
-          this.display();
+        button.setButtonText("清除").setWarning().onClick(async () => {
+          try {
+            await this.plugin.service.clearDidaToken();
+            this.plugin.refreshAutoSync();
+            new Notice("滴答 API 口令已清除");
+            this.display();
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : String(error));
+          }
         }),
       );
 
@@ -84,6 +91,57 @@ export class HelixSettingTab extends PluginSettingTab {
           }
         }),
       );
+
+    let scheduleModeSetting: Setting | null = null;
+    const writeTestSetting = new Setting(this.containerEl)
+      .setName("写入合同测试")
+      .setDesc(this.writeTestDescription())
+      .addButton((button) =>
+        button.setButtonText(this.writeTestArmed ? "再次点击开始" : "运行专用测试").onClick(async () => {
+          if (!this.writeTestArmed) {
+            this.writeTestArmed = true;
+            button.setButtonText("再次点击开始").setWarning();
+            new Notice("再次点击后将创建并清理专用测试清单；不会操作既有清单或任务", 8_000);
+            return;
+          }
+          this.writeTestArmed = false;
+          this.writeTestResult = "最近结果：测试运行中，其他远端写入与口令变更已冻结。";
+          writeTestSetting.setDesc(this.writeTestDescription());
+          button.setDisabled(true).setButtonText("测试中…");
+          try {
+            const report = await this.plugin.service.runDidaWriteContractTest((progress) => {
+              const attempt = progress.attempt && progress.maxAttempts
+                ? `（${progress.attempt}/${progress.maxAttempts}）`
+                : "";
+              this.writeTestResult = `最近结果：测试运行中 · ${progress.stage}${attempt}。其他远端写入与口令变更已冻结。`;
+              writeTestSetting.setDesc(this.writeTestDescription());
+            });
+            if (report.status === "passed" && !report.remoteArtifactsRemaining) {
+              this.writeTestResult = `最近结果：通过。${report.steps.join("；")}；测试对象已全部清理。`;
+              new Notice(`滴答写入合同测试通过：${report.steps.join("；")}`, 12_000);
+            } else {
+              const cleanup = report.remoteArtifactsRemaining
+                ? `；远端可能有测试残留：${report.cleanupErrors.join("；")}`
+                : "；测试对象已安全清理";
+              this.writeTestResult = `最近结果：未通过。${report.failure ?? "未知错误"}${cleanup}`;
+              new Notice(`滴答写入合同测试未通过：${report.failure ?? "未知错误"}${cleanup}`, 20_000);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.writeTestResult = `最近结果：无法运行。${message}`;
+            new Notice(`无法运行写入合同测试：${message}`, 12_000);
+          } finally {
+            writeTestSetting.setDesc(this.writeTestDescription());
+            scheduleModeSetting?.setDesc(this.scheduleModeDescription());
+            button.buttonEl.removeClass("mod-warning");
+            button.setDisabled(false).setButtonText("运行专用测试");
+          }
+        }),
+      );
+
+    scheduleModeSetting = new Setting(this.containerEl)
+      .setName("任务时间能力")
+      .setDesc(this.scheduleModeDescription());
 
     new Setting(this.containerEl)
       .setName("自动同步")
@@ -106,5 +164,19 @@ export class HelixSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+  }
+
+  private writeTestDescription(): string {
+    const scope = "只创建带唯一标记的两个临时清单及其中一个任务；每次删除前复读身份，绝不操作既有数据。";
+    return this.writeTestResult ? `${scope} ${this.writeTestResult}` : scope;
+  }
+
+  private scheduleModeDescription(): string {
+    const scheduleMode = this.plugin.service.snapshot().taskScheduleMode;
+    return scheduleMode === "unknown"
+      ? "尚未验证；运行写入合同测试后确定当前账号支持单点时间还是独立起止时间。"
+      : scheduleMode === "point"
+        ? "当前账号使用单点任务时间；已有独立时间段会保持原值。"
+        : "当前账号支持独立设置开始时间和截止时间。";
   }
 }

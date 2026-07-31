@@ -370,6 +370,46 @@ describe("HelixDataStore serialization", () => {
     expect(hydrateData({ schemaVersion: 2 }).schemaVersion).toBe(2);
   });
 
+  it("hydrates only a verified Dida task schedule capability", () => {
+    const valid = hydrateData({
+      schemaVersion: 2,
+      didaContractCapabilities: {
+        probeVersion: 2,
+        taskScheduleMode: "point",
+        verifiedAt: "2026-07-31T00:00:00.000Z",
+      },
+    });
+    expect(valid.didaContractCapabilities).toEqual({
+      probeVersion: 2,
+      taskScheduleMode: "point",
+      verifiedAt: "2026-07-31T00:00:00.000Z",
+    });
+
+    const invalid = hydrateData({
+      schemaVersion: 2,
+      didaContractCapabilities: {
+        probeVersion: 2,
+        taskScheduleMode: "unknown",
+        verifiedAt: "not-a-date",
+      },
+    });
+    expect(invalid.didaContractCapabilities).toBeUndefined();
+    expect(invalid.recoveryIssues).toEqual(expect.arrayContaining([
+      expect.stringMatching(/滴答合同能力缓存字段无效/),
+    ]));
+
+    const stale = hydrateData({
+      schemaVersion: 2,
+      didaContractCapabilities: {
+        probeVersion: 1,
+        taskScheduleMode: "duration",
+        verifiedAt: "2026-07-31T00:00:00.000Z",
+      },
+    });
+    expect(stale.didaContractCapabilities).toBeUndefined();
+    expect(stale.recoveryIssues).toEqual([]);
+  });
+
   it("makes snapshots wait for an in-flight save and preserves a later interleaved mutation", async () => {
     const gate = deferred();
     let firstSave = true;

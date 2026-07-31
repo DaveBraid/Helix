@@ -1,0 +1,38 @@
+import { describe, expect, it } from "vitest";
+import {
+  serializeDidaChecklistItems,
+  serializeDidaDate,
+} from "../src/integrations/dida/serialization";
+
+describe("Dida write serialization", () => {
+  it("uses the documented compact numeric UTC offset", () => {
+    expect(serializeDidaDate("2026-08-01T14:37:34.230Z"))
+      .toBe("2026-08-01T14:37:34+0000");
+    expect(serializeDidaDate("2026-08-01T22:37:34.230+08:00"))
+      .toBe("2026-08-01T14:37:34+0000");
+  });
+
+  it("preserves explicit clears and rejects malformed dates", () => {
+    expect(serializeDidaDate(null)).toBeNull();
+    expect(serializeDidaDate(undefined)).toBeUndefined();
+    expect(() => serializeDidaDate("not-a-date", "任务开始日期"))
+      .toThrow("Dida 任务开始日期格式无效");
+  });
+
+  it("serializes checklist dates without mutating the input", () => {
+    const items = [{
+      id: "item-1",
+      title: "检查项",
+      status: 0,
+      startDate: "2026-08-01T14:37:34.230Z",
+      completedTime: "2026-08-01T15:37:34.230Z",
+    }];
+    const serialized = serializeDidaChecklistItems(items);
+
+    expect(serialized?.[0]).toMatchObject({
+      startDate: "2026-08-01T14:37:34+0000",
+      completedTime: "2026-08-01T15:37:34+0000",
+    });
+    expect(items[0]?.startDate).toBe("2026-08-01T14:37:34.230Z");
+  });
+});

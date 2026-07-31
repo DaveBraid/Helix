@@ -35,6 +35,11 @@ import {
   instantToWallDateTime,
   wallDateTimeToInstant,
 } from "../domain/task-datetime";
+import {
+  taskScheduleEditorMode,
+  taskScheduleForSubmission,
+  type TaskScheduleMode,
+} from "../domain/task-schedule";
 import type { HelixRuntimeState } from "../services/helix-service";
 import { HelixService } from "../services/helix-service";
 import type {
@@ -530,6 +535,7 @@ export class HelixView extends ItemView {
           undefined,
           [],
           undefined,
+          "duration",
           async (updated) => {
             this.previewTasks = this.previewTasks.map((candidate) =>
               candidate.id === updated.id ? updated : candidate,
@@ -598,6 +604,7 @@ export class HelixView extends ItemView {
       references?.byTaskId.get(task.id),
       references?.blockingIssues ?? [],
       unavailableReasons.join("；") || undefined,
+      this.state?.taskScheduleMode ?? "unknown",
       async (updated) => {
         await this.service.queueTaskUpdate(updated);
         void this.render();
@@ -2435,6 +2442,7 @@ class TaskEditModal extends Modal {
     reference: TaskReferenceResolved | undefined,
     private readonly referenceBlockingIssues: string[],
     private readonly associationUnavailableReason: string | undefined,
+    private readonly scheduleMode: TaskScheduleMode,
     private readonly submitTask: (task: DidaTask) => Promise<void>,
     private readonly submitReference?: (
       selection: TaskReferenceSelection,
@@ -2487,36 +2495,67 @@ class TaskEditModal extends Modal {
           this.didaProjectId = value;
         });
       });
-    new Setting(this.contentEl)
-      .setName("开始时间")
-      .addText((text) => {
-        text.inputEl.type = "datetime-local";
-        text.setValue(this.startDate).onChange((value) => {
-          this.startDate = value;
+    const scheduleEditorMode = taskScheduleEditorMode(this.task, this.scheduleMode);
+    const scheduleMetadataLocked = scheduleEditorMode === "locked-duration";
+    if (scheduleEditorMode === "point") {
+      new Setting(this.contentEl)
+        .setName("任务时间")
+        .addText((text) => {
+          text.inputEl.type = "datetime-local";
+          text.setValue(this.dueDate || this.startDate).onChange((value) => {
+            this.startDate = value;
+            this.dueDate = value;
+          });
         });
-      });
-    new Setting(this.contentEl)
-      .setName("截止时间")
-      .addText((text) => {
-        text.inputEl.type = "datetime-local";
-        text.setValue(this.dueDate).onChange((value) => {
-          this.dueDate = value;
+    } else if (scheduleEditorMode === "locked-duration") {
+      new Setting(this.contentEl)
+        .setName("已有开始时间")
+        .setDesc("该任务已有独立时间段；当前账号仅支持单点任务时间，因此保持原值且不可在此转换。")
+        .addText((text) => {
+          text.inputEl.type = "datetime-local";
+          text.setValue(this.startDate).setDisabled(true);
         });
-      });
+      new Setting(this.contentEl)
+        .setName("已有截止时间")
+        .setDesc("仍可修改标题、内容、清单等其他字段，不会折叠这段时间。")
+        .addText((text) => {
+          text.inputEl.type = "datetime-local";
+          text.setValue(this.dueDate).setDisabled(true);
+        });
+    } else {
+      new Setting(this.contentEl)
+        .setName("开始时间")
+        .addText((text) => {
+          text.inputEl.type = "datetime-local";
+          text.setValue(this.startDate).onChange((value) => {
+            this.startDate = value;
+          });
+        });
+      new Setting(this.contentEl)
+        .setName("截止时间")
+        .addText((text) => {
+          text.inputEl.type = "datetime-local";
+          text.setValue(this.dueDate).onChange((value) => {
+            this.dueDate = value;
+          });
+        });
+    }
     new Setting(this.contentEl)
       .setName("全天")
-      .addToggle((toggle) =>
-        toggle.setValue(this.isAllDay).onChange((value) => {
+      .setDesc(scheduleMetadataLocked ? "已有时间段的全天状态保持原值。" : "")
+      .addToggle((toggle) => {
+        toggle.setValue(this.isAllDay).setDisabled(scheduleMetadataLocked).onChange((value) => {
           this.isAllDay = value;
-        }),
-      );
+        });
+      });
     new Setting(this.contentEl)
       .setName("时区")
-      .addText((text) =>
-        text.setValue(this.timeZone).onChange((value) => {
+      .setDesc(scheduleMetadataLocked ? "已有时间段的时区保持原值。" : "")
+      .addText((text) => {
+        text.setValue(this.timeZone).setDisabled(scheduleMetadataLocked).onChange((value) => {
           this.timeZone = value;
-        }),
-      );
+        });
+      });
     new Setting(this.contentEl)
       .setName("优先级")
       .addDropdown((dropdown) => {
@@ -2562,16 +2601,18 @@ class TaskEditModal extends Modal {
         new Notice("截止时间不能早于开始时间");
         return;
       }
+      const schedule = taskScheduleForSubmission(
+        this.task,
+        { startDate, dueDate, timeZone, isAllDay: this.isAllDay },
+        scheduleEditorMode,
+      );
       saveTask.disabled = true;
       void this.submitTask({
         ...this.task,
         title,
         projectId: this.didaProjectId,
         content: this.content,
-        startDate,
-        dueDate,
-        isAllDay: this.isAllDay,
-        timeZone,
+        ...schedule,
         priority: this.priority,
       })
         .then(() => {

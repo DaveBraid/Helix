@@ -5,6 +5,10 @@ import type {
   DidaProject,
   DidaTask,
 } from "../../domain/entities";
+import {
+  validateTaskScheduleWrite,
+  type TaskScheduleMode,
+} from "../../domain/task-schedule";
 import type { RemoteEntityAdapter } from "../../sync/types";
 import { DidaApi } from "./api";
 import {
@@ -14,11 +18,15 @@ import {
   normalizeProject,
   normalizeTask,
 } from "./normalization";
+import { serializeDidaChecklistItems, serializeDidaDate } from "./serialization";
 
 export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
   readonly kind = "task" as const;
 
-  constructor(private readonly api: DidaApi) {}
+  constructor(
+    private readonly api: DidaApi,
+    private readonly scheduleMode: () => TaskScheduleMode = () => "duration",
+  ) {}
 
   async get(entityId: string, context?: { projectId?: string }): Promise<DidaTask | null> {
     if (!context?.projectId) throw new Error("Task lookup requires projectId");
@@ -31,6 +39,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
   }
 
   async create(value: DidaTask): Promise<DidaTask> {
+    validateTaskScheduleWrite(value, this.scheduleMode());
     return normalizeTask(await this.api.createTask(taskCreatePayload(value)));
   }
 
@@ -39,13 +48,16 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     value: DidaTask,
     context?: { projectId?: string },
   ): Promise<DidaTask> {
+    let remoteBeforeWrite = await this.get(entityId, { projectId: value.projectId });
+    let scheduleValidated = false;
     if (context?.projectId && context.projectId !== value.projectId) {
-      const alreadyMoved = await this.get(entityId, { projectId: value.projectId });
-      if (!alreadyMoved) {
+      if (!remoteBeforeWrite) {
         const stillAtSource = await this.get(entityId, { projectId: context.projectId });
         if (!stillAtSource) {
           throw new Error("任务既不在原清单也不在目标清单，必须人工核对远端位置");
         }
+        validateTaskScheduleWrite(value, this.scheduleMode(), stillAtSource);
+        scheduleValidated = true;
         try {
           await this.api.moveTask({
             fromProjectId: context.projectId,
@@ -58,7 +70,12 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
         }
         const moved = await this.get(entityId, { projectId: value.projectId });
         if (!moved) throw new Error("任务迁移后无法在目标清单复读");
+        remoteBeforeWrite = moved;
       }
+    }
+    if (!remoteBeforeWrite) throw new Error("任务更新前无法在目标清单复读");
+    if (!scheduleValidated) {
+      validateTaskScheduleWrite(value, this.scheduleMode(), remoteBeforeWrite);
     }
     await this.api.updateTask(entityId, taskUpdatePayload(value));
     let current = await this.get(entityId, { projectId: value.projectId });
@@ -168,14 +185,14 @@ function taskCreatePayload(value: DidaTask): Partial<DidaTask> & Pick<DidaTask, 
     content: value.content,
     desc: value.desc,
     isAllDay: value.isAllDay,
-    startDate: value.startDate,
-    dueDate: value.dueDate,
+    startDate: serializeDidaDate(value.startDate, "任务开始日期"),
+    dueDate: serializeDidaDate(value.dueDate, "任务截止日期"),
     timeZone: value.timeZone,
     reminders: value.reminders,
     repeatFlag: value.repeatFlag,
     priority: value.priority,
     sortOrder: value.sortOrder,
-    items: value.items,
+    items: serializeDidaChecklistItems(value.items),
     tags: value.tags,
   };
 }
@@ -189,14 +206,14 @@ function taskUpdatePayload(value: DidaTask): Partial<DidaTask> {
     content: clearedAs(value, "content", ""),
     desc: clearedAs(value, "desc", ""),
     isAllDay: clearedAs(value, "isAllDay", false),
-    startDate: clearedAs(value, "startDate", null),
-    dueDate: clearedAs(value, "dueDate", null),
+    startDate: serializeDidaDate(clearedAs(value, "startDate", null), "任务开始日期"),
+    dueDate: serializeDidaDate(clearedAs(value, "dueDate", null), "任务截止日期"),
     timeZone: clearedAs(value, "timeZone", null),
     reminders: clearedAs(value, "reminders", []),
     repeatFlag: clearedAs(value, "repeatFlag", null),
     priority: clearedAs(value, "priority", 0),
     sortOrder: clearedAs(value, "sortOrder", 0),
-    items: clearedAs(value, "items", []),
+    items: serializeDidaChecklistItems(clearedAs(value, "items", [])),
     tags: clearedAs(value, "tags", []),
   };
 }

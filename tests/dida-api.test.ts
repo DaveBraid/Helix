@@ -93,4 +93,33 @@ describe("DidaApi non-idempotent safety", () => {
       expect.stringMatching(/专注接口返回值不是数组/),
     ]));
   });
+
+  it("applies a contract request policy without multiplying read retries", async () => {
+    const transport = new ThrowingTransport();
+    const api = new DidaApi(transport, () => "test-token-long-enough")
+      .withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 });
+
+    await expect(api.getProjects()).rejects.toThrow("socket closed after send");
+    expect(transport.calls).toHaveLength(1);
+    expect(transport.calls[0]?.timeoutMs).toBe(5_000);
+  });
+
+  it("keeps unknown-outcome protection for writes on a derived policy client", async () => {
+    const transport = new ThrowingTransport();
+    const api = new DidaApi(transport, () => "test-token-long-enough")
+      .withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 });
+
+    await expect(api.createTask({ title: "one", projectId: "project-1" }))
+      .rejects.toMatchObject({ category: "unknown-outcome", remoteOutcomeUnknown: true });
+    expect(transport.calls).toHaveLength(1);
+  });
+
+  it("falls back to three attempts when maxAttempts is not finite", async () => {
+    const transport = new StatusTransport(503);
+    const api = new DidaApi(transport, () => "test-token-long-enough")
+      .withRequestPolicy({ maxAttempts: Number.NaN });
+
+    await expect(api.getProjects()).rejects.toMatchObject({ category: "transient" });
+    expect(transport.calls).toBe(3);
+  });
 });

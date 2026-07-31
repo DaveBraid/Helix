@@ -33,6 +33,7 @@ export interface SyncEngineDependencies<T extends RemoteEntity> {
   deviceId: string;
   now?: () => Date;
   deferConflictFinalization?: boolean;
+  validateWrite?: (value: T, remoteBeforeWrite: T | null) => void;
 }
 
 export class SyncEngine<T extends RemoteEntity> {
@@ -255,6 +256,7 @@ export class SyncEngine<T extends RemoteEntity> {
   private async create(
     operation: SyncQueueOperation<T>,
   ): Promise<{ outcome: "pushed"; snapshot: EntitySnapshot<T> }> {
+    this.dependencies.validateWrite?.(operation.local.value, null);
     const created = await this.dependencies.adapter.create(operation.local.value);
     const createdId = created.id || operation.entityId;
     let verified: T | null;
@@ -321,6 +323,7 @@ export class SyncEngine<T extends RemoteEntity> {
         ),
       };
     }
+    this.dependencies.validateWrite?.(desired.value, preflight);
     await this.dependencies.adapter.update(operation.entityId, desired.value, {
       projectId: operation.projectId,
     });
@@ -367,6 +370,7 @@ export class SyncEngine<T extends RemoteEntity> {
     }
 
     if (freshRemote === null) {
+      this.dependencies.validateWrite?.(merged, null);
       const created = await this.dependencies.adapter.create(merged);
       const createdId = created.id || conflict.entityId;
       let verified: T | null;
@@ -386,6 +390,7 @@ export class SyncEngine<T extends RemoteEntity> {
     }
 
     if (!equivalentForVerification(merged, freshRemote)) {
+      this.dependencies.validateWrite?.(merged, freshRemote);
       await this.dependencies.adapter.update(conflict.entityId, merged, context);
     }
     const verified = await this.dependencies.adapter.get(conflict.entityId, {

@@ -11,6 +11,70 @@ import { deterministicEventId, type HelixEvent } from "../src/domain/events";
 import { rotatingChallenges } from "../src/domain/gamification";
 
 describe("HelixService runtime recovery", () => {
+  it("restores the verified schedule mode and clears it when authorization changes", async () => {
+    const data = createDefaultData("device-a");
+    data.didaContractCapabilities = {
+      probeVersion: 2,
+      taskScheduleMode: "point",
+      verifiedAt: "2026-07-31T00:00:00.000Z",
+    };
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      {
+        getDidaToken: () => "token",
+        clearDidaToken: () => undefined,
+      } as unknown as HelixSecretStore,
+    );
+
+    await service.initialize();
+    expect(service.snapshot().taskScheduleMode).toBe("point");
+
+    await service.clearDidaToken();
+    expect(service.snapshot().taskScheduleMode).toBe("unknown");
+    expect(persisted.didaContractCapabilities).toBeUndefined();
+  });
+
+  it("rejects a new duration before queueing when the account is in point mode", async () => {
+    const data = createDefaultData("device-a");
+    const baseTask: DidaTask = {
+      id: "task-schedule",
+      projectId: "project-1",
+      title: "Task",
+      status: 0,
+    };
+    data.baseSnapshots["task:task-schedule"] = createSnapshot("task", baseTask.id, baseTask);
+    data.localSnapshots["task:task-schedule"] = createSnapshot("task", baseTask.id, baseTask);
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    (service as unknown as { state: { taskScheduleMode: string } }).state.taskScheduleMode = "point";
+
+    await expect(service.queueTaskUpdate({
+      ...baseTask,
+      startDate: "2026-08-01T14:00:00Z",
+      dueDate: "2026-08-01T15:00:00Z",
+    })).rejects.toThrow(/仅支持单点任务时间/);
+    expect(persisted.queue).toEqual([]);
+  });
+
   it("migrates both persisted and live in-progress state when confirming an unknown create", async () => {
     const data = createDefaultData("device-a");
     const local: DidaTask = {
@@ -446,6 +510,72 @@ describe("HelixService runtime recovery", () => {
     ).rejects.toThrow(/不可修改字段选择/);
     await service.releaseApplyingConflict("conflict-applying");
     expect(persisted.conflicts[0]?.status).toBe("staged");
+  });
+
+  it("changes only the schedule field explicitly selected by the user", async () => {
+    const data = createDefaultData("device-a");
+    const baseTask: DidaTask = {
+      id: "task-schedule-conflict",
+      projectId: "project-1",
+      title: "Schedule",
+      status: 0,
+      startDate: "2026-08-01T10:00:00Z",
+      dueDate: "2026-08-01T11:00:00Z",
+      timeZone: "UTC",
+      isAllDay: false,
+    };
+    const localTask: DidaTask = {
+      ...baseTask,
+      startDate: "2026-08-01T12:00:00Z",
+      dueDate: "2026-08-01T13:00:00Z",
+      timeZone: "Asia/Shanghai",
+      isAllDay: true,
+    };
+    const remoteTask: DidaTask = {
+      ...baseTask,
+      startDate: "2026-08-01T14:00:00Z",
+      dueDate: "2026-08-01T15:00:00Z",
+      timeZone: "Asia/Tokyo",
+    };
+    const base = createSnapshot("task", baseTask.id, baseTask);
+    const local = createSnapshot("task", baseTask.id, localTask);
+    const remote = createSnapshot("task", baseTask.id, remoteTask);
+    data.conflicts = [{
+      id: "conflict-schedule-fields",
+      kind: "task",
+      entityId: baseTask.id,
+      title: baseTask.title,
+      createdAt: "2026-07-30T00:00:00.000Z",
+      updatedAt: "2026-07-30T00:00:00.000Z",
+      status: "open",
+      base,
+      local,
+      remote,
+      fields: buildConflictFields(base.value, local.value, remote.value),
+      remoteRecheckCount: 0,
+      sourceDeviceId: "device-a",
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+
+    await service.chooseConflict("conflict-schedule-fields", "dueDate", "local");
+
+    const fields = persisted.conflicts[0]?.fields ?? [];
+    expect(fields.find((field) => field.path === "dueDate")?.choice).toBe("local");
+    for (const path of ["startDate", "timeZone", "isAllDay"]) {
+      expect(fields.find((field) => field.path === path)?.choice).toBeUndefined();
+    }
   });
 
   it("blocks remote and local writes before network access in recovery mode", async () => {

@@ -185,4 +185,58 @@ describe("DidaTaskAdapter", () => {
     );
     expect(api.lastUpdate?.dueDate).toBeNull();
   });
+
+  it("serializes task dates in the documented Dida write format", async () => {
+    const api = new FakeTaskApi();
+    const desired = desiredTask(0);
+    desired.startDate = "2026-08-01T14:37:34.230Z";
+    desired.dueDate = "2026-08-01T15:37:34.230Z";
+    desired.timeZone = "Asia/Shanghai";
+
+    const result = await new DidaTaskAdapter(api as unknown as DidaApi).update(
+      "task-1",
+      desired,
+      { projectId: "project-old" },
+    );
+
+    expect(api.lastUpdate).toMatchObject({
+      startDate: "2026-08-01T14:37:34+0000",
+      dueDate: "2026-08-01T15:37:34+0000",
+      timeZone: "Asia/Shanghai",
+    });
+    expect(result).toMatchObject({
+      startDate: "2026-08-01T14:37:34.000Z",
+      dueDate: "2026-08-01T15:37:34.000Z",
+    });
+  });
+
+  it("blocks a changed duration in point mode before the update request", async () => {
+    const api = new FakeTaskApi();
+    const desired = desiredTask(0);
+    desired.startDate = "2026-08-01T14:00:00Z";
+    desired.dueDate = "2026-08-01T15:00:00Z";
+    const adapter = new DidaTaskAdapter(api as unknown as DidaApi, () => "point");
+
+    await expect(adapter.update("task-1", desired, { projectId: "project-old" }))
+      .rejects.toThrow(/仅支持单点任务时间/);
+    expect(api.calls).not.toContain("move");
+    expect(api.calls).not.toContain("update");
+  });
+
+  it("allows an unrelated update when a remote duration is unchanged", async () => {
+    const api = new FakeTaskApi();
+    api.location = "project-new";
+    api.task = {
+      ...desiredTask(0),
+      title: "旧标题",
+      startDate: "2026-08-01T14:00:00Z",
+      dueDate: "2026-08-01T15:00:00Z",
+    };
+    const desired = { ...api.task, title: "新标题" };
+    const adapter = new DidaTaskAdapter(api as unknown as DidaApi, () => "point");
+
+    await expect(adapter.update("task-1", desired, { projectId: "project-new" }))
+      .resolves.toMatchObject({ title: "新标题" });
+    expect(api.calls).toContain("update");
+  });
 });

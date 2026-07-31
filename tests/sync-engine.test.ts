@@ -58,6 +58,7 @@ class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
   readonly kind = "task" as const;
   value: DidaTask | null;
   getCount = 0;
+  updateCount = 0;
 
   constructor(value: DidaTask | null) {
     this.value = value;
@@ -71,6 +72,7 @@ class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
     return structuredClone(this.value);
   }
   async update(_entityId: string, value: DidaTask): Promise<DidaTask> {
+    this.updateCount += 1;
     this.value = structuredClone(value);
     return structuredClone(value);
   }
@@ -287,5 +289,47 @@ describe("SyncEngine safety gates", () => {
     if (applied.outcome !== "resolved") throw new Error("expected resolved");
     expect(applied.audit.choices.dueDate?.valueHash).toMatch(/^[0-9a-f]{64}$/);
     expect((adapter.value as DidaTask).dueDate).toBeUndefined();
+  });
+
+  it("rejects an invalid field-by-field schedule merge before the remote write", async () => {
+    const pointTime = "2026-08-01T10:00:00.000Z";
+    const laterTime = "2026-08-01T11:00:00.000Z";
+    const baseTask = { ...task("base"), startDate: pointTime, dueDate: pointTime };
+    const localTask = { ...baseTask, dueDate: laterTime };
+    const remoteTask = { ...baseTask, title: "remote title" };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+      validateWrite: (value, remoteBeforeWrite) => {
+        const isPoint = value.startDate === value.dueDate || !value.startDate;
+        const unchanged = value.startDate === remoteBeforeWrite?.startDate &&
+          value.dueDate === remoteBeforeWrite?.dueDate;
+        if (!isPoint && !unchanged) throw new Error("当前账号不支持独立起止时间");
+      },
+    });
+
+    const result = await engine.process(operation(localTask, base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    for (const field of result.conflict.fields) {
+      await engine.choose(
+        result.conflict.id,
+        field.path,
+        field.path === "dueDate" ? "local" : "remote",
+      );
+    }
+
+    await expect(
+      engine.applyConflict(result.conflict.id, { projectId: "project-1" }),
+    ).rejects.toThrow("当前账号不支持独立起止时间");
+    expect(adapter.updateCount).toBe(0);
+    expect(repository.conflicts[0]?.status).toBe("staged");
   });
 });

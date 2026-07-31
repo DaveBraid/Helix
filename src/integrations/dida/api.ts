@@ -20,11 +20,24 @@ export interface DidaCapabilities {
 
 export type TokenProvider = () => string | null;
 
+export interface DidaRequestPolicy {
+  timeoutMs?: number;
+  maxAttempts?: number;
+}
+
 export class DidaApi {
   constructor(
     private readonly transport: HttpTransport,
     private readonly tokenProvider: TokenProvider,
+    private readonly requestPolicy: DidaRequestPolicy = {},
   ) {}
+
+  withRequestPolicy(policy: DidaRequestPolicy): DidaApi {
+    return new DidaApi(this.transport, this.tokenProvider, {
+      ...this.requestPolicy,
+      ...policy,
+    });
+  }
 
   async probeCapabilities(): Promise<DidaCapabilities> {
     const result: DidaCapabilities = {
@@ -206,7 +219,12 @@ export class DidaApi {
     if (!token) throw new DidaHttpError("authentication", "尚未配置滴答 API 口令", 401);
     const requestBody = body === undefined ? undefined : JSON.stringify(body);
     let lastError: unknown;
-    const maxAttempts = options.outcomeUnknownOnNetworkFailure ? 1 : 3;
+    const configuredAttempts = this.requestPolicy.maxAttempts ?? 3;
+    const maxAttempts = options.outcomeUnknownOnNetworkFailure
+      ? 1
+      : Number.isFinite(configuredAttempts)
+        ? Math.max(1, Math.floor(configuredAttempts))
+        : 3;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         const response = await this.transport.request<T>({
@@ -217,6 +235,7 @@ export class DidaApi {
             "Content-Type": "application/json",
           },
           body: requestBody,
+          timeoutMs: this.requestPolicy.timeoutMs,
         });
         if (response.status >= 200 && response.status < 300) return response.data;
         const error = classifyStatus(

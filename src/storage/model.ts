@@ -8,6 +8,10 @@ import { deterministicEventId, isHelixEvent, type HelixEvent } from "../domain/e
 import { deepEqual, stableHash, stableStringify } from "../domain/stable";
 import { buildConflictFields, unresolvedFields } from "../sync/three-way-merge";
 import { rotatingChallenges } from "../domain/gamification";
+import {
+  DIDA_CONTRACT_PROBE_VERSION,
+  type TaskScheduleMode,
+} from "../domain/task-schedule";
 
 export interface HelixSettings {
   rootFolder: string;
@@ -37,6 +41,11 @@ export interface HelixPersistedData {
   inProgress: InProgressEntry[];
   events: unknown[];
   recoveryIssues: string[];
+  didaContractCapabilities?: {
+    probeVersion: number;
+    taskScheduleMode: Exclude<TaskScheduleMode, "unknown">;
+    verifiedAt: string;
+  };
   lineageConflict?: {
     detectedAt: string;
     canvasPath: string;
@@ -136,6 +145,10 @@ export function hydrateData(value: unknown): HelixPersistedData {
   );
   validateQueueConflictReferences(queue, conflicts, recoveryIssues);
   const lineageConflict = validateLineageConflict(raw.lineageConflict, recoveryIssues);
+  const didaContractCapabilities = validateDidaContractCapabilities(
+    raw.didaContractCapabilities,
+    recoveryIssues,
+  );
   return {
     ...defaults,
     schemaVersion: 2,
@@ -148,8 +161,35 @@ export function hydrateData(value: unknown): HelixPersistedData {
     inProgress,
     events,
     recoveryIssues,
+    didaContractCapabilities,
     lineageConflict,
     lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : undefined,
+  };
+}
+
+function validateDidaContractCapabilities(
+  value: unknown,
+  issues: string[],
+): HelixPersistedData["didaContractCapabilities"] {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    issues.push("滴答合同能力缓存无效，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.probeVersion !== DIDA_CONTRACT_PROBE_VERSION) return undefined;
+  if (
+    (record.taskScheduleMode !== "point" && record.taskScheduleMode !== "duration") ||
+    typeof record.verifiedAt !== "string" ||
+    !Number.isFinite(Date.parse(record.verifiedAt))
+  ) {
+    issues.push("滴答合同能力缓存字段无效，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  return {
+    probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+    taskScheduleMode: record.taskScheduleMode,
+    verifiedAt: record.verifiedAt,
   };
 }
 

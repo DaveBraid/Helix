@@ -1,5 +1,10 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type HelixPlugin from "../main";
+import {
+  DIDA_TOKEN_MENU_PATH,
+  DIDA_WEB_URL,
+} from "./dida-settings-contract";
+import { openInDefaultBrowser } from "./default-browser";
 
 export class HelixSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: HelixPlugin) {
@@ -13,10 +18,27 @@ export class HelixSettingTab extends PluginSettingTab {
       cls: "setting-item-description",
       text: "滴答 API 口令只保存在 Obsidian SecretStorage，不写入 data.json、日志或 Markdown。",
     });
+    const accountGuide = document.createDocumentFragment();
+    accountGuide.append(`在滴答网页版依次打开“${DIDA_TOKEN_MENU_PATH}”创建并复制口令。`);
+    new Setting(this.containerEl)
+      .setName("API 口令获取入口")
+      .setDesc(accountGuide)
+      .addButton((button) =>
+        button.setButtonText("打开滴答网页版").onClick(async () => {
+          try {
+            await openInDefaultBrowser(DIDA_WEB_URL);
+          } catch (error) {
+            new Notice(
+              `无法打开系统浏览器：${error instanceof Error ? error.message : String(error)}`,
+              8_000,
+            );
+          }
+        }),
+      );
     let token = "";
     new Setting(this.containerEl)
       .setName("滴答 API 口令")
-      .setDesc("在滴答开放平台获取。保存后可立即测试能力范围。")
+      .setDesc("按上方路径在滴答网页版获取。保存后可立即测试能力范围。")
       .addText((text) => {
         text.inputEl.type = "password";
         text.setPlaceholder(this.plugin.secrets.getDidaToken() ? "已安全保存" : "尚未配置");

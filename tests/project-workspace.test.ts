@@ -63,6 +63,90 @@ describe("ProjectWorkspaceService", () => {
     });
   });
 
+  it("waits through an intermediate invalid Canvas write before enabling edits", async () => {
+    const repo = baseRepository();
+    const stableCanvas = (await repo.read(CANVAS))!.content;
+    let canvasReads = 0;
+    repo.beforeRead = (path) => {
+      if (path !== CANVAS) return;
+      canvasReads += 1;
+      if (canvasReads === 2) repo.set(CANVAS, "{\"nodes\":");
+      if (canvasReads === 3) repo.set(CANVAS, stableCanvas);
+    };
+
+    await expect(workspace(repo).loadStableWorkspace()).resolves.toMatchObject({
+      projects: [expect.objectContaining({ id: "project-1" })],
+      migrationRequired: false,
+    });
+    expect(canvasReads).toBeGreaterThanOrEqual(5);
+    expect((await repo.read(CANVAS))!.content).toContain("\"nodes\"");
+  });
+
+  it("requires migration decisions to remain stable across both snapshots", async () => {
+    const repo = baseRepository();
+    const projectPath = "Helix/Projects/Alpha/Project.md";
+    const cleanProject = (await repo.read(projectPath))!.content;
+    repo.set(
+      projectPath,
+      cleanProject.replace(
+        "helix-status: active\n",
+        "helix-status: active\nhelix-parents:\n  - legacy-parent\n",
+      ),
+    );
+    let projectReads = 0;
+    repo.beforeRead = (path) => {
+      if (path !== projectPath || ++projectReads !== 3) return;
+      repo.set(projectPath, cleanProject);
+    };
+
+    const snapshot = await workspace(repo).loadStableWorkspace();
+    expect(snapshot.migrationRequired).toBe(false);
+    expect(projectReads).toBeGreaterThanOrEqual(8);
+  });
+
+  it("does not repair a Canvas created after a missing-file snapshot", async () => {
+    const repo = baseRepository();
+    repo.take(CANVAS);
+    const service = workspace(repo);
+    repo.beforeCreate = (path) => {
+      if (path !== CANVAS) return;
+      repo.set(CANVAS, JSON.stringify({
+        nodes: [],
+        edges: [],
+        externalOwner: "keep",
+      }));
+    };
+
+    await expect(service.ensureCanvas()).rejects.toThrow(/目标已经存在/);
+    expect(repo.json(CANVAS)).toEqual({
+      nodes: [],
+      edges: [],
+      externalOwner: "keep",
+    });
+  });
+
+  it("tracks stable-ID Markdown paths even when notes move outside the default root", async () => {
+    const repo = baseRepository();
+    const oldPath = "Helix/Projects/Alpha/Cycle-01.md";
+    const outsidePath = "Research/Active/Alpha-Stage.md";
+    const content = repo.take(oldPath)!;
+    repo.set(outsidePath, content);
+    const service = workspace(repo);
+
+    await service.snapshot();
+    await expect(service.hasProjectWorkspaceIdentity(outsidePath))
+      .resolves.toBe(true);
+    expect(service.isKnownProjectMarkdownPath(outsidePath)).toBe(true);
+    expect(service.isKnownProjectMarkdownPath(oldPath)).toBe(false);
+
+    const renamedPath = "Archive/Alpha-Stage.md";
+    repo.set(renamedPath, repo.take(outsidePath)!);
+    expect(service.isKnownProjectMarkdownPath(outsidePath)).toBe(true);
+    await service.snapshot();
+    expect(service.isKnownProjectMarkdownPath(renamedPath)).toBe(true);
+    expect(service.isKnownProjectMarkdownPath(outsidePath)).toBe(false);
+  });
+
   it("rejects duplicate canvas IDs and prevents writes after disposal", async () => {
     const repo = baseRepository();
     const duplicated = repo.json(CANVAS);
@@ -560,6 +644,179 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({ helixRelation: "branch" }),
     ]));
     await expect(service.connectCycles(plan)).rejects.toThrow(/已经变化/);
+  });
+
+  it("treats managed edge endpoints as truth and repairs only derived metadata", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300),
+    );
+    canvas.edges.push({
+      id: "native-retargeted-managed-edge",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      helixManaged: true,
+      helixRelation: "merge",
+      helixMergeGroupId: "stale-group",
+      label: "过期标签",
+      customArrowStyle: "keep",
+    });
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+
+    expect((await service.snapshot()).relations).toContainEqual({
+      id: "native-retargeted-managed-edge",
+      kind: "inherit",
+      fromCycleIds: ["cycle-1"],
+      toCycleId: "cycle-2",
+    });
+    await service.ensureCanvas();
+
+    expect(repo.json(CANVAS).edges).toContainEqual(expect.objectContaining({
+      id: "native-retargeted-managed-edge",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      helixManaged: true,
+      helixRelation: "inherit",
+      label: "继承",
+      customArrowStyle: "keep",
+    }));
+    expect(repo.json(CANVAS).edges[0]).not.toHaveProperty("helixMergeGroupId");
+  });
+
+  it("keeps a native Canvas edge untouched until explicit adoption", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300),
+    );
+    canvas.edges.push({
+      id: "native-stage-edge",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      label: "用户画的箭头",
+      customArrowStyle: "keep",
+    });
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const before = repo.json(CANVAS).edges[0];
+    const snapshot = await service.snapshot();
+
+    expect(snapshot.relations).toEqual([]);
+    expect(snapshot.nativeRelationCandidates).toEqual([
+      expect.objectContaining({
+        edgeId: "native-stage-edge",
+        fromCycleId: "cycle-1",
+        toCycleId: "cycle-2",
+        crossProject: false,
+      }),
+    ]);
+    const ensured = await service.ensureCanvas();
+    expect(repo.json(CANVAS).edges[0]).toEqual(before);
+
+    const plan = await service.planNativeRelationAdoption(
+      ensured.nativeRelationCandidates[0]!,
+    );
+    expect(plan).toMatchObject({
+      affectedNodeCount: 2,
+      relabeledEdgeCount: 0,
+      resultKind: "inherit",
+    });
+    await service.adoptNativeRelation(plan);
+    expect(repo.json(CANVAS).edges).toContainEqual(expect.objectContaining({
+      id: "native-stage-edge",
+      helixManaged: true,
+      helixRelation: "inherit",
+      label: "继承",
+      customArrowStyle: "keep",
+    }));
+    expect((await service.snapshot()).nativeRelationCandidates).toEqual([]);
+    expect(service.historyState()).toMatchObject({
+      undoLabel: "纳管原生阶段连线",
+      undoCount: 1,
+    });
+  });
+
+  it("rejects stale, cyclic and unconfirmed cross-project native adoption", async () => {
+    const staleRepo = baseRepository();
+    staleRepo.set(
+      "Helix/Projects/Alpha/Cycle-02.md",
+      cycle("cycle-2", "project-1", 2),
+    );
+    const staleCanvas = staleRepo.json(CANVAS);
+    staleCanvas.nodes.push(
+      card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300),
+    );
+    staleCanvas.edges.push({
+      id: "native-stale",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+    });
+    staleRepo.set(CANVAS, JSON.stringify(staleCanvas));
+    const staleService = workspace(staleRepo);
+    const staleCandidate = (await staleService.snapshot()).nativeRelationCandidates[0]!;
+    const changed = staleRepo.json(CANVAS);
+    changed.external = true;
+    staleRepo.set(CANVAS, JSON.stringify(changed));
+    await expect(staleService.adoptNativeRelation(staleCandidate))
+      .rejects.toThrow(/已经变化/);
+    expect(staleRepo.json(CANVAS).edges[0]).not.toHaveProperty("helixManaged");
+
+    const cyclicRepo = linearRepository();
+    const cyclicCanvas = cyclicRepo.json(CANVAS);
+    cyclicCanvas.edges.push({
+      id: "native-cycle",
+      fromNode: "cycle-3-node",
+      toNode: "cycle-node",
+    });
+    cyclicRepo.set(CANVAS, JSON.stringify(cyclicCanvas));
+    const cyclicService = workspace(cyclicRepo);
+    const cyclicCandidate = (await cyclicService.snapshot()).nativeRelationCandidates[0]!;
+    await expect(cyclicService.adoptNativeRelation(cyclicCandidate))
+      .rejects.toThrow(/环/);
+    expect(cyclicRepo.json(CANVAS).edges.find(
+      (edge: { id: string }) => edge.id === "native-cycle",
+    )).not.toHaveProperty("helixManaged");
+
+    const crossRepo = baseRepository();
+    crossRepo.set("Helix/Projects/Beta/Project.md", project("project-2", "Beta"));
+    crossRepo.set(
+      "Helix/Projects/Beta/Stage-01.md",
+      cycle("cycle-beta", "project-2", 1),
+    );
+    const crossCanvas = crossRepo.json(CANVAS);
+    crossCanvas.nodes.push(
+      {
+        ...card("project-2-node", "project", "project-2", undefined, 0, 900),
+        helixFilePath: "Helix/Projects/Beta/Project.md",
+        text: "[[Helix/Projects/Beta/Project|Beta]]\n\n项目",
+      },
+      {
+        ...card("cycle-beta-node", "cycle", "project-2", "cycle-beta", 408, 900),
+        helixNodeKind: "stage",
+        helixStageId: "cycle-beta",
+        helixFilePath: "Helix/Projects/Beta/Stage-01.md",
+        text: "[[Helix/Projects/Beta/Stage-01|阶段标题 1]]\n\n进行中",
+      },
+    );
+    crossCanvas.edges.push({
+      id: "native-cross-project",
+      fromNode: "cycle-node",
+      toNode: "cycle-beta-node",
+    });
+    crossRepo.set(CANVAS, JSON.stringify(crossCanvas));
+    const crossService = workspace(crossRepo);
+    const crossCandidate = (await crossService.snapshot()).nativeRelationCandidates[0]!;
+    expect(crossCandidate.crossProject).toBe(true);
+    await expect(crossService.adoptNativeRelation(crossCandidate))
+      .rejects.toThrow(/跨项目/);
+    await expect(crossService.adoptNativeRelation(
+      crossCandidate,
+      { confirmCrossProject: true },
+    )).resolves.toBeDefined();
   });
 
   it("allows a target stage to accept multiple inbound edges and becomes a merge", async () => {
@@ -2096,6 +2353,7 @@ class MemoryRepository {
   private readonly files = new Map<string, string>();
   failCreatePath?: string;
   failTrashPath?: string;
+  beforeCreate?: (path: string) => void;
   beforeCompare?: () => void;
   beforeRead?: (path: string) => void;
   beforeTrash?: (revision: VaultRevision) => void;
@@ -2131,6 +2389,8 @@ class MemoryRepository {
   }
 
   async create(path: string, content: string): Promise<VaultRevision> {
+    this.beforeCreate?.(path);
+    this.beforeCreate = undefined;
     if (path === this.failCreatePath) throw new Error("injected create failure");
     if (this.files.has(path)) throw new Error(`目标已经存在：${path}`);
     this.files.set(path, content);

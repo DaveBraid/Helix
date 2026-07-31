@@ -441,6 +441,7 @@ describe("Project Lineage card-plus intent", () => {
         projectId: "project",
       })),
       collapsedCompletedProjectIds: ["project"],
+      nativeRelationCandidates: [],
     };
     const projection = completedLineageProjection(snapshot);
     expect(projection.hiddenByCollapseHead.size).toBe(0);
@@ -555,6 +556,7 @@ function foldedSnapshot(): ProjectWorkspaceSnapshot {
     migrationRequired: false,
     canvasNodes,
     collapsedCompletedProjectIds: ["project-a", "project-b"],
+    nativeRelationCandidates: [],
   };
 }
 

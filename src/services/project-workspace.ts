@@ -143,6 +143,24 @@ export interface ProjectWorkspaceSnapshot {
   migrationRequired: boolean;
   canvasNodes: ProjectWorkspaceCanvasNode[];
   collapsedCompletedProjectIds: string[];
+  nativeRelationCandidates: ProjectWorkspaceNativeRelationCandidate[];
+}
+
+export interface ProjectWorkspaceNativeRelationCandidate {
+  edgeId: string;
+  canvasRevisionHash: string;
+  fromCycleId: string;
+  toCycleId: string;
+  fromTitle: string;
+  toTitle: string;
+  crossProject: boolean;
+}
+
+export interface ProjectWorkspaceNativeRelationAdoptionPlan
+  extends ProjectWorkspaceNativeRelationCandidate {
+  affectedNodeCount: number;
+  relabeledEdgeCount: number;
+  resultKind: CycleRelationKind;
 }
 
 export interface ProjectConnectionPlan {
@@ -274,6 +292,7 @@ export class ProjectWorkspaceService {
   private readonly undoStack: ProjectWorkspaceHistoryEntry[] = [];
   private readonly redoStack: ProjectWorkspaceHistoryEntry[] = [];
   private applyingHistory = false;
+  private knownMarkdownPaths = new Set<string>();
 
   constructor(
     private readonly app: App,
@@ -332,6 +351,47 @@ export class ProjectWorkspaceService {
       return;
     }
     this.invalidateHistory();
+  }
+
+  isKnownProjectMarkdownPath(path: string): boolean {
+    return this.knownMarkdownPaths.has(normalizePath(path));
+  }
+
+  async hasProjectWorkspaceIdentity(path: string): Promise<boolean> {
+    const normalized = normalizePath(path);
+    if (!normalized.endsWith(".md")) return false;
+    const revision = await this.repository.read(normalized);
+    if (!revision) return false;
+    const kind = frontmatterFromContent(revision.content)?.["helix-kind"];
+    return kind === "helix-project" ||
+      kind === "helix-stage" ||
+      kind === "helix-cycle";
+  }
+
+  async loadStableWorkspace(): Promise<ProjectWorkspaceSnapshot> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const first = await this.snapshot();
+        await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 60));
+        const second = await this.snapshot();
+        if (workspaceStabilitySignature(first) !== workspaceStabilitySignature(second)) {
+          throw new Error("项目 Markdown 或 Canvas 仍在变化");
+        }
+        if (second.migrationRequired) return second;
+        return await this.ensureCanvasFromSnapshot(second);
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) {
+          await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 100));
+        }
+      }
+    }
+    throw new Error(
+      `项目文件尚未稳定，Helix 已暂停结构写入：${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+    );
   }
 
   async undoLastWorkspaceChange(): Promise<ProjectWorkspaceSnapshot> {
@@ -720,18 +780,34 @@ export class ProjectWorkspaceService {
         title: cycle.title,
       }));
     }
-    const recognizedEdges = canvas.document.edges.flatMap((edge) => {
-      if (edge.helixManaged !== true) return [];
-      const kind = cycleRelationKindFromLabel(edge.helixRelation);
+    const physicalEdges: ProjectGraphEdge[] = [];
+    const nativeRelationCandidates: ProjectWorkspaceNativeRelationCandidate[] = [];
+    for (const edge of canvas.document.edges) {
       const from = cycleByNode.get(edge.fromNode);
       const to = cycleByNode.get(edge.toNode);
-      const isLegacy = edge.label === "derives-from" ||
-        edge.helixRelation === "derives-from";
-      if (isLegacy) return [];
-      if (!kind) throw new Error(`Helix 托管边关系类型无效：${edge.id}`);
-      if (!from || !to) throw new Error(`Helix 托管边引用缺失或非阶段节点：${edge.id}`);
-      return [{ edge, kind, from, to }];
-    });
+      if (isLegacyDerivesEdge(edge)) continue;
+      if (edge.helixManaged === true) {
+        if (!from || !to) {
+          throw new Error(`Helix 托管边引用缺失或非阶段节点：${edge.id}`);
+        }
+        physicalEdges.push({
+          id: edge.id,
+          fromCycleId: from.id,
+          toCycleId: to.id,
+        });
+        continue;
+      }
+      if (!from || !to) continue;
+      nativeRelationCandidates.push({
+        edgeId: edge.id,
+        canvasRevisionHash: canvas.revision?.hash ?? "",
+        fromCycleId: from.id,
+        toCycleId: to.id,
+        fromTitle: from.title,
+        toTitle: to.title,
+        crossProject: cycleOwner.get(from.id) !== cycleOwner.get(to.id),
+      });
+    }
     if (
       canvas.document.edges.some(
         (edge) => edge.label === "derives-from" || edge.helixRelation === "derives-from",
@@ -761,39 +837,11 @@ export class ProjectWorkspaceService {
         detail: "旧 derives-from 边继续保留为非阶段关系，不自动转换。",
       });
     }
-    const relations: CycleRelation[] = [];
-    const groupedMerge = new Map<string, typeof recognizedEdges>();
-    for (const item of recognizedEdges) {
-      if (item.kind !== "merge") {
-        relations.push({
-          id: item.edge.id,
-          kind: item.kind,
-          fromCycleIds: [item.from.id],
-          toCycleId: item.to.id,
-        });
-        continue;
-      }
-      const group = groupedMerge.get(item.to.id) ?? [];
-      group.push(item);
-      groupedMerge.set(item.to.id, group);
-    }
-    for (const [toCycleId, items] of groupedMerge) {
-      const mergeGroups = new Set(items.map((item) => item.edge.helixMergeGroupId));
-      if (
-        mergeGroups.size !== 1 ||
-        [...mergeGroups][0] === undefined ||
-        items.some((item) => item.edge.helixManaged !== true)
-      ) {
-        throw new Error(`合并边缺少一致的 helixMergeGroupId：${toCycleId}`);
-      }
-      relations.push({
-        id: `merge:${toCycleId}`,
-        kind: "merge",
-        fromCycleIds: items.map((item) => item.from.id),
-        toCycleId,
-      });
-    }
-    validateCycleGraph(cycles.map((cycle) => cycle.id), relations);
+    const normalizedGraph = normalizeProjectGraph(
+      cycles.map((cycle) => cycle.id),
+      physicalEdges,
+    );
+    const relations = normalizedGraph.relations;
     const acknowledgedMigrationItems = new Set(
       canvas.document.helixMigration?.acknowledgedItemIds ?? [],
     );
@@ -806,7 +854,7 @@ export class ProjectWorkspaceService {
         nextStageSequence(canvas.document, project),
       ]),
     );
-    return {
+    const result: ProjectWorkspaceSnapshot = {
       canvasPath: normalizePath(this.canvasPath()),
       canvasRevisionHash: canvas.revision?.hash ?? null,
       projects,
@@ -820,16 +868,41 @@ export class ProjectWorkspaceService {
         canvas.document,
         new Set(projects.map((project) => project.id)),
       ),
+      nativeRelationCandidates,
     };
+    this.knownMarkdownPaths = new Set([
+      ...projects.map((project) => normalizePath(project.notePath)),
+      ...projects.flatMap((project) =>
+        project.cycles.map((cycle) => normalizePath(cycle.notePath))),
+    ]);
+    return result;
   }
 
   async ensureCanvas(): Promise<ProjectWorkspaceSnapshot> {
+    return this.ensureCanvasFromSnapshot(await this.snapshot());
+  }
+
+  private async ensureCanvasFromSnapshot(
+    snapshot: ProjectWorkspaceSnapshot,
+  ): Promise<ProjectWorkspaceSnapshot> {
     const generation = this.beginOperation();
-    const snapshot = await this.snapshot();
     if (snapshot.migrationRequired) {
       throw new Error("检测到旧项目数据。请先在项目页预览并确认迁移，不会自动改写。");
     }
-    const canvas = await this.readCanvas(true, generation);
+    let canvas = await this.readCanvas(false, generation);
+    if ((canvas.revision?.hash ?? null) !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在稳定读取后再次变化，未执行摘要修复");
+    }
+    if (!canvas.revision) {
+      const document: CanvasDocument = { nodes: [], edges: [] };
+      const content = JSON.stringify(document, null, 2);
+      const revision = await this.repository.create(
+        normalizePath(this.canvasPath()),
+        content,
+        () => this.assertActive(generation),
+      );
+      canvas = { revision, document };
+    }
     let changed = false;
     const entityById = new Map<string, { path: string; title: string; status: string }>([
       ...snapshot.projects.map((project) => [
@@ -936,6 +1009,16 @@ export class ProjectWorkspaceService {
       });
     });
     if (ensureStageSequenceLedger(canvas.document, snapshot)) {
+      changed = true;
+    }
+    const edgeBefore = JSON.stringify(canvas.document.edges);
+    const normalized = normalizeProjectGraph(
+      snapshot.projects.flatMap((project) =>
+        project.cycles.map((cycle) => cycle.id)),
+      physicalManagedEdges(canvas.document),
+    );
+    applyNormalizedManagedEdges(canvas.document, normalized.edges);
+    if (JSON.stringify(canvas.document.edges) !== edgeBefore) {
       changed = true;
     }
     if (changed) {
@@ -1252,6 +1335,120 @@ export class ProjectWorkspaceService {
       markdownTransitions: [],
     });
     return this.snapshot();
+  }
+
+  async adoptNativeRelation(
+    candidate: ProjectWorkspaceNativeRelationCandidate,
+    options: { confirmCrossProject?: boolean } = {},
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const canonical = snapshot.nativeRelationCandidates.find((current) =>
+      sameNativeRelationCandidate(current, candidate));
+    if (!canonical) {
+      throw new Error("原生 Canvas 连线在确认期间已经变化，请重新打开项目页");
+    }
+    if (canonical.crossProject && !options.confirmCrossProject) {
+      throw new Error("跨项目原生连线必须明确确认");
+    }
+    const canvas = await this.readCanvas(false, generation);
+    if (
+      !canvas.revision ||
+      canvas.revision.hash !== canonical.canvasRevisionHash ||
+      snapshot.canvasRevisionHash !== canonical.canvasRevisionHash
+    ) {
+      throw new Error("Canvas 在纳管确认期间已经变化，本次操作未写入");
+    }
+    const stageByNode = new Map(canvas.document.nodes.flatMap((node) => {
+      const stageId = managedStageId(node);
+      return stageId ? [[node.id, stageId] as const] : [];
+    }));
+    const edge = canvas.document.edges.find((current) =>
+      current.id === canonical.edgeId);
+    if (
+      !edge ||
+      edge.helixManaged === true ||
+      isLegacyDerivesEdge(edge) ||
+      stageByNode.get(edge.fromNode) !== canonical.fromCycleId ||
+      stageByNode.get(edge.toNode) !== canonical.toCycleId
+    ) {
+      throw new Error("原生 Canvas 连线的端点或身份已经变化，本次操作未写入");
+    }
+    const physical = [
+      ...physicalManagedEdges(canvas.document),
+      {
+        id: canonical.edgeId,
+        fromCycleId: canonical.fromCycleId,
+        toCycleId: canonical.toCycleId,
+      },
+    ];
+    const normalized = normalizeProjectGraph(
+      snapshot.projects.flatMap((project) =>
+        project.cycles.map((cycle) => cycle.id)),
+      physical,
+    );
+    edge.helixManaged = true;
+    applyNormalizedManagedEdges(canvas.document, normalized.edges);
+    const affected = affectedWeakComponent(
+      [canonical.fromCycleId, canonical.toCycleId],
+      physical,
+    );
+    applyManagedLayout(canvas.document, snapshot, physical, affected);
+    this.assertActive(generation);
+    await this.writeCanvas(canvas, generation, {
+      label: "纳管原生阶段连线",
+      markdownTransitions: [],
+    });
+    return this.snapshot();
+  }
+
+  async planNativeRelationAdoption(
+    candidate: ProjectWorkspaceNativeRelationCandidate,
+  ): Promise<ProjectWorkspaceNativeRelationAdoptionPlan> {
+    const snapshot = await this.snapshot();
+    const canonical = snapshot.nativeRelationCandidates.find((current) =>
+      sameNativeRelationCandidate(current, candidate));
+    if (!canonical) {
+      throw new Error("原生 Canvas 连线在预览期间已经变化，请重新打开项目页");
+    }
+    const canvas = await this.readCanvas();
+    if (
+      !canvas.revision ||
+      canvas.revision.hash !== canonical.canvasRevisionHash ||
+      snapshot.canvasRevisionHash !== canonical.canvasRevisionHash
+    ) {
+      throw new Error("Canvas 在纳管预览期间已经变化，请重试");
+    }
+    const physical = physicalManagedEdges(canvas.document);
+    const before = normalizeProjectGraph(
+      snapshot.projects.flatMap((project) =>
+        project.cycles.map((cycle) => cycle.id)),
+      physical,
+    );
+    const nextPhysical = [
+      ...physical,
+      {
+        id: canonical.edgeId,
+        fromCycleId: canonical.fromCycleId,
+        toCycleId: canonical.toCycleId,
+      },
+    ];
+    const after = normalizeProjectGraph(
+      snapshot.projects.flatMap((project) =>
+        project.cycles.map((cycle) => cycle.id)),
+      nextPhysical,
+    );
+    const adopted = after.edges.find((edge) => edge.id === canonical.edgeId);
+    if (!adopted) throw new Error("无法计算原生 Canvas 连线的关系类型");
+    return {
+      ...canonical,
+      affectedNodeCount: affectedWeakComponent(
+        [canonical.fromCycleId, canonical.toCycleId],
+        nextPhysical,
+      ).size,
+      relabeledEdgeCount: countRelabeledEdges(before, after),
+      resultKind: adopted.kind,
+    };
   }
 
   async autoLayoutCanvas(): Promise<ProjectWorkspaceSnapshot> {
@@ -2977,6 +3174,19 @@ function sameConnectionPlan(
     left.resultKind === right.resultKind;
 }
 
+function sameNativeRelationCandidate(
+  left: ProjectWorkspaceNativeRelationCandidate,
+  right: ProjectWorkspaceNativeRelationCandidate,
+): boolean {
+  return left.edgeId === right.edgeId &&
+    left.canvasRevisionHash === right.canvasRevisionHash &&
+    left.fromCycleId === right.fromCycleId &&
+    left.toCycleId === right.toCycleId &&
+    left.fromTitle === right.fromTitle &&
+    left.toTitle === right.toTitle &&
+    left.crossProject === right.crossProject;
+}
+
 function stageDescriptor(
   projects: ProjectWorkspaceProject[],
   stageId: string,
@@ -3044,6 +3254,36 @@ function sameDeletionPlan(
     left.bridgeLimitExceeded === right.bridgeLimitExceeded &&
     JSON.stringify(left.impacts) === JSON.stringify(right.impacts) &&
     JSON.stringify(left.bridgeCandidates) === JSON.stringify(right.bridgeCandidates);
+}
+
+function workspaceStabilitySignature(
+  snapshot: ProjectWorkspaceSnapshot,
+): string {
+  return stableHash({
+    canvasRevisionHash: snapshot.canvasRevisionHash,
+    migrationRequired: snapshot.migrationRequired,
+    migrationItems: snapshot.migrationItems.map((item) => ({
+      id: item.id,
+      sourcePath: item.sourcePath,
+      action: item.action,
+    })),
+    migrationWarnings: [...snapshot.migrationWarnings].sort(),
+    projects: snapshot.projects.map((project) => ({
+      id: project.id,
+      title: project.title,
+      status: project.status,
+      notePath: project.notePath,
+      didaProjectId: project.didaProjectId,
+      color: project.color,
+      cycles: project.cycles.map((cycle) => ({
+        id: cycle.id,
+        title: cycle.title,
+        notePath: cycle.notePath,
+        sequence: cycle.sequence,
+        status: cycle.status,
+      })),
+    })),
+  });
 }
 
 function applyManagedLayout(

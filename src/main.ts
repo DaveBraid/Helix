@@ -60,6 +60,7 @@ export default class HelixPlugin extends Plugin {
   private projectMutationDepth = 0;
   private projectRefreshPending = false;
   private projectCanvasRefreshPending = false;
+  private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
 
   async onload(): Promise<void> {
@@ -219,14 +220,18 @@ export default class HelixPlugin extends Plugin {
       this.app.vault.on("modify", (file) => {
         if (this.isProjectWorkspaceFile(file.path)) {
           this.scheduleProjectRefresh(file.path);
+          return;
         }
+        this.scheduleProjectIdentityProbe(file.path);
       }),
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         if (this.isProjectWorkspaceFile(file.path)) {
           this.scheduleProjectRefresh(file.path);
+          return;
         }
+        this.scheduleProjectIdentityProbe(file.path);
       }),
     );
     this.registerEvent(
@@ -245,7 +250,9 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(
             this.isProjectWorkspaceFile(file.path) ? file.path : oldPath,
           );
+          return;
         }
+        this.scheduleProjectIdentityProbe(file.path);
       }),
     );
 
@@ -258,6 +265,10 @@ export default class HelixPlugin extends Plugin {
       window.clearTimeout(this.projectRefreshTimer);
       this.projectRefreshTimer = null;
     }
+    for (const timer of this.projectIdentityProbeTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.projectIdentityProbeTimers.clear();
     this.service?.dispose();
     this.projectWorkspace?.dispose();
     if (this.dataGeneration) invalidateDataGeneration(this.dataGeneration);
@@ -642,6 +653,27 @@ export default class HelixPlugin extends Plugin {
     }, 200);
   }
 
+  private scheduleProjectIdentityProbe(path: string): void {
+    if (this.unloaded || !path.endsWith(".md")) return;
+    const normalized = normalizePath(path);
+    const existing = this.projectIdentityProbeTimers.get(normalized);
+    if (existing !== undefined) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      this.projectIdentityProbeTimers.delete(normalized);
+      if (this.unloaded || this.isProjectWorkspaceFile(normalized)) return;
+      void this.projectWorkspace.hasProjectWorkspaceIdentity(normalized)
+        .then((isProjectWorkspaceMarkdown) => {
+          if (isProjectWorkspaceMarkdown) {
+            this.scheduleProjectRefresh(normalized);
+          }
+        })
+        .catch((error) => {
+          console.warn("Helix 无法检查 Markdown 的项目身份", error);
+        });
+    }, 120);
+    this.projectIdentityProbeTimers.set(normalized, timer);
+  }
+
   private async withProjectMutation<T>(operation: () => Promise<T>): Promise<T> {
     return this.projectMutationRunner.run(async () => {
       if (this.projectMutationDepth === 0 && this.projectRefreshTimer !== null) {
@@ -667,6 +699,7 @@ export default class HelixPlugin extends Plugin {
     const normalized = normalizePath(path);
     return (
       normalized === normalizePath(this.settings.lineageCanvasPath) ||
+      this.projectWorkspace?.isKnownProjectMarkdownPath(normalized) ||
       (
         normalized.startsWith(`${projectsRoot}/`) &&
         normalized.endsWith(".md")

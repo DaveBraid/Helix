@@ -40,6 +40,8 @@ import { HelixService } from "../services/helix-service";
 import type {
   ProjectConnectionPlan,
   ProjectWorkspaceCycleStatus,
+  ProjectWorkspaceNativeRelationAdoptionPlan,
+  ProjectWorkspaceNativeRelationCandidate,
   ProjectWorkspaceProjectStatus,
   ProjectWorkspaceService,
   ProjectWorkspaceSnapshot,
@@ -115,6 +117,7 @@ export class HelixView extends ItemView {
   private selectedProjectId: string | null | undefined;
   private projectLineageMode: ProjectLineageViewMode = "graph";
   private projectWorkbench: ProjectLineageWorkbench | null = null;
+  private lastGoodProjectWorkspace: ProjectWorkspaceSnapshot | null = null;
   private lineageCamera: LineageCamera | undefined;
   private lineageFocusRequest: { entityId: string; generation: number } | null = null;
   private viewGeneration = 0;
@@ -755,21 +758,15 @@ export class HelixView extends ItemView {
   private async renderProjects(content: HTMLElement, token: number): Promise<void> {
     let workspace: ProjectWorkspaceSnapshot;
     try {
-      workspace = await this.actions.projectWorkspace.snapshot();
-      if (!workspace.migrationRequired) {
-        workspace = await this.actions.mutateProjectWorkspace(() =>
-          this.actions.projectWorkspace.ensureCanvas());
-      }
+      workspace = await this.actions.mutateProjectWorkspace(() =>
+        this.actions.projectWorkspace.loadStableWorkspace());
     } catch (error) {
       if (token !== this.renderToken) return;
-      this.renderPageTitle(content, "项目");
-      content.createDiv({
-        cls: "helix-card helix-error-card",
-        text: error instanceof Error ? error.message : String(error),
-      });
+      this.renderProjectReadOnlyFallback(content, error);
       return;
     }
     if (token !== this.renderToken) return;
+    this.lastGoodProjectWorkspace = workspace;
     if (workspace.migrationRequired) {
       const migration = content.createDiv({ cls: "helix-card helix-migration-card" });
       const migrationIcon = migration.createSpan();
@@ -818,6 +815,11 @@ export class HelixView extends ItemView {
       this.selectedProjectId = workspace.projects[0]!.id;
     }
     const lifecycleGeneration = this.viewGeneration;
+    this.renderNativeRelationCandidates(
+      content,
+      workspace,
+      lifecycleGeneration,
+    );
     const focusEntityId = this.currentLineageFocusId();
     this.projectWorkbench = new ProjectLineageWorkbench({
       snapshot: workspace,
@@ -978,6 +980,124 @@ export class HelixView extends ItemView {
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
     this.projectWorkbench.render(content);
+  }
+
+  private renderNativeRelationCandidates(
+    content: HTMLElement,
+    workspace: ProjectWorkspaceSnapshot,
+    lifecycleGeneration: number,
+  ): void {
+    if (workspace.nativeRelationCandidates.length === 0) return;
+    const panel = content.createEl("details", {
+      cls: "helix-native-relation-panel",
+    });
+    panel.createEl("summary", {
+      text: `${workspace.nativeRelationCandidates.length} 条 Canvas 连线等待确认`,
+    });
+    const list = panel.createDiv({ cls: "helix-native-relation-list" });
+    for (const candidate of workspace.nativeRelationCandidates) {
+      const row = list.createDiv({ cls: "helix-native-relation-row" });
+      const copy = row.createDiv();
+      copy.createEl("strong", {
+        text: `${candidate.fromTitle} → ${candidate.toTitle}`,
+      });
+      if (candidate.crossProject) copy.createSpan({ text: "跨项目" });
+      const adopt = row.createEl("button", {
+        cls: "helix-primary-button",
+        text: "纳入 Helix",
+      });
+      adopt.addEventListener("click", () => {
+        adopt.disabled = true;
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.planNativeRelationAdoption(candidate))
+          .then((plan) => {
+            new NativeRelationAdoptionModal(
+              this.app,
+              plan,
+              async (confirmCrossProject) => {
+                await this.actions.mutateProjectWorkspace(() =>
+                  this.actions.projectWorkspace.adoptNativeRelation(
+                    plan,
+                    { confirmCrossProject },
+                  ));
+                this.requestLineageFocus(
+                  plan.toCycleId,
+                  lifecycleGeneration,
+                );
+                await this.render();
+              },
+            ).open();
+          })
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000))
+          .finally(() => {
+            adopt.disabled = false;
+          });
+      });
+    }
+  }
+
+  private renderProjectReadOnlyFallback(
+    content: HTMLElement,
+    error: unknown,
+  ): void {
+    this.renderPageTitle(content, "项目");
+    const warning = content.createDiv({
+      cls: "helix-card helix-error-card helix-project-readonly",
+    });
+    warning.createEl("strong", { text: "项目文件尚未稳定，已暂停结构编辑" });
+    warning.createEl("p", {
+      text: error instanceof Error ? error.message : String(error),
+    });
+    const retry = warning.createEl("button", {
+      cls: "helix-primary-button",
+      text: "重新读取",
+    });
+    retry.addEventListener("click", () => void this.render());
+    const cached = this.lastGoodProjectWorkspace;
+    if (!cached) return;
+    warning.createEl("p", {
+      text: "以下为最后一次有效快照，只提供 Markdown 打开入口。",
+    });
+    const list = content.createDiv({
+      cls: "helix-project-readonly-list",
+      attr: { "aria-label": "最后一次有效项目快照" },
+    });
+    for (const project of cached.projects) {
+      const card = list.createDiv({ cls: "helix-card" });
+      const openProject = card.createEl("button", {
+        cls: "helix-link-button",
+        text: project.title,
+      });
+      openProject.addEventListener("click", () => {
+        void this.actions.openProjectFile(project.notePath)
+          .catch((error) =>
+            new Notice(
+              `缓存路径已失效，请重新读取：${
+                error instanceof Error ? error.message : String(error)
+              }`,
+              8_000,
+            ));
+      });
+      const stages = card.createEl("ul");
+      for (const stage of project.cycles) {
+        const item = stages.createEl("li");
+        const openStage = item.createEl("button", {
+          cls: "helix-link-button",
+          text: `阶段 ${stage.sequence} · ${stage.title}`,
+        });
+        openStage.addEventListener("click", () => {
+          void this.actions.openProjectFile(stage.notePath)
+            .catch((error) =>
+              new Notice(
+                `缓存路径已失效，请重新读取：${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+                8_000,
+              ));
+        });
+      }
+    }
   }
 
   private async openConnection(
@@ -1809,6 +1929,70 @@ class ConnectionConfirmModal extends Modal {
 
   private stageLabel(stage: ProjectConnectionPlan["source"]): string {
     return `${stage.projectTitle} / 阶段 ${stage.sequence} · ${stage.cycleTitle}`;
+  }
+}
+
+class NativeRelationAdoptionModal extends Modal {
+  private crossProjectConfirmed = false;
+
+  constructor(
+    app: HelixView["app"],
+    private readonly candidate: ProjectWorkspaceNativeRelationAdoptionPlan,
+    private readonly submit: (confirmCrossProject: boolean) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("纳管 Canvas 连线");
+    this.contentEl.createEl("p", {
+      text: `${this.candidate.fromTitle} → ${this.candidate.toTitle}`,
+    });
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: `完整拓扑计算为${
+        CYCLE_RELATION_LABELS[this.candidate.resultKind]
+      }；将整理受影响的 ${this.candidate.affectedNodeCount} 个节点。`,
+    });
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: this.candidate.relabeledEdgeCount > 0
+        ? `另有 ${this.candidate.relabeledEdgeCount} 条已有边会同步改为继承、分支或合并。`
+        : "已有托管边的关系类型不会变化。",
+    });
+    if (this.candidate.crossProject) {
+      const confirmation = this.contentEl.createEl("label", {
+        cls: "helix-branch-confirm",
+      });
+      const checkbox = confirmation.createEl("input", { type: "checkbox" });
+      confirmation.createSpan({ text: "我确认纳管这条跨项目连线" });
+      checkbox.addEventListener("change", () => {
+        this.crossProjectConfirmed = checkbox.checked;
+        confirm.disabled = !this.crossProjectConfirmed;
+      });
+    }
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" })
+      .addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", {
+      cls: "mod-cta",
+      text: "确认纳管",
+    });
+    confirm.disabled = this.candidate.crossProject;
+    confirm.addEventListener("click", () => {
+      confirm.disabled = true;
+      void this.submit(this.crossProjectConfirmed)
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled =
+            this.candidate.crossProject && !this.crossProjectConfirmed;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 

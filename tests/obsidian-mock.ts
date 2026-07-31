@@ -37,6 +37,13 @@ export function parseYaml(source: string): Record<string, unknown> {
 }
 
 function parseScalar(raw: string): unknown {
+  if (raw.startsWith("[") && raw.endsWith("]")) {
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      // Keep malformed inline YAML as a string so production validation can reject it.
+    }
+  }
   const unquoted = raw.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");
   if (/^-?\d+(?:\.\d+)?$/.test(unquoted)) return Number(unquoted);
   if (unquoted === "true") return true;

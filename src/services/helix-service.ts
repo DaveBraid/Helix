@@ -333,6 +333,15 @@ export class HelixService {
     return capabilities;
   }
 
+  async verifyRemoteTask(projectId: string, taskId: string): Promise<DidaTask> {
+    this.assertActive();
+    const task = normalizeTask(await this.api.getTask(projectId, taskId));
+    if (task.id !== taskId || task.projectId !== projectId) {
+      throw new Error("滴答复读返回的任务身份或清单与待绑定目标不一致");
+    }
+    return task;
+  }
+
   async refreshPersistedEvents(): Promise<void> {
     this.assertActive();
     const data = await this.store.snapshot();

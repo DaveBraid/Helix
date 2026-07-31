@@ -134,6 +134,40 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.queue[0]?.status).toBe("pending");
   });
 
+  it("re-reads and verifies the exact remote task identity before reference rebinding", async () => {
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return createDefaultData("device-a");
+        },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    let returnedProjectId = "project-1";
+    Object.defineProperty(service, "api", {
+      value: {
+        async getTask(projectId: string, taskId: string): Promise<DidaTask> {
+          expect(projectId).toBe("project-1");
+          expect(taskId).toBe("task-1");
+          return {
+            id: "task-1",
+            projectId: returnedProjectId,
+            title: "Verified",
+            status: 0,
+          };
+        },
+      },
+    });
+
+    await expect(service.verifyRemoteTask("project-1", "task-1"))
+      .resolves.toMatchObject({ id: "task-1", projectId: "project-1" });
+    returnedProjectId = "project-other";
+    await expect(service.verifyRemoteTask("project-1", "task-1"))
+      .rejects.toThrow(/身份或清单/);
+  });
+
   it("migrates an in-progress marker after an ordinary queued create succeeds", async () => {
     const data = createDefaultData("device-a");
     const local: DidaTask = {

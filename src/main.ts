@@ -27,6 +27,7 @@ import { aggregateAnalytics } from "./domain/analytics";
 import { patchManagedFrontmatter } from "./storage/frontmatter";
 import { HelixService } from "./services/helix-service";
 import { ProjectWorkspaceService } from "./services/project-workspace";
+import { TaskReferenceService } from "./services/task-references";
 import { SerializedRunner } from "./services/serialized-runner";
 import type {
   ProjectWorkspaceMigrationItem,
@@ -52,6 +53,7 @@ export default class HelixPlugin extends Plugin {
   service!: HelixService;
   vaultRepository!: HelixVaultRepository;
   projectWorkspace!: ProjectWorkspaceService;
+  taskReferences!: TaskReferenceService;
   private syncIntervalId: number | null = null;
   private unloaded = false;
   private recoveryMode = false;
@@ -74,6 +76,12 @@ export default class HelixPlugin extends Plugin {
       this.vaultRepository,
       () => this.settings.rootFolder,
       () => this.settings.lineageCanvasPath,
+    );
+    this.taskReferences = new TaskReferenceService(
+      this.app,
+      this.vaultRepository,
+      this.projectWorkspace,
+      () => this.settings.rootFolder,
     );
     const data = await this.store.load();
     this.settings = data.settings;
@@ -124,6 +132,7 @@ export default class HelixPlugin extends Plugin {
           this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
+        taskReferences: this.taskReferences,
         mutateProjectWorkspace: (operation) => this.withProjectMutation(operation),
         reviewLegacyMigration: () => this.showLegacyMigrationModal(),
       }),
@@ -222,6 +231,10 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(file.path);
           return;
         }
+        if (this.taskReferences.isKnownTaskReferencePath(file.path)) {
+          this.scheduleProjectRefresh();
+          return;
+        }
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
@@ -231,12 +244,19 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(file.path);
           return;
         }
+        if (this.taskReferences.isKnownTaskReferencePath(file.path)) {
+          this.scheduleProjectRefresh();
+          return;
+        }
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        if (this.isProjectWorkspaceFile(file.path)) {
+        if (
+          this.isProjectWorkspaceFile(file.path) ||
+          this.taskReferences.isKnownTaskReferencePath(file.path)
+        ) {
           this.scheduleProjectRefresh(file.path);
         }
       }),
@@ -250,6 +270,13 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(
             this.isProjectWorkspaceFile(file.path) ? file.path : oldPath,
           );
+          return;
+        }
+        if (
+          this.taskReferences.isKnownTaskReferencePath(file.path) ||
+          this.taskReferences.isKnownTaskReferencePath(oldPath)
+        ) {
+          this.scheduleProjectRefresh();
           return;
         }
         this.scheduleProjectIdentityProbe(file.path);
@@ -661,9 +688,12 @@ export default class HelixPlugin extends Plugin {
     const timer = window.setTimeout(() => {
       this.projectIdentityProbeTimers.delete(normalized);
       if (this.unloaded || this.isProjectWorkspaceFile(normalized)) return;
-      void this.projectWorkspace.hasProjectWorkspaceIdentity(normalized)
-        .then((isProjectWorkspaceMarkdown) => {
-          if (isProjectWorkspaceMarkdown) {
+      void Promise.all([
+        this.projectWorkspace.hasProjectWorkspaceIdentity(normalized),
+        this.taskReferences.hasTaskReferenceIdentity(normalized),
+      ])
+        .then(([isProjectWorkspaceMarkdown, isTaskReferenceMarkdown]) => {
+          if (isProjectWorkspaceMarkdown || isTaskReferenceMarkdown) {
             this.scheduleProjectRefresh(normalized);
           }
         })

@@ -43,6 +43,14 @@ describe("SerializedRunner", () => {
     await next;
     expect(events).toEqual(["next"]);
   });
+
+  it("returns each serialized operation result", async () => {
+    const runner = new SerializedRunner();
+    const first = runner.run(async () => "first");
+    const second = runner.run(async () => 2);
+    await expect(first).resolves.toBe("first");
+    await expect(second).resolves.toBe(2);
+  });
 });
 
 describe("SelfWriteTracker", () => {

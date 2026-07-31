@@ -19,7 +19,11 @@ import {
 import { assertProjectMappingsUnique } from "../domain/project-mapping";
 import { stableHash } from "../domain/stable";
 import { patchManagedFrontmatter } from "../storage/frontmatter";
-import type { HelixVaultRepository, VaultRevision } from "../storage/vault-repository";
+import {
+  VaultDeletionClaimError,
+  type HelixVaultRepository,
+  type VaultRevision,
+} from "../storage/vault-repository";
 
 interface CanvasNode {
   id: string;
@@ -218,6 +222,43 @@ interface StageDeletionJournal {
   canvasAfterContent: string;
 }
 
+interface ProjectWorkspaceHistoryFileTransition {
+  path: string;
+  kind: "project" | "stage";
+  entityId: string;
+  projectId: string;
+  fromContent: string | null;
+  toContent: string | null;
+}
+
+interface ProjectWorkspaceHistoryEntry {
+  id: string;
+  label: string;
+  canvasPath: string;
+  canvasBeforeContent: string;
+  canvasAfterContent: string;
+  markdownTransitions: ProjectWorkspaceHistoryFileTransition[];
+}
+
+interface ProjectWorkspaceHistoryJournal {
+  version: 1;
+  operation: "apply-workspace-history";
+  createdAt: string;
+  entryId: string;
+  direction: "undo" | "redo";
+  canvasPath: string;
+  canvasFromContent: string;
+  canvasToContent: string;
+  markdownTransitions: ProjectWorkspaceHistoryFileTransition[];
+}
+
+export interface ProjectWorkspaceHistoryState {
+  undoCount: number;
+  redoCount: number;
+  undoLabel?: string;
+  redoLabel?: string;
+}
+
 export type StageDeletionRecoveryResult =
   | "none"
   | "aborted"
@@ -225,9 +266,14 @@ export type StageDeletionRecoveryResult =
   | "rolled-back";
 
 export class ProjectWorkspaceService {
+  private static readonly HISTORY_ENTRY_LIMIT = 50;
+  private static readonly HISTORY_BYTE_LIMIT = 5 * 1024 * 1024;
   private disposed = false;
   private generation = 0;
   private recoveryIssue: string | null = null;
+  private readonly undoStack: ProjectWorkspaceHistoryEntry[] = [];
+  private readonly redoStack: ProjectWorkspaceHistoryEntry[] = [];
+  private applyingHistory = false;
 
   constructor(
     private readonly app: App,
@@ -258,11 +304,96 @@ export class ProjectWorkspaceService {
     }
   }
 
+  historyState(): ProjectWorkspaceHistoryState {
+    return {
+      undoCount: this.undoStack.length,
+      redoCount: this.redoStack.length,
+      undoLabel: this.undoStack.at(-1)?.label,
+      redoLabel: this.redoStack.at(-1)?.label,
+    };
+  }
+
+  invalidateHistory(): void {
+    if (this.applyingHistory) return;
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+  }
+
+  async observeCanvasChange(): Promise<void> {
+    if (this.applyingHistory) return;
+    const current = await this.repository.read(normalizePath(this.canvasPath()));
+    const currentHash = current?.hash ?? "<missing>";
+    const latestUndo = this.undoStack.at(-1);
+    const latestRedo = this.redoStack.at(-1);
+    if (
+      (latestUndo && stableHash(latestUndo.canvasAfterContent) === currentHash) ||
+      (latestRedo && stableHash(latestRedo.canvasBeforeContent) === currentHash)
+    ) {
+      return;
+    }
+    this.invalidateHistory();
+  }
+
+  async undoLastWorkspaceChange(): Promise<ProjectWorkspaceSnapshot> {
+    const entry = this.undoStack.at(-1);
+    if (!entry) throw new Error("没有可撤销的项目图谱操作");
+    await this.applyHistoryEntry(entry, "undo");
+    this.undoStack.pop();
+    this.redoStack.push(entry);
+    return this.snapshot();
+  }
+
+  async redoLastWorkspaceChange(): Promise<ProjectWorkspaceSnapshot> {
+    const entry = this.redoStack.at(-1);
+    if (!entry) throw new Error("没有可重做的项目图谱操作");
+    await this.applyHistoryEntry(entry, "redo");
+    this.redoStack.pop();
+    this.undoStack.push(entry);
+    return this.snapshot();
+  }
+
+  async recoverPendingWorkspaceHistory(): Promise<StageDeletionRecoveryResult> {
+    const generation = this.beginOperation();
+    const journalRevision = await this.repository.read(this.historyJournalPath());
+    if (!journalRevision) return "none";
+    try {
+      if (await this.repository.read(this.stageDeletionJournalPath())) {
+        throw new Error("同时发现撤销事务与阶段删除事务，禁止猜测执行顺序");
+      }
+      const journal = this.parseHistoryJournal(journalRevision.content);
+      const canvas = await this.repository.read(journal.canvasPath);
+      if (!canvas) throw new Error("撤销事务引用的 Canvas 已不存在");
+      const fromHash = stableHash(journal.canvasFromContent);
+      const toHash = stableHash(journal.canvasToContent);
+      if (canvas.hash === fromHash) {
+        await this.rollbackHistoryAdditions(journal.markdownTransitions, generation);
+        await this.finishMachineJournal(journalRevision, generation);
+        return "aborted";
+      }
+      if (canvas.hash !== toHash) {
+        throw new Error("Canvas 同时偏离撤销事务的起点和终点");
+      }
+      await this.finishHistoryRemovals(journal.markdownTransitions, generation);
+      await this.finishMachineJournal(journalRevision, generation);
+      return "completed";
+    } catch (error) {
+      const message =
+        `项目图谱撤销事务需要人工检查：${
+          error instanceof Error ? error.message : String(error)
+        }`;
+      this.freezePendingStageDeletion(message);
+      throw new Error(message);
+    }
+  }
+
   async recoverPendingStageDeletion(): Promise<StageDeletionRecoveryResult> {
     const generation = this.beginOperation();
     try {
       const journalRevision = await this.repository.read(this.stageDeletionJournalPath());
       if (!journalRevision) return "none";
+      if (await this.repository.read(this.historyJournalPath())) {
+        throw new Error("同时发现阶段删除事务与撤销事务，禁止猜测执行顺序");
+      }
       const journal = this.parseStageDeletionJournal(journalRevision.content);
       const canvasRevision = await this.repository.read(journal.canvasPath);
       if (!canvasRevision) {
@@ -819,7 +950,12 @@ export class ProjectWorkspaceService {
     x: number,
     y: number,
   ): Promise<ProjectWorkspaceSnapshot> {
-    return this.moveCanvasNodes([{ nodeId, x, y }]);
+    const snapshot = await this.snapshot();
+    if (!snapshot.canvasRevisionHash) throw new Error("项目 Canvas 不存在");
+    return this.moveCanvasNodes(
+      [{ nodeId, x, y }],
+      snapshot.canvasRevisionHash,
+    );
   }
 
   async updateProjectColor(
@@ -1007,7 +1143,10 @@ export class ProjectWorkspaceService {
       projectIds: [...current].sort(),
     };
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation);
+    await this.writeCanvas(canvas, generation, {
+      label: collapsed ? "折叠已完成阶段" : "展开已完成阶段",
+      markdownTransitions: [],
+    });
     return this.snapshot();
   }
 
@@ -1108,7 +1247,10 @@ export class ProjectWorkspaceService {
     );
     applyManagedLayout(canvas.document, snapshot, physical, affected);
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation);
+    await this.writeCanvas(canvas, generation, {
+      label: "建立阶段连接",
+      markdownTransitions: [],
+    });
     return this.snapshot();
   }
 
@@ -1122,7 +1264,10 @@ export class ProjectWorkspaceService {
     const physical = physicalManagedEdges(canvas.document);
     applyManagedLayout(canvas.document, snapshot, physical);
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation);
+    await this.writeCanvas(canvas, generation, {
+      label: "整理项目图谱",
+      markdownTransitions: [],
+    });
     return this.snapshot();
   }
 
@@ -1188,6 +1333,7 @@ export class ProjectWorkspaceService {
 
   async moveCanvasNodes(
     moves: ProjectWorkspaceNodeMove[],
+    expectedCanvasRevisionHash: string,
   ): Promise<ProjectWorkspaceSnapshot> {
     const generation = this.beginOperation();
     if (moves.length === 0) return this.snapshot();
@@ -1207,6 +1353,12 @@ export class ProjectWorkspaceService {
     }
     const canvas = await this.readCanvas();
     if (!canvas.revision) throw new Error("项目 Canvas 不存在");
+    if (
+      !expectedCanvasRevisionHash ||
+      canvas.revision.hash !== expectedCanvasRevisionHash
+    ) {
+      throw new Error("Canvas 在拖动期间已经变化，卡片位置未写入");
+    }
     const managedNodes = new Map(
       canvas.document.nodes
         .filter((node) => node.helixManaged === true)
@@ -1219,7 +1371,10 @@ export class ProjectWorkspaceService {
       node.y = Math.round(move.y);
     }
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation);
+    await this.writeCanvas(canvas, generation, {
+      label: moves.length > 1 ? `移动 ${moves.length} 个阶段` : "移动阶段",
+      markdownTransitions: [],
+    });
     return this.snapshot();
   }
 
@@ -1284,6 +1439,17 @@ export class ProjectWorkspaceService {
     }
     const cycleRevision = await this.repository.read(cycle.notePath);
     if (!cycleRevision) throw new Error("阶段 Markdown 已不存在");
+    const cycleFrontmatter = frontmatterFromContent(cycleRevision.content);
+    if (
+      (
+        cycleFrontmatter?.["helix-kind"] !== "helix-stage" &&
+        cycleFrontmatter?.["helix-kind"] !== "helix-cycle"
+      ) ||
+      cycleFrontmatter["helix-id"] !== cycleId ||
+      cycleFrontmatter["helix-project-id"] !== owner.id
+    ) {
+      throw new Error("阶段 Markdown 在删除确认后被其他内容替换，本次操作未写入");
+    }
 
     const canvas = await this.readCanvas(false, generation);
     if (!canvas.revision || canvas.revision.hash !== canonicalPlan.canvasRevisionHash) {
@@ -1292,6 +1458,15 @@ export class ProjectWorkspaceService {
     const node = canvas.document.nodes.find((candidate) =>
       candidate.helixManaged === true && managedStageId(candidate) === cycleId);
     if (!node) throw new Error("Canvas 中找不到需要删除的阶段节点");
+    const unmanagedAttachments = canvas.document.edges.filter((edge) =>
+      (edge.fromNode === node.id || edge.toNode === node.id) &&
+      (edge.helixManaged !== true || isLegacyDerivesEdge(edge)));
+    if (unmanagedAttachments.length > 0) {
+      throw new Error(
+        `该阶段还有 ${unmanagedAttachments.length} 条原生 Canvas 非托管连线；` +
+        "为避免删除用户关系，请先在 Canvas 中移除或显式纳管这些连线",
+      );
+    }
     const physical = physicalManagedEdges(canvas.document).filter((edge) =>
       edge.fromCycleId !== cycleId && edge.toCycleId !== cycleId);
     if (bridge) {
@@ -1347,6 +1522,14 @@ export class ProjectWorkspaceService {
       canvasAfterContent: nextCanvasContent,
     };
     this.assertActive(generation);
+    if (
+      await this.repository.read(this.historyJournalPath()) ||
+      await this.repository.read(this.stageDeletionJournalPath())
+    ) {
+      const message = "已有项目图谱事务日志，不能开始阶段删除";
+      this.freezePendingStageDeletion(message);
+      throw new Error(message);
+    }
     const journalRevision = await this.repository.create(
       this.stageDeletionJournalPath(),
       JSON.stringify(journal, null, 2),
@@ -1372,6 +1555,12 @@ export class ProjectWorkspaceService {
         { requireExisting: true },
       );
     } catch (error) {
+      if (error instanceof VaultDeletionClaimError) {
+        const message =
+          `阶段删除的 Markdown 认领无法恢复，Canvas 和事务日志保持待恢复状态：${error.message}`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
       try {
         await this.repository.compareAndWrite(
           writtenCanvas,
@@ -1392,11 +1581,336 @@ export class ProjectWorkspaceService {
       );
     }
     await this.finishStageDeletionJournal(journalRevision, generation);
+    this.recordHistoryEntry({
+      id: crypto.randomUUID(),
+      label: bridge ? "删除并桥接阶段" : "删除阶段",
+      canvasPath: canvas.revision.path,
+      canvasBeforeContent: canvas.revision.content,
+      canvasAfterContent: writtenCanvas.content,
+      markdownTransitions: [{
+        path: cycleRevision.path,
+        kind: "stage",
+        entityId: cycleId,
+        projectId: owner.id,
+        fromContent: cycleRevision.content,
+        toContent: null,
+      }],
+    });
     return this.snapshot();
   }
 
   private stageDeletionJournalPath(): string {
     return normalizePath(`${this.rootFolder()}/.transactions/stage-delete.json`);
+  }
+
+  private historyJournalPath(): string {
+    return normalizePath(`${this.rootFolder()}/.transactions/workspace-history.json`);
+  }
+
+  private recordHistoryEntry(entry: ProjectWorkspaceHistoryEntry): void {
+    if (this.applyingHistory) return;
+    if (entry.canvasBeforeContent === entry.canvasAfterContent &&
+      entry.markdownTransitions.length === 0) return;
+    this.undoStack.push(entry);
+    while (
+      this.undoStack.length > ProjectWorkspaceService.HISTORY_ENTRY_LIMIT ||
+      this.historyBytes(this.undoStack) >
+        ProjectWorkspaceService.HISTORY_BYTE_LIMIT
+    ) {
+      this.undoStack.shift();
+    }
+    this.redoStack.length = 0;
+  }
+
+  private historyBytes(entries: ProjectWorkspaceHistoryEntry[]): number {
+    const bytes = (value: string): number =>
+      new TextEncoder().encode(value).byteLength;
+    return entries.reduce((sum, entry) =>
+      sum + bytes(entry.canvasBeforeContent) + bytes(entry.canvasAfterContent) +
+      entry.markdownTransitions.reduce((transitionSum, transition) =>
+        transitionSum +
+        (transition.fromContent ? bytes(transition.fromContent) : 0) +
+        (transition.toContent ? bytes(transition.toContent) : 0), 0), 0);
+  }
+
+  private async applyHistoryEntry(
+    entry: ProjectWorkspaceHistoryEntry,
+    direction: "undo" | "redo",
+  ): Promise<void> {
+    if (this.applyingHistory) throw new Error("已有撤销或重做正在执行");
+    const generation = this.beginOperation();
+    const fromCanvasContent = direction === "undo"
+      ? entry.canvasAfterContent
+      : entry.canvasBeforeContent;
+    const toCanvasContent = direction === "undo"
+      ? entry.canvasBeforeContent
+      : entry.canvasAfterContent;
+    const transitions = entry.markdownTransitions.map((transition) =>
+      direction === "undo"
+        ? {
+            ...transition,
+            fromContent: transition.toContent,
+            toContent: transition.fromContent,
+          }
+        : { ...transition });
+    const canvas = await this.repository.read(entry.canvasPath);
+    if (!canvas || canvas.hash !== stableHash(fromCanvasContent)) {
+      throw new Error("Canvas 在操作完成后已被修改，不能撤销或重做");
+    }
+    await this.assertHistoryFromState(transitions);
+    const journal: ProjectWorkspaceHistoryJournal = {
+      version: 1,
+      operation: "apply-workspace-history",
+      createdAt: new Date().toISOString(),
+      entryId: entry.id,
+      direction,
+      canvasPath: entry.canvasPath,
+      canvasFromContent: fromCanvasContent,
+      canvasToContent: toCanvasContent,
+      markdownTransitions: transitions,
+    };
+    if (
+      await this.repository.read(this.stageDeletionJournalPath()) ||
+      await this.repository.read(this.historyJournalPath())
+    ) {
+      const message = "已有项目图谱事务日志，不能开始撤销或重做";
+      this.freezePendingStageDeletion(message);
+      throw new Error(message);
+    }
+    const journalRevision = await this.repository.create(
+      this.historyJournalPath(),
+      JSON.stringify(journal, null, 2),
+      () => this.assertActive(generation),
+    );
+    this.applyingHistory = true;
+    try {
+      for (const transition of transitions) {
+        if (transition.fromContent === null && transition.toContent !== null) {
+          await this.repository.create(
+            transition.path,
+            transition.toContent,
+            () => this.assertActive(generation),
+          );
+        }
+      }
+      await this.repository.compareAndWrite(
+        canvas,
+        toCanvasContent,
+        () => this.assertActive(generation),
+      );
+      await this.finishHistoryRemovals(transitions, generation);
+      await this.finishMachineJournal(journalRevision, generation);
+    } catch (error) {
+      let currentCanvas: VaultRevision | null;
+      try {
+        currentCanvas = await this.repository.read(entry.canvasPath);
+      } catch (readError) {
+        const message =
+          `项目图谱历史失败后无法复核 Canvas，事务日志已保留：${
+            readError instanceof Error ? readError.message : String(readError)
+          }`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
+      if (currentCanvas?.hash === stableHash(fromCanvasContent)) {
+        try {
+          await this.rollbackHistoryAdditions(transitions, generation);
+          await this.finishMachineJournal(journalRevision, generation);
+        } catch (cleanupError) {
+          const message =
+            `项目图谱历史失败且清理未完成，事务日志已保留：${
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : String(cleanupError)
+            }`;
+          this.freezePendingStageDeletion(message);
+          throw new Error(message);
+        }
+      } else {
+        const message =
+          `项目图谱${direction === "undo" ? "撤销" : "重做"}未完整结束；事务日志已保留，重启将继续恢复：${
+            error instanceof Error ? error.message : String(error)
+          }`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
+      throw error;
+    } finally {
+      this.applyingHistory = false;
+    }
+  }
+
+  private async assertHistoryFromState(
+    transitions: ProjectWorkspaceHistoryFileTransition[],
+  ): Promise<void> {
+    for (const transition of transitions) {
+      const current = await this.repository.read(transition.path);
+      if (transition.fromContent === null) {
+        if (current) throw new Error(`目标路径已被占用，不能应用历史：${transition.path}`);
+        continue;
+      }
+      if (!current || current.hash !== stableHash(transition.fromContent)) {
+        throw new Error(`阶段 Markdown 已变化，不能应用历史：${transition.path}`);
+      }
+      this.assertHistoryStageIdentity(current.content, transition);
+    }
+  }
+
+  private async rollbackHistoryAdditions(
+    transitions: ProjectWorkspaceHistoryFileTransition[],
+    generation: number,
+  ): Promise<void> {
+    for (const transition of transitions) {
+      if (transition.fromContent === null && transition.toContent !== null) {
+        const current = await this.repository.read(transition.path);
+        if (!current) continue;
+        if (current.hash !== stableHash(transition.toContent)) {
+          throw new Error(`撤销事务新增的 Markdown 已被修改：${transition.path}`);
+        }
+        this.assertHistoryStageIdentity(current.content, transition);
+        await this.repository.trashIfUnchanged(
+          current,
+          () => this.assertActive(generation),
+          { requireExisting: true },
+        );
+      } else if (transition.fromContent !== null) {
+        const current = await this.repository.read(transition.path);
+        if (!current || current.hash !== stableHash(transition.fromContent)) {
+          throw new Error(`撤销事务起点 Markdown 已变化：${transition.path}`);
+        }
+        this.assertHistoryStageIdentity(current.content, transition);
+      }
+    }
+  }
+
+  private async finishHistoryRemovals(
+    transitions: ProjectWorkspaceHistoryFileTransition[],
+    generation: number,
+  ): Promise<void> {
+    for (const transition of transitions) {
+      const current = await this.repository.read(transition.path);
+      if (transition.toContent === null) {
+        if (!current) continue;
+        if (
+          transition.fromContent === null ||
+          current.hash !== stableHash(transition.fromContent)
+        ) {
+          throw new Error(`待移除的阶段 Markdown 已变化：${transition.path}`);
+        }
+        this.assertHistoryStageIdentity(current.content, transition);
+        await this.repository.trashIfUnchanged(
+          current,
+          () => this.assertActive(generation),
+          { requireExisting: true },
+        );
+        continue;
+      }
+      if (!current || current.hash !== stableHash(transition.toContent)) {
+        throw new Error(`历史目标 Markdown 缺失或已变化：${transition.path}`);
+      }
+      this.assertHistoryStageIdentity(current.content, transition);
+    }
+  }
+
+  private assertHistoryStageIdentity(
+    content: string,
+    transition: ProjectWorkspaceHistoryFileTransition,
+  ): void {
+    const frontmatter = frontmatterFromContent(content);
+    const valid = transition.kind === "project"
+      ? (
+          frontmatter?.["helix-kind"] === "helix-project" &&
+          frontmatter["helix-id"] === transition.entityId
+        )
+      : (
+          (
+            frontmatter?.["helix-kind"] === "helix-stage" ||
+            frontmatter?.["helix-kind"] === "helix-cycle"
+          ) &&
+          frontmatter["helix-id"] === transition.entityId &&
+          frontmatter["helix-project-id"] === transition.projectId
+        );
+    if (!valid) {
+      throw new Error(`历史事务中的 Markdown 身份不匹配：${transition.path}`);
+    }
+  }
+
+  private parseHistoryJournal(content: string): ProjectWorkspaceHistoryJournal {
+    let value: unknown;
+    try {
+      value = JSON.parse(content);
+    } catch {
+      throw new Error("项目图谱撤销事务日志不是有效 JSON");
+    }
+    if (!value || typeof value !== "object") {
+      throw new Error("项目图谱撤销事务日志根结构无效");
+    }
+    const journal = value as Partial<ProjectWorkspaceHistoryJournal>;
+    if (
+      journal.version !== 1 ||
+      journal.operation !== "apply-workspace-history" ||
+      (journal.direction !== "undo" && journal.direction !== "redo") ||
+      typeof journal.entryId !== "string" ||
+      !journal.entryId ||
+      typeof journal.canvasPath !== "string" ||
+      journal.canvasPath !== normalizePath(this.canvasPath()) ||
+      typeof journal.canvasFromContent !== "string" ||
+      typeof journal.canvasToContent !== "string" ||
+      !Array.isArray(journal.markdownTransitions)
+    ) {
+      throw new Error("项目图谱撤销事务日志字段无效");
+    }
+    const root = `${normalizePath(this.rootFolder())}/Projects/`;
+    for (const transition of journal.markdownTransitions) {
+      if (
+        !transition ||
+        (transition.kind !== "stage" && transition.kind !== "project") ||
+        typeof transition.path !== "string" ||
+        normalizePath(transition.path) !== transition.path ||
+        !transition.path.startsWith(root) ||
+        !transition.path.endsWith(".md") ||
+        typeof transition.entityId !== "string" ||
+        !transition.entityId ||
+        typeof transition.projectId !== "string" ||
+        !transition.projectId ||
+        !(
+          transition.fromContent === null ||
+          typeof transition.fromContent === "string"
+        ) ||
+        !(
+          transition.toContent === null ||
+          typeof transition.toContent === "string"
+        ) ||
+        transition.fromContent === transition.toContent
+      ) {
+        throw new Error("项目图谱撤销事务日志的 Markdown 转换无效");
+      }
+      if (transition.fromContent !== null) {
+        this.assertHistoryStageIdentity(transition.fromContent, transition);
+      }
+      if (transition.toContent !== null) {
+        this.assertHistoryStageIdentity(transition.toContent, transition);
+      }
+    }
+    return journal as ProjectWorkspaceHistoryJournal;
+  }
+
+  private async finishMachineJournal(
+    revision: VaultRevision,
+    generation: number,
+  ): Promise<void> {
+    const current = await this.repository.read(revision.path);
+    if (!current) throw new Error("项目图谱事务日志在清理前已不存在");
+    const expected = this.parseHistoryJournal(revision.content);
+    const actual = this.parseHistoryJournal(current.content);
+    if (stableHash(expected) !== stableHash(actual)) {
+      throw new Error("项目图谱事务日志在清理前发生语义变化");
+    }
+    await this.repository.trashIfUnchanged(
+      current,
+      () => this.assertActive(generation),
+      { requireExisting: true },
+    );
   }
 
   private parseStageDeletionJournal(content: string): StageDeletionJournal {
@@ -1561,6 +2075,9 @@ export class ProjectWorkspaceService {
     }
     const canvas = await this.readCanvas(false, generation);
     if (!canvas.revision) throw new Error("项目 Canvas 不存在");
+    if (canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在关系编辑期间已经变化，本次操作未写入");
+    }
     const nodeByCycle = new Map(
       canvas.document.nodes.flatMap((node) => {
         const id = managedStageId(node);
@@ -1618,7 +2135,10 @@ export class ProjectWorkspaceService {
     );
     applyNormalizedManagedEdges(canvas.document, normalized.edges);
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation);
+    await this.writeCanvas(canvas, generation, {
+      label: replacement ? "修改阶段关系" : "删除阶段关系",
+      markdownTransitions: [],
+    });
     return this.snapshot();
   }
 
@@ -1801,7 +2321,17 @@ export class ProjectWorkspaceService {
         [projectId]: 1,
       };
       this.assertActive(generation);
-      await this.writeCanvas(canvas, generation);
+      await this.writeCanvas(canvas, generation, {
+        label: "创建项目",
+        markdownTransitions: createdRevisions.map((revision, index) => ({
+          path: revision.path,
+          kind: index === 0 ? "project" as const : "stage" as const,
+          entityId: index === 0 ? projectId : cycleId,
+          projectId,
+          fromContent: null,
+          toContent: revision.content,
+        })),
+      });
       canvasWritten = true;
     } catch (error) {
       if (!canvasWritten) await this.rollbackCreatedFiles(createdRevisions, error);
@@ -2149,7 +2679,17 @@ export class ProjectWorkspaceService {
         affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
       );
       this.assertActive(generation);
-      await this.writeCanvas(canvas, generation);
+      await this.writeCanvas(canvas, generation, {
+        label: specs.length > 1 ? `创建 ${specs.length} 个阶段` : "创建阶段",
+        markdownTransitions: createdRevisions.map((revision, index) => ({
+          path: revision.path,
+          kind: "stage",
+          entityId: specs[index]!.id,
+          projectId,
+          fromContent: null,
+          toContent: revision.content,
+        })),
+      });
       canvasWritten = true;
     } catch (error) {
       if (!canvasWritten) {
@@ -2178,9 +2718,10 @@ export class ProjectWorkspaceService {
     }
     const message = cause instanceof Error ? cause.message : String(cause);
     if (rollbackErrors.length > 0) {
-      throw new Error(
-        `阶段操作失败且回滚遇到竞争，已停止后续写入：${message}；${rollbackErrors.join("；")}`,
-      );
+      const failure =
+        `阶段操作失败且回滚遇到竞争，已停止后续写入：${message}；${rollbackErrors.join("；")}`;
+      this.freezePendingStageDeletion(failure);
+      throw new Error(failure);
     }
     throw new Error(`阶段操作失败，已将新建文件移入废纸篓：${message}`);
   }
@@ -2224,16 +2765,37 @@ export class ProjectWorkspaceService {
   private async writeCanvas(canvas: {
     revision: VaultRevision | null;
     document: CanvasDocument;
-  }, generation?: number): Promise<void> {
+  }, generation?: number, history?: {
+    label: string;
+    markdownTransitions: ProjectWorkspaceHistoryFileTransition[];
+  }): Promise<VaultRevision> {
     const content = JSON.stringify(canvas.document, null, 2);
     const fence = generation === undefined
       ? undefined
       : () => this.assertActive(generation);
+    let written: VaultRevision;
     if (canvas.revision) {
-      await this.repository.compareAndWrite(canvas.revision, content, fence);
+      written = await this.repository.compareAndWrite(canvas.revision, content, fence);
     } else {
-      await this.repository.create(normalizePath(this.canvasPath()), content, fence);
+      written = await this.repository.create(
+        normalizePath(this.canvasPath()),
+        content,
+        fence,
+      );
     }
+    if (history && canvas.revision) {
+      this.recordHistoryEntry({
+        id: crypto.randomUUID(),
+        label: history.label,
+        canvasPath: written.path,
+        canvasBeforeContent: canvas.revision.content,
+        canvasAfterContent: written.content,
+        markdownTransitions: history.markdownTransitions,
+      });
+    } else if (!history && !this.applyingHistory) {
+      this.invalidateHistory();
+    }
+    return written;
   }
 }
 

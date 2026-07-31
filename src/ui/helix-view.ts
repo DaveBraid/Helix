@@ -148,6 +148,7 @@ export class HelixView extends ItemView {
       ) => void;
       openProjectFile: (path: string) => Promise<void>;
       projectWorkspace: ProjectWorkspaceService;
+      mutateProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       reviewLegacyMigration: () => void;
     },
   ) {
@@ -756,7 +757,8 @@ export class HelixView extends ItemView {
     try {
       workspace = await this.actions.projectWorkspace.snapshot();
       if (!workspace.migrationRequired) {
-        workspace = await this.actions.projectWorkspace.ensureCanvas();
+        workspace = await this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.ensureCanvas());
       }
     } catch (error) {
       if (token !== this.renderToken) return;
@@ -854,7 +856,12 @@ export class HelixView extends ItemView {
         void this.actions.openProjectFile(path);
       },
       onMoveNodes: async (moves) => {
-        await this.actions.projectWorkspace.moveCanvasNodes(moves);
+        if (!workspace.canvasRevisionHash) throw new Error("项目 Canvas 不存在");
+        await this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.moveCanvasNodes(
+            moves,
+            workspace.canvasRevisionHash!,
+          ));
       },
       onManageRelation: (relationId) => this.actions.manageRelation(
         relationId,
@@ -881,7 +888,8 @@ export class HelixView extends ItemView {
         ).open();
       },
       onEditProjectColor: (projectId, color) => {
-        void this.actions.projectWorkspace.updateProjectColor(projectId, color)
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.updateProjectColor(projectId, color))
           .then(() => this.render())
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
@@ -898,7 +906,8 @@ export class HelixView extends ItemView {
               plan.currentStatus,
               PROJECT_STATUS_OPTIONS,
               async (status) => {
-                await this.actions.projectWorkspace.updateProjectStatus(plan, status);
+                await this.actions.mutateProjectWorkspace(() =>
+                  this.actions.projectWorkspace.updateProjectStatus(plan, status));
                 await this.render();
               },
             ).open();
@@ -920,7 +929,8 @@ export class HelixView extends ItemView {
               plan.currentStatus,
               CYCLE_STATUS_OPTIONS,
               async (status) => {
-                await this.actions.projectWorkspace.updateCycleStatus(plan, status);
+                await this.actions.mutateProjectWorkspace(() =>
+                  this.actions.projectWorkspace.updateCycleStatus(plan, status));
                 await this.render();
               },
             ).open();
@@ -929,19 +939,37 @@ export class HelixView extends ItemView {
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
       onToggleCompletedCollapse: (projectId, collapsed) => {
-        void this.actions.projectWorkspace.setCompletedProjectCollapsed(projectId, collapsed)
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.setCompletedProjectCollapsed(projectId, collapsed))
           .then(() => this.render())
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
       onExpandCompletedProjects: (projectIds) => {
-        void this.actions.projectWorkspace.setCompletedProjectsCollapsed(projectIds, false)
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.setCompletedProjectsCollapsed(projectIds, false))
           .then(() => this.render())
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
       onAutoLayout: () => {
-        void this.actions.projectWorkspace.autoLayoutCanvas()
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.autoLayoutCanvas())
+          .then(() => this.render())
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      history: this.actions.projectWorkspace.historyState(),
+      onUndo: () => {
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.undoLastWorkspaceChange())
+          .then(() => this.render())
+          .catch((error) =>
+            new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      onRedo: () => {
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.redoLastWorkspaceChange())
           .then(() => this.render())
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
@@ -958,17 +986,19 @@ export class HelixView extends ItemView {
     lifecycleGeneration = this.viewGeneration,
   ): Promise<void> {
     try {
-      const plan = await this.actions.projectWorkspace.planConnection(
-        sourceCycleId,
-        targetCycleId,
-      );
+      const plan = await this.actions.mutateProjectWorkspace(() =>
+        this.actions.projectWorkspace.planConnection(
+          sourceCycleId,
+          targetCycleId,
+        ));
       new ConnectionConfirmModal(
         this.app,
         plan,
         async (confirmCrossProject) => {
-          await this.actions.projectWorkspace.connectCycles(plan, {
-            confirmCrossProject,
-          });
+          await this.actions.mutateProjectWorkspace(() =>
+            this.actions.projectWorkspace.connectCycles(plan, {
+              confirmCrossProject,
+            }));
           this.requestLineageFocus(sourceCycleId, lifecycleGeneration);
           new Notice("阶段连接已建立，受影响分支已自动整理");
         },

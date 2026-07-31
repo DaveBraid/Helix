@@ -27,6 +27,7 @@ import { aggregateAnalytics } from "./domain/analytics";
 import { patchManagedFrontmatter } from "./storage/frontmatter";
 import { HelixService } from "./services/helix-service";
 import { ProjectWorkspaceService } from "./services/project-workspace";
+import { SerializedRunner } from "./services/serialized-runner";
 import type {
   ProjectWorkspaceMigrationItem,
   ProjectWorkspaceProject,
@@ -58,6 +59,8 @@ export default class HelixPlugin extends Plugin {
   private projectRefreshTimer: number | null = null;
   private projectMutationDepth = 0;
   private projectRefreshPending = false;
+  private projectCanvasRefreshPending = false;
+  private readonly projectMutationRunner = new SerializedRunner();
 
   async onload(): Promise<void> {
     this.unloaded = false;
@@ -80,6 +83,16 @@ export default class HelixPlugin extends Plugin {
       );
     } else {
       try {
+        const restoredClaims =
+          await this.vaultRepository.recoverDeletionClaims(this.settings.rootFolder);
+        if (restoredClaims.length > 0) {
+          new Notice(`Helix 已恢复 ${restoredClaims.length} 个中断的文件删除认领`);
+        }
+        const historyRecovered =
+          await this.projectWorkspace.recoverPendingWorkspaceHistory();
+        if (historyRecovered !== "none") {
+          new Notice(`Helix 已恢复未完成的图谱撤销事务：${historyRecovered}`);
+        }
         const recovered = await this.projectWorkspace.recoverPendingStageDeletion();
         if (recovered !== "none") {
           new Notice(`Helix 已恢复未完成的阶段删除事务：${recovered}`);
@@ -110,6 +123,7 @@ export default class HelixPlugin extends Plugin {
           this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
+        mutateProjectWorkspace: (operation) => this.withProjectMutation(operation),
         reviewLegacyMigration: () => this.showLegacyMigrationModal(),
       }),
     );
@@ -128,6 +142,36 @@ export default class HelixPlugin extends Plugin {
       id: "create-project",
       name: "创建项目",
       callback: () => this.openProjectModal(),
+    });
+    this.addCommand({
+      id: "undo-project-workspace",
+      name: "撤销上一次项目图谱操作",
+      checkCallback: (checking) => {
+        const available = this.projectWorkspace.historyState().undoCount > 0;
+        if (!checking && available) {
+          void this.withProjectMutation(() =>
+            this.projectWorkspace.undoLastWorkspaceChange())
+            .then(() => this.service.refreshPersistedEvents())
+            .catch((error) =>
+              new Notice(error instanceof Error ? error.message : String(error), 8_000));
+        }
+        return available;
+      },
+    });
+    this.addCommand({
+      id: "redo-project-workspace",
+      name: "重做上一次项目图谱操作",
+      checkCallback: (checking) => {
+        const available = this.projectWorkspace.historyState().redoCount > 0;
+        if (!checking && available) {
+          void this.withProjectMutation(() =>
+            this.projectWorkspace.redoLastWorkspaceChange())
+            .then(() => this.service.refreshPersistedEvents())
+            .catch((error) =>
+              new Notice(error instanceof Error ? error.message : String(error), 8_000));
+        }
+        return available;
+      },
     });
     this.addCommand({
       id: "open-daily-review",
@@ -173,17 +217,23 @@ export default class HelixPlugin extends Plugin {
     this.addSettingTab(new HelixSettingTab(this.app, this));
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (this.isProjectWorkspaceFile(file.path)) this.scheduleProjectRefresh();
+        if (this.isProjectWorkspaceFile(file.path)) {
+          this.scheduleProjectRefresh(file.path);
+        }
       }),
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
-        if (this.isProjectWorkspaceFile(file.path)) this.scheduleProjectRefresh();
+        if (this.isProjectWorkspaceFile(file.path)) {
+          this.scheduleProjectRefresh(file.path);
+        }
       }),
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        if (this.isProjectWorkspaceFile(file.path)) this.scheduleProjectRefresh();
+        if (this.isProjectWorkspaceFile(file.path)) {
+          this.scheduleProjectRefresh(file.path);
+        }
       }),
     );
     this.registerEvent(
@@ -191,7 +241,11 @@ export default class HelixPlugin extends Plugin {
         if (
           this.isProjectWorkspaceFile(file.path) ||
           this.isProjectWorkspaceFile(oldPath)
-        ) this.scheduleProjectRefresh();
+        ) {
+          this.scheduleProjectRefresh(
+            this.isProjectWorkspaceFile(file.path) ? file.path : oldPath,
+          );
+        }
       }),
     );
 
@@ -334,10 +388,11 @@ export default class HelixPlugin extends Plugin {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能删除阶段", 8_000);
       return;
     }
-    void Promise.all([
-      this.projectWorkspace.snapshot(),
-      this.projectWorkspace.planCycleDeletion(cycleId),
-    ])
+    void this.withProjectMutation(async () => {
+      const snapshot = await this.projectWorkspace.snapshot();
+      const plan = await this.projectWorkspace.planCycleDeletion(cycleId);
+      return [snapshot, plan] as const;
+    })
       .then(([snapshot, plan]) => {
         const owner = snapshot.projects.find((project) =>
           project.cycles.some((cycle) => cycle.id === cycleId));
@@ -558,8 +613,14 @@ export default class HelixPlugin extends Plugin {
     );
   }
 
-  private scheduleProjectRefresh(): void {
+  private scheduleProjectRefresh(changedPath?: string): void {
     if (this.unloaded) return;
+    if (
+      changedPath &&
+      normalizePath(changedPath) === normalizePath(this.settings.lineageCanvasPath)
+    ) {
+      this.projectCanvasRefreshPending = true;
+    }
     if (this.projectMutationDepth > 0) {
       this.projectRefreshPending = true;
       return;
@@ -569,26 +630,36 @@ export default class HelixPlugin extends Plugin {
     }
     this.projectRefreshTimer = window.setTimeout(() => {
       this.projectRefreshTimer = null;
-      if (!this.unloaded) void this.service.refreshPersistedEvents();
+      if (this.unloaded) return;
+      const observeCanvas = this.projectCanvasRefreshPending;
+      this.projectCanvasRefreshPending = false;
+      void (observeCanvas
+        ? this.projectWorkspace.observeCanvasChange()
+        : Promise.resolve())
+        .then(() => this.service.refreshPersistedEvents())
+        .catch((error) =>
+          new Notice(error instanceof Error ? error.message : String(error), 8_000));
     }, 200);
   }
 
   private async withProjectMutation<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.projectMutationDepth === 0 && this.projectRefreshTimer !== null) {
-      window.clearTimeout(this.projectRefreshTimer);
-      this.projectRefreshTimer = null;
-      this.projectRefreshPending = true;
-    }
-    this.projectMutationDepth += 1;
-    try {
-      return await operation();
-    } finally {
-      this.projectMutationDepth -= 1;
-      if (this.projectMutationDepth === 0 && this.projectRefreshPending) {
-        this.projectRefreshPending = false;
-        this.scheduleProjectRefresh();
+    return this.projectMutationRunner.run(async () => {
+      if (this.projectMutationDepth === 0 && this.projectRefreshTimer !== null) {
+        window.clearTimeout(this.projectRefreshTimer);
+        this.projectRefreshTimer = null;
+        this.projectRefreshPending = true;
       }
-    }
+      this.projectMutationDepth += 1;
+      try {
+        return await operation();
+      } finally {
+        this.projectMutationDepth -= 1;
+        if (this.projectMutationDepth === 0 && this.projectRefreshPending) {
+          this.projectRefreshPending = false;
+          this.scheduleProjectRefresh();
+        }
+      }
+    });
   }
 
   private isProjectWorkspaceFile(path: string): boolean {

@@ -10,6 +10,7 @@ import {
 } from "../domain/project-graph";
 import type {
   ProjectWorkspaceCanvasNode,
+  ProjectWorkspaceHistoryState,
   ProjectWorkspaceNodeMove,
   ProjectWorkspaceProject,
   ProjectWorkspaceSnapshot,
@@ -71,6 +72,9 @@ interface WorkbenchOptions {
   onToggleCompletedCollapse: (projectId: string, collapsed: boolean) => void;
   onExpandCompletedProjects: (projectIds: string[]) => void;
   onAutoLayout: () => void;
+  history: ProjectWorkspaceHistoryState;
+  onUndo: () => void;
+  onRedo: () => void;
   onError: (error: unknown) => void;
 }
 
@@ -774,6 +778,34 @@ export class ProjectLineageWorkbench {
       fold.addEventListener("click", () =>
         this.options.onToggleCompletedCollapse(selectedProject.id, !collapsed));
     }
+    const undo = actions.createEl("button", {
+      cls: "helix-secondary-button helix-lineage-history-button",
+      text: "撤销",
+      attr: {
+        title: this.options.history.undoLabel
+          ? `撤销：${this.options.history.undoLabel}`
+          : "没有可撤销的项目图谱操作",
+        "aria-label": this.options.history.undoLabel
+          ? `撤销${this.options.history.undoLabel}`
+          : "没有可撤销的项目图谱操作",
+      },
+    });
+    undo.disabled = this.options.history.undoCount === 0;
+    undo.addEventListener("click", this.options.onUndo);
+    const redo = actions.createEl("button", {
+      cls: "helix-secondary-button helix-lineage-history-button",
+      text: "重做",
+      attr: {
+        title: this.options.history.redoLabel
+          ? `重做：${this.options.history.redoLabel}`
+          : "没有可重做的项目图谱操作",
+        "aria-label": this.options.history.redoLabel
+          ? `重做${this.options.history.redoLabel}`
+          : "没有可重做的项目图谱操作",
+      },
+    });
+    redo.disabled = this.options.history.redoCount === 0;
+    redo.addEventListener("click", this.options.onRedo);
     const arrange = actions.createEl("button", {
       cls: "helix-secondary-button",
       text: "整理全部",

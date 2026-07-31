@@ -18,7 +18,20 @@ export class VaultWriteConflictError extends Error {
   }
 }
 
+export class VaultDeletionClaimError extends Error {
+  constructor(
+    public readonly originalPath: string,
+    public readonly claimPath: string,
+    message: string,
+  ) {
+    super(`${message}；认领文件保留在：${claimPath}`);
+    this.name = "VaultDeletionClaimError";
+  }
+}
+
 export class HelixVaultRepository {
+  private static readonly DELETE_CLAIM_SUFFIX = ".helix-delete-claim";
+
   constructor(private readonly vault: Vault) {}
 
   async read(path: string): Promise<VaultRevision | null> {
@@ -59,19 +72,24 @@ export class HelixVaultRepository {
     nextContent: string,
     beforeWrite?: () => void,
   ): Promise<VaultRevision> {
-    const current = await this.read(revision.path);
-    if (!current) throw new Error(`目标已经删除：${revision.path}`);
-    if (current.hash !== revision.hash) {
-      throw new VaultWriteConflictError(revision.path, revision.hash, current.hash);
-    }
     const file = this.vault.getAbstractFileByPath(revision.path);
     if (!(file instanceof TFile)) throw new Error(`目标不是文件：${revision.path}`);
-    beforeWrite?.();
-    await this.vault.modify(file, nextContent);
+    const written = await this.vault.process(file, (currentContent) => {
+      const actualHash = stableHash(currentContent);
+      if (actualHash !== revision.hash) {
+        throw new VaultWriteConflictError(
+          revision.path,
+          revision.hash,
+          actualHash,
+        );
+      }
+      beforeWrite?.();
+      return nextContent;
+    });
     return {
       path: revision.path,
-      content: nextContent,
-      hash: stableHash(nextContent),
+      content: written,
+      hash: stableHash(written),
     };
   }
 
@@ -98,15 +116,127 @@ export class HelixVaultRepository {
         current.hash,
       );
     }
+    const claimPath = normalizePath(
+      `${revision.path}${HelixVaultRepository.DELETE_CLAIM_SUFFIX}`,
+    );
+    if (await this.pathExists(claimPath)) {
+      throw new VaultDeletionClaimError(
+        revision.path,
+        claimPath,
+        "已有未恢复的删除认领，禁止覆盖",
+      );
+    }
     const file = this.vault.getAbstractFileByPath(revision.path);
+    const adapter = this.vault.adapter;
+    if (!(file instanceof TFile) && !adapter) {
+      throw new Error(`目标不是文件：${revision.path}`);
+    }
     beforeWrite?.();
     if (file instanceof TFile) {
-      await this.vault.trash(file, false);
+      await this.vault.rename(file, claimPath);
     } else {
-      const adapter = this.vault.adapter;
-      if (!adapter) throw new Error(`目标不是文件：${revision.path}`);
-      await adapter.remove(revision.path);
+      await adapter!.rename(revision.path, claimPath);
     }
+    try {
+      const claimed = await this.read(claimPath);
+      if (!claimed) throw new Error("删除认领后无法读取文件");
+      if (claimed.hash !== revision.hash) {
+        await this.restoreDeletionClaim(revision.path, claimPath);
+        throw new VaultWriteConflictError(
+          revision.path,
+          revision.hash,
+          claimed.hash,
+        );
+      }
+      const claimedFile = this.vault.getAbstractFileByPath(claimPath);
+      if (claimedFile instanceof TFile) {
+        await this.vault.trash(claimedFile, false);
+      } else {
+        await adapter!.remove(claimPath);
+      }
+    } catch (error) {
+      if (await this.pathExists(claimPath)) {
+        try {
+          await this.restoreDeletionClaim(revision.path, claimPath);
+        } catch (restoreError) {
+          throw new VaultDeletionClaimError(
+            revision.path,
+            claimPath,
+            `删除认领失败且无法恢复原路径：${
+              restoreError instanceof Error
+                ? restoreError.message
+                : String(restoreError)
+            }`,
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
+  async recoverDeletionClaims(rootPath: string): Promise<string[]> {
+    const root = normalizePath(rootPath);
+    const claims = await this.findDeletionClaims(root);
+    const restored: string[] = [];
+    for (const claimPath of claims.sort()) {
+      const originalPath = claimPath.slice(
+        0,
+        -HelixVaultRepository.DELETE_CLAIM_SUFFIX.length,
+      );
+      await this.restoreDeletionClaim(originalPath, claimPath);
+      restored.push(originalPath);
+    }
+    return restored;
+  }
+
+  private async restoreDeletionClaim(
+    originalPath: string,
+    claimPath: string,
+  ): Promise<void> {
+    if (await this.pathExists(originalPath)) {
+      throw new VaultDeletionClaimError(
+        originalPath,
+        claimPath,
+        "原路径已被其他内容占用，不能自动恢复删除认领",
+      );
+    }
+    const claimedFile = this.vault.getAbstractFileByPath(claimPath);
+    if (claimedFile instanceof TFile) {
+      await this.vault.rename(claimedFile, originalPath);
+      return;
+    }
+    const adapter = this.vault.adapter;
+    if (!adapter || !(await adapter.exists(claimPath))) {
+      throw new VaultDeletionClaimError(
+        originalPath,
+        claimPath,
+        "删除认领文件已不存在",
+      );
+    }
+    await adapter.rename(claimPath, originalPath);
+  }
+
+  private async findDeletionClaims(rootPath: string): Promise<string[]> {
+    const adapter = this.vault.adapter;
+    if (!adapter || !(await adapter.exists(rootPath))) return [];
+    const claims: string[] = [];
+    const visit = async (path: string): Promise<void> => {
+      const listed = await adapter.list(path);
+      for (const file of listed.files) {
+        const normalized = normalizePath(file);
+        if (normalized.endsWith(HelixVaultRepository.DELETE_CLAIM_SUFFIX)) {
+          claims.push(normalized);
+        }
+      }
+      for (const folder of listed.folders) await visit(normalizePath(folder));
+    };
+    await visit(rootPath);
+    return [...new Set(claims)];
+  }
+
+  private async pathExists(path: string): Promise<boolean> {
+    return this.vault.getAbstractFileByPath(path) != null ||
+      Boolean(this.vault.adapter && await this.vault.adapter.exists(path));
   }
 
   private async ensureParent(path: string, beforeWrite?: () => void): Promise<void> {

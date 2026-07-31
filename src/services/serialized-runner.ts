@@ -6,16 +6,19 @@ export class SerializedRunner {
     return this.running > 0;
   }
 
-  run(operation: () => Promise<void>): Promise<void> {
+  run<T>(operation: () => Promise<T>): Promise<T> {
     const next = this.tail.then(async () => {
       this.running += 1;
       try {
-        await operation();
+        return await operation();
       } finally {
         this.running -= 1;
       }
     });
-    this.tail = next.catch(() => undefined);
+    this.tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
     return next;
   }
 }

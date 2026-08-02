@@ -17,7 +17,7 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-Helix 将衍生实现隔离在 `src/integrations/dida`。上游更新只在人工审查后按安全、认证、接口兼容或同步正确性需要移植，不自动合并 UI 与一般功能。
+Helix 将同步衍生实现隔离在 `src/integrations/dida`，任务视图投影的衍生实现位于 `src/domain/task-views.ts`。上游更新只在人工审查后按安全、认证、接口兼容或同步正确性需要移植，不自动合并 UI 与一般功能。
 
 ## Obsidian Research Card Manager
 

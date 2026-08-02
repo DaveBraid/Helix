@@ -984,6 +984,246 @@
   gap: 8px;
 }
 
+.helix-task-view-toolbar {
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.helix-task-view-tabs,
+.helix-task-view-navigation {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.helix-task-view-tabs {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.helix-task-view-tabs button,
+.helix-task-view-navigation button {
+  min-width: 34px;
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--helix-line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--helix-surface-control) 82%, transparent);
+  color: var(--helix-muted);
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.helix-task-view-tabs button.is-active {
+  border-color: color-mix(in srgb, var(--helix-accent-ink) 42%, var(--helix-line));
+  background: var(--helix-accent-soft);
+  color: var(--helix-accent-ink);
+}
+
+.helix-task-view-tabs button:focus-visible,
+.helix-task-view-navigation button:focus-visible {
+  outline: 2px solid var(--helix-accent-ink);
+  outline-offset: 2px;
+}
+
+.helix-task-view-navigation button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.helix-task-calendar {
+  overflow: hidden;
+}
+
+.helix-task-calendar-range {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--helix-line);
+  color: var(--helix-text-strong);
+  font-size: 14px;
+  font-weight: 720;
+}
+
+.helix-task-calendar-weekdays,
+.helix-task-calendar-grid {
+  display: grid;
+}
+
+.helix-task-calendar-weekdays {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  border-bottom: 1px solid var(--helix-line);
+  color: var(--helix-muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.helix-task-calendar.is-three-day .helix-task-calendar-weekdays,
+.helix-task-calendar.is-three-day .helix-task-calendar-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.helix-task-calendar.is-week .helix-task-calendar-grid,
+.helix-task-calendar.is-month .helix-task-calendar-grid {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.helix-task-calendar-weekdays > div {
+  padding: 7px 4px;
+  border-right: 1px solid var(--helix-line);
+}
+
+.helix-task-calendar-weekdays > div:last-child {
+  border-right: 0;
+}
+
+.helix-task-calendar-day {
+  min-width: 0;
+  min-height: 154px;
+  padding: 8px;
+  border-right: 1px solid var(--helix-line);
+  border-bottom: 1px solid var(--helix-line);
+  background: color-mix(in srgb, var(--helix-card) 96%, var(--helix-accent-soft));
+}
+
+.helix-task-calendar.is-day .helix-task-calendar-day {
+  min-height: 320px;
+}
+
+.helix-task-calendar.is-month .helix-task-calendar-day {
+  min-height: 112px;
+  padding: 6px;
+}
+
+.helix-task-calendar-day.is-outside {
+  opacity: .44;
+  background: var(--background-secondary);
+}
+
+.helix-task-calendar-day.is-today {
+  box-shadow: inset 0 3px 0 var(--helix-accent-ink);
+}
+
+.helix-task-calendar-day-head {
+  min-height: 22px;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--helix-muted);
+  font-size: 10px;
+}
+
+.helix-task-calendar-day-head strong {
+  color: var(--helix-text-strong);
+  font-size: 11px;
+}
+
+.helix-task-calendar-items {
+  display: grid;
+  gap: 5px;
+}
+
+.helix-task-calendar-chip {
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--helix-line) 82%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--helix-surface-control) 88%, transparent);
+  color: var(--helix-text-strong);
+  box-shadow: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+
+.helix-task-calendar-chip:hover {
+  border-color: color-mix(in srgb, var(--helix-accent-ink) 45%, var(--helix-line));
+}
+
+.helix-task-calendar-chip.is-all-day {
+  background: var(--helix-accent-soft);
+}
+
+.helix-task-calendar-chip.is-completed {
+  opacity: .58;
+  text-decoration: line-through;
+}
+
+.helix-task-calendar-chip .helix-project-dot {
+  flex: 0 0 auto;
+}
+
+.helix-task-calendar-chip-title {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-calendar-chip-time {
+  flex: 0 0 auto;
+  color: var(--helix-muted);
+  font-size: 9px;
+}
+
+.helix-task-calendar-chip.is-compact {
+  min-height: 24px;
+  padding: 4px 5px;
+}
+
+.helix-task-calendar-chip.is-compact .helix-task-calendar-chip-title {
+  font-size: 9px;
+}
+
+.helix-task-matrix {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.helix-task-quadrant {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.helix-task-quadrant-head {
+  min-height: 48px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--helix-line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.helix-task-quadrant-head h3 {
+  margin: 0;
+  color: var(--helix-text-strong);
+  font-size: 13px;
+}
+
+.helix-task-quadrant-head span {
+  min-width: 24px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--helix-surface-control);
+  color: var(--helix-muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.helix-task-quadrant.is-important-urgent { border-top: 3px solid #d85b68; }
+.helix-task-quadrant.is-important-not-urgent { border-top: 3px solid #d39a42; }
+.helix-task-quadrant.is-not-important-urgent { border-top: 3px solid #5278d4; }
+.helix-task-quadrant.is-not-important-not-urgent { border-top: 3px solid #7c879a; }
+
 .helix-task-composer {
   margin-bottom: 14px;
   padding: 10px;
@@ -2957,6 +3197,15 @@
 .helix-lineage-column-list { display: grid; gap: 10px; }
 
 @media (max-width: 900px) {
+  .helix-task-view-toolbar { align-items: stretch; flex-direction: column; }
+  .helix-task-view-navigation { justify-content: flex-end; }
+  .helix-task-calendar.is-week,
+  .helix-task-calendar.is-month { overflow-x: auto; }
+  .helix-task-calendar.is-week .helix-task-calendar-weekdays,
+  .helix-task-calendar.is-week .helix-task-calendar-grid,
+  .helix-task-calendar.is-month .helix-task-calendar-weekdays,
+  .helix-task-calendar.is-month .helix-task-calendar-grid { min-width: 720px; }
+  .helix-task-matrix { grid-template-columns: 1fr; }
   .helix-lineage-toolbar { grid-template-columns: 1fr auto; }
   .helix-lineage-view-switcher { order: 3; grid-column: 1 / -1; justify-self: start; }
   .helix-lineage-kanban { grid-template-columns: repeat(3, 260px); }

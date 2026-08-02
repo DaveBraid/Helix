@@ -40,6 +40,13 @@ import {
   taskScheduleForSubmission,
   type TaskScheduleMode,
 } from "../domain/task-schedule";
+import {
+  buildTaskDateRange,
+  buildTaskMatrix,
+  groupTasksByViewDay,
+  type TaskDateRange,
+  type TaskViewMode,
+} from "../domain/task-views";
 import type { HelixRuntimeState } from "../services/helix-service";
 import { HelixService } from "../services/helix-service";
 import type {
@@ -127,7 +134,9 @@ const SAMPLE_TASKS: DidaTask[] = [
 export class HelixView extends ItemView {
   private section: Section = "today";
   private expandedInProgress = false;
-  private taskFilter: "all" | "today" | "in-progress" | "completed" = "all";
+  private taskFilter: "all" | "open" | "in-progress" | "completed" = "open";
+  private taskViewMode: TaskViewMode = "list";
+  private taskViewDate = new Date();
   private selectedProjectId: string | null | undefined;
   private projectLineageMode: ProjectLineageViewMode = "graph";
   private projectWorkbench: ProjectLineageWorkbench | null = null;
@@ -859,7 +868,7 @@ export class HelixView extends ItemView {
     const filters = content.createDiv({ cls: "helix-filter-row" });
     const filterItems = [
       ["all", "全部"],
-      ["today", "今天"],
+      ["open", "待完成"],
       ["in-progress", "进行中"],
       ["completed", "已完成"],
     ] as const;
@@ -867,15 +876,224 @@ export class HelixView extends ItemView {
       const button = filters.createEl("button", {
         text: label,
         cls: this.taskFilter === id ? "is-active" : "",
+        attr: { "aria-pressed": String(this.taskFilter === id) },
       });
       button.addEventListener("click", () => {
         this.taskFilter = id;
         void this.render();
       });
     }
-    const card = content.createDiv({ cls: "helix-card helix-table-card" });
-    for (const task of this.filterTasks(tasks)) {
-      this.renderTaskRow(card, task, projects.find((project) => project.id === task.projectId), false);
+    this.renderTaskViewToolbar(content);
+    const visibleTasks = this.filterTasks(tasks);
+    const panel = content.createDiv({
+      cls: "helix-task-view-panel",
+      attr: {
+        id: "helix-task-view-panel",
+        role: "tabpanel",
+        "aria-labelledby": `helix-task-view-tab-${this.taskViewMode}`,
+      },
+    });
+    if (this.taskViewMode === "matrix") {
+      this.renderTaskMatrix(panel, visibleTasks, projects);
+    } else if (this.taskViewMode === "list") {
+      const card = panel.createDiv({ cls: "helix-card helix-table-card" });
+      if (visibleTasks.length === 0) card.createDiv({ cls: "helix-empty", text: "当前筛选没有任务。" });
+      for (const task of visibleTasks) {
+        this.renderTaskRow(card, task, projects.find((project) => project.id === task.projectId), false);
+      }
+    } else {
+      this.renderTaskCalendar(panel, visibleTasks, projects, this.taskViewMode);
+    }
+  }
+
+  private renderTaskViewToolbar(content: HTMLElement): void {
+    const toolbar = content.createDiv({ cls: "helix-task-view-toolbar" });
+    const modes: Array<{ id: TaskViewMode; label: string }> = [
+      { id: "list", label: "列表" },
+      { id: "day", label: "日" },
+      { id: "three-day", label: "3 日" },
+      { id: "week", label: "周" },
+      { id: "month", label: "月" },
+      { id: "matrix", label: "四象限" },
+    ];
+    const tabs = toolbar.createDiv({
+      cls: "helix-task-view-tabs",
+      attr: { role: "tablist", "aria-label": "任务视图" },
+    });
+    for (const [index, mode] of modes.entries()) {
+      const button = tabs.createEl("button", {
+        text: mode.label,
+        cls: this.taskViewMode === mode.id ? "is-active" : "",
+        attr: {
+          id: `helix-task-view-tab-${mode.id}`,
+          role: "tab",
+          "aria-selected": String(this.taskViewMode === mode.id),
+          "aria-controls": "helix-task-view-panel",
+          tabindex: this.taskViewMode === mode.id ? "0" : "-1",
+        },
+      });
+      button.addEventListener("click", () => {
+        this.activateTaskViewMode(mode.id);
+      });
+      button.addEventListener("keydown", (event) => {
+        const targetIndex = event.key === "ArrowRight"
+          ? (index + 1) % modes.length
+          : event.key === "ArrowLeft"
+            ? (index - 1 + modes.length) % modes.length
+            : event.key === "Home" ? 0 : event.key === "End" ? modes.length - 1 : undefined;
+        if (targetIndex === undefined) return;
+        event.preventDefault();
+        this.activateTaskViewMode(modes[targetIndex]!.id);
+      });
+    }
+    if (this.taskViewMode === "list" || this.taskViewMode === "matrix") return;
+    const navigation = toolbar.createDiv({ cls: "helix-task-view-navigation" });
+    const previous = navigation.createEl("button", { attr: { "aria-label": "上一时间段" } });
+    setIcon(previous, "chevron-left");
+    previous.addEventListener("click", () => this.shiftTaskViewDate(-1));
+    navigation.createEl("button", { text: "今天" }).addEventListener("click", () => {
+      this.taskViewDate = new Date();
+      void this.render();
+    });
+    const next = navigation.createEl("button", { attr: { "aria-label": "下一时间段" } });
+    setIcon(next, "chevron-right");
+    next.addEventListener("click", () => this.shiftTaskViewDate(1));
+  }
+
+  private activateTaskViewMode(mode: TaskViewMode): void {
+    this.taskViewMode = mode;
+    void this.render().then(() => {
+      this.contentEl.querySelector<HTMLElement>(`#helix-task-view-tab-${mode}`)?.focus();
+    });
+  }
+
+  private shiftTaskViewDate(direction: -1 | 1): void {
+    const next = new Date(this.taskViewDate);
+    if (this.taskViewMode === "month") next.setMonth(next.getMonth() + direction, 1);
+    else if (this.taskViewMode === "week") next.setDate(next.getDate() + direction * 7);
+    else if (this.taskViewMode === "three-day") next.setDate(next.getDate() + direction * 3);
+    else next.setDate(next.getDate() + direction);
+    this.taskViewDate = next;
+    void this.render();
+  }
+
+  private renderTaskCalendar(
+    content: HTMLElement,
+    tasks: DidaTask[],
+    projects: DidaProject[],
+    mode: Extract<TaskViewMode, "day" | "three-day" | "week" | "month">,
+  ): void {
+    const range = buildTaskDateRange(mode, this.taskViewDate);
+    const grouped = groupTasksByViewDay(tasks, range);
+    const card = content.createDiv({ cls: `helix-card helix-task-calendar is-${mode}` });
+    card.createDiv({
+      cls: "helix-task-calendar-range",
+      text: taskRangeLabel(range, mode, this.taskViewDate),
+    });
+    if (mode !== "day") {
+      const weekdays = card.createDiv({ cls: "helix-task-calendar-weekdays" });
+      const labels = mode === "three-day"
+        ? range.days.map((day) => weekdayLabel(day.date))
+        : ["一", "二", "三", "四", "五", "六", "日"];
+      for (const label of labels) weekdays.createDiv({ text: label });
+    }
+    const grid = card.createDiv({ cls: "helix-task-calendar-grid" });
+    for (const day of range.days) {
+      const cell = grid.createDiv({
+        cls: `helix-task-calendar-day${day.inAnchorMonth ? "" : " is-outside"}` +
+          `${day.key === localDateKey(new Date()) ? " is-today" : ""}`,
+      });
+      const header = cell.createDiv({ cls: "helix-task-calendar-day-head" });
+      header.createEl("strong", {
+        text: mode === "day" ? longDateLabel(day.date) : String(day.date.getDate()),
+      });
+      const dayTasks = grouped.get(day.key) ?? [];
+      header.createSpan({ text: dayTasks.length > 0 ? String(dayTasks.length) : "" });
+      const list = cell.createDiv({ cls: "helix-task-calendar-items" });
+      for (const task of dayTasks) {
+        this.renderTaskCalendarChip(
+          list,
+          task,
+          projects.find((project) => project.id === task.projectId),
+          mode === "month",
+          day.key,
+        );
+      }
+    }
+  }
+
+  private renderTaskCalendarChip(
+    parent: HTMLElement,
+    task: DidaTask,
+    project: DidaProject | undefined,
+    compact: boolean,
+    dayKey: string,
+  ): void {
+    const chip = parent.createEl("button", {
+      cls: `helix-task-calendar-chip${task.status === 2 ? " is-completed" : ""}` +
+        `${task.isAllDay ? " is-all-day" : ""}${compact ? " is-compact" : ""}`,
+      attr: { "aria-label": `编辑任务：${task.title}，${dayKey}` },
+    });
+    const dot = chip.createSpan({ cls: "helix-project-dot" });
+    dot.style.backgroundColor = project?.color ?? "#8891a7";
+    chip.createSpan({ cls: "helix-task-calendar-chip-title", text: task.title });
+    if (!compact && !task.isAllDay && (task.startDate || task.dueDate)) {
+      chip.createSpan({
+        cls: "helix-task-calendar-chip-time",
+        text: formatHour(task.startDate ?? task.dueDate!, task.timeZone),
+      });
+    }
+    chip.addEventListener("click", () => {
+      if (task.id.startsWith("sample-")) {
+        this.renderTaskPreviewEditor(task);
+      } else {
+        void this.openTaskEditor(task, this.state?.projects ?? []);
+      }
+    });
+  }
+
+  private renderTaskPreviewEditor(task: DidaTask): void {
+    new TaskEditModal(
+      this.app,
+      task,
+      SAMPLE_PROJECTS,
+      [],
+      undefined,
+      [],
+      undefined,
+      "duration",
+      async (updated) => {
+        this.previewTasks = this.previewTasks.map((candidate) =>
+          candidate.id === updated.id ? updated : candidate,
+        );
+        await this.render();
+      },
+      undefined,
+      true,
+    ).open();
+  }
+
+  private renderTaskMatrix(
+    content: HTMLElement,
+    tasks: DidaTask[],
+    projects: DidaProject[],
+  ): void {
+    const matrix = content.createDiv({ cls: "helix-task-matrix" });
+    for (const quadrant of buildTaskMatrix(tasks, new Date())) {
+      const card = matrix.createDiv({ cls: `helix-card helix-task-quadrant is-${quadrant.id}` });
+      const header = card.createDiv({ cls: "helix-task-quadrant-head" });
+      header.createEl("h3", { text: quadrant.title });
+      header.createSpan({ text: String(quadrant.tasks.length) });
+      const list = card.createDiv();
+      if (quadrant.tasks.length === 0) list.createDiv({ cls: "helix-empty", text: "暂无任务" });
+      for (const task of quadrant.tasks) {
+        this.renderTaskRow(
+          list,
+          task,
+          projects.find((project) => project.id === task.projectId),
+          false,
+        );
+      }
     }
   }
 
@@ -1905,14 +2123,7 @@ export class HelixView extends ItemView {
       const ids = new Set(this.state?.inProgress.map((entry) => entry.taskId) ?? []);
       return tasks.filter((task) => ids.has(task.id) && task.status !== 2);
     }
-    if (this.taskFilter === "today") {
-      const today = localDateKey(new Date());
-      return tasks.filter(
-        (task) =>
-          task.status !== 2 &&
-          (taskDateKey(task.startDate) === today || taskDateKey(task.dueDate) === today),
-      );
-    }
+    if (this.taskFilter === "open") return tasks.filter((task) => task.status !== 2);
     return tasks;
   }
 
@@ -2225,20 +2436,45 @@ function formatFullDate(date: Date): string {
   }).format(date);
 }
 
+function longDateLabel(date: Date): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "long",
+  }).format(date);
+}
+
+function weekdayLabel(date: Date): string {
+  return new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(date);
+}
+
+function taskRangeLabel(
+  range: TaskDateRange,
+  mode: Extract<TaskViewMode, "day" | "three-day" | "week" | "month">,
+  anchor: Date,
+): string {
+  if (mode === "day") return longDateLabel(anchor);
+  if (mode === "month") {
+    return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(anchor);
+  }
+  const short = (date: Date): string => new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+  }).format(date);
+  return `${short(range.start)} – ${short(range.end)}`;
+}
+
 function formatShortTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(date);
 }
 
-function formatHour(value: string): string {
+function formatHour(value: string, timeZone?: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--:--";
-  return new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date);
+  return instantToWallDateTime(date.toISOString(), safeTaskTimeZone(timeZone)).slice(11, 16);
 }
 
 function displayValue(value: unknown): string {

@@ -62,6 +62,7 @@ describe("DidaApi non-idempotent safety", () => {
   });
 
   it.each([
+    ["update", (api: DidaApi) => api.updateTask("task-1", { title: "updated" })],
     ["move", (api: DidaApi) => api.moveTask({
       fromProjectId: "project-1",
       toProjectId: "project-2",
@@ -76,6 +77,17 @@ describe("DidaApi non-idempotent safety", () => {
       remoteOutcomeUnknown: true,
     });
     expect(transport.calls).toHaveLength(1);
+  });
+
+  it("never retries an update after a 5xx response with uncertain server outcome", async () => {
+    const transport = new StatusTransport(503);
+    const api = new DidaApi(transport, () => "test-token-long-enough");
+
+    await expect(api.updateTask("task-1", { title: "updated" })).rejects.toMatchObject({
+      category: "unknown-outcome",
+      remoteOutcomeUnknown: true,
+    });
+    expect(transport.calls).toBe(1);
   });
 
   it("marks 200 responses unavailable when collection endpoints return non-arrays", async () => {

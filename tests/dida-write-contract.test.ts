@@ -24,6 +24,11 @@ class ContractApiFake {
   duplicateSourceCollectionAfterMove = false;
   sourceTombstoneReads = 0;
   throwAfterComplete = false;
+  updateOutcome: "success" | "applied-unknown" | "not-applied-unknown" = "success";
+  updateCalls = 0;
+  failUpdateRereadOnce = false;
+  returnWrongIdOnUpdateReread = false;
+  corruptUpdatedAllDay = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
   throwAfterDelete = false;
@@ -39,6 +44,8 @@ class ContractApiFake {
   private moveSourceCollectionGhosts = new Map<string, DidaTask>();
   private projectSequence = 0;
   private taskSequence = 0;
+  private updateRereadPending = false;
+  private wrongUpdateIdPending = false;
 
   async getProjects(): Promise<DidaProject[]> {
     const projects = [...this.projects.values()].map((project) => ({ ...project }));
@@ -153,7 +160,15 @@ class ContractApiFake {
   }
 
   async getTask(projectId: string, taskId: string): Promise<DidaTask> {
+    if (this.updateRereadPending) {
+      this.updateRereadPending = false;
+      throw new Error("update reread unavailable");
+    }
     const task = this.tasks.get(taskId);
+    if (task && this.wrongUpdateIdPending) {
+      this.wrongUpdateIdPending = false;
+      return { ...task, id: "wrong-task-id" };
+    }
     if (!task || task.projectId !== projectId) {
       const moveTombstone = this.moveSourceTombstones.get(`${projectId}:${taskId}`);
       if (this.returnMoveTombstoneAtSource && moveTombstone) {
@@ -169,12 +184,23 @@ class ContractApiFake {
   }
 
   async updateTask(taskId: string, value: Partial<DidaTask>): Promise<DidaTask> {
+    this.updateCalls += 1;
     const current = this.tasks.get(taskId);
     if (!current) throw notFound();
+    if (this.updateOutcome === "not-applied-unknown") {
+      if (this.failUpdateRereadOnce) this.updateRereadPending = true;
+      throw new DidaHttpError("unknown-outcome", "update unknown", 503, undefined, true);
+    }
     const updated = { ...current, ...value };
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
     if (this.corruptSchedule) updated.dueDate = "2030-01-01T00:00:00.000Z";
+    if (this.corruptUpdatedAllDay) updated.isAllDay = true;
     this.tasks.set(taskId, updated);
+    if (this.updateOutcome === "applied-unknown") {
+      if (this.failUpdateRereadOnce) this.updateRereadPending = true;
+      if (this.returnWrongIdOnUpdateReread) this.wrongUpdateIdPending = true;
+      throw new DidaHttpError("unknown-outcome", "update unknown", 503, undefined, true);
+    }
     return { ...updated };
   }
 
@@ -297,6 +323,92 @@ describe("DidaWriteContractRunner", () => {
     expect(report.steps.join(" ")).toMatch(/单点任务时间/);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.deletedTasks).toEqual(["test-task-1"]);
+  });
+
+  it("continues after one unknown update response when an exact reread proves the write", async () => {
+    const api = new ContractApiFake();
+    api.updateOutcome = "applied-unknown";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-update-applied-unknown",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "passed",
+      cleanupErrors: [],
+      remoteArtifactsRemaining: false,
+    });
+    expect(report.steps.join(" ")).toMatch(/未重发.*精确复读已证明字段生效/);
+    expect(api.updateCalls).toBe(1);
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it("fails without resending when an exact reread cannot prove an unknown update", async () => {
+    const api = new ContractApiFake();
+    api.updateOutcome = "not-applied-unknown";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-update-not-applied-unknown",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.failureStage).toBe("编辑并复读测试任务");
+    expect(report.failure).toMatch(/编辑并复读测试任务.*未证明写入生效.*未重发/);
+    expect(api.updateCalls).toBe(1);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it("fails with the exact stage and never resends when the unknown update reread fails", async () => {
+    const api = new ContractApiFake();
+    api.updateOutcome = "applied-unknown";
+    api.failUpdateRereadOnce = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-update-reread-failed",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.failureStage).toBe("编辑并复读测试任务");
+    expect(report.failure).toMatch(/精确复读失败.*未重发.*update reread unavailable/);
+    expect(api.updateCalls).toBe(1);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it("does not accept a different task ID as proof of an unknown update", async () => {
+    const api = new ContractApiFake();
+    api.updateOutcome = "applied-unknown";
+    api.returnWrongIdOnUpdateReread = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-update-wrong-id",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.failure).toMatch(/未证明写入生效.*任务身份/);
+    expect(api.updateCalls).toBe(1);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+  });
+
+  it("does not accept a changed all-day value as proof of an unknown update", async () => {
+    const api = new ContractApiFake();
+    api.updateOutcome = "applied-unknown";
+    api.corruptUpdatedAllDay = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-update-all-day-mismatch",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.failure).toMatch(/未证明写入生效.*全天状态/);
+    expect(api.updateCalls).toBe(1);
+    expect(report.remoteArtifactsRemaining).toBe(false);
   });
 
   it("fails on an unexpected schedule transformation while still cleaning test artifacts", async () => {

@@ -116,7 +116,9 @@ export class DidaApi {
   }
 
   updateTask(taskId: string, task: Partial<DidaTask>): Promise<DidaTask> {
-    return this.request(`/task/${encodeURIComponent(taskId)}`, "POST", task);
+    return this.request(`/task/${encodeURIComponent(taskId)}`, "POST", task, {
+      outcomeUnknownOnNetworkFailure: true,
+    });
   }
 
   moveTask(input: {

@@ -1,6 +1,7 @@
 import type { DidaProject, DidaTask } from "../../domain/entities";
 import type { TaskScheduleMode } from "../../domain/task-schedule";
 import type { DidaApi } from "./api";
+import { DidaHttpError } from "./http-contract";
 import { normalizeProject, normalizeTask } from "./normalization";
 import { serializeDidaDate } from "./serialization";
 
@@ -34,6 +35,7 @@ export interface DidaWriteContractReport {
   status: "passed" | "failed";
   steps: string[];
   failure?: string;
+  failureStage?: string;
   cleanupErrors: string[];
   remoteArtifactsRemaining: boolean;
   taskScheduleMode: TaskScheduleMode;
@@ -54,6 +56,7 @@ interface CreatedTask {
 export class DidaWriteContractRunner {
   private untrackedCreateOutcome = false;
   private taskScheduleMode: TaskScheduleMode = "unknown";
+  private currentStage = "准备合同测试";
   private readonly timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
   constructor(
@@ -68,6 +71,7 @@ export class DidaWriteContractRunner {
   async run(): Promise<DidaWriteContractReport> {
     this.untrackedCreateOutcome = false;
     this.taskScheduleMode = "unknown";
+    this.currentStage = "准备合同测试";
     const runId = this.createRunId();
     const marker = `[Helix 合同测试 ${runId}]`;
     const projectAName = `${marker} 清单 A`;
@@ -78,9 +82,10 @@ export class DidaWriteContractRunner {
     const forbiddenProjectIds = new Set<string>();
     let task: CreatedTask | null = null;
     let failure: string | undefined;
+    let failureStage: string | undefined;
 
     try {
-      this.reportProgress("冻结测试前清单范围");
+      this.beginStage("冻结测试前清单范围");
       const existingProjects = await this.api.getProjects();
       if (!Array.isArray(existingProjects)) throw new Error("写入测试前清单列表不是数组");
       for (const project of existingProjects.map(normalizeProject)) {
@@ -88,7 +93,7 @@ export class DidaWriteContractRunner {
       }
       steps.push("冻结测试前既有清单 ID 集合");
 
-      this.reportProgress("创建并复读专用清单 A");
+      this.beginStage("创建并复读专用清单 A");
       const projectA = await this.createAndVerifyProject(
         projectAName,
         projects,
@@ -96,7 +101,7 @@ export class DidaWriteContractRunner {
       );
       steps.push("创建并复读专用清单 A");
 
-      this.reportProgress("创建并复读专用清单 B");
+      this.beginStage("创建并复读专用清单 B");
       const projectB = await this.createAndVerifyProject(
         projectBName,
         projects,
@@ -106,7 +111,7 @@ export class DidaWriteContractRunner {
 
       const firstStart = this.futureInstant(86_400_000);
       const firstDue = this.futureInstant(90_000_000);
-      this.reportProgress("创建并核对测试任务字段");
+      this.beginStage("创建并核对测试任务字段");
       let created: DidaTask;
       try {
         created = normalizeTask(await this.api.createTask({
@@ -129,14 +134,15 @@ export class DidaWriteContractRunner {
         candidateProjectIds: [projectA.id, projectB.id],
         state: "open",
       };
-      this.assertTaskIdentity(created, projectA.id, marker);
+      this.assertTaskIdentity(created, created.id, projectA.id, marker);
       const rereadCreated = normalizeTask(await this.api.getTask(projectA.id, created.id));
-      this.assertTaskIdentity(rereadCreated, projectA.id, marker);
+      this.assertTaskIdentity(rereadCreated, created.id, projectA.id, marker);
       this.assertTaskFields(rereadCreated, {
         title: `${marker} 新建任务`,
         content: `${marker} create`,
         priority: 1,
         timeZone: this.timeZone,
+        isAllDay: false,
         startDate: firstStart,
         dueDate: firstDue,
       });
@@ -153,9 +159,9 @@ export class DidaWriteContractRunner {
 
       const secondStart = this.futureInstant(172_800_000);
       const secondDue = this.futureInstant(178_200_000);
-      this.reportProgress("编辑并复读测试任务");
+      this.beginStage("编辑并复读测试任务");
       const updateStart = this.taskScheduleMode === "duration" ? secondStart : secondDue;
-      await this.api.updateTask(created.id, {
+      const updatePayload = {
         id: created.id,
         projectId: projectA.id,
         title: `${marker} 已编辑任务`,
@@ -165,21 +171,22 @@ export class DidaWriteContractRunner {
         timeZone: this.timeZone,
         startDate: serializeDidaDate(updateStart, "任务开始日期"),
         dueDate: serializeDidaDate(secondDue, "任务截止日期"),
-      });
-      const rereadUpdated = normalizeTask(await this.api.getTask(projectA.id, created.id));
-      this.assertTaskIdentity(rereadUpdated, projectA.id, marker);
-      this.assertTaskFields(rereadUpdated, {
-        title: `${marker} 已编辑任务`,
-        content: `${marker} update`,
-        priority: 5,
-        timeZone: this.timeZone,
-        startDate: updateStart,
-        dueDate: secondDue,
-      });
-      this.assertScheduleForMode(rereadUpdated, updateStart, secondDue);
-      steps.push("编辑任务并复读验证字段");
+      };
+      const reconciledUnknownUpdate = await this.updateAndVerifyTask(
+        created.id,
+        projectA.id,
+        marker,
+        updatePayload,
+        updateStart,
+        secondDue,
+      );
+      steps.push(
+        reconciledUnknownUpdate
+          ? "编辑响应未知；未重发，精确复读已证明字段生效"
+          : "编辑任务并复读验证字段",
+      );
 
-      this.reportProgress("移动测试任务并核对来源清单");
+      this.beginStage("移动测试任务并核对来源清单");
       await this.api.moveTask({
         fromProjectId: projectA.id,
         toProjectId: projectB.id,
@@ -187,32 +194,33 @@ export class DidaWriteContractRunner {
       });
       task.projectId = projectB.id;
       const rereadMoved = normalizeTask(await this.api.getTask(projectB.id, created.id));
-      this.assertTaskIdentity(rereadMoved, projectB.id, marker);
+      this.assertTaskIdentity(rereadMoved, created.id, projectB.id, marker);
       await this.waitForTaskAbsentFromProjectData(projectA.id, created.id);
       steps.push("移动任务并验证原清单已无该任务");
 
-      this.reportProgress("完成并复读测试任务");
+      this.beginStage("完成并复读测试任务");
       task.state = "unknown";
       await this.api.completeTask(projectB.id, created.id);
       const rereadCompleted = normalizeTask(await this.api.getTask(projectB.id, created.id));
-      this.assertTaskIdentity(rereadCompleted, projectB.id, marker);
+      this.assertTaskIdentity(rereadCompleted, created.id, projectB.id, marker);
       if (rereadCompleted.status !== 2) throw new Error("任务完成后 status 未变为 2");
       task.state = "completed";
       steps.push("完成任务并复读状态");
 
-      this.reportProgress("删除并核对测试任务");
+      this.beginStage("删除并核对测试任务");
       await this.deleteVerifiedTask(task, marker);
       task = null;
       steps.push("删除测试任务并验证不存在");
 
-      this.reportProgress("核对并删除空测试清单");
+      this.beginStage("核对并删除空测试清单");
       for (const project of [...projects].reverse()) {
         await this.deleteVerifiedProject(project, marker);
         projects.splice(projects.indexOf(project), 1);
       }
       steps.push("删除两个空测试清单并验证身份");
     } catch (error) {
-      failure = messageOf(error);
+      failureStage = this.currentStage;
+      failure = `${failureStage}：${messageOf(error)}`;
     } finally {
       let taskCleanupFailed = false;
       if (task) {
@@ -236,10 +244,60 @@ export class DidaWriteContractRunner {
       status: failure ? "failed" : "passed",
       steps,
       failure,
+      failureStage,
       cleanupErrors,
       remoteArtifactsRemaining: cleanupErrors.length > 0 || this.untrackedCreateOutcome,
       taskScheduleMode: this.taskScheduleMode,
     };
+  }
+
+  private async updateAndVerifyTask(
+    taskId: string,
+    projectId: string,
+    marker: string,
+    payload: Partial<DidaTask>,
+    expectedStart: string,
+    expectedDue: string,
+  ): Promise<boolean> {
+    let unknownOutcome: unknown;
+    try {
+      await this.api.updateTask(taskId, payload);
+    } catch (error) {
+      if (!isUnknownRemoteOutcome(error)) throw error;
+      unknownOutcome = error;
+    }
+
+    let reread: DidaTask;
+    try {
+      reread = normalizeTask(await this.api.getTask(projectId, taskId));
+    } catch (error) {
+      if (!unknownOutcome) throw error;
+      throw new Error(
+        `编辑响应未知且精确复读失败；未重发。原始错误：${messageOf(unknownOutcome)}；` +
+        `复读错误：${messageOf(error)}`,
+      );
+    }
+
+    try {
+      this.assertTaskIdentity(reread, taskId, projectId, marker);
+      this.assertTaskFields(reread, {
+        title: payload.title ?? "",
+        content: payload.content,
+        priority: payload.priority,
+        timeZone: payload.timeZone,
+        isAllDay: payload.isAllDay,
+        startDate: expectedStart,
+        dueDate: expectedDue,
+      });
+      this.assertScheduleForMode(reread, expectedStart, expectedDue);
+    } catch (error) {
+      if (!unknownOutcome) throw error;
+      throw new Error(
+        `编辑响应未知，精确复读未证明写入生效；未重发。原始错误：` +
+        `${messageOf(unknownOutcome)}；核对错误：${messageOf(error)}`,
+      );
+    }
+    return unknownOutcome !== undefined;
   }
 
   private async createAndVerifyProject(
@@ -272,8 +330,13 @@ export class DidaWriteContractRunner {
     return project;
   }
 
-  private assertTaskIdentity(task: DidaTask, projectId: string, marker: string): void {
-    if (task.projectId !== projectId || !task.title.includes(marker)) {
+  private assertTaskIdentity(
+    task: DidaTask,
+    taskId: string,
+    projectId: string,
+    marker: string,
+  ): void {
+    if (task.id !== taskId || task.projectId !== projectId || !task.title.includes(marker)) {
       throw new Error("任务身份、清单或本轮唯一标记不一致");
     }
   }
@@ -282,7 +345,13 @@ export class DidaWriteContractRunner {
     task: DidaTask,
     expected: Pick<
       DidaTask,
-      "title" | "content" | "priority" | "timeZone" | "startDate" | "dueDate"
+      | "title"
+      | "content"
+      | "priority"
+      | "timeZone"
+      | "isAllDay"
+      | "startDate"
+      | "dueDate"
     >,
   ): void {
     const mismatches = [
@@ -292,6 +361,7 @@ export class DidaWriteContractRunner {
       task.timeZone !== expected.timeZone
         ? `时区（预期 ${expected.timeZone ?? "空"}，实际 ${task.timeZone ?? "空"}）`
         : null,
+      task.isAllDay !== expected.isAllDay ? "全天状态" : null,
     ].filter((label): label is string => label !== null);
     if (mismatches.length > 0) {
       throw new Error(`任务写后复读字段与提交值不一致：${mismatches.join("、")}`);
@@ -342,7 +412,7 @@ export class DidaWriteContractRunner {
   private async deleteVerifiedTask(task: CreatedTask, marker: string): Promise<void> {
     const current = normalizeTask(await this.api.getTask(task.projectId, task.id));
     if (current.id !== task.id) throw new Error("删除前任务 ID 复读不一致");
-    this.assertTaskIdentity(current, task.projectId, marker);
+    this.assertTaskIdentity(current, task.id, task.projectId, marker);
     await this.assertTaskPresentInObservableCollection(task);
     try {
       await this.api.deleteTask(task.projectId, task.id);
@@ -536,12 +606,25 @@ export class DidaWriteContractRunner {
       // 进度展示不能中断远端清理或改变合同测试结论。
     }
   }
+
+  private beginStage(stage: string): void {
+    this.currentStage = stage;
+    this.reportProgress(stage);
+  }
 }
 
 class ConsistencyPendingError extends Error {}
 
 function isNotFound(error: unknown): boolean {
   return !!error && typeof error === "object" && "statusCode" in error && error.statusCode === 404;
+}
+
+function isUnknownRemoteOutcome(error: unknown): boolean {
+  if (error instanceof DidaHttpError) {
+    return error.category === "unknown-outcome" || error.remoteOutcomeUnknown === true;
+  }
+  return !!error && typeof error === "object" &&
+    "remoteOutcomeUnknown" in error && error.remoteOutcomeUnknown === true;
 }
 
 function messageOf(error: unknown): string {

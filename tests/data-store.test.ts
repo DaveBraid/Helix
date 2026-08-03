@@ -20,6 +20,192 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("HelixDataStore serialization", () => {
+  it("hydrates validated remote board caches and rejects malformed column identity", () => {
+    const valid = hydrateData({
+      schemaVersion: 2,
+      boardSnapshots: {
+        "project-1": {
+          projectId: "project-1",
+          capturedAt: "2026-08-03T00:00:00.000Z",
+          stale: false,
+          columns: [{ id: "todo", projectId: "project-1", name: "To do", sortOrder: 10 }],
+        },
+      },
+    });
+    expect(valid.boardSnapshots["project-1"]?.columns).toMatchObject([{ id: "todo" }]);
+    expect(valid.boardSnapshots["project-1"]?.taskColumnIds).toEqual({});
+    const invalid = hydrateData({
+      schemaVersion: 2,
+      boardSnapshots: {
+        "project-1": {
+          projectId: "project-1",
+          capturedAt: "2026-08-03T00:00:00.000Z",
+          stale: false,
+          columns: [{ id: "todo", projectId: "other", name: "Wrong" }],
+        },
+      },
+    });
+    expect(invalid.boardSnapshots).toEqual({});
+    expect(invalid.recoveryIssues).toEqual([]);
+  });
+
+  it("migrates task column placement into the read-only board cache", () => {
+    const task = { id: "task-1", projectId: "project-1", title: "Placed", status: 0, columnId: "todo" };
+    const snapshot = createSnapshot("task", task.id, task);
+    const data = hydrateData({
+      schemaVersion: 2,
+      baseSnapshots: { [`task:${task.id}`]: snapshot },
+      localSnapshots: { [`task:${task.id}`]: snapshot },
+      boardSnapshots: {
+        "project-1": {
+          projectId: "project-1",
+          capturedAt: "2026-08-03T00:00:00.000Z",
+          stale: false,
+          columns: [{ id: "todo", projectId: "project-1", name: "To do" }],
+        },
+      },
+    });
+    expect(data.boardSnapshots["project-1"]?.taskColumnIds).toEqual({ "task-1": "todo" });
+    expect(data.baseSnapshots[`task:${task.id}`]?.value).not.toHaveProperty("columnId");
+    expect(data.localSnapshots[`task:${task.id}`]?.value).not.toHaveProperty("columnId");
+  });
+
+  it("migrates legacy task conflicts before strict validation and preserves blocked queue references", () => {
+    const baseValue = {
+      id: "task-conflict",
+      projectId: "project-1",
+      title: "Original",
+      status: 0,
+      columnId: "todo",
+    };
+    const localValue = { ...baseValue, title: "Local title" };
+    const remoteValue = { ...baseValue, columnId: "doing" };
+    const base = createSnapshot("task", baseValue.id, baseValue);
+    const local = createSnapshot("task", baseValue.id, localValue);
+    const remote = createSnapshot("task", baseValue.id, remoteValue);
+    const fields = buildConflictFields(
+      base.value,
+      local.value,
+      remote.value,
+    ).map((field) => field.path === "title" ? { ...field, choice: "local" as const } : field);
+    fields.push({
+      path: "columnId",
+      label: "看板列",
+      baseValue: "todo",
+      localValue: "todo",
+      remoteValue: "doing",
+      localChanged: false,
+      remoteChanged: true,
+      sameResult: false,
+      group: "scalar" as const,
+      suggestedChoice: "remote" as const,
+    });
+    fields.sort((left, right) => left.path.localeCompare(right.path));
+    const conflict = {
+      id: "conflict-column",
+      kind: "task" as const,
+      entityId: baseValue.id,
+      title: baseValue.title,
+      createdAt: "2026-08-03T00:00:00.000Z",
+      updatedAt: "2026-08-03T00:00:00.000Z",
+      status: "staged" as const,
+      base,
+      local,
+      remote,
+      fields,
+      remoteRecheckCount: 0,
+      sourceDeviceId: "device-a",
+    };
+    const operation = {
+      id: "op-column",
+      kind: "task" as const,
+      entityId: baseValue.id,
+      projectId: baseValue.projectId,
+      operation: "update" as const,
+      createdAt: conflict.createdAt,
+      updatedAt: conflict.updatedAt,
+      attempts: 0,
+      status: "blocked" as const,
+      conflictId: conflict.id,
+      base,
+      local,
+    };
+    const data = hydrateData({
+      schemaVersion: 2,
+      boardSnapshots: {
+        "project-1": {
+          projectId: "project-1",
+          capturedAt: "2026-08-03T00:00:00.000Z",
+          stale: false,
+          columns: [
+            { id: "todo", projectId: "project-1", name: "To do" },
+            { id: "doing", projectId: "project-1", name: "Doing" },
+          ],
+        },
+      },
+      queue: [operation],
+      conflicts: [conflict],
+    });
+    expect(data.conflicts).toHaveLength(1);
+    expect(data.conflicts[0]?.fields).toMatchObject([{ path: "title", choice: "local" }]);
+    expect(data.queue).toHaveLength(1);
+    expect(data.queue[0]?.conflictId).toBe(conflict.id);
+    for (const snapshot of [
+      data.conflicts[0]?.base,
+      data.conflicts[0]?.local,
+      data.conflicts[0]?.remote,
+      data.queue[0]?.base,
+      data.queue[0]?.local,
+    ]) {
+      expect(snapshot?.value).not.toHaveProperty("columnId");
+    }
+    expect(data.boardSnapshots["project-1"]?.taskColumnIds).toEqual({
+      [baseValue.id]: "doing",
+    });
+    expect(data.recoveryIssues).toEqual([]);
+
+    const forgedConflict = structuredClone(conflict);
+    const forgedTitle = forgedConflict.fields.find((field) => field.path === "title");
+    if (forgedTitle) forgedTitle.label = "伪造标题";
+    const rejected = hydrateData({
+      schemaVersion: 2,
+      boardSnapshots: {
+        "project-1": {
+          projectId: "project-1",
+          capturedAt: "2026-08-03T00:00:00.000Z",
+          stale: false,
+          columns: [{ id: "doing", projectId: "project-1", name: "Doing" }],
+        },
+      },
+      queue: [operation],
+      conflicts: [forgedConflict],
+    });
+    expect(rejected.conflicts).toEqual([]);
+    expect(rejected.queue).toHaveLength(1);
+    expect(rejected.recoveryIssues).toEqual(expect.arrayContaining([
+      expect.stringMatching(/冲突记录含损坏条目/),
+      expect.stringMatching(/冲突引用缺失/),
+    ]));
+  });
+
+  it("degrades an already cached unsafe project sort order before any later write", () => {
+    const project = {
+      id: "project-unsafe",
+      name: "Unsafe",
+      sortOrder: Number.MAX_SAFE_INTEGER + 2,
+    };
+    const snapshot = createSnapshot("project", project.id, project);
+    const data = hydrateData({
+      schemaVersion: 2,
+      baseSnapshots: { [`project:${project.id}`]: snapshot },
+      localSnapshots: { [`project:${project.id}`]: snapshot },
+    });
+    expect(data.baseSnapshots[`project:${project.id}`]?.value).toMatchObject({ sortOrderUnsafe: true });
+    expect(data.baseSnapshots[`project:${project.id}`]?.value).not.toHaveProperty("sortOrder");
+    expect(data.localSnapshots[`project:${project.id}`]?.value).toMatchObject({ sortOrderUnsafe: true });
+    expect(data.localSnapshots[`project:${project.id}`]?.value).not.toHaveProperty("sortOrder");
+  });
+
   it("hydrates valid task matrix display rules and isolates nested defaults", () => {
     const first = createDefaultData("device-a");
     const second = createDefaultData("device-b");

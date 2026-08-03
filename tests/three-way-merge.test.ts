@@ -32,6 +32,23 @@ function conflictOf(
 }
 
 describe("three-way conflict fields", () => {
+  it("labels project view-mode conflicts for manual field resolution", () => {
+    expect(buildConflictFields(
+      { viewMode: "list" },
+      { viewMode: "kanban" },
+      { viewMode: "timeline" },
+    )).toMatchObject([{ path: "viewMode", label: "清单视图" }]);
+  });
+
+  it("keeps read-only board placement out of writable task conflicts", () => {
+    const fields = buildConflictFields(
+      { title: "Base", columnId: "todo" },
+      { title: "Local", columnId: "todo" },
+      { title: "Base", columnId: "done" },
+    );
+    expect(fields.map((field) => field.path)).toEqual(["title"]);
+  });
+
   it("distinguishes local-only, remote-only, same, and divergent changes", () => {
     const fields = buildConflictFields(
       { title: "base", priority: 1, status: 0, content: "old" },

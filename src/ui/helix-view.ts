@@ -42,6 +42,7 @@ import {
 } from "../domain/task-schedule";
 import { parseTaskQuickEntry } from "../domain/task-quick-entry";
 import {
+  buildTaskBoard,
   buildTaskDateRange,
   buildTaskMatrix,
   buildTaskTimeBlocks,
@@ -53,7 +54,10 @@ import {
   type TaskMatrixRules,
   type TaskViewMode,
 } from "../domain/task-views";
-import type { HelixRuntimeState } from "../services/helix-service";
+import type {
+  DidaProjectViewModeSyncStatus,
+  HelixRuntimeState,
+} from "../services/helix-service";
 import { HelixService } from "../services/helix-service";
 import type {
   ProjectConnectionPlan,
@@ -148,6 +152,8 @@ export class HelixView extends ItemView {
   private expandedInProgress = false;
   private taskFilter: "all" | "open" | "in-progress" | "completed" = "open";
   private taskViewMode: TaskViewMode = "list";
+  private taskViewModeSyncStatus: DidaProjectViewModeSyncStatus | null = null;
+  private taskViewModeSyncingProjectId: string | null = null;
   private taskViewDate = new Date();
   private taskCollectionFilters: TaskCollectionFilters = { date: "all" };
   private advancedTaskFiltersExpanded = false;
@@ -305,7 +311,9 @@ export class HelixView extends ItemView {
       cls: `helix-sidebar-list${this.section === "tasks" && !this.taskCollectionFilters.didaProjectId ? " is-active" : ""}`,
       attr: {
         "aria-label": "显示全部清单中的任务",
-        "aria-pressed": String(this.section === "tasks" && !this.taskCollectionFilters.didaProjectId),
+        "aria-current": this.section === "tasks" && !this.taskCollectionFilters.didaProjectId
+          ? "page"
+          : "false",
       },
     });
     const allIcon = allLists.createSpan({ cls: "helix-sidebar-list-icon" });
@@ -318,6 +326,7 @@ export class HelixView extends ItemView {
     allLists.addEventListener("click", () => {
       this.section = "tasks";
       this.taskCollectionFilters.didaProjectId = undefined;
+      if (this.taskViewMode === "kanban") this.taskViewMode = "list";
       void this.render();
     });
     for (const project of sidebarProjects) {
@@ -327,9 +336,9 @@ export class HelixView extends ItemView {
           "aria-label": project.id.startsWith("local-project-")
             ? `筛选待核对清单 ${project.name}`
             : `筛选清单 ${project.name}`,
-          "aria-pressed": String(
-            this.section === "tasks" && this.taskCollectionFilters.didaProjectId === project.id,
-          ),
+          "aria-current": this.section === "tasks" && this.taskCollectionFilters.didaProjectId === project.id
+            ? "page"
+            : "false",
         },
       });
       const dot = button.createSpan({ cls: "helix-project-dot" });
@@ -345,6 +354,7 @@ export class HelixView extends ItemView {
       button.addEventListener("click", () => {
         this.section = "tasks";
         this.taskCollectionFilters.didaProjectId = project.id;
+        this.taskViewMode = project.viewMode === "kanban" ? "kanban" : "list";
         void this.render();
       });
     }
@@ -1043,6 +1053,14 @@ export class HelixView extends ItemView {
       });
     }
     this.renderTaskFilterToolbar(content, tasks, projects);
+    if (this.taskViewMode === "kanban" && !this.taskCollectionFilters.didaProjectId) {
+      this.taskViewMode = "list";
+    }
+    const selectedDidaProjectId = this.taskCollectionFilters.didaProjectId;
+    this.taskViewModeSyncStatus = selectedDidaProjectId && !this.state?.demoMode
+      ? await this.service.getDidaProjectViewModeSyncStatus(selectedDidaProjectId)
+      : null;
+    if (token !== this.renderToken) return;
     this.renderTaskViewToolbar(content);
     const helixProjectByTaskId = new Map(
       (this.taskReferenceSnapshot?.references ?? []).map((reference) => [
@@ -1064,6 +1082,12 @@ export class HelixView extends ItemView {
     });
     if (this.taskViewMode === "matrix") {
       this.renderTaskMatrix(panel, visibleTasks, projects);
+    } else if (this.taskViewMode === "kanban") {
+      const project = projects.find(
+        (candidate) => candidate.id === this.taskCollectionFilters.didaProjectId,
+      );
+      if (project) this.renderTaskBoard(panel, project, visibleTasks);
+      else panel.createDiv({ cls: "helix-empty", text: "请先选择一个清单再打开看板。" });
     } else if (this.taskViewMode === "year") {
       this.renderTaskYearView(panel, visibleTasks);
     } else if (this.taskViewMode === "list") {
@@ -1074,6 +1098,40 @@ export class HelixView extends ItemView {
       }
     } else {
       this.renderTaskCalendar(panel, visibleTasks, projects, this.taskViewMode);
+    }
+  }
+
+  private renderTaskBoard(
+    content: HTMLElement,
+    project: DidaProject,
+    tasks: DidaTask[],
+  ): void {
+    const status = content.createDiv({ cls: "helix-task-board-status" });
+    const lock = status.createSpan();
+    setIcon(lock, project.boardStale ? "cloud-off" : "lock-keyhole");
+    status.createSpan({
+      text: project.boardStale
+        ? `详情已过期 · ${formatBoardCapturedAt(project.boardCapturedAt)} · 看板写入已禁用`
+        : `滴答看板快照 · ${formatBoardCapturedAt(project.boardCapturedAt)} · 暂不支持拖动列与卡片`,
+    });
+    const board = content.createDiv({ cls: "helix-task-board" });
+    for (const column of buildTaskBoard(project, tasks)) {
+      const lane = board.createEl("section", {
+        cls: `helix-task-board-column${column.source ? "" : " is-unassigned"}`,
+        attr: { "aria-labelledby": `helix-task-board-column-${column.id}` },
+      });
+      const heading = lane.createDiv({ cls: "helix-task-board-column-head" });
+      heading.createEl("h3", {
+        text: column.title,
+        attr: { id: `helix-task-board-column-${column.id}` },
+      });
+      heading.createSpan({ text: String(column.tasks.length) });
+      const items = lane.createDiv({ cls: "helix-task-board-items" });
+      if (column.tasks.length === 0) items.createDiv({ cls: "helix-task-board-empty", text: "暂无任务" });
+      for (const task of column.tasks) {
+        const card = items.createDiv({ cls: "helix-task-board-card" });
+        this.renderTaskRow(card, task, project, false);
+      }
     }
   }
 
@@ -1269,6 +1327,9 @@ export class HelixView extends ItemView {
     const toolbar = content.createDiv({ cls: "helix-task-view-toolbar" });
     const modes: Array<{ id: TaskViewMode; label: string }> = [
       { id: "list", label: "列表" },
+      ...(this.taskCollectionFilters.didaProjectId
+        ? [{ id: "kanban" as const, label: "看板" }]
+        : []),
       { id: "day", label: "日" },
       { id: "three-day", label: "3 日" },
       { id: "week", label: "周" },
@@ -1306,7 +1367,13 @@ export class HelixView extends ItemView {
         this.activateTaskViewMode(modes[targetIndex]!.id);
       });
     }
-    if (this.taskViewMode === "list" || this.taskViewMode === "matrix") return;
+    const project = this.state?.projects.find(
+      (candidate) => candidate.id === this.taskCollectionFilters.didaProjectId,
+    );
+    if ((this.taskViewMode === "list" || this.taskViewMode === "kanban") && project && !this.state?.demoMode) {
+      this.renderDidaViewModeSyncControl(toolbar, project, this.taskViewMode);
+    }
+    if (this.taskViewMode === "list" || this.taskViewMode === "kanban" || this.taskViewMode === "matrix") return;
     const navigation = toolbar.createDiv({ cls: "helix-task-view-navigation" });
     const previous = navigation.createEl("button", { attr: { "aria-label": "上一时间段" } });
     setIcon(previous, "chevron-left");
@@ -1324,6 +1391,59 @@ export class HelixView extends ItemView {
     this.taskViewMode = mode;
     void this.render().then(() => {
       this.contentEl.querySelector<HTMLElement>(`#helix-task-view-tab-${mode}`)?.focus();
+    });
+  }
+
+  private renderDidaViewModeSyncControl(
+    toolbar: HTMLElement,
+    project: DidaProject,
+    mode: "list" | "kanban",
+  ): void {
+    const status = this.taskViewModeSyncStatus;
+    const syncing = this.taskViewModeSyncingProjectId === project.id;
+    const matchesRemote = project.viewMode === mode;
+    const permissionDenied = !!project.permission && project.permission !== "write";
+    const disabled = syncing || permissionDenied || !!project.boardStale ||
+      project.id.startsWith("local-project-") || status === "pending" ||
+      status === "conflict" || status === "attention";
+    const label = syncing
+      ? "正在同步…"
+      : status === "pending"
+        ? "等待联网同步"
+        : status === "conflict"
+          ? "默认视图有冲突"
+          : status === "attention"
+            ? "同步需要处理"
+            : matchesRemote
+              ? "滴答默认视图"
+              : "设为滴答默认";
+    const button = toolbar.createEl("button", {
+      cls: `helix-task-view-remote${matchesRemote && status === "synced" ? " is-synced" : ""}`,
+      text: label,
+      attr: {
+        "aria-label": `${label}：${mode === "kanban" ? "看板" : "列表"}`,
+        title: permissionDenied
+          ? "该清单没有写入权限"
+          : project.boardStale
+            ? "清单详情已过期，请先同步"
+            : status === "conflict" || status === "attention"
+              ? "请在冲突页处理后再试"
+              : "",
+      },
+    });
+    button.disabled = disabled || (matchesRemote && status === "synced");
+    if (button.disabled) return;
+    button.addEventListener("click", () => {
+      this.taskViewModeSyncingProjectId = project.id;
+      void this.service.setDidaProjectViewMode(project.id, mode)
+        .then(() => {
+          new Notice(this.state?.connected ? "已同步滴答默认视图" : "已加入队列，将在联网后同步");
+        })
+        .catch((error) => new Notice(error instanceof Error ? error.message : String(error), 8_000))
+        .finally(() => {
+          this.taskViewModeSyncingProjectId = null;
+          void this.render();
+        });
     });
   }
 
@@ -3737,6 +3857,16 @@ function taskPriorityLabel(priority: 0 | 1 | 3 | 5): string {
 function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatBoardCapturedAt(value: string | undefined): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return "同步时间未知";
+  return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",

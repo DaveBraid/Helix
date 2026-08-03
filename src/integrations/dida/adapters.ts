@@ -31,7 +31,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
   async get(entityId: string, context?: { projectId?: string }): Promise<DidaTask | null> {
     if (!context?.projectId) throw new Error("Task lookup requires projectId");
     try {
-      return normalizeTask(await this.api.getTask(context.projectId, entityId));
+      return taskSyncValue(normalizeTask(await this.api.getTask(context.projectId, entityId)));
     } catch (error) {
       if (isNotFound(error)) return null;
       throw error;
@@ -40,7 +40,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
 
   async create(value: DidaTask): Promise<DidaTask> {
     validateTaskScheduleWrite(value, this.scheduleMode());
-    return normalizeTask(await this.api.createTask(taskCreatePayload(value)));
+    return taskSyncValue(normalizeTask(await this.api.createTask(taskCreatePayload(value))));
   }
 
   async update(
@@ -90,7 +90,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
       current = await this.get(entityId, { projectId: value.projectId });
       if (current?.status !== 2) throw new Error("任务完成后远端状态未变为已完成");
     }
-    return normalizeTask(current);
+    return taskSyncValue(normalizeTask(current));
   }
 
   async delete(entityId: string, context?: { projectId?: string }): Promise<void> {
@@ -191,7 +191,7 @@ function taskCreatePayload(value: DidaTask): Partial<DidaTask> & Pick<DidaTask, 
     reminders: value.reminders,
     repeatFlag: value.repeatFlag,
     priority: value.priority,
-    sortOrder: value.sortOrder,
+    sortOrder: value.sortOrderUnsafe ? undefined : value.sortOrder,
     items: serializeDidaChecklistItems(value.items),
     tags: value.tags,
   };
@@ -212,7 +212,7 @@ function taskUpdatePayload(value: DidaTask): Partial<DidaTask> {
     reminders: clearedAs(value, "reminders", []),
     repeatFlag: clearedAs(value, "repeatFlag", null),
     priority: clearedAs(value, "priority", 0),
-    sortOrder: clearedAs(value, "sortOrder", 0),
+    sortOrder: value.sortOrderUnsafe ? undefined : clearedAs(value, "sortOrder", 0),
     items: serializeDidaChecklistItems(clearedAs(value, "items", [])),
     tags: clearedAs(value, "tags", []),
   };
@@ -233,8 +233,13 @@ function projectWritePayload(value: DidaProject): Partial<DidaProject> & Pick<Di
   return {
     name: value.name,
     color: value.color,
-    sortOrder: value.sortOrder,
+    sortOrder: value.sortOrderUnsafe ? undefined : value.sortOrder,
     viewMode: value.viewMode,
     kind: value.kind,
   };
+}
+
+function taskSyncValue(value: DidaTask): DidaTask {
+  const { columnId: _columnId, ...syncValue } = value;
+  return syncValue;
 }

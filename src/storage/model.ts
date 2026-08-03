@@ -1,11 +1,16 @@
-import type { EntityKind, EntitySnapshot, InProgressEntry } from "../domain/entities";
+import type {
+  DidaBoardSnapshot,
+  EntityKind,
+  EntitySnapshot,
+  InProgressEntry,
+} from "../domain/entities";
 import type {
   ResolutionAuditEntry,
   SyncConflict,
   SyncQueueOperation,
 } from "../sync/types";
 import { deterministicEventId, isHelixEvent, type HelixEvent } from "../domain/events";
-import { deepEqual, stableHash, stableStringify } from "../domain/stable";
+import { cloneValue, deepEqual, stableHash, stableStringify } from "../domain/stable";
 import { buildConflictFields, unresolvedFields } from "../sync/three-way-merge";
 import { rotatingChallenges } from "../domain/gamification";
 import {
@@ -41,6 +46,7 @@ export interface HelixPersistedData {
   settings: HelixSettings;
   baseSnapshots: Record<string, EntitySnapshot<unknown>>;
   localSnapshots: Record<string, EntitySnapshot<unknown>>;
+  boardSnapshots: Record<string, DidaBoardSnapshot>;
   queue: SyncQueueOperation[];
   conflicts: SyncConflict[];
   resolutionAudit: ResolutionAuditEntry[];
@@ -71,6 +77,7 @@ export function createDefaultData(deviceId?: string): HelixPersistedData {
     },
     baseSnapshots: {},
     localSnapshots: {},
+    boardSnapshots: {},
     queue: [],
     conflicts: [],
     resolutionAudit: [],
@@ -122,6 +129,8 @@ export function hydrateData(value: unknown): HelixPersistedData {
     "Local 快照",
     recoveryIssues,
   );
+  const boardSnapshots = hydrateBoardSnapshots(raw.boardSnapshots);
+  const migratedConflicts = migrateConflictBoardProjection(raw.conflicts);
   const queue = uniqueArray(
     validArray(raw.queue, isQueueOperation, "队列操作", recoveryIssues),
     (entry) => entry.id,
@@ -129,11 +138,13 @@ export function hydrateData(value: unknown): HelixPersistedData {
     recoveryIssues,
   );
   const conflicts = uniqueArray(
-    validArray(raw.conflicts, isConflict, "冲突记录", recoveryIssues),
+    validArray(migratedConflicts, isConflict, "冲突记录", recoveryIssues),
     (entry) => entry.id,
     "冲突记录 ID",
     recoveryIssues,
   );
+  stripTaskBoardProjection(baseSnapshots, localSnapshots, boardSnapshots, queue, conflicts);
+  restoreMigratedConflictPlacement(raw.conflicts, conflicts, boardSnapshots);
   const resolutionAudit = uniqueArray(
     validArray(raw.resolutionAudit, isAudit, "冲突审计", recoveryIssues),
     (entry) => entry.id,
@@ -164,6 +175,7 @@ export function hydrateData(value: unknown): HelixPersistedData {
     settings: hydrateSettings(rawSettings as Partial<HelixSettings>, recoveryIssues),
     baseSnapshots,
     localSnapshots,
+    boardSnapshots,
     queue,
     conflicts,
     resolutionAudit,
@@ -580,20 +592,7 @@ function isConflict(value: unknown): value is SyncConflict {
   for (let index = 0; index < expected.length; index += 1) {
     const actual = value.fields[index]!;
     const rebuilt = expected[index]!;
-    if (
-      actual.path !== rebuilt.path ||
-      actual.label !== rebuilt.label ||
-      actual.group !== rebuilt.group ||
-      actual.localChanged !== rebuilt.localChanged ||
-      actual.remoteChanged !== rebuilt.remoteChanged ||
-      actual.sameResult !== rebuilt.sameResult ||
-      actual.suggestedChoice !== rebuilt.suggestedChoice ||
-      !deepEqual(actual.baseValue, rebuilt.baseValue) ||
-      !deepEqual(actual.localValue, rebuilt.localValue) ||
-      !deepEqual(actual.remoteValue, rebuilt.remoteValue)
-    ) {
-      return false;
-    }
+    if (!matchesRebuiltConflictField(actual, rebuilt)) return false;
   }
   return !(
     (value.status === "staged" || value.status === "applying") &&
@@ -625,6 +624,247 @@ function isInProgress(value: unknown): value is InProgressEntry {
 
 function isEntityKind(value: unknown): value is EntityKind {
   return ["task", "project", "habit", "habit-checkin", "focus"].includes(String(value));
+}
+
+function isBoardSnapshot(value: unknown): value is DidaBoardSnapshot {
+  if (!isRecord(value) || typeof value.projectId !== "string" || !value.projectId) return false;
+  if (typeof value.capturedAt !== "string" || !Number.isFinite(Date.parse(value.capturedAt))) return false;
+  if (typeof value.stale !== "boolean" || !Array.isArray(value.columns)) return false;
+  const ids = new Set<string>();
+  for (const column of value.columns) {
+    if (!isRecord(column) || typeof column.id !== "string" || !column.id || ids.has(column.id)) {
+      return false;
+    }
+    if (
+      column.projectId !== value.projectId ||
+      typeof column.name !== "string" ||
+      !column.name.trim() ||
+      (column.sortOrder !== undefined &&
+        (typeof column.sortOrder !== "number" || !Number.isSafeInteger(column.sortOrder))) ||
+      (column.sortOrderUnsafe !== undefined && column.sortOrderUnsafe !== true)
+    ) {
+      return false;
+    }
+    ids.add(column.id);
+  }
+  if (value.taskColumnIds !== undefined) {
+    if (!isRecord(value.taskColumnIds)) return false;
+    for (const [taskId, columnId] of Object.entries(value.taskColumnIds)) {
+      if (!taskId || (columnId !== null && (typeof columnId !== "string" || !columnId))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function hydrateBoardSnapshots(value: unknown): Record<string, DidaBoardSnapshot> {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(
+        (entry): entry is [string, DidaBoardSnapshot] =>
+          isBoardSnapshot(entry[1]) && entry[0] === entry[1].projectId,
+      )
+      .map(([key, snapshot]) => [key, {
+        ...snapshot,
+        taskColumnIds: { ...(snapshot.taskColumnIds ?? {}) },
+      }]),
+  );
+}
+
+function migrateConflictBoardProjection(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((entry) => {
+    if (
+      !isRecord(entry) ||
+      !Array.isArray(entry.fields) ||
+      !entry.fields.every(isConflictField) ||
+      !isSnapshot(entry.base, true, true) ||
+      !isSnapshot(entry.local, true, false) ||
+      !isSnapshot(entry.remote, true, false)
+    ) {
+      return entry;
+    }
+    const rawFields = entry.fields;
+    const snapshots = [entry.base, entry.local, entry.remote];
+    const hasLegacyProjection = entry.kind === "task" && snapshots.some(
+      (snapshot) => isRecord(snapshot.value) &&
+        Object.prototype.hasOwnProperty.call(snapshot.value, "columnId"),
+    );
+    const hasUnsafeProjectOrder = entry.kind === "project" && snapshots.some(
+      (snapshot) => isRecord(snapshot.value) &&
+        typeof snapshot.value.sortOrder === "number" &&
+        !Number.isSafeInteger(snapshot.value.sortOrder),
+    );
+    if (!hasLegacyProjection && !hasUnsafeProjectOrder) return entry;
+    const legacyExpected = buildLegacyConflictFields(entry, hasLegacyProjection);
+    if (
+      legacyExpected.length !== rawFields.length ||
+      legacyExpected.some((field, index) =>
+        !matchesRebuiltConflictField(rawFields[index], field)
+      )
+    ) {
+      return entry;
+    }
+    const migrated = cloneValue(entry) as unknown as SyncConflict;
+    const previousFields = migrated.fields;
+    stripTaskBoardProjection({}, {}, {}, [], [migrated]);
+    const rebuilt = buildConflictFields(
+      migrated.base.value,
+      migrated.local.value,
+      migrated.remote.value,
+    );
+    for (const field of rebuilt) {
+      const previous = previousFields.find((candidate) => candidate.path === field.path);
+      if (!previous?.choice) continue;
+      field.choice = previous.choice;
+      if (previous.choice === "custom") field.customValue = cloneValue(previous.customValue);
+    }
+    migrated.fields = rebuilt;
+    return migrated;
+  });
+}
+
+function buildLegacyConflictFields(
+  entry: Record<string, unknown>,
+  includeColumnId: boolean,
+): ReturnType<typeof buildConflictFields> {
+  const base = (entry.base as EntitySnapshot<unknown>).value;
+  const local = (entry.local as EntitySnapshot<unknown>).value;
+  const remote = (entry.remote as EntitySnapshot<unknown>).value;
+  const fields = buildConflictFields(base, local, remote);
+  if (!includeColumnId) return fields;
+  const values = [base, local, remote].map((value) =>
+    isRecord(value) ? value.columnId : undefined
+  );
+  const [baseValue, localValue, remoteValue] = values;
+  const localChanged = !deepEqual(localValue, baseValue);
+  const remoteChanged = !deepEqual(remoteValue, baseValue);
+  if (!localChanged && !remoteChanged) return fields;
+  const sameResult = deepEqual(localValue, remoteValue);
+  const suggestedChoice = sameResult || (localChanged && !remoteChanged)
+    ? "local" as const
+    : remoteChanged && !localChanged
+      ? "remote" as const
+      : undefined;
+  fields.push({
+    path: "columnId",
+    // 冻结迁移窗口内曾写入 data.json 的历史界面标签，不能随当前字段表改名。
+    label: "看板列",
+    baseValue: cloneValue(baseValue),
+    localValue: cloneValue(localValue),
+    remoteValue: cloneValue(remoteValue),
+    localChanged,
+    remoteChanged,
+    sameResult,
+    group: "scalar",
+    suggestedChoice,
+  });
+  return fields.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function matchesRebuiltConflictField(
+  actual: unknown,
+  rebuilt: ReturnType<typeof buildConflictFields>[number],
+): boolean {
+  return isRecord(actual) &&
+    actual.path === rebuilt.path &&
+    actual.label === rebuilt.label &&
+    actual.group === rebuilt.group &&
+    actual.localChanged === rebuilt.localChanged &&
+    actual.remoteChanged === rebuilt.remoteChanged &&
+    actual.sameResult === rebuilt.sameResult &&
+    actual.suggestedChoice === rebuilt.suggestedChoice &&
+    deepEqual(actual.baseValue, rebuilt.baseValue) &&
+    deepEqual(actual.localValue, rebuilt.localValue) &&
+    deepEqual(actual.remoteValue, rebuilt.remoteValue);
+}
+
+function restoreMigratedConflictPlacement(
+  rawConflicts: unknown,
+  conflicts: SyncConflict[],
+  boardSnapshots: Record<string, DidaBoardSnapshot>,
+): void {
+  if (!Array.isArray(rawConflicts)) return;
+  const retainedIds = new Set(conflicts.map((conflict) => conflict.id));
+  for (const entry of rawConflicts) {
+    if (
+      !isRecord(entry) ||
+      entry.kind !== "task" ||
+      typeof entry.id !== "string" ||
+      !retainedIds.has(entry.id) ||
+      !isSnapshot(entry.remote, true, false) ||
+      !isRecord(entry.remote.value)
+    ) {
+      continue;
+    }
+    const taskId = typeof entry.remote.value.id === "string"
+      ? entry.remote.value.id
+      : entry.remote.entityId;
+    const projectId = entry.remote.value.projectId;
+    const columnId = entry.remote.value.columnId;
+    if (
+      typeof projectId === "string" &&
+      boardSnapshots[projectId] &&
+      (columnId === null || (typeof columnId === "string" && columnId))
+    ) {
+      boardSnapshots[projectId].taskColumnIds[taskId] = columnId;
+    }
+  }
+}
+
+function stripTaskBoardProjection(
+  baseSnapshots: Record<string, EntitySnapshot<unknown>>,
+  localSnapshots: Record<string, EntitySnapshot<unknown>>,
+  boardSnapshots: Record<string, DidaBoardSnapshot>,
+  queue: SyncQueueOperation[],
+  conflicts: SyncConflict[],
+): void {
+  const stripSnapshot = (snapshot: EntitySnapshot<unknown> | undefined): void => {
+    if (!snapshot || !isRecord(snapshot.value)) return;
+    const value = snapshot.value;
+    if (
+      snapshot.kind === "project" &&
+      typeof value.sortOrder === "number" &&
+      !Number.isSafeInteger(value.sortOrder)
+    ) {
+      delete value.sortOrder;
+      value.sortOrderUnsafe = true;
+      snapshot.stamp.hash = stableHash(value);
+      return;
+    }
+    if (snapshot.kind !== "task") return;
+    const taskId = typeof value.id === "string" ? value.id : snapshot.entityId;
+    const projectId = typeof value.projectId === "string" ? value.projectId : undefined;
+    if (Object.prototype.hasOwnProperty.call(value, "columnId") && projectId) {
+      const columnId = value.columnId;
+      const board = boardSnapshots[projectId];
+      if (board && (columnId === null || (typeof columnId === "string" && columnId))) {
+        board.taskColumnIds[taskId] = columnId;
+      }
+      delete value.columnId;
+      snapshot.stamp.hash = stableHash(value);
+    }
+  };
+  for (const snapshot of Object.values(baseSnapshots)) stripSnapshot(snapshot);
+  for (const snapshot of Object.values(localSnapshots)) stripSnapshot(snapshot);
+  for (const operation of queue) {
+    stripSnapshot(operation.base);
+    stripSnapshot(operation.local);
+  }
+  for (const conflict of conflicts) {
+    stripSnapshot(conflict.base);
+    stripSnapshot(conflict.local);
+    stripSnapshot(conflict.remote);
+    const unsafeProjectOrder = conflict.kind === "project" &&
+      [conflict.base.value, conflict.local.value, conflict.remote.value].some(
+        (value) => isRecord(value) && value.sortOrderUnsafe === true,
+      );
+    conflict.fields = conflict.fields.filter(
+      (field) => field.path !== "columnId" && !(unsafeProjectOrder && field.path === "sortOrder"),
+    );
+  }
 }
 
 function isEntityValue(

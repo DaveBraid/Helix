@@ -461,6 +461,7 @@ describe("HelixService runtime recovery", () => {
         async getProjectData() {
           return {
             project: { id: "project-detail", name: "Detail list" },
+            columns: [],
             tasks: [task],
           };
         },
@@ -484,6 +485,90 @@ describe("HelixService runtime recovery", () => {
     expect(service.snapshot().tasks).toMatchObject([{ id: "task-from-detail" }]);
     expect(persisted.localSnapshots[`task:${task.id}`]).toBeDefined();
     expect(persisted.conflicts).toEqual([]);
+  });
+
+  it("publishes remote kanban columns and preserves detail-only task placement", async () => {
+    const data = createDefaultData("device-board-detail");
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    let boardDetailMode: "full" | "unavailable" | "missing-columns" = "full";
+    Object.defineProperty(service, "api", {
+      value: {
+        async getProjects() {
+          return boardDetailMode === "missing-columns"
+            ? [{ id: "project-board", name: "Global truth", color: "#123456", viewMode: "kanban" }]
+            : [{ id: "project-board", name: "Board", viewMode: "kanban" }];
+        },
+        async getProjectData() {
+          if (boardDetailMode === "unavailable") throw new Error("board detail unavailable");
+          if (boardDetailMode === "missing-columns") {
+            return {
+              project: { id: "project-board", name: "Stale detail", color: "#ffffff", viewMode: "list" },
+              tasks: [{ id: "task-board", projectId: "project-board", title: "Placed", status: 0, columnId: "todo" }],
+            };
+          }
+          return {
+            project: { id: "project-board", name: "Board", viewMode: "kanban" },
+            columns: [
+              { id: "done", projectId: "project-board", name: "Done", sortOrder: 20 },
+              { id: "todo", projectId: "project-board", name: "To do", sortOrder: 10 },
+            ],
+            tasks: [{
+              id: "task-board",
+              projectId: "project-board",
+              title: "Placed",
+              status: 0,
+              columnId: "todo",
+            }],
+          };
+        },
+        async filterTasks() {
+          return [{ id: "task-board", projectId: "project-board", title: "Placed", status: 0 }];
+        },
+        async getCompletedTasks() { return []; },
+      },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", { value: { async list() { return []; } } });
+
+    await service.pullOnlySync();
+
+    expect(service.snapshot().projects[0]).toMatchObject({
+      id: "project-board",
+      viewMode: "kanban",
+      columns: [{ id: "todo" }, { id: "done" }],
+    });
+    expect(service.snapshot().tasks[0]).toMatchObject({ id: "task-board", columnId: "todo" });
+    expect(persisted.boardSnapshots["project-board"]?.taskColumnIds).toEqual({
+      "task-board": "todo",
+    });
+    expect(persisted.localSnapshots["task:task-board"]?.value).not.toHaveProperty("columnId");
+
+    boardDetailMode = "unavailable";
+    await service.pullOnlySync();
+    expect(service.snapshot().projects[0]).toMatchObject({
+      columns: [{ id: "todo" }, { id: "done" }],
+      boardStale: true,
+    });
+    expect(service.snapshot().tasks[0]).toMatchObject({ id: "task-board", columnId: "todo" });
+
+    boardDetailMode = "missing-columns";
+    await service.pullOnlySync();
+    expect(service.snapshot().projects[0]).toMatchObject({
+      name: "Global truth",
+      color: "#123456",
+      columns: [{ id: "todo" }, { id: "done" }],
+      boardStale: true,
+    });
   });
 
   it("keeps the completed endpoint authoritative over a stale open list detail", async () => {
@@ -895,6 +980,101 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.inProgress[0]?.projectId).toBe("project-new");
     expect(service.snapshot().inProgress[0]?.projectId).toBe("project-new");
     expect(service.visibleInProgress(false)[0]?.project).toBeUndefined();
+  });
+
+  it("queues a remote view-mode update without putting board cache into project truth", async () => {
+    const data = createDefaultData("device-project-view");
+    const project = { id: "project-view", name: "Board", viewMode: "list", permission: "write" } as const;
+    const base = createSnapshot("project", project.id, project);
+    data.baseSnapshots[`project:${project.id}`] = base;
+    data.localSnapshots[`project:${project.id}`] = base;
+    data.boardSnapshots[project.id] = {
+      projectId: project.id,
+      capturedAt: "2026-08-03T00:00:00.000Z",
+      stale: false,
+      columns: [{ id: "todo", projectId: project.id, name: "To do", sortOrder: 10 }],
+      taskColumnIds: {},
+    };
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    (service as unknown as { patch(value: { connected: boolean }): void }).patch({ connected: true });
+    let processed: SyncQueueOperation | undefined;
+    Object.defineProperty(service, "projectEngine", {
+      value: {
+        async process(operation: SyncQueueOperation) {
+          processed = structuredClone(operation);
+          return { outcome: "pushed", snapshot: operation.local };
+        },
+      },
+    });
+
+    await service.setDidaProjectViewMode(project.id, "kanban");
+
+    expect(processed?.local.value).toMatchObject({ id: project.id, viewMode: "kanban" });
+    expect(processed?.local.value).not.toHaveProperty("columns");
+    expect(persisted.boardSnapshots[project.id]?.columns).toMatchObject([{ id: "todo" }]);
+    expect(service.snapshot().projects[0]).toMatchObject({
+      viewMode: "kanban",
+      columns: [{ id: "todo" }],
+    });
+  });
+
+  it("keeps a view-mode update pending while offline and reports its sync state", async () => {
+    const data = createDefaultData("device-project-view-offline");
+    const project = { id: "project-offline", name: "Offline", viewMode: "list", permission: "write" } as const;
+    const base = createSnapshot("project", project.id, project);
+    data.baseSnapshots[`project:${project.id}`] = base;
+    data.localSnapshots[`project:${project.id}`] = base;
+    data.boardSnapshots[project.id] = {
+      projectId: project.id,
+      capturedAt: "2026-08-03T00:00:00.000Z",
+      stale: false,
+      columns: [],
+      taskColumnIds: {},
+    };
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+
+    await service.setDidaProjectViewMode(project.id, "kanban");
+
+    expect(persisted.queue).toMatchObject([{ kind: "project", entityId: project.id, status: "pending" }]);
+    expect(await service.getDidaProjectViewModeSyncStatus(project.id)).toBe("pending");
+    expect(service.snapshot().projects[0]?.viewMode).toBe("kanban");
+  });
+
+  it("refuses view-mode writes for a read-only list before queueing", async () => {
+    const data = createDefaultData("device-project-read-only");
+    const project = { id: "project-read", name: "Shared", viewMode: "list", permission: "read" } as const;
+    const base = createSnapshot("project", project.id, project);
+    data.baseSnapshots[`project:${project.id}`] = base;
+    data.localSnapshots[`project:${project.id}`] = base;
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+
+    await expect(service.setDidaProjectViewMode(project.id, "kanban"))
+      .rejects.toThrow(/没有写入权限/);
+    expect(persisted.queue).toEqual([]);
   });
 
   it("records a verified completion immediately after the queue write succeeds", async () => {

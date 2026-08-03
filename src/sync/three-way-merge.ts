@@ -19,9 +19,17 @@ const FIELD_LABELS: Record<string, string> = {
   items: "检查事项",
   parentId: "父任务",
   completedTime: "完成时间",
+  viewMode: "清单视图",
+  sortOrder: "排序",
 };
 
-const IGNORED_FIELDS = new Set(["etag", "modifiedTime", "createdTime"]);
+const IGNORED_FIELDS = new Set([
+  "etag",
+  "modifiedTime",
+  "createdTime",
+  "sortOrderUnsafe",
+  "columnId",
+]);
 const TEXT_FIELDS = new Set(["content", "desc", "note", "encouragement"]);
 const SCHEDULE_FIELDS = new Set([
   "startDate",

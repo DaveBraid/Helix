@@ -24,10 +24,28 @@ export interface DidaChecklistItem {
   title: string;
   status: number;
   sortOrder?: number;
+  sortOrderUnsafe?: boolean;
   startDate?: string;
   isAllDay?: boolean;
   timeZone?: string;
   completedTime?: string | number;
+}
+
+export interface DidaColumn {
+  id: string;
+  projectId: string;
+  name: string;
+  sortOrder?: number;
+  sortOrderUnsafe?: boolean;
+}
+
+export interface DidaBoardSnapshot {
+  projectId: string;
+  columns: DidaColumn[];
+  /** 只读详情投影；不进入任务 Base/Local/Remote，也不参与任务写载荷。 */
+  taskColumnIds: Record<string, string | null>;
+  capturedAt: string;
+  stale: boolean;
 }
 
 export interface DidaTask {
@@ -46,6 +64,8 @@ export interface DidaTask {
   completedTime?: string | null;
   status: number;
   sortOrder?: number;
+  columnId?: string | null;
+  sortOrderUnsafe?: boolean;
   items?: DidaChecklistItem[];
   tags?: string[];
   parentId?: string | null;
@@ -61,12 +81,17 @@ export interface DidaProject {
   name: string;
   color?: string;
   sortOrder?: number;
+  sortOrderUnsafe?: boolean;
   closed?: boolean;
   groupId?: string;
   viewMode?: "list" | "kanban" | "timeline" | string;
   permission?: "read" | "comment" | "write" | string;
   kind?: "TASK" | "NOTE" | string;
   etag?: string;
+  /** 由只读远端看板快照临时附加，不进入项目同步写载荷。 */
+  columns?: DidaColumn[];
+  boardCapturedAt?: string;
+  boardStale?: boolean;
 }
 
 export interface DidaHabit {

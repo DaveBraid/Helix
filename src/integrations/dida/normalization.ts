@@ -1,4 +1,5 @@
 import type {
+  DidaColumn,
   DidaChecklistItem,
   DidaFocusRecord,
   DidaHabit,
@@ -32,6 +33,7 @@ function normalizeChecklist(items: DidaChecklistItem[] | undefined): DidaCheckli
       ) {
         throw new Error("Dida 检查项完成日期格式无效");
       }
+      const sortOrderUnsafe = item.sortOrder !== undefined && !Number.isSafeInteger(item.sortOrder);
       return {
         ...item,
         title: item.title.trim(),
@@ -40,6 +42,8 @@ function normalizeChecklist(items: DidaChecklistItem[] | undefined): DidaCheckli
           typeof item.completedTime === "string"
             ? normalizedDate(item.completedTime, "检查项完成日期") ?? undefined
             : item.completedTime,
+        sortOrder: sortOrderUnsafe ? undefined : item.sortOrder,
+        sortOrderUnsafe: sortOrderUnsafe || undefined,
       };
     })
     .sort((left, right) => {
@@ -55,6 +59,14 @@ export function normalizeTask(task: DidaTask): DidaTask {
   requireString(task.projectId, "任务 projectId");
   requireString(task.title, "任务 title");
   if (typeof task.status !== "number") throw new Error("Dida 任务 status 不是数字");
+  if (
+    task.columnId !== undefined &&
+    task.columnId !== null &&
+    (typeof task.columnId !== "string" || !task.columnId.trim())
+  ) {
+    throw new Error("Dida 任务 columnId 缺失或类型错误");
+  }
+  const sortOrderUnsafe = task.sortOrder !== undefined && !Number.isSafeInteger(task.sortOrder);
   return {
     ...task,
     title: task.title.trim(),
@@ -72,17 +84,49 @@ export function normalizeTask(task: DidaTask): DidaTask {
     tags: normalizedStrings(task.tags),
     items: normalizeChecklist(task.items),
     parentId: task.parentId || null,
+    columnId: task.columnId === undefined ? undefined : task.columnId?.trim() || null,
+    sortOrder: sortOrderUnsafe ? undefined : task.sortOrder,
+    sortOrderUnsafe: sortOrderUnsafe || undefined,
   };
+}
+
+export function normalizeColumn(column: DidaColumn): DidaColumn {
+  assertRecord(column, "看板列");
+  requireString(column.id, "看板列 id");
+  requireString(column.projectId, "看板列 projectId");
+  requireString(column.name, "看板列 name");
+  const sortOrderUnsafe = column.sortOrder !== undefined && !Number.isSafeInteger(column.sortOrder);
+  return {
+    ...column,
+    name: column.name.trim(),
+    sortOrder: sortOrderUnsafe ? undefined : column.sortOrder,
+    sortOrderUnsafe: sortOrderUnsafe || undefined,
+  };
+}
+
+export function normalizeColumns(columns: DidaColumn[] | undefined): DidaColumn[] {
+  if (columns === undefined) throw new Error("Dida 看板列字段缺失");
+  if (!Array.isArray(columns)) throw new Error("Dida 看板列返回值不是数组");
+  const normalized = columns.map(normalizeColumn);
+  if (new Set(normalized.map((column) => column.id)).size !== normalized.length) {
+    throw new Error("Dida 看板列 id 重复");
+  }
+  return normalized.sort((left, right) =>
+    (left.sortOrder ?? 0) - (right.sortOrder ?? 0) || left.id.localeCompare(right.id));
 }
 
 export function normalizeProject(project: DidaProject): DidaProject {
   assertRecord(project, "项目");
   requireString(project.id, "项目 id");
   requireString(project.name, "项目 name");
+  const sortOrderUnsafe = project.sortOrder !== undefined && !Number.isSafeInteger(project.sortOrder);
   return {
     ...project,
     name: project.name.trim(),
     closed: project.closed ?? false,
+    sortOrder: sortOrderUnsafe ? undefined : project.sortOrder,
+    sortOrderUnsafe: sortOrderUnsafe || undefined,
+    columns: project.columns === undefined ? undefined : normalizeColumns(project.columns),
   };
 }
 

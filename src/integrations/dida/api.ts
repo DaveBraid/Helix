@@ -1,4 +1,5 @@
 import type {
+  DidaColumn,
   DidaFocusRecord,
   DidaHabit,
   DidaHabitCheckin,
@@ -88,7 +89,7 @@ export class DidaApi {
   getProjectData(projectId: string): Promise<{
     project: DidaProject;
     tasks: DidaTask[];
-    columns?: unknown[];
+    columns?: DidaColumn[];
   }> {
     return this.request(`/project/${encodeURIComponent(projectId)}/data`);
   }

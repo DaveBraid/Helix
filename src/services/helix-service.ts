@@ -1,5 +1,6 @@
 import { Notice } from "obsidian";
 import type {
+  DidaColumn,
   DidaFocusRecord,
   DidaHabit,
   DidaHabitCheckin,
@@ -30,7 +31,11 @@ import {
   DidaTaskAdapter,
 } from "../integrations/dida/adapters";
 import { ObsidianHttpTransport } from "../integrations/dida/http";
-import { normalizeProject, normalizeTask } from "../integrations/dida/normalization";
+import {
+  normalizeColumns,
+  normalizeProject,
+  normalizeTask,
+} from "../integrations/dida/normalization";
 import {
   DidaWriteContractRunner,
   type DidaWriteContractProgress,
@@ -52,6 +57,7 @@ import {
   buildTaskUpdateOperation,
   migrateInProgressTaskId,
 } from "./task-operations";
+import { buildProjectUpdateOperation } from "./project-operations";
 import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
 import { RemoteWriteGate } from "./remote-write-gate";
@@ -81,6 +87,8 @@ export interface HelixRuntimeState {
   attentionCount: number;
   recoveryIssues: string[];
 }
+
+export type DidaProjectViewModeSyncStatus = "synced" | "pending" | "conflict" | "attention";
 
 export type StateListener = (state: HelixRuntimeState) => void;
 
@@ -164,8 +172,8 @@ export class HelixService {
       deviceId: data.deviceId,
       deferConflictFinalization: true,
     });
-    const projects = cachedValues<DidaProject>(data, "project");
-    const tasks = cachedValues<DidaTask>(data, "task");
+    const projects = attachBoardSnapshots(cachedValues<DidaProject>(data, "project"), data);
+    const tasks = cachedTaskValues(data);
     const habits = cachedValues<DidaHabit>(data, "habit");
     const habitCheckins = cachedValues<DidaHabitCheckin>(data, "habit-checkin");
     const focus = cachedValues<DidaFocusRecord>(data, "focus");
@@ -290,15 +298,20 @@ export class HelixService {
   private async syncWithAuthorizationLease(pullOnly: boolean): Promise<void> {
     this.patch({ loading: true, error: undefined, syncWarnings: [] });
     try {
+      const capturedAt = new Date().toISOString();
       // 先完整读取所有项目；任何一页失败时保留上一次可用快照，避免发布“半份数据”。
       const projectPayload = await this.api.getProjects();
       if (!Array.isArray(projectPayload)) throw new Error("项目接口返回值不是数组");
-      const projects = projectPayload.map(normalizeProject);
+      const projects = projectPayload.map((project) => projectSyncValue(normalizeProject(project)));
       // 清单详情只用于证明删除覆盖；单个详情失败不能阻断全局清单与任务发布。
       const projectCoverage = await Promise.allSettled(
         projects.map((project) => this.api.getProjectData(project.id)),
       );
       const verifiedProjectIds = new Set<string>();
+      const boardDetailsByProject = new Map<string, {
+        columns: DidaColumn[];
+        taskColumnIds: Record<string, string | null>;
+      }>();
       const projectDetailTasks: DidaTask[] = [];
       for (const [index, result] of projectCoverage.entries()) {
         if (result.status !== "fulfilled") continue;
@@ -308,10 +321,20 @@ export class HelixService {
           if (detailProject.id !== expectedProject.id || !Array.isArray(result.value.tasks)) {
             continue;
           }
+          const columns = normalizeColumns(result.value.columns);
+          if (columns.some((column) => column.projectId !== expectedProject.id)) continue;
           const detailTasks = result.value.tasks.map(normalizeTask);
           if (detailTasks.some((task) => task.projectId !== expectedProject.id)) continue;
+          boardDetailsByProject.set(expectedProject.id, {
+            columns,
+            taskColumnIds: Object.fromEntries(
+              detailTasks
+                .filter((task) => task.columnId !== undefined)
+                .map((task) => [task.id, task.columnId ?? null]),
+            ),
+          });
           verifiedProjectIds.add(expectedProject.id);
-          projectDetailTasks.push(...detailTasks);
+          projectDetailTasks.push(...detailTasks.map(taskSyncValue));
         } catch {
           // 结构无效等同本清单覆盖未获证明；保留旧快照且不参与删除推断。
         }
@@ -332,8 +355,8 @@ export class HelixService {
       }
       const tasks = deduplicateTasks([
         ...projectDetailTasks,
-        ...openPayload.map(normalizeTask),
-        ...completedPayload.map(normalizeTask),
+        ...openPayload.map(normalizeTaskWithoutBoardProjection),
+        ...completedPayload.map(normalizeTaskWithoutBoardProjection),
       ]);
 
       const now = Date.now();
@@ -380,8 +403,6 @@ export class HelixService {
         checkedAt: new Date().toISOString(),
         errors: capabilityErrors,
       };
-      const capturedAt = new Date().toISOString();
-
       if (this.disposed) return;
       await this.store.mutate((data) => {
         const ledger = new EventLedger(data.events.filter(isHelixEvent));
@@ -406,6 +427,27 @@ export class HelixService {
           capturedAt,
           coveredEntityIds: coveredProjectIds,
         });
+        const remoteProjectIds = new Set(projects.map((project) => project.id));
+        for (const projectId of Object.keys(data.boardSnapshots)) {
+          if (!remoteProjectIds.has(projectId)) delete data.boardSnapshots[projectId];
+        }
+        for (const project of projects) {
+          const boardDetails = boardDetailsByProject.get(project.id);
+          if (boardDetails) {
+            data.boardSnapshots[project.id] = {
+              projectId: project.id,
+              columns: boardDetails.columns,
+              taskColumnIds: boardDetails.taskColumnIds,
+              capturedAt,
+              stale: false,
+            };
+          } else {
+            const previousBoard = data.boardSnapshots[project.id];
+            if (previousBoard) {
+              data.boardSnapshots[project.id] = { ...previousBoard, stale: true };
+            }
+          }
+        }
         const coveredTasks = new Set(tasks.map((task) => task.id));
         const lastSyncIsInsideCompletionWindow =
           !!data.lastSyncAt &&
@@ -451,9 +493,9 @@ export class HelixService {
       if (!pullOnly) await this.drainQueue();
       if (this.disposed) return;
       const finalData = await this.store.snapshot();
-      const finalTasks = cachedValues<DidaTask>(finalData, "task");
+      const finalTasks = cachedTaskValues(finalData);
       const finalProjects = addUnlistedProjects(
-        cachedValues<DidaProject>(finalData, "project"),
+        attachBoardSnapshots(cachedValues<DidaProject>(finalData, "project"), finalData),
         finalTasks,
       );
       this.patch({
@@ -664,7 +706,7 @@ export class HelixService {
     await this.drainQueue();
     await this.throwIfOperationNeedsAttention(effectiveOperationId);
     this.patch({
-      tasks: cachedValues<DidaTask>(await this.store.snapshot(), "task"),
+      tasks: cachedTaskValues(await this.store.snapshot()),
     });
   }
 
@@ -717,6 +759,74 @@ export class HelixService {
     }
   }
 
+  async setDidaProjectViewMode(projectId: string, viewMode: "list" | "kanban"): Promise<void> {
+    this.assertWritable();
+    const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
+    try {
+      const project = this.state.projects.find((candidate) => candidate.id === projectId);
+      if (!project) throw new Error("找不到清单");
+      if (project.id.startsWith("local-project-")) throw new Error("清单尚未完成远端创建核对");
+      if (project.permission && project.permission !== "write") {
+        throw new Error("该清单没有写入权限");
+      }
+      if (project.boardStale) throw new Error("清单详情已过期，请同步成功后再修改滴答默认视图");
+      if (project.viewMode === viewMode) return;
+      const data = await this.store.snapshot();
+      const base = data.baseSnapshots[`project:${projectId}`] as
+        | EntitySnapshot<DidaProject>
+        | undefined;
+      if (!base) throw new Error("清单缺少同步基线，请先完成一次同步");
+      const now = new Date().toISOString();
+      const next = { ...project, viewMode };
+      const syncValue = projectSyncValue(next);
+      const operation = buildProjectUpdateOperation(
+        syncValue,
+        base,
+        now,
+        `op-${crypto.randomUUID()}`,
+      );
+      let effectiveOperationId = operation.id;
+      await this.store.mutate((draft) => {
+        draft.localSnapshots[`project:${projectId}`] = operation.local;
+        const queue = new OfflineQueue(draft.queue);
+        effectiveOperationId = queue.enqueue(operation);
+        draft.queue = queue.list();
+      });
+      this.patch({
+        projects: this.state.projects.map((candidate) =>
+          candidate.id === projectId ? next : candidate),
+      });
+      if (!this.state.connected) return;
+      await this.drainQueue();
+      await this.throwIfOperationNeedsAttention(effectiveOperationId);
+      const finalData = await this.store.snapshot();
+      this.patch({
+        projects: attachBoardSnapshots(cachedValues<DidaProject>(finalData, "project"), finalData),
+      });
+    } finally {
+      releaseAuthorizationLease();
+    }
+  }
+
+  async getDidaProjectViewModeSyncStatus(
+    projectId: string,
+  ): Promise<DidaProjectViewModeSyncStatus> {
+    const data = await this.store.snapshot();
+    const conflict = data.conflicts.find(
+      (candidate) => candidate.kind === "project" && candidate.entityId === projectId &&
+        candidate.fields.some((field) => field.path === "viewMode"),
+    );
+    if (conflict) return "conflict";
+    const operations = data.queue.filter(
+      (operation) => operation.kind === "project" && operation.entityId === projectId,
+    );
+    if (operations.some((operation) => needsAttention(operation))) return "attention";
+    if (operations.some((operation) => operation.status === "pending" || operation.status === "running")) {
+      return "pending";
+    }
+    return "synced";
+  }
+
   async completeTask(taskId: string): Promise<void> {
     this.assertWritable();
     const task = this.state.tasks.find((candidate) => candidate.id === taskId);
@@ -759,7 +869,7 @@ export class HelixService {
     validateTaskScheduleWrite(task, this.state.taskScheduleMode, base.value);
     const now = new Date().toISOString();
     const operation = buildTaskUpdateOperation(
-      task,
+      taskSyncValue(task),
       base,
       operationType,
       now,
@@ -786,7 +896,7 @@ export class HelixService {
     await this.drainQueue();
     await this.throwIfOperationNeedsAttention(effectiveOperationId);
     this.patch({
-      tasks: cachedValues<DidaTask>(await this.store.snapshot(), "task"),
+      tasks: cachedTaskValues(await this.store.snapshot()),
       inProgress: (await this.store.snapshot()).inProgress,
     });
   }
@@ -1380,8 +1490,20 @@ export class HelixService {
 
 function deduplicateTasks(tasks: DidaTask[]): DidaTask[] {
   const byId = new Map<string, DidaTask>();
-  for (const task of tasks) byId.set(task.id, task);
+  for (const task of tasks) {
+    byId.set(task.id, task);
+  }
   return [...byId.values()];
+}
+
+function normalizeTaskWithoutBoardProjection(task: DidaTask): DidaTask {
+  const { columnId: _columnId, ...value } = task;
+  return taskSyncValue(normalizeTask(value as DidaTask));
+}
+
+function taskSyncValue(task: DidaTask): DidaTask {
+  const { columnId: _columnId, ...value } = task;
+  return value;
 }
 
 function addUnlistedProjects(projects: DidaProject[], tasks: DidaTask[]): DidaProject[] {
@@ -1398,6 +1520,41 @@ function addUnlistedProjects(projects: DidaProject[], tasks: DidaTask[]): DidaPr
       permission: "write",
     } satisfies DidaProject)),
   ];
+}
+
+function projectSyncValue(project: DidaProject): DidaProject {
+  const { columns: _columns, boardCapturedAt: _boardCapturedAt, boardStale: _boardStale, ...value } = project;
+  return value;
+}
+
+function attachBoardSnapshots(
+  projects: DidaProject[],
+  data: HelixPersistedData,
+): DidaProject[] {
+  return projects.map((project) => {
+    const board = data.boardSnapshots[project.id];
+    return board
+      ? {
+        ...projectSyncValue(project),
+        columns: structuredClone(board.columns),
+        boardCapturedAt: board.capturedAt,
+        boardStale: board.stale,
+      }
+      : projectSyncValue(project);
+  });
+}
+
+function cachedTaskValues(data: HelixPersistedData): DidaTask[] {
+  return cachedValues<DidaTask>(data, "task").map((task) => {
+    const board = data.boardSnapshots[task.projectId];
+    if (!board || !Object.prototype.hasOwnProperty.call(board.taskColumnIds, task.id)) {
+      return taskSyncValue(task);
+    }
+    return {
+      ...taskSyncValue(task),
+      columnId: board.taskColumnIds[task.id] ?? null,
+    };
+  });
 }
 
 function cachedValues<T>(

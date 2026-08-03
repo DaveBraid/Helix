@@ -13,12 +13,16 @@ export function serializeDidaDate(
 export function serializeDidaChecklistItems(
   items: DidaChecklistItem[] | undefined,
 ): DidaChecklistItem[] | undefined {
-  return items?.map((item) => ({
-    ...item,
-    startDate: serializeDidaDate(item.startDate, "检查项开始日期") ?? undefined,
-    completedTime:
-      typeof item.completedTime === "string"
-        ? serializeDidaDate(item.completedTime, "检查项完成日期") ?? undefined
-        : item.completedTime,
-  }));
+  return items?.map((item) => {
+    const { sortOrderUnsafe: _sortOrderUnsafe, ...value } = item;
+    return {
+      ...value,
+      sortOrder: item.sortOrderUnsafe ? undefined : item.sortOrder,
+      startDate: serializeDidaDate(item.startDate, "检查项开始日期") ?? undefined,
+      completedTime:
+        typeof item.completedTime === "string"
+          ? serializeDidaDate(item.completedTime, "检查项完成日期") ?? undefined
+          : item.completedTime,
+    };
+  });
 }

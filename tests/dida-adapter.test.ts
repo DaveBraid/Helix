@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DidaTask } from "../src/domain/entities";
-import { DidaTaskAdapter } from "../src/integrations/dida/adapters";
+import { DidaProjectAdapter, DidaTaskAdapter } from "../src/integrations/dida/adapters";
 import type { DidaApi } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
 import {
@@ -78,6 +78,14 @@ function desiredTask(status: number): DidaTask {
 }
 
 describe("DidaTaskAdapter", () => {
+  it("keeps board placement out of writable task snapshots", async () => {
+    const api = new FakeTaskApi();
+    api.task = { ...api.task, columnId: "todo" };
+    await expect(new DidaTaskAdapter(api as unknown as DidaApi).get(
+      api.task.id,
+      { projectId: api.task.projectId },
+    )).resolves.not.toHaveProperty("columnId");
+  });
   it("migrates an in-progress marker when an unknown create is bound to a remote id", () => {
     expect(migrateInProgressTaskId([
       {
@@ -186,6 +194,18 @@ describe("DidaTaskAdapter", () => {
     expect(api.lastUpdate?.dueDate).toBeNull();
   });
 
+  it("never writes back an unsafe remote sort order during an ordinary task edit", async () => {
+    const api = new FakeTaskApi();
+    api.task = { ...api.task, sortOrderUnsafe: true };
+    const desired = { ...api.task, title: "Edited", sortOrderUnsafe: true };
+    await new DidaTaskAdapter(api as unknown as DidaApi).update(
+      desired.id,
+      desired,
+      { projectId: desired.projectId },
+    );
+    expect(api.lastUpdate?.sortOrder).toBeUndefined();
+  });
+
   it("serializes task dates in the documented Dida write format", async () => {
     const api = new FakeTaskApi();
     const desired = desiredTask(0);
@@ -238,5 +258,24 @@ describe("DidaTaskAdapter", () => {
     await expect(adapter.update("task-1", desired, { projectId: "project-new" }))
       .resolves.toMatchObject({ title: "新标题" });
     expect(api.calls).toContain("update");
+  });
+});
+
+describe("DidaProjectAdapter", () => {
+  it("never writes back an unsafe remote project sort order with view-mode changes", async () => {
+    let lastUpdate: Record<string, unknown> | undefined;
+    const api = {
+      async updateProject(_id: string, value: Record<string, unknown>) {
+        lastUpdate = structuredClone(value);
+        return { id: "project-1", name: "Board", viewMode: value.viewMode };
+      },
+    } as unknown as DidaApi;
+    await new DidaProjectAdapter(api).update("project-1", {
+      id: "project-1",
+      name: "Board",
+      viewMode: "kanban",
+      sortOrderUnsafe: true,
+    });
+    expect(lastUpdate).toMatchObject({ viewMode: "kanban", sortOrder: undefined });
   });
 });

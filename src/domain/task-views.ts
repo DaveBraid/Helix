@@ -1,4 +1,4 @@
-import type { DidaTask } from "./entities";
+import type { DidaColumn, DidaProject, DidaTask } from "./entities";
 import { localDateKey } from "./local-date";
 import { instantToWallDateTime } from "./task-datetime";
 
@@ -10,6 +10,7 @@ const POINT_TIME_BLOCK_MINUTES = 15;
 
 export type TaskViewMode =
   | "list"
+  | "kanban"
   | "day"
   | "three-day"
   | "week"
@@ -65,6 +66,40 @@ export interface TaskViewDay {
   date: Date;
   key: string;
   inAnchorMonth: boolean;
+}
+
+export interface TaskBoardColumn {
+  id: string;
+  title: string;
+  source: DidaColumn | null;
+  tasks: DidaTask[];
+}
+
+export function buildTaskBoard(project: DidaProject, tasks: DidaTask[]): TaskBoardColumn[] {
+  const columns = [...(project.columns ?? [])].sort((left, right) =>
+    safeSortOrder(left) - safeSortOrder(right) || left.id.localeCompare(right.id));
+  const grouped = new Map(columns.map((column) => [column.id, [] as DidaTask[]]));
+  const unassigned: DidaTask[] = [];
+  for (const task of tasks.filter((candidate) => candidate.projectId === project.id)) {
+    const target = task.columnId ? grouped.get(task.columnId) : undefined;
+    (target ?? unassigned).push(task);
+  }
+  const byOrder = (left: DidaTask, right: DidaTask): number =>
+    safeSortOrder(left) - safeSortOrder(right) || left.id.localeCompare(right.id);
+  const result: TaskBoardColumn[] = columns.map((column) => ({
+    id: column.id,
+    title: column.name,
+    source: column,
+    tasks: (grouped.get(column.id) ?? []).sort(byOrder),
+  }));
+  if (unassigned.length > 0 || result.length === 0) {
+    result.push({ id: "unassigned", title: "未分栏", source: null, tasks: unassigned.sort(byOrder) });
+  }
+  return result;
+}
+
+function safeSortOrder(value: { sortOrder?: number; sortOrderUnsafe?: boolean }): number {
+  return value.sortOrderUnsafe || !Number.isSafeInteger(value.sortOrder) ? 0 : value.sortOrder ?? 0;
 }
 
 export interface TaskDateRange {

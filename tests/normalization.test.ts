@@ -1,12 +1,43 @@
 import { describe, expect, it } from "vitest";
 import {
+  normalizeColumns,
   normalizeFocus,
   normalizeHabit,
   normalizeHabitCheckin,
+  normalizeProject,
   normalizeTask,
 } from "../src/integrations/dida/normalization";
 
 describe("Dida normalization", () => {
+  it("normalizes and deterministically orders kanban columns", () => {
+    expect(normalizeColumns([
+      { id: "b", projectId: "project-1", name: " Done ", sortOrder: 20 },
+      { id: "a", projectId: "project-1", name: "Doing", sortOrder: 10 },
+    ])).toEqual([
+      { id: "a", projectId: "project-1", name: "Doing", sortOrder: 10 },
+      { id: "b", projectId: "project-1", name: "Done", sortOrder: 20 },
+    ]);
+    expect(() => normalizeColumns([
+      { id: "", projectId: "project-1", name: "Broken" },
+    ])).toThrow(/看板列 id/);
+    expect(normalizeColumns([
+      { id: "unsafe", projectId: "project-1", name: "Large", sortOrder: Number.MAX_SAFE_INTEGER + 2 },
+    ])).toMatchObject([{ id: "unsafe", sortOrder: undefined, sortOrderUnsafe: true }]);
+    expect(normalizeTask({
+      id: "unsafe-task",
+      projectId: "project-1",
+      title: "Large order",
+      status: 0,
+      sortOrder: Number.MAX_SAFE_INTEGER + 2,
+    })).toMatchObject({ sortOrder: undefined, sortOrderUnsafe: true });
+    expect(normalizeProject({
+      id: "project-unsafe",
+      name: "Large order",
+      sortOrder: Number.MAX_SAFE_INTEGER + 2,
+    })).toMatchObject({ sortOrder: undefined, sortOrderUnsafe: true });
+    expect(() => normalizeColumns(undefined)).toThrow(/字段缺失/);
+  });
+
   it("normalizes date forms, set ordering, empty values, and checklist ordering", () => {
     const first = normalizeTask({
       id: "task-1",
@@ -38,6 +69,13 @@ describe("Dida normalization", () => {
   });
 
   it("rejects invalid task, checklist, focus, and habit-checkin dates", () => {
+    expect(() => normalizeTask({
+      id: "task-column-invalid",
+      projectId: "project-1",
+      title: "Bad column",
+      status: 0,
+      columnId: 7 as unknown as string,
+    })).toThrow(/columnId/);
     expect(() => normalizeTask({
       id: "task-1",
       projectId: "project-1",

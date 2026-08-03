@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DidaTask } from "../src/domain/entities";
 import {
+  buildTaskBoard,
   buildTaskDateRange,
   buildTaskMatrix,
   buildTaskTimeBlocks,
@@ -18,6 +19,28 @@ const task = (value: Partial<DidaTask> & Pick<DidaTask, "id" | "title">): DidaTa
 });
 
 describe("task view projections", () => {
+  it("groups a selected list by remote kanban columns without inventing placement", () => {
+    const project = {
+      id: "project-1",
+      name: "Research",
+      columns: [
+        { id: "done", projectId: "project-1", name: "Done", sortOrder: 20 },
+        { id: "todo", projectId: "project-1", name: "To do", sortOrder: 10 },
+      ],
+    };
+    const board = buildTaskBoard(project, [
+      task({ id: "2", projectId: "project-1", title: "Second", columnId: "todo", sortOrder: 20 }),
+      task({ id: "1", projectId: "project-1", title: "First", columnId: "todo", sortOrder: 10 }),
+      task({ id: "3", projectId: "project-1", title: "Unknown", columnId: "missing" }),
+      task({ id: "other", projectId: "project-2", title: "Other" }),
+    ]);
+    expect(board.map((column) => [column.id, column.tasks.map((item) => item.id)])).toEqual([
+      ["todo", ["1", "2"]],
+      ["done", []],
+      ["unassigned", ["3"]],
+    ]);
+  });
+
   it("builds day, three-day, Monday week, and complete month grids", () => {
     const anchor = new Date(2026, 7, 2, 12);
     expect(buildTaskDateRange("day", anchor).days.map((day) => day.key)).toEqual(["2026-08-02"]);

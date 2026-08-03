@@ -504,11 +504,15 @@ export class HelixService {
     this.patch({ inProgress: data.inProgress });
   }
 
-  async createTask(title: string, projectId: string): Promise<void> {
+  async createTask(
+    title: string,
+    projectId: string,
+    attributes: Partial<Pick<DidaTask, "content" | "tags" | "priority">> = {},
+  ): Promise<void> {
     this.assertWritable();
     const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
     try {
-      await this.createTaskWithAuthorizationLease(title, projectId);
+      await this.createTaskWithAuthorizationLease(title, projectId, attributes);
     } finally {
       releaseAuthorizationLease();
     }
@@ -517,9 +521,13 @@ export class HelixService {
   private async createTaskWithAuthorizationLease(
     title: string,
     projectId: string,
+    attributes: Partial<Pick<DidaTask, "content" | "tags" | "priority">>,
   ): Promise<void> {
     const normalized = title.trim();
     if (!normalized) throw new Error("任务标题不能为空");
+    if (projectId.startsWith("local-project-")) {
+      throw new Error("该清单尚未取得滴答远端 ID，请先在冲突中心完成核对");
+    }
     const now = new Date().toISOString();
     const localId = `local-${crypto.randomUUID()}`;
     const task: DidaTask = {
@@ -527,7 +535,13 @@ export class HelixService {
       projectId,
       title: normalized,
       status: 0,
-      priority: 0,
+      content: attributes.content,
+      tags: attributes.tags
+        ? [...new Set(attributes.tags.map((tag) => tag.trim()).filter(Boolean))].sort(
+            (left, right) => left.localeCompare(right),
+          )
+        : undefined,
+      priority: attributes.priority ?? 0,
     };
     const local = createSnapshot("task", localId, task, { capturedAt: now });
     const operation: SyncQueueOperation<DidaTask> = {
@@ -556,6 +570,55 @@ export class HelixService {
     this.patch({
       tasks: cachedValues<DidaTask>(await this.store.snapshot(), "task"),
     });
+  }
+
+  async createDidaProject(name: string, color?: string): Promise<void> {
+    this.assertWritable();
+    const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
+    try {
+      const normalized = name.trim();
+      if (!normalized) throw new Error("清单名称不能为空");
+      if (this.state.projects.some((project) => project.name === normalized)) {
+        throw new Error("已经存在同名清单");
+      }
+      const normalizedColor = color?.trim();
+      if (normalizedColor && !/^#[0-9a-f]{6}$/iu.test(normalizedColor)) {
+        throw new Error("清单颜色必须为 #RRGGBB");
+      }
+      const now = new Date().toISOString();
+      const localId = `local-project-${crypto.randomUUID()}`;
+      const project: DidaProject = {
+        id: localId,
+        name: normalized,
+        color: normalizedColor || undefined,
+      };
+      const local = createSnapshot("project", localId, project, { capturedAt: now });
+      const operation: SyncQueueOperation<DidaProject> = {
+        id: `op-${crypto.randomUUID()}`,
+        kind: "project",
+        entityId: localId,
+        operation: "create",
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+        status: "pending",
+        idempotencyFingerprint: `project:${normalized}:${now.slice(0, 16)}`,
+        local,
+      };
+      let effectiveOperationId = operation.id;
+      await this.store.mutate((data) => {
+        data.localSnapshots[`project:${localId}`] = local;
+        const queue = new OfflineQueue(data.queue);
+        effectiveOperationId = queue.enqueue(operation);
+        data.queue = queue.list();
+      });
+      this.patch({ projects: [...this.state.projects, project] });
+      await this.drainQueue();
+      await this.throwIfOperationNeedsAttention(effectiveOperationId);
+      this.patch({ projects: cachedValues<DidaProject>(await this.store.snapshot(), "project") });
+    } finally {
+      releaseAuthorizationLease();
+    }
   }
 
   async completeTask(taskId: string): Promise<void> {
@@ -588,6 +651,9 @@ export class HelixService {
   ): Promise<void> {
     if (task.id.startsWith("local-")) {
       throw new Error("该任务尚未完成远端创建核对，暂不能继续修改");
+    }
+    if (task.projectId.startsWith("local-project-")) {
+      throw new Error("目标清单尚未取得滴答远端 ID，请先在冲突中心完成核对");
     }
     const data = await this.store.snapshot();
     const base = data.baseSnapshots[`task:${task.id}`] as

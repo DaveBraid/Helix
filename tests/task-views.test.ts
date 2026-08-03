@@ -176,6 +176,25 @@ describe("task view projections", () => {
       .map((candidate) => candidate.id)).toEqual(["unlinked"]);
   });
 
+  it("searches task titles, notes and checklist item text case-insensitively", () => {
+    const tasks = [
+      task({ id: "title", title: "Read PAPER" }),
+      task({ id: "content", title: "整理", content: "复现实验备注" }),
+      task({ id: "desc", title: "归档", desc: "补充消融结论" }),
+      task({ id: "item", title: "检查清单", items: [{ id: "i", title: "核对图表", status: 0 }] }),
+      task({ id: "miss", title: "无关任务", content: "普通内容" }),
+    ];
+    const context = { anchor: new Date("2026-08-03T04:00:00.000Z") };
+    expect(filterTaskCollection(tasks, { date: "all", query: "paper" }, context)
+      .map(({ id }) => id)).toEqual(["title"]);
+    expect(filterTaskCollection(tasks, { date: "all", query: "实验备注" }, context)
+      .map(({ id }) => id)).toEqual(["content"]);
+    expect(filterTaskCollection(tasks, { date: "all", query: "消融" }, context)
+      .map(({ id }) => id)).toEqual(["desc"]);
+    expect(filterTaskCollection(tasks, { date: "all", query: "图表" }, context)
+      .map(({ id }) => id)).toEqual(["item"]);
+  });
+
   it("treats the seven-day filter as today plus six task-zone calendar days", () => {
     const tasks = [
       task({ id: "today", title: "今天", dueDate: "2026-08-03", isAllDay: true }),

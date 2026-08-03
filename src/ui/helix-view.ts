@@ -40,6 +40,7 @@ import {
   taskScheduleForSubmission,
   type TaskScheduleMode,
 } from "../domain/task-schedule";
+import { parseTaskQuickEntry } from "../domain/task-quick-entry";
 import {
   buildTaskDateRange,
   buildTaskMatrix,
@@ -50,7 +51,6 @@ import {
   type TaskCollectionFilters,
   type TaskDateRange,
   type TaskMatrixRules,
-  type TaskTimeBlockRangeMode,
   type TaskViewMode,
 } from "../domain/task-views";
 import type { HelixRuntimeState } from "../services/helix-service";
@@ -149,8 +149,9 @@ export class HelixView extends ItemView {
   private taskFilter: "all" | "open" | "in-progress" | "completed" = "open";
   private taskViewMode: TaskViewMode = "list";
   private taskViewDate = new Date();
-  private taskTimeBlockRangeMode: TaskTimeBlockRangeMode = "day";
   private taskCollectionFilters: TaskCollectionFilters = { date: "all" };
+  private advancedTaskFiltersExpanded = false;
+  private taskSearchTimer: number | null = null;
   private selectedProjectId: string | null | undefined;
   private projectLineageMode: ProjectLineageViewMode = "graph";
   private projectWorkbench: ProjectLineageWorkbench | null = null;
@@ -163,6 +164,7 @@ export class HelixView extends ItemView {
   private renderToken = 0;
   private heatmapMetric: HeatmapMetric = "tasks";
   private heatmapMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  private previewProjects = SAMPLE_PROJECTS.map((project) => ({ ...project }));
   private previewTasks = SAMPLE_TASKS.map((task) => ({ ...task }));
   private previewInProgress = new Set(SAMPLE_TASKS.map((task) => task.id));
   private state: HelixRuntimeState | null = null;
@@ -226,6 +228,10 @@ export class HelixView extends ItemView {
     this.viewGeneration += 1;
     this.renderToken += 1;
     this.unsubscribe?.();
+    if (this.taskSearchTimer !== null) {
+      window.clearTimeout(this.taskSearchTimer);
+      this.taskSearchTimer = null;
+    }
     this.lineageFocusRequest = null;
     this.lineageCamera = undefined;
     this.projectWorkbench?.destroy();
@@ -282,22 +288,63 @@ export class HelixView extends ItemView {
       });
     }
     const sidebarProjects = this.state?.demoMode
-      ? SAMPLE_PROJECTS
+      ? this.previewProjects
       : (this.state?.projects ?? []);
-    const projectSection = sidebar.createDiv({ cls: "helix-sidebar-projects" });
-    const projectHeading = projectSection.createDiv({ cls: "helix-sidebar-projects-head" });
-    projectHeading.createSpan({ text: "我的项目" });
-    projectHeading.createSpan({ text: String(sidebarProjects.length) });
-    for (const project of sidebarProjects.slice(0, 5)) {
+    const sidebarTasks = this.state?.demoMode ? this.previewTasks : (this.state?.tasks ?? []);
+    const projectSection = sidebar.createDiv({ cls: "helix-sidebar-lists" });
+    const projectHeading = projectSection.createDiv({ cls: "helix-sidebar-lists-head" });
+    projectHeading.createSpan({ text: "清单" });
+    const listHeadActions = projectHeading.createDiv({ cls: "helix-sidebar-lists-actions" });
+    listHeadActions.createSpan({ text: String(sidebarProjects.length) });
+    if (this.state?.connected || this.state?.demoMode) {
+      const addList = listHeadActions.createEl("button", { attr: { "aria-label": "创建清单" } });
+      setIcon(addList, "plus");
+      addList.addEventListener("click", () => this.openCreateDidaProjectModal());
+    }
+    const allLists = projectSection.createEl("button", {
+      cls: `helix-sidebar-list${this.section === "tasks" && !this.taskCollectionFilters.didaProjectId ? " is-active" : ""}`,
+      attr: {
+        "aria-label": "显示全部清单中的任务",
+        "aria-pressed": String(this.section === "tasks" && !this.taskCollectionFilters.didaProjectId),
+      },
+    });
+    const allIcon = allLists.createSpan({ cls: "helix-sidebar-list-icon" });
+    setIcon(allIcon, "inbox");
+    allLists.createSpan({ cls: "helix-sidebar-list-name", text: "全部任务" });
+    allLists.createSpan({
+      cls: "helix-sidebar-list-count",
+      text: String(sidebarTasks.filter((task) => task.status !== 2).length),
+    });
+    allLists.addEventListener("click", () => {
+      this.section = "tasks";
+      this.taskCollectionFilters.didaProjectId = undefined;
+      void this.render();
+    });
+    for (const project of sidebarProjects) {
       const button = projectSection.createEl("button", {
-        cls: "helix-sidebar-project",
-        attr: { "aria-label": `打开项目 ${project.name}` },
+        cls: `helix-sidebar-list${this.section === "tasks" && this.taskCollectionFilters.didaProjectId === project.id ? " is-active" : ""}`,
+        attr: {
+          "aria-label": project.id.startsWith("local-project-")
+            ? `筛选待核对清单 ${project.name}`
+            : `筛选清单 ${project.name}`,
+          "aria-pressed": String(
+            this.section === "tasks" && this.taskCollectionFilters.didaProjectId === project.id,
+          ),
+        },
       });
       const dot = button.createSpan({ cls: "helix-project-dot" });
       dot.style.backgroundColor = project.color ?? "#5268d4";
-      button.createSpan({ text: project.name });
+      button.createSpan({ cls: "helix-sidebar-list-name", text: project.name });
+      if (project.id.startsWith("local-project-")) {
+        button.createSpan({ cls: "helix-sidebar-list-pending", text: "待核对" });
+      }
+      button.createSpan({
+        cls: "helix-sidebar-list-count",
+        text: String(sidebarTasks.filter((task) => task.projectId === project.id && task.status !== 2).length),
+      });
       button.addEventListener("click", () => {
-        this.section = "projects";
+        this.section = "tasks";
+        this.taskCollectionFilters.didaProjectId = project.id;
         void this.render();
       });
     }
@@ -341,6 +388,31 @@ export class HelixView extends ItemView {
     sync.addEventListener("click", () => {
       void this.service.sync().catch((error) => this.service.notifySyncError(error));
     });
+  }
+
+  private openCreateDidaProjectModal(): void {
+    new DidaProjectCreateModal(this.app, async (name, color) => {
+      if (this.state?.demoMode) {
+        if (this.previewProjects.some((project) => project.name === name)) {
+          throw new Error("已经存在同名清单");
+        }
+        const project: DidaProject = {
+          id: `sample-project-${crypto.randomUUID()}`,
+          name,
+          color,
+        };
+        this.previewProjects = [...this.previewProjects, project];
+        this.section = "tasks";
+        this.taskCollectionFilters.didaProjectId = project.id;
+        await this.render();
+        return;
+      }
+      await this.service.createDidaProject(name, color);
+      const project = this.service.snapshot().projects.find((candidate) => candidate.name === name);
+      this.section = "tasks";
+      this.taskCollectionFilters.didaProjectId = project?.id;
+      await this.render();
+    }).open();
   }
 
   private async renderToday(content: HTMLElement, token: number): Promise<void> {
@@ -824,85 +896,137 @@ export class HelixView extends ItemView {
     await this.refreshTaskReferenceSnapshot(token);
     if (token !== this.renderToken) return;
     const { tasks, projects } = this.displayState();
+    const writableProjects = projects.filter((project) => !project.id.startsWith("local-project-"));
     this.renderPageTitle(content, "任务总览");
     this.renderTaskReferenceDiagnostics(content, tasks);
-    const canCompose = projects.length > 0 &&
+    const canCompose = writableProjects.length > 0 &&
       (this.state?.connected || this.state?.demoMode);
     if (canCompose) {
       const composer = content.createDiv({ cls: "helix-card helix-task-composer" });
       const input = composer.createEl("input", {
         type: "text",
-        placeholder: this.state?.demoMode ? "新建预览任务…" : "新建滴答任务…",
+        placeholder: this.state?.demoMode ? "新建演示任务…" : "新建任务…",
         attr: { "aria-label": "任务标题" },
       });
       const select = composer.createEl("select", { attr: { "aria-label": "滴答清单" } });
-      for (const project of projects) {
+      for (const project of writableProjects) {
         select.createEl("option", { text: project.name, value: project.id });
+      }
+      if (this.taskCollectionFilters.didaProjectId &&
+        writableProjects.some((project) => project.id === this.taskCollectionFilters.didaProjectId)) {
+        select.value = this.taskCollectionFilters.didaProjectId;
       }
       const submit = composer.createEl("button", {
         cls: "helix-primary-button",
-        text: this.state?.demoMode ? "添加" : "加入同步队列",
+        text: this.state?.demoMode ? "添加演示任务" : "创建任务",
       });
+      const preview = composer.createDiv({ cls: "helix-task-quick-preview" });
+      let parsingEnabled = true;
+      let writing = false;
+      const quickResult = () => parsingEnabled
+        ? parseTaskQuickEntry(input.value, writableProjects)
+        : {
+          title: input.value.trim(),
+          projectId: undefined,
+          tags: [],
+          priority: undefined,
+          issues: [],
+        };
+      const renderQuickPreview = (): void => {
+        preview.empty();
+        const parsed = quickResult();
+        submit.disabled = writing || parsed.issues.length > 0;
+        if (!input.value.trim()) return;
+        if (!parsingEnabled) {
+          preview.addClass("is-disabled");
+          preview.createSpan({ text: "快捷属性解析已撤销，本次按普通标题创建" });
+          const restore = preview.createEl("button", { text: "重新解析" });
+          restore.addEventListener("click", () => {
+            parsingEnabled = true;
+            renderQuickPreview();
+          });
+          return;
+        }
+        preview.removeClass("is-disabled");
+        const changed = parsed.title !== input.value.trim() || parsed.issues.length > 0;
+        if (!changed) return;
+        if (parsed.title) preview.createSpan({ cls: "helix-task-quick-title", text: `标题：${parsed.title}` });
+        if (parsed.projectId) {
+          const project = writableProjects.find((candidate) => candidate.id === parsed.projectId);
+          preview.createSpan({ cls: "helix-chip is-soft", text: `清单：${project?.name ?? parsed.projectId}` });
+        }
+        for (const tag of parsed.tags) {
+          preview.createSpan({ cls: "helix-chip is-soft", text: `#${tag}` });
+        }
+        if (parsed.priority !== undefined) {
+          preview.createSpan({
+            cls: "helix-chip is-soft",
+            text: `优先级：${taskPriorityLabel(parsed.priority)}`,
+          });
+        }
+        for (const issue of parsed.issues) {
+          preview.createSpan({ cls: "helix-task-quick-issue", text: issue });
+        }
+        const undo = preview.createEl("button", {
+          text: parsed.issues.length > 0 ? "按普通标题处理" : "撤销解析",
+        });
+        undo.addEventListener("click", () => {
+          parsingEnabled = false;
+          renderQuickPreview();
+        });
+      };
       const create = (): void => {
-        const title = input.value.trim();
+        const parsed = quickResult();
+        if (parsed.issues.length > 0) {
+          new Notice(parsed.issues.join("；"));
+          return;
+        }
+        const title = parsed.title;
         if (!title) {
           new Notice("任务标题不能为空");
           return;
         }
+        const targetProjectId = parsed.projectId ?? select.value;
         if (this.state?.demoMode) {
           this.previewTasks = [
             ...this.previewTasks,
             {
               id: `sample-${crypto.randomUUID()}`,
-              projectId: select.value,
+              projectId: targetProjectId,
               title,
               status: 0,
-              priority: 0,
+              priority: parsed.priority ?? 0,
+              tags: parsed.tags,
             },
           ];
           input.value = "";
           void this.render();
           return;
         }
+        writing = true;
         submit.disabled = true;
-        void this.service.createTask(title, select.value)
+        void this.service.createTask(title, targetProjectId, {
+          priority: parsed.priority,
+          tags: parsed.tags,
+        })
           .then(() => {
             input.value = "";
             new Notice("任务已安全写入同步队列");
           })
           .catch((error) => new Notice(error instanceof Error ? error.message : String(error), 8_000))
           .finally(() => {
+            writing = false;
             submit.disabled = false;
             void this.render();
           });
       };
       submit.addEventListener("click", create);
+      input.addEventListener("input", renderQuickPreview);
       input.addEventListener("keydown", (event) => {
         if (event.key === "Enter") create();
       });
     }
-    const filters = content.createDiv({ cls: "helix-filter-row" });
-    const filterItems = [
-      ["all", "全部"],
-      ["open", "待完成"],
-      ["in-progress", "进行中"],
-      ["completed", "已完成"],
-    ] as const;
-    for (const [id, label] of filterItems) {
-      const button = filters.createEl("button", {
-        text: label,
-        cls: this.taskFilter === id ? "is-active" : "",
-        attr: {
-          id: `helix-task-status-filter-${id}`,
-          "aria-pressed": String(this.taskFilter === id),
-        },
-      });
-      button.addEventListener("click", () => {
-        this.taskFilter = id;
-        this.renderAndRestoreFocus(`helix-task-status-filter-${id}`);
-      });
-    }
-    this.renderTaskCollectionFilters(content, tasks, projects);
+    this.renderTaskFilterToolbar(content, tasks, projects);
     this.renderTaskViewToolbar(content);
     const helixProjectByTaskId = new Map(
       (this.taskReferenceSnapshot?.references ?? []).map((reference) => [
@@ -924,8 +1048,6 @@ export class HelixView extends ItemView {
     });
     if (this.taskViewMode === "matrix") {
       this.renderTaskMatrix(panel, visibleTasks, projects);
-    } else if (this.taskViewMode === "time-block") {
-      this.renderTaskTimeBlockView(panel, visibleTasks, projects);
     } else if (this.taskViewMode === "year") {
       this.renderTaskYearView(panel, visibleTasks);
     } else if (this.taskViewMode === "list") {
@@ -939,12 +1061,11 @@ export class HelixView extends ItemView {
     }
   }
 
-  private renderTaskCollectionFilters(
+  private renderTaskFilterToolbar(
     content: HTMLElement,
     tasks: DidaTask[],
     didaProjects: DidaProject[],
   ): void {
-    const bar = content.createDiv({ cls: "helix-task-filter-bar" });
     const linkedProjects = [...new Map(
       (this.taskReferenceSnapshot?.references ?? [])
         .filter((reference) => reference.project)
@@ -967,11 +1088,74 @@ export class HelixView extends ItemView {
     if (this.taskCollectionFilters.tag && !availableTags.has(this.taskCollectionFilters.tag)) {
       this.taskCollectionFilters.tag = undefined;
     }
-    this.renderTaskFilterSelect(bar, "helix-task-filter-dida", "滴答清单", this.taskCollectionFilters.didaProjectId ?? "", [
-      ["", "全部清单"],
-      ...didaProjects.map((project): [string, string] => [project.id, project.name]),
-    ], (value) => {
-      this.taskCollectionFilters.didaProjectId = value || undefined;
+    const toolbar = content.createDiv({ cls: "helix-task-filter-toolbar" });
+    const statuses = toolbar.createDiv({ cls: "helix-filter-row", attr: { role: "group", "aria-label": "任务状态" } });
+    for (const [id, label] of [
+      ["all", "全部"],
+      ["open", "待完成"],
+      ["in-progress", "进行中"],
+      ["completed", "已完成"],
+    ] as const) {
+      const button = statuses.createEl("button", {
+        text: label,
+        cls: this.taskFilter === id ? "is-active" : "",
+        attr: {
+          id: `helix-task-status-filter-${id}`,
+          "aria-pressed": String(this.taskFilter === id),
+        },
+      });
+      button.addEventListener("click", () => {
+        this.taskFilter = id;
+        this.renderAndRestoreFocus(`helix-task-status-filter-${id}`);
+      });
+    }
+    const searchWrap = toolbar.createDiv({ cls: "helix-task-search" });
+    const searchIcon = searchWrap.createSpan();
+    setIcon(searchIcon, "search");
+    const search = searchWrap.createEl("input", {
+      type: "search",
+      value: this.taskCollectionFilters.query ?? "",
+      placeholder: "搜索任务和备注",
+      attr: { id: "helix-task-search", "aria-label": "搜索任务标题、备注和检查项" },
+    });
+    let composing = false;
+    search.addEventListener("compositionstart", () => { composing = true; });
+    search.addEventListener("compositionend", () => {
+      composing = false;
+      this.taskCollectionFilters.query = search.value || undefined;
+      this.scheduleTaskSearchRender();
+    });
+    search.addEventListener("input", () => {
+      this.taskCollectionFilters.query = search.value || undefined;
+      if (!composing) this.scheduleTaskSearchRender();
+    });
+    search.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !search.value) return;
+      event.preventDefault();
+      this.taskCollectionFilters.query = undefined;
+      this.renderAndRestoreFocus("helix-task-search");
+    });
+    const advancedCount = this.taskAdvancedFilterCount();
+    const advanced = toolbar.createEl("button", {
+      cls: `helix-task-advanced-toggle${this.advancedTaskFiltersExpanded ? " is-active" : ""}`,
+      attr: {
+        id: "helix-task-advanced-toggle",
+        "aria-expanded": String(this.advancedTaskFiltersExpanded),
+        "aria-controls": "helix-task-advanced-filters",
+      },
+    });
+    const advancedIcon = advanced.createSpan();
+    setIcon(advancedIcon, "sliders-horizontal");
+    advanced.createSpan({ text: "高级筛选" });
+    if (advancedCount > 0) advanced.createSpan({ cls: "helix-task-filter-count", text: String(advancedCount) });
+    advanced.addEventListener("click", () => {
+      this.advancedTaskFiltersExpanded = !this.advancedTaskFiltersExpanded;
+      this.renderAndRestoreFocus("helix-task-advanced-toggle");
+    });
+    if (!this.advancedTaskFiltersExpanded) return;
+    const bar = content.createDiv({
+      cls: "helix-task-filter-bar",
+      attr: { id: "helix-task-advanced-filters" },
     });
     this.renderTaskFilterSelect(bar, "helix-task-filter-helix", "Helix 项目", this.taskCollectionFilters.helixProjectId ?? "", [
       ["", "全部项目"],
@@ -1006,20 +1190,32 @@ export class HelixView extends ItemView {
     ], (value) => {
       this.taskCollectionFilters.date = value as TaskCollectionFilters["date"];
     });
-    const hasFilters = Boolean(
-      this.taskCollectionFilters.didaProjectId ||
-      this.taskCollectionFilters.helixProjectId ||
-      this.taskCollectionFilters.tag ||
-      this.taskCollectionFilters.priority !== undefined ||
-      this.taskCollectionFilters.date !== "all",
-    );
-    if (hasFilters) {
-      const clear = bar.createEl("button", { cls: "helix-task-filter-clear", text: "清除筛选" });
+    if (advancedCount > 0) {
+      const clear = bar.createEl("button", { cls: "helix-task-filter-clear", text: "清除高级筛选" });
       clear.addEventListener("click", () => {
-        this.taskCollectionFilters = { date: "all" };
-        this.renderAndRestoreFocus("helix-task-filter-dida");
+        this.taskCollectionFilters = {
+          didaProjectId: this.taskCollectionFilters.didaProjectId,
+          query: this.taskCollectionFilters.query,
+          date: "all",
+        };
+        this.renderAndRestoreFocus("helix-task-advanced-toggle");
       });
     }
+  }
+
+  private taskAdvancedFilterCount(): number {
+    return Number(Boolean(this.taskCollectionFilters.helixProjectId)) +
+      Number(Boolean(this.taskCollectionFilters.tag)) +
+      Number(this.taskCollectionFilters.priority !== undefined) +
+      Number(this.taskCollectionFilters.date !== "all");
+  }
+
+  private scheduleTaskSearchRender(): void {
+    if (this.taskSearchTimer !== null) window.clearTimeout(this.taskSearchTimer);
+    this.taskSearchTimer = window.setTimeout(() => {
+      this.taskSearchTimer = null;
+      this.renderAndRestoreFocus("helix-task-search");
+    }, 160);
   }
 
   private renderTaskFilterSelect(
@@ -1045,7 +1241,11 @@ export class HelixView extends ItemView {
 
   private renderAndRestoreFocus(id: string): void {
     void this.render().then(() => {
-      this.containerEl.querySelector<HTMLElement>(`#${id}`)?.focus();
+      const element = this.containerEl.querySelector<HTMLElement>(`#${id}`);
+      element?.focus();
+      if (element instanceof HTMLInputElement) {
+        element.setSelectionRange(element.value.length, element.value.length);
+      }
     });
   }
 
@@ -1057,7 +1257,6 @@ export class HelixView extends ItemView {
       { id: "three-day", label: "3 日" },
       { id: "week", label: "周" },
       { id: "month", label: "月" },
-      { id: "time-block", label: "时间块" },
       { id: "year", label: "年" },
       { id: "matrix", label: "四象限" },
     ];
@@ -1116,12 +1315,6 @@ export class HelixView extends ItemView {
     const next = new Date(this.taskViewDate);
     if (this.taskViewMode === "year") next.setFullYear(next.getFullYear() + direction, 0, 1);
     else if (this.taskViewMode === "month") next.setMonth(next.getMonth() + direction, 1);
-    else if (this.taskViewMode === "time-block") {
-      const amount = this.taskTimeBlockRangeMode === "week"
-        ? 7
-        : this.taskTimeBlockRangeMode === "three-day" ? 3 : 1;
-      next.setDate(next.getDate() + direction * amount);
-    }
     else if (this.taskViewMode === "week") next.setDate(next.getDate() + direction * 7);
     else if (this.taskViewMode === "three-day") next.setDate(next.getDate() + direction * 3);
     else next.setDate(next.getDate() + direction);
@@ -1135,19 +1328,21 @@ export class HelixView extends ItemView {
     projects: DidaProject[],
     mode: Extract<TaskViewMode, "day" | "three-day" | "week" | "month">,
   ): void {
+    if (mode === "day" || mode === "three-day") {
+      this.renderTaskTimeGrid(content, tasks, projects, mode);
+      return;
+    }
     const range = buildTaskDateRange(mode, this.taskViewDate);
-    const grouped = groupTasksByViewDay(tasks, range);
+    const grouped = mode === "week" ? groupTasksByViewDay(tasks, range) : undefined;
+    const timeBlocks = mode === "month" ? buildTaskTimeBlocks(tasks, range) : undefined;
     const card = content.createDiv({ cls: `helix-card helix-task-calendar is-${mode}` });
     card.createDiv({
       cls: "helix-task-calendar-range",
       text: taskRangeLabel(range, mode, this.taskViewDate),
     });
-    if (mode !== "day") {
-      const weekdays = card.createDiv({ cls: "helix-task-calendar-weekdays" });
-      const labels = mode === "three-day"
-        ? range.days.map((day) => weekdayLabel(day.date))
-        : ["一", "二", "三", "四", "五", "六", "日"];
-      for (const label of labels) weekdays.createDiv({ text: label });
+    const weekdays = card.createDiv({ cls: "helix-task-calendar-weekdays" });
+    for (const label of ["一", "二", "三", "四", "五", "六", "日"]) {
+      weekdays.createDiv({ text: label });
     }
     const grid = card.createDiv({ cls: "helix-task-calendar-grid" });
     for (const day of range.days) {
@@ -1157,18 +1352,24 @@ export class HelixView extends ItemView {
       });
       const header = cell.createDiv({ cls: "helix-task-calendar-day-head" });
       header.createEl("strong", {
-        text: mode === "day" ? longDateLabel(day.date) : String(day.date.getDate()),
+        text: String(day.date.getDate()),
       });
-      const dayTasks = grouped.get(day.key) ?? [];
-      header.createSpan({ text: dayTasks.length > 0 ? String(dayTasks.length) : "" });
+      const dayEntries = timeBlocks
+        ? (timeBlocks.get(day.key) ?? []).map((block) => ({
+          task: block.task,
+          timeLabel: block.allDay ? undefined : minuteLabel(block.startMinute),
+        }))
+        : (grouped?.get(day.key) ?? []).map((task) => ({ task, timeLabel: undefined }));
+      header.createSpan({ text: dayEntries.length > 0 ? String(dayEntries.length) : "" });
       const list = cell.createDiv({ cls: "helix-task-calendar-items" });
-      for (const task of dayTasks) {
+      for (const entry of dayEntries) {
         this.renderTaskCalendarChip(
           list,
-          task,
-          projects.find((project) => project.id === task.projectId),
+          entry.task,
+          projects.find((project) => project.id === entry.task.projectId),
           mode === "month",
           day.key,
+          entry.timeLabel,
         );
       }
     }
@@ -1180,16 +1381,19 @@ export class HelixView extends ItemView {
     project: DidaProject | undefined,
     compact: boolean,
     dayKey: string,
+    timeLabel?: string,
   ): void {
     const chip = parent.createEl("button", {
       cls: `helix-task-calendar-chip${task.status === 2 ? " is-completed" : ""}` +
-        `${task.isAllDay ? " is-all-day" : ""}${compact ? " is-compact" : ""}`,
+        `${task.isAllDay && timeLabel === undefined ? " is-all-day" : ""}${compact ? " is-compact" : ""}`,
       attr: { "aria-label": `编辑任务：${task.title}，${dayKey}` },
     });
     const dot = chip.createSpan({ cls: "helix-project-dot" });
     dot.style.backgroundColor = project?.color ?? "#8891a7";
     chip.createSpan({ cls: "helix-task-calendar-chip-title", text: task.title });
-    if (!compact && !task.isAllDay && (task.startDate || task.dueDate)) {
+    if (timeLabel !== undefined) {
+      chip.createSpan({ cls: "helix-task-calendar-chip-time", text: timeLabel });
+    } else if (!compact && !task.isAllDay && (task.startDate || task.dueDate)) {
       chip.createSpan({
         cls: "helix-task-calendar-chip-time",
         text: formatHour(task.startDate ?? task.dueDate!, task.timeZone),
@@ -1208,7 +1412,7 @@ export class HelixView extends ItemView {
     new TaskEditModal(
       this.app,
       task,
-      SAMPLE_PROJECTS,
+      this.previewProjects,
       [],
       undefined,
       [],
@@ -1225,33 +1429,19 @@ export class HelixView extends ItemView {
     ).open();
   }
 
-  private renderTaskTimeBlockView(
+  private renderTaskTimeGrid(
     content: HTMLElement,
     tasks: DidaTask[],
     projects: DidaProject[],
+    mode: Extract<TaskViewMode, "day" | "three-day">,
   ): void {
-    const range = buildTaskDateRange(this.taskTimeBlockRangeMode, this.taskViewDate);
+    const range = buildTaskDateRange(mode, this.taskViewDate);
     const blocks = buildTaskTimeBlocks(tasks, range);
-    const card = content.createDiv({ cls: "helix-card helix-task-time-block" });
+    const card = content.createDiv({ cls: `helix-card helix-task-time-block is-${mode}` });
     const heading = card.createDiv({ cls: "helix-task-time-block-heading" });
     heading.createEl("strong", {
-      text: taskRangeLabel(range, this.taskTimeBlockRangeMode, this.taskViewDate),
+      text: taskRangeLabel(range, mode, this.taskViewDate),
     });
-    const scale = heading.createDiv({ cls: "helix-task-time-scale", attr: { role: "group", "aria-label": "时间块范围" } });
-    for (const [mode, label] of [["day", "日"], ["three-day", "3 日"], ["week", "周"]] as const) {
-      const button = scale.createEl("button", {
-        text: label,
-        cls: this.taskTimeBlockRangeMode === mode ? "is-active" : "",
-        attr: {
-          id: `helix-task-time-scale-${mode}`,
-          "aria-pressed": String(this.taskTimeBlockRangeMode === mode),
-        },
-      });
-      button.addEventListener("click", () => {
-        this.taskTimeBlockRangeMode = mode;
-        this.renderAndRestoreFocus(`helix-task-time-scale-${mode}`);
-      });
-    }
     const frame = card.createDiv({ cls: "helix-task-time-frame" });
     const allDayGrid = frame.createDiv({ cls: "helix-task-time-all-day" });
     allDayGrid.style.setProperty("--helix-time-days", String(range.days.length));
@@ -2418,7 +2608,7 @@ export class HelixView extends ItemView {
   }
 
   private displayState(): { projects: DidaProject[]; tasks: DidaTask[] } {
-    const projects = this.state?.demoMode ? SAMPLE_PROJECTS : this.state?.projects ?? [];
+    const projects = this.state?.demoMode ? this.previewProjects : this.state?.projects ?? [];
     const tasks = this.state?.demoMode ? this.previewTasks : this.state?.tasks ?? [];
     return { projects, tasks };
   }
@@ -2968,6 +3158,59 @@ class TaskReferenceRemovalModal extends Modal {
   }
 }
 
+class DidaProjectCreateModal extends Modal {
+  private name = "";
+  private color = "#5268d4";
+
+  constructor(
+    app: HelixView["app"],
+    private readonly submit: (name: string, color: string) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("创建滴答清单");
+    new Setting(this.contentEl)
+      .setName("清单名称")
+      .addText((text) => text.setPlaceholder("例如：论文实验").onChange((value) => {
+        this.name = value;
+      }));
+    new Setting(this.contentEl)
+      .setName("清单颜色")
+      .addText((text) => {
+        text.inputEl.type = "color";
+        text.setValue(this.color).onChange((value) => {
+          this.color = value;
+        });
+      });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const create = actions.createEl("button", { cls: "mod-cta", text: "创建清单" });
+    create.addEventListener("click", () => {
+      const name = this.name.trim();
+      if (!name) {
+        new Notice("清单名称不能为空");
+        return;
+      }
+      create.disabled = true;
+      void this.submit(name, this.color)
+        .then(() => {
+          new Notice("清单已创建");
+          this.close();
+        })
+        .catch((error) => {
+          create.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 class TaskEditModal extends Modal {
   private title: string;
   private didaProjectId: string;
@@ -2977,6 +3220,7 @@ class TaskEditModal extends Modal {
   private isAllDay: boolean;
   private timeZone: string;
   private priority: number;
+  private tags: string[];
   private helixProjectId: string;
   private readonly helixStageIds: Set<string>;
   private stageChoicesEl: HTMLElement | null = null;
@@ -3007,22 +3251,61 @@ class TaskEditModal extends Modal {
     this.dueDate = instantToWallDateTime(task.dueDate, this.timeZone);
     this.isAllDay = task.isAllDay ?? false;
     this.priority = task.priority ?? 0;
+    this.tags = [...(task.tags ?? [])];
     this.currentReference = reference;
     this.helixProjectId = reference?.projectId ?? "";
     this.helixStageIds = new Set(reference?.stageIds ?? []);
   }
 
   onOpen(): void {
-    this.setTitle(this.preview ? "编辑预览任务" : "编辑任务");
+    this.setTitle(this.preview ? "编辑演示任务" : "编辑任务");
     this.contentEl.addClass("helix-task-edit-modal");
     this.contentEl.createEl("h3", { text: "滴答任务" });
+    let titleInputEl: HTMLInputElement | undefined;
+    let projectSelectEl: HTMLSelectElement | undefined;
+    let prioritySelectEl: HTMLSelectElement | undefined;
+    let tagsInputEl: HTMLInputElement | undefined;
     new Setting(this.contentEl)
       .setName("任务标题")
-      .addText((text) =>
+      .addText((text) => {
+        titleInputEl = text.inputEl;
         text.setValue(this.title).onChange((value) => {
           this.title = value;
-        }),
-      );
+        });
+      });
+    let quickEntry = "";
+    let quickEntryEl: HTMLInputElement | undefined;
+    const writableDidaProjects = this.didaProjects.filter((project) =>
+      !project.id.startsWith("local-project-"));
+    new Setting(this.contentEl)
+      .setName("快捷属性")
+      .setDesc("输入 ~清单、#标签、!高／!中／!低／!无；只解析明确匹配的属性。")
+      .addText((text) => {
+        quickEntryEl = text.inputEl;
+        text.setPlaceholder("例如：~科研 #实验 !高").onChange((value) => {
+          quickEntry = value;
+        });
+      })
+      .addButton((button) => button.setButtonText("应用").onClick(() => {
+        const parsed = parseTaskQuickEntry(quickEntry, writableDidaProjects);
+        if (parsed.issues.length > 0) {
+          new Notice(parsed.issues.join("；"));
+          return;
+        }
+        if (parsed.title) {
+          new Notice("快捷属性栏只接受 ~、#、! 属性，请把普通文字写入任务标题");
+          return;
+        }
+        if (parsed.projectId) this.didaProjectId = parsed.projectId;
+        if (parsed.priority !== undefined) this.priority = parsed.priority;
+        this.tags = [...new Set([...this.tags, ...parsed.tags])];
+        if (projectSelectEl) projectSelectEl.value = this.didaProjectId;
+        if (prioritySelectEl) prioritySelectEl.value = String(this.priority);
+        if (tagsInputEl) tagsInputEl.value = this.tags.join(" ");
+        if (titleInputEl) titleInputEl.value = this.title;
+        if (quickEntryEl) quickEntryEl.value = "";
+        quickEntry = "";
+      }));
     new Setting(this.contentEl)
       .setName("内容")
       .addTextArea((text) =>
@@ -3033,11 +3316,21 @@ class TaskEditModal extends Modal {
     new Setting(this.contentEl)
       .setName("滴答清单")
       .addDropdown((dropdown) => {
-        for (const project of this.didaProjects) {
+        projectSelectEl = dropdown.selectEl;
+        for (const project of writableDidaProjects) {
           dropdown.addOption(project.id, project.name);
         }
-        if (!this.didaProjects.some((project) => project.id === this.didaProjectId)) {
-          dropdown.addOption(this.didaProjectId, "当前清单");
+        if (!writableDidaProjects.some((project) => project.id === this.didaProjectId)) {
+          const pending = this.didaProjectId.startsWith("local-project-");
+          dropdown.addOption(
+            this.didaProjectId,
+            pending ? "当前待核对清单（不可移动）" : "当前清单",
+          );
+          if (pending) {
+            dropdown.selectEl.querySelector<HTMLOptionElement>(
+              `option[value="${CSS.escape(this.didaProjectId)}"]`,
+            )?.setAttribute("disabled", "true");
+          }
         }
         dropdown.setValue(this.didaProjectId).onChange((value) => {
           this.didaProjectId = value;
@@ -3105,8 +3398,18 @@ class TaskEditModal extends Modal {
         });
       });
     new Setting(this.contentEl)
+      .setName("标签")
+      .setDesc("多个标签使用空格或逗号分隔。")
+      .addText((text) => {
+        tagsInputEl = text.inputEl;
+        text.setValue(this.tags.join(" ")).onChange((value) => {
+          this.tags = [...new Set(value.split(/[\s,，]+/u).map((tag) => tag.trim()).filter(Boolean))];
+        });
+      });
+    new Setting(this.contentEl)
       .setName("优先级")
       .addDropdown((dropdown) => {
+        prioritySelectEl = dropdown.selectEl;
         dropdown
           .addOption("0", "无")
           .addOption("1", "低")
@@ -3122,7 +3425,7 @@ class TaskEditModal extends Modal {
     });
     const saveTask = taskActions.createEl("button", {
       cls: "mod-cta",
-      text: this.preview ? "保存预览" : "保存滴答任务",
+      text: this.preview ? "保存演示任务" : "保存滴答任务",
     });
     saveTask.addEventListener("click", () => {
       const title = this.title.trim();
@@ -3162,9 +3465,10 @@ class TaskEditModal extends Modal {
         content: this.content,
         ...schedule,
         priority: this.priority,
+        tags: this.tags,
       })
         .then(() => {
-          new Notice(this.preview ? "预览任务已保存" : "滴答任务已加入同步队列");
+          new Notice(this.preview ? "演示任务已保存" : "滴答任务已加入同步队列");
           this.close();
         })
         .catch((error) => {
@@ -3408,6 +3712,10 @@ function challengeMetricLabel(metric: ChallengeDefinition["metric"]): string {
     reviews: "关闭复盘数",
     "active-days": "活跃天数",
   }[metric];
+}
+
+function taskPriorityLabel(priority: 0 | 1 | 3 | 5): string {
+  return { 0: "无", 1: "低", 3: "中", 5: "高" }[priority];
 }
 
 function formatDateTime(value: string): string {

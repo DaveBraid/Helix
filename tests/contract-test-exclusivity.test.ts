@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { App } from "obsidian";
 import type { DidaApi } from "../src/integrations/dida/api";
-import type { DidaTask } from "../src/domain/entities";
+import type { DidaProject, DidaTask } from "../src/domain/entities";
 import { HelixService } from "../src/services/helix-service";
 import { HelixDataStore, type PluginDataPort } from "../src/storage/data-store";
 import { createDefaultData } from "../src/storage/model";
@@ -10,6 +10,119 @@ import { createSnapshot } from "../src/sync/snapshots";
 import type { SyncQueueOperation } from "../src/sync/types";
 
 describe("HelixService contract-test exclusivity", () => {
+  it("preserves quick-entry task attributes through the normal create queue", async () => {
+    const { service } = await serviceFixture();
+    const api = serviceApi(service);
+    let created: DidaTask | undefined;
+    api.createTask = async (value) => {
+      created = { ...value, id: "remote-quick", status: 0 } as DidaTask;
+      return created;
+    };
+    api.getTask = async () => created!;
+
+    await service.createTask("快速任务", "project-a", {
+      priority: 5,
+      tags: ["科研", "科研", "实验"],
+    });
+    expect(created).toMatchObject({
+      title: "快速任务",
+      projectId: "project-a",
+      priority: 5,
+      tags: ["实验", "科研"],
+    });
+    expect(service.snapshot().tasks.find((task) => task.id === "remote-quick"))
+      .toMatchObject({ priority: 5, tags: ["实验", "科研"] });
+  });
+
+  it("creates a list through the project queue and rejects a duplicate name", async () => {
+    const { service } = await serviceFixture();
+    const api = serviceApi(service);
+    let created: DidaProject | undefined;
+    let createCalls = 0;
+    api.createProject = async (value) => {
+      createCalls += 1;
+      created = { ...value, id: "remote-list" } as DidaProject;
+      return created;
+    };
+    api.getProject = async () => created!;
+
+    await service.createDidaProject("论文实验", "#5268d4");
+    expect(service.snapshot().projects.find((project) => project.id === "remote-list"))
+      .toMatchObject({
+      id: "remote-list",
+      name: "论文实验",
+      color: "#5268d4",
+      });
+    await expect(service.createDidaProject("论文实验", "#5268d4"))
+      .rejects.toThrow(/同名清单/);
+    expect(createCalls).toBe(1);
+  });
+
+  it("rejects an invalid list color before enqueueing a remote write", async () => {
+    const { service } = await serviceFixture();
+    const api = serviceApi(service);
+    let createCalls = 0;
+    api.createProject = async () => {
+      createCalls += 1;
+      throw new Error("should not write");
+    };
+
+    await expect(service.createDidaProject("错误颜色", "red"))
+      .rejects.toThrow(/#RRGGBB/);
+    expect(createCalls).toBe(0);
+  });
+
+  it("blocks tasks from referencing a list whose remote identity needs confirmation", async () => {
+    const { service } = await serviceFixture();
+    const api = serviceApi(service);
+    api.createProject = async (value) => ({ ...value, id: "remote-uncertain" }) as DidaProject;
+    api.getProject = async () => {
+      throw new Error("temporary reread failure");
+    };
+    let taskCreateCalls = 0;
+    api.createTask = async (value) => {
+      taskCreateCalls += 1;
+      return { ...value, id: "must-not-run", status: 0 } as DidaTask;
+    };
+
+    await expect(service.createDidaProject("待核对清单", "#5268d4"))
+      .rejects.toThrow(/复读验证失败/);
+    const localProject = service.snapshot().projects.find((project) =>
+      project.id.startsWith("local-project-"));
+    expect(localProject?.name).toBe("待核对清单");
+    await expect(service.createTask("禁止提交", localProject!.id))
+      .rejects.toThrow(/尚未取得滴答远端 ID/);
+    expect(taskCreateCalls).toBe(0);
+    const pending = (await service.diagnosticSummary()).queue as Array<{
+      id: string;
+      kind: string;
+      status: string;
+      remoteOutcomeUnknown?: boolean;
+    }>;
+    expect(pending).toMatchObject([
+      { kind: "project", status: "reconciliation", remoteOutcomeUnknown: true },
+    ]);
+    api.getProject = async () => ({
+      id: "remote-uncertain",
+      name: "待核对清单",
+      color: "#5268d4",
+    });
+    service.sync = async () => undefined;
+    await service.resolveUnknownCreate(pending[0]!.id, "confirmed", "remote-uncertain");
+    expect((await service.diagnosticSummary()).queue).toEqual([]);
+    let createdAfterClaim: DidaTask | undefined;
+    api.createTask = async (value) => {
+      createdAfterClaim = { ...value, id: "remote-task-after-claim", status: 0 } as DidaTask;
+      return createdAfterClaim;
+    };
+    api.getTask = async () => createdAfterClaim!;
+    await service.createTask("认领后创建", "remote-uncertain");
+    expect(service.snapshot().tasks).toContainEqual(expect.objectContaining({
+      id: "remote-task-after-claim",
+      projectId: "remote-uncertain",
+    }));
+  });
+
   it("rejects contract startup while an ordinary remote write is in flight", async () => {
     const { service, secrets } = await serviceFixture();
     const api = serviceApi(service);

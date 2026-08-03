@@ -75,6 +75,50 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.queue).toEqual([]);
   });
 
+  it("rejects moving an existing task into a list without a remote identity", async () => {
+    const data = createDefaultData("device-a");
+    const task: DidaTask = {
+      id: "task-existing",
+      projectId: "project-remote",
+      title: "Existing",
+      status: 0,
+    };
+    const base = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`task:${task.id}`] = base;
+    data.localSnapshots[`task:${task.id}`] = base;
+    let persisted = structuredClone(data);
+    let processCalls = 0;
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "taskEngine", {
+      value: {
+        async process() {
+          processCalls += 1;
+          throw new Error("must not run");
+        },
+      },
+    });
+
+    await expect(service.queueTaskUpdate({
+      ...task,
+      projectId: "local-project-pending",
+    })).rejects.toThrow(/目标清单尚未取得滴答远端 ID/);
+    expect(processCalls).toBe(0);
+    expect(persisted.queue).toEqual([]);
+    expect((persisted.localSnapshots[`task:${task.id}`]?.value as DidaTask).projectId)
+      .toBe("project-remote");
+  });
+
   it("migrates both persisted and live in-progress state when confirming an unknown create", async () => {
     const data = createDefaultData("device-a");
     const local: DidaTask = {

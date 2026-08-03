@@ -14,11 +14,8 @@ export type TaskViewMode =
   | "three-day"
   | "week"
   | "month"
-  | "time-block"
   | "year"
   | "matrix";
-
-export type TaskTimeBlockRangeMode = "day" | "three-day" | "week";
 
 export interface TaskMatrixRules {
   importantPriorityThreshold: 1 | 3 | 5;
@@ -38,6 +35,7 @@ export interface TaskCollectionFilters {
   tag?: string;
   priority?: "0" | "1" | "3" | "5";
   date: TaskDateFilter;
+  query?: string;
 }
 
 export interface TaskFilterContext {
@@ -170,6 +168,8 @@ export function filterTaskCollection(
   context: TaskFilterContext,
 ): DidaTask[] {
   return tasks.filter((task) => {
+    const query = filters.query?.trim().toLocaleLowerCase();
+    if (query && !taskSearchText(task).includes(query)) return false;
     if (filters.didaProjectId && task.projectId !== filters.didaProjectId) return false;
     if (filters.helixProjectId) {
       const linked = context.helixProjectByTaskId?.get(task.id);
@@ -181,6 +181,17 @@ export function filterTaskCollection(
     if (filters.priority !== undefined && (task.priority ?? 0) !== Number(filters.priority)) return false;
     return matchesDateFilter(task, filters.date, context.anchor);
   });
+}
+
+function taskSearchText(task: DidaTask): string {
+  return [
+    task.title,
+    task.content,
+    task.desc,
+    ...(task.items ?? []).map((item) => item.title),
+  ].filter((value): value is string => typeof value === "string")
+    .join("\n")
+    .toLocaleLowerCase();
 }
 
 export function buildTaskTimeBlocks(

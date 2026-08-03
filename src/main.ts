@@ -30,6 +30,7 @@ import { ProjectWorkspaceService } from "./services/project-workspace";
 import { TaskReferenceService } from "./services/task-references";
 import { SerializedRunner } from "./services/serialized-runner";
 import { TaskMatrixRuleUpdater } from "./services/task-view-settings";
+import { autoSyncPlan } from "./services/auto-sync";
 import type {
   ProjectWorkspaceMigrationItem,
   ProjectWorkspaceProject,
@@ -59,6 +60,7 @@ export default class HelixPlugin extends Plugin {
   projectWorkspace!: ProjectWorkspaceService;
   taskReferences!: TaskReferenceService;
   private syncIntervalId: number | null = null;
+  private immediateSyncTimerId: number | null = null;
   private unloaded = false;
   private recoveryMode = false;
   private dataGeneration!: DataGeneration;
@@ -291,7 +293,7 @@ export default class HelixPlugin extends Plugin {
       }),
     );
 
-    this.refreshAutoSync();
+    this.refreshAutoSync(this.settings.autoSync);
   }
 
   onunload(): void {
@@ -312,17 +314,21 @@ export default class HelixPlugin extends Plugin {
       window.clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
     }
+    if (this.immediateSyncTimerId !== null) {
+      window.clearTimeout(this.immediateSyncTimerId);
+      this.immediateSyncTimerId = null;
+    }
     this.app.workspace.detachLeavesOfType(HELIX_VIEW_TYPE);
   }
 
-  async saveSettings(): Promise<void> {
+  async saveSettings(runImmediately = false): Promise<void> {
     await this.settingsMutationRunner.run(() => {
       const snapshot = this.settingsSnapshot();
       return this.store.mutate((data) => {
         data.settings = snapshot;
       });
     });
-    this.refreshAutoSync();
+    this.refreshAutoSync(runImmediately);
   }
 
   private async updateTaskMatrixRules(rules: HelixSettings["taskMatrixRules"]): Promise<void> {
@@ -350,16 +356,36 @@ export default class HelixPlugin extends Plugin {
     };
   }
 
-  refreshAutoSync(): void {
+  refreshAutoSync(runImmediately = false): void {
     if (this.syncIntervalId !== null) {
       window.clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
     }
-    if (this.recoveryMode || !this.settings.autoSync || !this.secrets.getDidaToken()) return;
-    const interval = Math.max(5, this.settings.syncIntervalMinutes) * 60_000;
+    if (this.immediateSyncTimerId !== null) {
+      window.clearTimeout(this.immediateSyncTimerId);
+      this.immediateSyncTimerId = null;
+    }
+    const plan = autoSyncPlan({
+      recoveryMode: this.recoveryMode,
+      tokenConfigured: Boolean(this.secrets.getDidaToken()),
+      autoSync: this.settings.autoSync,
+      runImmediately,
+      intervalMinutes: this.settings.syncIntervalMinutes,
+    });
+    if (plan.runImmediately) {
+      this.immediateSyncTimerId = window.setTimeout(
+        () => {
+          this.immediateSyncTimerId = null;
+          if (this.unloaded || this.recoveryMode || !this.secrets.getDidaToken()) return;
+          void this.service.sync().catch((error) => this.service.notifySyncError(error));
+        },
+        0,
+      );
+    }
+    if (plan.intervalMs === null) return;
     this.syncIntervalId = window.setInterval(
-      () => void this.service.sync().catch(() => undefined),
-      interval,
+      () => void this.service.sync().catch((error) => this.service.notifySyncError(error)),
+      plan.intervalMs,
     );
     this.registerInterval(this.syncIntervalId);
   }

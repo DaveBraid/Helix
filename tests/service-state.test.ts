@@ -11,6 +11,67 @@ import { deterministicEventId, type HelixEvent } from "../src/domain/events";
 import { rotatingChallenges } from "../src/domain/gamification";
 
 describe("HelixService runtime recovery", () => {
+  it("does not cover a configured account or real cache with sample data", async () => {
+    const configuredData = createDefaultData("device-configured");
+    const configured = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(configuredData);
+        },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "configured-token" } as HelixSecretStore,
+    );
+    await configured.initialize();
+    expect(configured.snapshot()).toMatchObject({
+      authorizationConfigured: true,
+      connected: false,
+      demoMode: false,
+    });
+
+    const cachedData = createDefaultData("device-cached");
+    cachedData.localSnapshots["project:cached-project"] = createSnapshot(
+      "project",
+      "cached-project",
+      { id: "cached-project", name: "Cached" },
+    );
+    const cached = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(cachedData);
+        },
+        async saveData() {},
+      }),
+      { getDidaToken: () => null } as HelixSecretStore,
+    );
+    await cached.initialize();
+    expect(cached.snapshot()).toMatchObject({
+      authorizationConfigured: false,
+      connected: false,
+      demoMode: false,
+    });
+    expect(cached.snapshot().projects).toHaveLength(1);
+  });
+
+  it("uses sample data only when neither authorization nor real cache exists", async () => {
+    const data = createDefaultData("device-demo");
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(data);
+        },
+        async saveData() {},
+      }),
+      { getDidaToken: () => null } as HelixSecretStore,
+    );
+    await service.initialize();
+    expect(service.snapshot()).toMatchObject({
+      authorizationConfigured: false,
+      connected: false,
+      demoMode: true,
+    });
+  });
+
   it("restores the verified schedule mode and clears it when authorization changes", async () => {
     const data = createDefaultData("device-a");
     data.didaContractCapabilities = {
@@ -19,6 +80,7 @@ describe("HelixService runtime recovery", () => {
       verifiedAt: "2026-07-31T00:00:00.000Z",
     };
     let persisted = structuredClone(data);
+    let token: string | null = "token";
     const service = new HelixService(
       new HelixDataStore({
         async loadData() {
@@ -29,16 +91,21 @@ describe("HelixService runtime recovery", () => {
         },
       }),
       {
-        getDidaToken: () => "token",
-        clearDidaToken: () => undefined,
+        getDidaToken: () => token,
+        clearDidaToken: () => {
+          token = null;
+        },
       } as unknown as HelixSecretStore,
     );
 
     await service.initialize();
     expect(service.snapshot().taskScheduleMode).toBe("point");
+    expect(service.snapshot().authorizationConfigured).toBe(true);
 
     await service.clearDidaToken();
     expect(service.snapshot().taskScheduleMode).toBe("unknown");
+    expect(service.snapshot().authorizationConfigured).toBe(false);
+    expect(service.snapshot().demoMode).toBe(true);
     expect(persisted.didaContractCapabilities).toBeUndefined();
   });
 
@@ -240,6 +307,373 @@ describe("HelixService runtime recovery", () => {
 
     expect(persisted.queue).toHaveLength(1);
     expect(persisted.queue[0]?.status).toBe("pending");
+  });
+
+  it("pulls core data without draining a pending write and tolerates list coverage failure", async () => {
+    const data = createDefaultData("device-pull-only");
+    const pendingTask: DidaTask = {
+      id: "pending-task",
+      projectId: "project-1",
+      title: "Pending local edit",
+      status: 0,
+    };
+    data.queue = [{
+      id: "op-pending-pull-only",
+      kind: "task",
+      entityId: pendingTask.id,
+      projectId: pendingTask.projectId,
+      operation: "update",
+      createdAt: "2026-08-03T00:00:00.000Z",
+      updatedAt: "2026-08-03T00:00:00.000Z",
+      attempts: 0,
+      status: "pending",
+      base: createSnapshot("task", pendingTask.id, pendingTask),
+      local: createSnapshot("task", pendingTask.id, { ...pendingTask, title: "Edited" }),
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "api", {
+      value: {
+        async probeCapabilities() {
+          return {
+            projects: "available",
+            tasks: "available",
+            habits: "unavailable",
+            focus: "unavailable",
+            checkedAt: "2026-08-03T00:00:00.000Z",
+            errors: [],
+          };
+        },
+        async getProjects() {
+          return [{ id: "project-1", name: "Remote list" }];
+        },
+        async getProjectData() {
+          throw new Error("one list detail unavailable");
+        },
+        async filterTasks() {
+          return [{
+            id: "remote-task",
+            projectId: "project-1",
+            title: "Remote task",
+            status: 0,
+          }];
+        },
+        async getCompletedTasks() {
+          return [];
+        },
+      },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", {
+      value: { async list() { return []; } },
+    });
+
+    await service.pullOnlySync();
+
+    expect(service.snapshot()).toMatchObject({
+      connected: true,
+      demoMode: false,
+      projects: [{ id: "project-1", name: "Remote list" }],
+      tasks: [{ id: "remote-task", projectId: "project-1", title: "Remote task" }],
+      syncWarnings: ["1 个清单暂未完成删除覆盖校验"],
+    });
+    expect(persisted.queue).toMatchObject([{ id: "op-pending-pull-only", status: "pending" }]);
+  });
+
+  it("shares one in-flight sync instead of publishing an early success", async () => {
+    const data = createDefaultData("device-single-sync");
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(data);
+        },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    let finishProbe!: () => void;
+    const probeGate = new Promise<void>((resolve) => {
+      finishProbe = resolve;
+    });
+    let probes = 0;
+    Object.defineProperty(service, "api", {
+      value: {
+        async getProjects() {
+          probes += 1;
+          await probeGate;
+          throw new Error("shared failure");
+        },
+      },
+    });
+
+    const first = service.sync();
+    const second = service.sync();
+    finishProbe();
+    await expect(first).rejects.toThrow("shared failure");
+    await expect(second).rejects.toThrow("shared failure");
+    expect(probes).toBe(1);
+  });
+
+  it("keeps a task returned by list detail when the global filter temporarily omits it", async () => {
+    const data = createDefaultData("device-detail-coverage");
+    const task: DidaTask = {
+      id: "task-from-detail",
+      projectId: "project-detail",
+      title: "Detail truth",
+      status: 0,
+    };
+    const snapshot = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`task:${task.id}`] = snapshot;
+    data.localSnapshots[`task:${task.id}`] = snapshot;
+    data.lastSyncAt = new Date().toISOString();
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "api", {
+      value: {
+        async getProjects() {
+          return [{ id: "project-detail", name: "Detail list" }];
+        },
+        async getProjectData() {
+          return {
+            project: { id: "project-detail", name: "Detail list" },
+            tasks: [task],
+          };
+        },
+        async filterTasks() {
+          return [];
+        },
+        async getCompletedTasks() {
+          return [];
+        },
+      },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", {
+      value: { async list() { return []; } },
+    });
+
+    await service.pullOnlySync();
+
+    expect(service.snapshot().tasks).toMatchObject([{ id: "task-from-detail" }]);
+    expect(persisted.localSnapshots[`task:${task.id}`]).toBeDefined();
+    expect(persisted.conflicts).toEqual([]);
+  });
+
+  it("keeps the completed endpoint authoritative over a stale open list detail", async () => {
+    const data = createDefaultData("device-completed-priority");
+    const baseTask: DidaTask = {
+      id: "task-completed-priority",
+      projectId: "project-completed-priority",
+      title: "Completion wins",
+      status: 0,
+    };
+    const snapshot = createSnapshot("task", baseTask.id, baseTask);
+    data.baseSnapshots[`task:${baseTask.id}`] = snapshot;
+    data.localSnapshots[`task:${baseTask.id}`] = snapshot;
+    data.lastSyncAt = new Date(Date.now() - 60_000).toISOString();
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    const completedTime = new Date().toISOString();
+    Object.defineProperty(service, "api", {
+      value: {
+        async getProjects() {
+          return [{ id: baseTask.projectId, name: "Completion list" }];
+        },
+        async getProjectData() {
+          return {
+            project: { id: baseTask.projectId, name: "Completion list" },
+            tasks: [baseTask],
+          };
+        },
+        async filterTasks() {
+          return [baseTask];
+        },
+        async getCompletedTasks() {
+          return [{ ...baseTask, status: 2, completedTime }];
+        },
+      },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", {
+      value: { async list() { return []; } },
+    });
+
+    await service.pullOnlySync();
+
+    expect(service.snapshot().tasks).toMatchObject([{
+      id: baseTask.id,
+      status: 2,
+      completedTime,
+    }]);
+    expect(service.snapshot().events.filter((event) =>
+      event.type === "task-completed" && event.entityId === baseTask.id)).toHaveLength(1);
+    expect(service.snapshot().events.some((event) =>
+      event.type === "task-reopened" && event.entityId === baseTask.id)).toBe(false);
+  });
+
+  it("publishes core tasks while preserving optional caches that temporarily fail", async () => {
+    const data = createDefaultData("device-optional-cache");
+    data.localSnapshots["habit:habit-old"] = createSnapshot("habit", "habit-old", {
+      id: "habit-old",
+      name: "Cached habit",
+    });
+    data.localSnapshots["focus:focus-old"] = createSnapshot("focus", "focus-old", {
+      id: "focus-old",
+      startTime: "2026-08-02T00:00:00.000Z",
+      endTime: "2026-08-02T00:30:00.000Z",
+      type: 1,
+    });
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "api", {
+      value: {
+        async probeCapabilities() {
+          return {
+            projects: "available",
+            tasks: "available",
+            habits: "available",
+            focus: "available",
+            checkedAt: "2026-08-03T00:00:00.000Z",
+            errors: [],
+          };
+        },
+        async getProjects() {
+          return [];
+        },
+        async filterTasks() {
+          return [{ id: "task-core", projectId: "inbox", title: "Core", status: 0 }];
+        },
+        async getCompletedTasks() {
+          return [];
+        },
+      },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: {
+        async list() {
+          return [{ id: "habit-new", name: "New habit" }];
+        },
+        async checkins() {
+          throw new Error("checkins unavailable");
+        },
+      },
+    });
+    Object.defineProperty(service, "focusService", {
+      value: { async list() { throw new Error("focus unavailable"); } },
+    });
+
+    await service.pullOnlySync();
+
+    expect(service.snapshot().tasks).toMatchObject([{ id: "task-core" }]);
+    expect(service.snapshot().habits).toMatchObject([{ id: "habit-old" }]);
+    expect(service.snapshot().focus).toMatchObject([{ id: "focus-old" }]);
+    expect(service.snapshot().syncWarnings).toEqual([
+      "习惯数据暂不可用，已保留上次缓存",
+      "专注数据暂不可用，已保留上次缓存",
+    ]);
+  });
+
+  it("keeps the last good cache and sync timestamp when a core read fails", async () => {
+    const data = createDefaultData("device-core-failure");
+    const previousTask: DidaTask = {
+      id: "task-previous",
+      projectId: "project-previous",
+      title: "Previous",
+      status: 0,
+    };
+    data.localSnapshots["task:task-previous"] = createSnapshot(
+      "task",
+      previousTask.id,
+      previousTask,
+    );
+    data.lastSyncAt = "2026-08-02T00:00:00.000Z";
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() {
+          return structuredClone(persisted);
+        },
+        async saveData(value) {
+          persisted = structuredClone(value) as typeof persisted;
+        },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "api", {
+      value: {
+        async probeCapabilities() {
+          return {
+            projects: "available",
+            tasks: "available",
+            habits: "unavailable",
+            focus: "unavailable",
+            checkedAt: "2026-08-03T00:00:00.000Z",
+            errors: [],
+          };
+        },
+        async getProjects() {
+          throw new Error("core unavailable");
+        },
+      },
+    });
+
+    await expect(service.pullOnlySync()).rejects.toThrow("core unavailable");
+
+    expect(service.snapshot().tasks).toMatchObject([{ id: "task-previous" }]);
+    expect(service.snapshot().lastSyncAt).toBe("2026-08-02T00:00:00.000Z");
+    expect(persisted.lastSyncAt).toBe("2026-08-02T00:00:00.000Z");
   });
 
   it("re-reads and verifies the exact remote task identity before reference rebinding", async () => {

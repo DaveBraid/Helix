@@ -53,7 +53,7 @@ export class HelixSettingTab extends PluginSettingTab {
         button.setButtonText("保存").setCta().onClick(async () => {
           try {
             await this.plugin.service.replaceDidaToken(token);
-            this.plugin.refreshAutoSync();
+            this.plugin.refreshAutoSync(true);
             token = "";
             new Notice("滴答 API 口令已保存到 SecretStorage");
             this.display();
@@ -76,18 +76,18 @@ export class HelixSettingTab extends PluginSettingTab {
       );
 
     new Setting(this.containerEl)
-      .setName("测试连接")
-      .setDesc("读取项目、任务、习惯和专注能力；不会修改远端。")
+      .setName("只读拉取测试")
+      .setDesc("拉取并显示真实清单与任务；不会发送待处理写入，也不会修改远端。")
       .addButton((button) =>
-        button.setButtonText("只读测试").onClick(async () => {
+        button.setButtonText("拉取真实数据").onClick(async () => {
           button.setDisabled(true).setButtonText("测试中…");
           try {
-            await this.plugin.service.probeConnection();
-            new Notice("滴答连接正常；本次只读测试未执行队列写入");
+            await this.plugin.service.pullOnlySync();
+            new Notice("真实清单与任务已拉取；本次测试未执行任何远端写入");
           } catch (error) {
             this.plugin.service.notifySyncError(error);
           } finally {
-            button.setDisabled(false).setButtonText("只读测试");
+            button.setDisabled(false).setButtonText("拉取真实数据");
           }
         }),
       );
@@ -149,7 +149,7 @@ export class HelixSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
           this.plugin.settings.autoSync = value;
-          await this.plugin.saveSettings();
+          await this.plugin.saveSettings(value);
         }),
       );
     new Setting(this.containerEl)

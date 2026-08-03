@@ -64,6 +64,7 @@ import {
 export interface HelixRuntimeState {
   loading: boolean;
   connected: boolean;
+  authorizationConfigured: boolean;
   projects: DidaProject[];
   tasks: DidaTask[];
   habits: DidaHabit[];
@@ -74,6 +75,7 @@ export interface HelixRuntimeState {
   capabilities: DidaCapabilities | null;
   taskScheduleMode: TaskScheduleMode;
   demoMode: boolean;
+  syncWarnings: string[];
   lastSyncAt?: string;
   error?: string;
   attentionCount: number;
@@ -85,6 +87,7 @@ export type StateListener = (state: HelixRuntimeState) => void;
 const EMPTY_STATE: HelixRuntimeState = {
   loading: false,
   connected: false,
+  authorizationConfigured: false,
   projects: [],
   tasks: [],
   habits: [],
@@ -95,6 +98,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   capabilities: null,
   taskScheduleMode: "unknown",
   demoMode: false,
+  syncWarnings: [],
   attentionCount: 0,
   recoveryIssues: [],
 };
@@ -108,6 +112,7 @@ export class HelixService {
   private readonly listeners = new Set<StateListener>();
   private state: HelixRuntimeState = { ...EMPTY_STATE };
   private readonly queueDrain = new SingleFlight();
+  private syncPromise: Promise<void> | null = null;
   private readonly conflictApplications = new Map<string, Promise<void>>();
   private readonly remoteWriteGate = new RemoteWriteGate();
   private contractTestRunning = false;
@@ -159,13 +164,25 @@ export class HelixService {
       deviceId: data.deviceId,
       deferConflictFinalization: true,
     });
+    const projects = cachedValues<DidaProject>(data, "project");
+    const tasks = cachedValues<DidaTask>(data, "task");
+    const habits = cachedValues<DidaHabit>(data, "habit");
+    const habitCheckins = cachedValues<DidaHabitCheckin>(data, "habit-checkin");
+    const focus = cachedValues<DidaFocusRecord>(data, "focus");
+    const authorizationConfigured = Boolean(this.secrets.getDidaToken());
+    const hasCachedDidaData =
+      projects.length > 0 ||
+      tasks.length > 0 ||
+      habits.length > 0 ||
+      habitCheckins.length > 0 ||
+      focus.length > 0;
     this.state = {
       ...this.state,
-      projects: cachedValues<DidaProject>(data, "project"),
-      tasks: cachedValues<DidaTask>(data, "task"),
-      habits: cachedValues<DidaHabit>(data, "habit"),
-      habitCheckins: cachedValues<DidaHabitCheckin>(data, "habit-checkin"),
-      focus: cachedValues<DidaFocusRecord>(data, "focus"),
+      projects,
+      tasks,
+      habits,
+      habitCheckins,
+      focus,
       events: data.events.filter(isHelixEvent),
       inProgress: data.inProgress,
       lastSyncAt: data.lastSyncAt,
@@ -176,11 +193,14 @@ export class HelixService {
         (data.lineageConflict ? 1 : 0),
       recoveryIssues: data.recoveryIssues,
       connected: false,
+      authorizationConfigured,
       taskScheduleMode:
         data.didaContractCapabilities?.taskScheduleMode ?? "unknown",
       demoMode:
+        !authorizationConfigured &&
+        !hasCachedDidaData &&
         data.settings.showSampleDataWhenDisconnected &&
-        cachedValues<DidaTask>(data, "task").length === 0,
+        tasks.length === 0,
     };
     if (recoveredAttention > previousAttention) {
       new Notice("Helix 检测到中断的远端写入，已停止自动重试；请在“冲突”中人工核对。", 10_000);
@@ -226,8 +246,17 @@ export class HelixService {
       }
       this.patch({
         connected: false,
+        authorizationConfigured: Boolean(this.secrets.getDidaToken()),
         capabilities: null,
         taskScheduleMode: "unknown",
+        demoMode:
+          !this.secrets.getDidaToken() &&
+          this.state.projects.length === 0 &&
+          this.state.tasks.length === 0 &&
+          this.state.habits.length === 0 &&
+          this.state.habitCheckins.length === 0 &&
+          this.state.focus.length === 0 &&
+          (await this.store.snapshot()).settings.showSampleDataWhenDisconnected,
       });
     } finally {
       releaseExclusive();
@@ -236,26 +265,62 @@ export class HelixService {
 
   async sync(): Promise<void> {
     this.assertWritable();
-    await this.withAuthorizationLease(() => this.syncWithAuthorizationLease());
+    if (this.syncPromise) return this.syncPromise;
+    const current = this.withAuthorizationLease(() => this.syncWithAuthorizationLease(false))
+      .finally(() => {
+        if (this.syncPromise === current) this.syncPromise = null;
+      });
+    this.syncPromise = current;
+    return current;
   }
 
-  private async syncWithAuthorizationLease(): Promise<void> {
-    if (this.state.loading) return;
-    this.patch({ loading: true, error: undefined });
-    try {
-      const capabilities = await this.api.probeCapabilities();
-      if (capabilities.projects !== "available" || capabilities.tasks !== "available") {
-        throw new Error(capabilities.errors.join("；") || "任务与项目接口不可用");
-      }
+  async pullOnlySync(): Promise<void> {
+    this.assertWritable();
+    if (this.syncPromise) throw new Error("已有滴答同步正在进行，请完成后再执行只读拉取");
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答只读拉取");
+    const current = this.syncWithAuthorizationLease(true)
+      .finally(() => {
+        releaseExclusive();
+        if (this.syncPromise === current) this.syncPromise = null;
+      });
+    this.syncPromise = current;
+    return current;
+  }
 
+  private async syncWithAuthorizationLease(pullOnly: boolean): Promise<void> {
+    this.patch({ loading: true, error: undefined, syncWarnings: [] });
+    try {
       // 先完整读取所有项目；任何一页失败时保留上一次可用快照，避免发布“半份数据”。
       const projectPayload = await this.api.getProjects();
       if (!Array.isArray(projectPayload)) throw new Error("项目接口返回值不是数组");
       const projects = projectPayload.map(normalizeProject);
-      // 项目 data 逐一成功是删除推断的必要前提；全局 filter 负责包含收集箱。
-      await Promise.all(
+      // 清单详情只用于证明删除覆盖；单个详情失败不能阻断全局清单与任务发布。
+      const projectCoverage = await Promise.allSettled(
         projects.map((project) => this.api.getProjectData(project.id)),
       );
+      const verifiedProjectIds = new Set<string>();
+      const projectDetailTasks: DidaTask[] = [];
+      for (const [index, result] of projectCoverage.entries()) {
+        if (result.status !== "fulfilled") continue;
+        const expectedProject = projects[index]!;
+        try {
+          const detailProject = normalizeProject(result.value.project);
+          if (detailProject.id !== expectedProject.id || !Array.isArray(result.value.tasks)) {
+            continue;
+          }
+          const detailTasks = result.value.tasks.map(normalizeTask);
+          if (detailTasks.some((task) => task.projectId !== expectedProject.id)) continue;
+          verifiedProjectIds.add(expectedProject.id);
+          projectDetailTasks.push(...detailTasks);
+        } catch {
+          // 结构无效等同本清单覆盖未获证明；保留旧快照且不参与删除推断。
+        }
+      }
+      const syncWarnings: string[] = [];
+      const failedProjectCoverage = projectCoverage.length - verifiedProjectIds.size;
+      if (failedProjectCoverage > 0) {
+        syncWarnings.push(`${failedProjectCoverage} 个清单暂未完成删除覆盖校验`);
+      }
       const completedFrom = new Date(Date.now() - 31 * 86_400_000).toISOString();
       const completedTo = new Date().toISOString();
       const [openPayload, completedPayload] = await Promise.all([
@@ -265,25 +330,56 @@ export class HelixService {
       if (!Array.isArray(openPayload) || !Array.isArray(completedPayload)) {
         throw new Error("任务接口返回值不是数组，拒绝发布不完整快照");
       }
-      const tasks = deduplicateTasks([...openPayload, ...completedPayload].map(normalizeTask));
+      const tasks = deduplicateTasks([
+        ...projectDetailTasks,
+        ...openPayload.map(normalizeTask),
+        ...completedPayload.map(normalizeTask),
+      ]);
 
-      const habits =
-        capabilities.habits === "available"
-          ? await this.habitService.list()
-          : this.state.habits;
       const now = Date.now();
       const from = now - 31 * 86_400_000;
-      const habitCheckins =
-        habits.length > 0 && capabilities.habits === "available"
-          ? await this.habitService.checkins(habits.map((habit) => habit.id), from, now)
-          : this.state.habitCheckins;
-      const focus =
-        capabilities.focus === "available"
-          ? await this.focusService.list(
-              new Date(from).toISOString(),
-              new Date(now).toISOString(),
-            )
-          : this.state.focus;
+      let habits = this.state.habits;
+      let habitCheckins = this.state.habitCheckins;
+      let focus = this.state.focus;
+      let habitCoverageComplete = false;
+      let focusCoverageComplete = false;
+      const capabilityErrors: string[] = [];
+      const [habitResult, focusResult] = await Promise.allSettled([
+        (async () => {
+        const nextHabits = await this.habitService.list();
+        const nextHabitCheckins = nextHabits.length > 0
+          ? await this.habitService.checkins(nextHabits.map((habit) => habit.id), from, now)
+          : [];
+          return { habits: nextHabits, checkins: nextHabitCheckins };
+        })(),
+        this.focusService.list(
+          new Date(from).toISOString(),
+          new Date(now).toISOString(),
+        ),
+      ]);
+      if (habitResult.status === "fulfilled") {
+        habits = habitResult.value.habits;
+        habitCheckins = habitResult.value.checkins;
+        habitCoverageComplete = true;
+      } else {
+        capabilityErrors.push("habits: unavailable");
+        syncWarnings.push("习惯数据暂不可用，已保留上次缓存");
+      }
+      if (focusResult.status === "fulfilled") {
+        focus = focusResult.value;
+        focusCoverageComplete = true;
+      } else {
+        capabilityErrors.push("focus: unavailable");
+        syncWarnings.push("专注数据暂不可用，已保留上次缓存");
+      }
+      const capabilities: DidaCapabilities = {
+        projects: "available",
+        tasks: "available",
+        habits: habitCoverageComplete ? "available" : "unavailable",
+        focus: focusCoverageComplete ? "available" : "unavailable",
+        checkedAt: new Date().toISOString(),
+        errors: capabilityErrors,
+      };
       const capturedAt = new Date().toISOString();
 
       if (this.disposed) return;
@@ -291,8 +387,8 @@ export class HelixService {
         const ledger = new EventLedger(data.events.filter(isHelixEvent));
         for (const event of eventsFromDida(data, tasks, habitCheckins, focus, {
           capturedAt,
-          habitCoverageComplete: capabilities.habits === "available",
-          focusCoverageComplete: capabilities.focus === "available",
+          habitCoverageComplete,
+          focusCoverageComplete,
           coverageFrom: from,
           coverageTo: now,
         })) {
@@ -310,7 +406,6 @@ export class HelixService {
           capturedAt,
           coveredEntityIds: coveredProjectIds,
         });
-        const coveredProjects = new Set(projects.map((project) => project.id));
         const coveredTasks = new Set(tasks.map((task) => task.id));
         const lastSyncIsInsideCompletionWindow =
           !!data.lastSyncAt &&
@@ -322,7 +417,7 @@ export class HelixService {
             if (
               value.status !== 2 &&
               value.projectId &&
-              (coveredProjects.has(value.projectId) || value.projectId.toLowerCase().includes("inbox"))
+              (verifiedProjectIds.has(value.projectId) || value.projectId.toLowerCase().includes("inbox"))
             ) {
               coveredTasks.add(snapshot.entityId);
             }
@@ -353,7 +448,7 @@ export class HelixService {
         data.lastSyncAt = capturedAt;
       });
       if (this.disposed) return;
-      await this.drainQueue();
+      if (!pullOnly) await this.drainQueue();
       if (this.disposed) return;
       const finalData = await this.store.snapshot();
       const finalTasks = cachedValues<DidaTask>(finalData, "task");
@@ -379,6 +474,7 @@ export class HelixService {
         recoveryIssues: finalData.recoveryIssues,
         capabilities,
         demoMode: false,
+        syncWarnings,
         lastSyncAt: capturedAt,
       });
     } catch (error) {

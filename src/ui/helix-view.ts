@@ -370,14 +370,29 @@ export class HelixView extends ItemView {
     const actions = header.createDiv({ cls: "helix-header-actions" });
     const status = actions.createDiv({
       cls: `helix-sync-status ${this.state?.connected ? "is-online" : "is-offline"}`,
+      attr: {
+        title: this.state?.syncWarnings.join("；") || this.state?.error || "",
+      },
     });
     status.createSpan();
     status.createSpan({
-      text: this.state?.connected
-        ? "滴答已连接"
+      text: this.state?.loading
+        ? "正在同步"
+        : this.state?.connected
+        ? this.state.syncWarnings.length > 0
+          ? "滴答已连接 · 部分数据待恢复"
+          : "滴答已连接"
         : this.state?.demoMode
           ? "演示数据"
-          : "离线缓存",
+          : this.state?.authorizationConfigured
+            ? this.state?.error
+              ? this.state?.lastSyncAt
+                ? "同步失败 · 显示缓存"
+                : "同步失败"
+              : this.state?.lastSyncAt
+                ? "离线缓存"
+                : "等待首次同步"
+            : "未配置滴答",
     });
     const sync = actions.createEl("button", {
       cls: "helix-icon-button",
@@ -385,6 +400,7 @@ export class HelixView extends ItemView {
     });
     setIcon(sync, "refresh-cw");
     if (this.state?.loading) sync.addClass("is-spinning");
+    sync.disabled = !this.state?.authorizationConfigured || Boolean(this.state?.loading);
     sync.addEventListener("click", () => {
       void this.service.sync().catch((error) => this.service.notifySyncError(error));
     });

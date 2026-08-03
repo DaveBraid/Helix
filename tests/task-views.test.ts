@@ -3,6 +3,9 @@ import type { DidaTask } from "../src/domain/entities";
 import {
   buildTaskDateRange,
   buildTaskMatrix,
+  buildTaskTimeBlocks,
+  buildTaskYearSummary,
+  filterTaskCollection,
   groupTasksByViewDay,
   taskViewDateKeys,
 } from "../src/domain/task-views";
@@ -131,5 +134,174 @@ describe("task view projections", () => {
     const afterLocalMidnight = buildTaskMatrix([candidate], new Date("2026-08-02T15:00:00.000Z"));
     expect(afterLocalMidnight.find((quadrant) => quadrant.id === "not-important-urgent")?.tasks)
       .toHaveLength(1);
+  });
+
+  it("applies reviewable matrix thresholds without changing task fields", () => {
+    const source = task({ id: "medium", title: "中优先级", priority: 3, dueDate: "2026-08-05" });
+    const quadrants = buildTaskMatrix([source], new Date("2026-08-02T04:00:00.000Z"), {
+      importantPriorityThreshold: 3,
+      urgentWithinDays: 3,
+    });
+    expect(quadrants.find((quadrant) => quadrant.id === "important-urgent")?.tasks)
+      .toEqual([source]);
+    expect(source).toMatchObject({ priority: 3, dueDate: "2026-08-05" });
+  });
+
+  it("combines list, Helix project, tag, priority and task-zone date filters", () => {
+    const tasks = [
+      task({
+        id: "match",
+        title: "命中",
+        projectId: "list-a",
+        tags: ["科研"],
+        priority: 5,
+        dueDate: "2026-08-03T00:30:00.000Z",
+        timeZone: "America/Los_Angeles",
+      }),
+      task({ id: "wrong-list", title: "其他清单", projectId: "list-b", tags: ["科研"], priority: 5 }),
+      task({ id: "unlinked", title: "未关联", projectId: "list-a", tags: ["科研"], priority: 5 }),
+    ];
+    const context = {
+      anchor: new Date("2026-08-03T02:00:00.000Z"),
+      helixProjectByTaskId: new Map([["match", "helix-a"], ["wrong-list", "helix-a"]]),
+    };
+    expect(filterTaskCollection(tasks, {
+      didaProjectId: "list-a",
+      helixProjectId: "helix-a",
+      tag: "科研",
+      priority: "5",
+      date: "today",
+    }, context).map((candidate) => candidate.id)).toEqual(["match"]);
+    expect(filterTaskCollection(tasks, { helixProjectId: "unlinked", date: "all" }, context)
+      .map((candidate) => candidate.id)).toEqual(["unlinked"]);
+  });
+
+  it("treats the seven-day filter as today plus six task-zone calendar days", () => {
+    const tasks = [
+      task({ id: "today", title: "今天", dueDate: "2026-08-03", isAllDay: true }),
+      task({ id: "day-six", title: "第七个日期", dueDate: "2026-08-09", isAllDay: true }),
+      task({ id: "day-seven", title: "范围外", dueDate: "2026-08-10", isAllDay: true }),
+      task({ id: "overdue", title: "逾期", dueDate: "2026-08-02", isAllDay: true }),
+    ];
+    expect(filterTaskCollection(tasks, { date: "next-seven-days" }, {
+      anchor: new Date("2026-08-03T04:00:00.000Z"),
+    }).map((candidate) => candidate.id)).toEqual(["today", "day-six"]);
+    expect(filterTaskCollection(tasks, { date: "overdue" }, {
+      anchor: new Date("2026-08-03T04:00:00.000Z"),
+    }).map((candidate) => candidate.id)).toEqual(["overdue"]);
+  });
+
+  it("matches date filters by interval intersection instead of a single endpoint", () => {
+    const tasks = [
+      task({
+        id: "spans-today",
+        title: "跨过今天",
+        startDate: "2026-08-01",
+        dueDate: "2026-08-05",
+        isAllDay: true,
+      }),
+      task({
+        id: "spans-window",
+        title: "跨过未来窗口",
+        startDate: "2026-08-01",
+        dueDate: "2026-08-20",
+        isAllDay: true,
+      }),
+    ];
+    const context = { anchor: new Date("2026-08-03T04:00:00.000Z") };
+    expect(filterTaskCollection(tasks, { date: "today" }, context).map(({ id }) => id))
+      .toEqual(["spans-today", "spans-window"]);
+    expect(filterTaskCollection(tasks, { date: "next-seven-days" }, context).map(({ id }) => id))
+      .toEqual(["spans-today", "spans-window"]);
+  });
+
+  it("lays out time blocks with point defaults, all-day bands and overlap lanes", () => {
+    const range = buildTaskDateRange("day", new Date(2026, 7, 3, 12));
+    const blocks = buildTaskTimeBlocks([
+      task({ id: "a", title: "A", startDate: "2026-08-03T01:00:00.000Z", dueDate: "2026-08-03T02:00:00.000Z", timeZone: "UTC" }),
+      task({ id: "b", title: "B", startDate: "2026-08-03T01:30:00.000Z", dueDate: "2026-08-03T02:30:00.000Z", timeZone: "UTC" }),
+      task({ id: "point", title: "单点", dueDate: "2026-08-03T05:00:00.000Z", timeZone: "UTC" }),
+      task({
+        id: "same-instant",
+        title: "相同时刻",
+        startDate: "2026-08-03T07:00:00.000Z",
+        dueDate: "2026-08-03T09:00:00.000+02:00",
+        timeZone: "UTC",
+      }),
+      task({ id: "all-day", title: "全天", dueDate: "2026-08-03", isAllDay: true }),
+      task({
+        id: "completed",
+        title: "已完成",
+        status: 2,
+        startDate: "2026-08-01T01:00:00.000Z",
+        dueDate: "2026-08-01T02:00:00.000Z",
+        completedTime: "2026-08-03T06:00:00.000Z",
+        timeZone: "UTC",
+      }),
+      task({
+        id: "completed-all-day",
+        title: "已完成全天任务",
+        status: 2,
+        isAllDay: true,
+        dueDate: "2026-08-01",
+        completedTime: "2026-08-03T08:00:00.000Z",
+        timeZone: "UTC",
+      }),
+    ], range).get("2026-08-03")!;
+    expect(blocks[0]).toMatchObject({ allDay: true, startMinute: 0, endMinute: 1_440 });
+    expect(blocks.find((block) => block.task.id === "a")).toMatchObject({ lane: 0, laneCount: 2 });
+    expect(blocks.find((block) => block.task.id === "b")).toMatchObject({ lane: 1, laneCount: 2 });
+    expect(blocks.find((block) => block.task.id === "point")).toMatchObject({
+      startMinute: 300,
+      endMinute: 315,
+      lane: 0,
+      laneCount: 1,
+    });
+    expect(blocks.find((block) => block.task.id === "completed")).toMatchObject({
+      startMinute: 360,
+      endMinute: 375,
+    });
+    expect(blocks.find((block) => block.task.id === "completed-all-day")).toMatchObject({
+      allDay: false,
+      startMinute: 480,
+      endMinute: 495,
+    });
+    expect(blocks.find((block) => block.task.id === "same-instant")).toMatchObject({
+      startMinute: 420,
+      endMinute: 435,
+    });
+  });
+
+  it("projects spring gaps and fall folds onto a stable wall-clock grid", () => {
+    const springRange = buildTaskDateRange("day", new Date(2026, 2, 8, 12));
+    const spring = buildTaskTimeBlocks([task({
+      id: "spring-gap",
+      title: "春季跳时",
+      startDate: "2026-03-08T09:30:00.000Z",
+      dueDate: "2026-03-08T10:30:00.000Z",
+      timeZone: "America/Los_Angeles",
+    })], springRange).get("2026-03-08")?.[0];
+    expect(spring).toMatchObject({ startMinute: 90, endMinute: 210 });
+
+    const fallRange = buildTaskDateRange("day", new Date(2026, 10, 1, 12));
+    const fall = buildTaskTimeBlocks([task({
+      id: "fall-fold",
+      title: "秋季重叠",
+      startDate: "2026-11-01T08:30:00.000Z",
+      dueDate: "2026-11-01T10:30:00.000Z",
+      timeZone: "America/Los_Angeles",
+    })], fallRange).get("2026-11-01")?.[0];
+    expect(fall).toMatchObject({ startMinute: 90, endMinute: 150 });
+  });
+
+  it("summarizes each task once per intersecting month in the year view", () => {
+    const summary = buildTaskYearSummary([
+      task({ id: "span", title: "跨月", startDate: "2026-01-31", dueDate: "2026-02-02", isAllDay: true }),
+      task({ id: "done", title: "完成", status: 2, completedTime: "2026-02-15T08:00:00.000Z", timeZone: "UTC" }),
+      task({ id: "other-year", title: "其他年份", dueDate: "2025-12-31", isAllDay: true }),
+    ], new Date(2026, 7, 3));
+    expect(summary[0]).toMatchObject({ scheduled: 1, open: 1, completed: 0 });
+    expect(summary[1]).toMatchObject({ scheduled: 2, open: 1, completed: 1 });
+    expect(summary.slice(2).every((month) => month.scheduled === 0)).toBe(true);
   });
 });

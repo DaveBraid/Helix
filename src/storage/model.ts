@@ -12,6 +12,10 @@ import {
   DIDA_CONTRACT_PROBE_VERSION,
   type TaskScheduleMode,
 } from "../domain/task-schedule";
+import {
+  DEFAULT_TASK_MATRIX_RULES,
+  type TaskMatrixRules,
+} from "../domain/task-views";
 
 export interface HelixSettings {
   rootFolder: string;
@@ -19,6 +23,7 @@ export interface HelixSettings {
   syncIntervalMinutes: number;
   showSampleDataWhenDisconnected: boolean;
   lineageCanvasPath: string;
+  taskMatrixRules: TaskMatrixRules;
 }
 
 export const DEFAULT_SETTINGS: HelixSettings = {
@@ -27,6 +32,7 @@ export const DEFAULT_SETTINGS: HelixSettings = {
   syncIntervalMinutes: 10,
   showSampleDataWhenDisconnected: true,
   lineageCanvasPath: "Helix/Project Lineage.canvas",
+  taskMatrixRules: { ...DEFAULT_TASK_MATRIX_RULES },
 };
 
 export interface HelixPersistedData {
@@ -59,7 +65,10 @@ export function createDefaultData(deviceId?: string): HelixPersistedData {
   return {
     schemaVersion: 2,
     deviceId: deviceId ?? crypto.randomUUID(),
-    settings: { ...DEFAULT_SETTINGS },
+    settings: {
+      ...DEFAULT_SETTINGS,
+      taskMatrixRules: { ...DEFAULT_TASK_MATRIX_RULES },
+    },
     baseSnapshots: {},
     localSnapshots: {},
     queue: [],
@@ -197,7 +206,10 @@ function hydrateSettings(
   raw: Partial<HelixSettings>,
   issues: string[],
 ): HelixSettings {
-  const settings = { ...DEFAULT_SETTINGS };
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    taskMatrixRules: { ...DEFAULT_TASK_MATRIX_RULES },
+  };
   if (raw.rootFolder !== undefined) {
     if (isSafeVaultPath(raw.rootFolder, false)) settings.rootFolder = raw.rootFolder.trim();
     else issues.push("rootFolder 设置无效，已恢复默认值并进入只读恢复模式");
@@ -229,6 +241,28 @@ function hydrateSettings(
       settings.syncIntervalMinutes = raw.syncIntervalMinutes;
     } else {
       issues.push("syncIntervalMinutes 设置无效，已恢复默认值并进入只读恢复模式");
+    }
+  }
+  if (raw.taskMatrixRules !== undefined) {
+    const rules = raw.taskMatrixRules;
+    if (
+      rules &&
+      typeof rules === "object" &&
+      !Array.isArray(rules) &&
+      (rules.importantPriorityThreshold === 1 ||
+        rules.importantPriorityThreshold === 3 ||
+        rules.importantPriorityThreshold === 5) &&
+      (rules.urgentWithinDays === 0 ||
+        rules.urgentWithinDays === 1 ||
+        rules.urgentWithinDays === 3 ||
+        rules.urgentWithinDays === 7)
+    ) {
+      settings.taskMatrixRules = {
+        importantPriorityThreshold: rules.importantPriorityThreshold,
+        urgentWithinDays: rules.urgentWithinDays,
+      };
+    } else {
+      issues.push("taskMatrixRules 设置无效，已恢复默认值并进入只读恢复模式");
     }
   }
   return settings;

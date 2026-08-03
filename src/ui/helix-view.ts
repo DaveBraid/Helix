@@ -43,8 +43,14 @@ import {
 import {
   buildTaskDateRange,
   buildTaskMatrix,
+  buildTaskTimeBlocks,
+  buildTaskYearSummary,
+  filterTaskCollection,
   groupTasksByViewDay,
+  type TaskCollectionFilters,
   type TaskDateRange,
+  type TaskMatrixRules,
+  type TaskTimeBlockRangeMode,
   type TaskViewMode,
 } from "../domain/task-views";
 import type { HelixRuntimeState } from "../services/helix-service";
@@ -124,11 +130,17 @@ const SAMPLE_PROJECTS: DidaProject[] = [
   { id: "sample-c", name: "研究方法课程", color: "#e29b3c" },
 ];
 
+const sampleInstant = (hour: number, minute = 0): string => {
+  const value = new Date();
+  value.setHours(hour, minute, 0, 0);
+  return value.toISOString();
+};
+
 const SAMPLE_TASKS: DidaTask[] = [
-  { id: "sample-1", projectId: "sample-a", title: "复现实验基线并核对指标", status: 0, priority: 5, dueDate: new Date().toISOString() },
-  { id: "sample-2", projectId: "sample-b", title: "整理冲突合并真值表", status: 0, priority: 3 },
-  { id: "sample-3", projectId: "sample-c", title: "完成本周阅读笔记", status: 0, priority: 1 },
-  { id: "sample-4", projectId: "sample-a", title: "补充消融实验计划", status: 0, priority: 3 },
+  { id: "sample-1", projectId: "sample-a", title: "复现实验基线并核对指标", status: 0, priority: 5, startDate: sampleInstant(9), dueDate: sampleInstant(10, 30), tags: ["科研", "实验"] },
+  { id: "sample-2", projectId: "sample-b", title: "整理冲突合并真值表", status: 0, priority: 3, startDate: sampleInstant(10), dueDate: sampleInstant(11), tags: ["Helix"] },
+  { id: "sample-3", projectId: "sample-c", title: "完成本周阅读笔记", status: 0, priority: 1, dueDate: sampleInstant(14), tags: ["阅读"] },
+  { id: "sample-4", projectId: "sample-a", title: "补充消融实验计划", status: 0, priority: 3, startDate: sampleInstant(15), dueDate: sampleInstant(16, 30), tags: ["科研", "实验"] },
 ];
 
 export class HelixView extends ItemView {
@@ -137,6 +149,8 @@ export class HelixView extends ItemView {
   private taskFilter: "all" | "open" | "in-progress" | "completed" = "open";
   private taskViewMode: TaskViewMode = "list";
   private taskViewDate = new Date();
+  private taskTimeBlockRangeMode: TaskTimeBlockRangeMode = "day";
+  private taskCollectionFilters: TaskCollectionFilters = { date: "all" };
   private selectedProjectId: string | null | undefined;
   private projectLineageMode: ProjectLineageViewMode = "graph";
   private projectWorkbench: ProjectLineageWorkbench | null = null;
@@ -178,6 +192,8 @@ export class HelixView extends ItemView {
       taskReferences: TaskReferenceService;
       mutateProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       reviewLegacyMigration: () => void;
+      getTaskMatrixRules: () => TaskMatrixRules;
+      updateTaskMatrixRules: (rules: TaskMatrixRules) => Promise<void>;
     },
   ) {
     super(leaf);
@@ -876,15 +892,28 @@ export class HelixView extends ItemView {
       const button = filters.createEl("button", {
         text: label,
         cls: this.taskFilter === id ? "is-active" : "",
-        attr: { "aria-pressed": String(this.taskFilter === id) },
+        attr: {
+          id: `helix-task-status-filter-${id}`,
+          "aria-pressed": String(this.taskFilter === id),
+        },
       });
       button.addEventListener("click", () => {
         this.taskFilter = id;
-        void this.render();
+        this.renderAndRestoreFocus(`helix-task-status-filter-${id}`);
       });
     }
+    this.renderTaskCollectionFilters(content, tasks, projects);
     this.renderTaskViewToolbar(content);
-    const visibleTasks = this.filterTasks(tasks);
+    const helixProjectByTaskId = new Map(
+      (this.taskReferenceSnapshot?.references ?? []).map((reference) => [
+        reference.taskId,
+        reference.projectId,
+      ]),
+    );
+    const visibleTasks = filterTaskCollection(this.filterTasks(tasks), this.taskCollectionFilters, {
+      anchor: new Date(),
+      helixProjectByTaskId,
+    });
     const panel = content.createDiv({
       cls: "helix-task-view-panel",
       attr: {
@@ -895,6 +924,10 @@ export class HelixView extends ItemView {
     });
     if (this.taskViewMode === "matrix") {
       this.renderTaskMatrix(panel, visibleTasks, projects);
+    } else if (this.taskViewMode === "time-block") {
+      this.renderTaskTimeBlockView(panel, visibleTasks, projects);
+    } else if (this.taskViewMode === "year") {
+      this.renderTaskYearView(panel, visibleTasks);
     } else if (this.taskViewMode === "list") {
       const card = panel.createDiv({ cls: "helix-card helix-table-card" });
       if (visibleTasks.length === 0) card.createDiv({ cls: "helix-empty", text: "当前筛选没有任务。" });
@@ -906,6 +939,116 @@ export class HelixView extends ItemView {
     }
   }
 
+  private renderTaskCollectionFilters(
+    content: HTMLElement,
+    tasks: DidaTask[],
+    didaProjects: DidaProject[],
+  ): void {
+    const bar = content.createDiv({ cls: "helix-task-filter-bar" });
+    const linkedProjects = [...new Map(
+      (this.taskReferenceSnapshot?.references ?? [])
+        .filter((reference) => reference.project)
+        .map((reference) => [reference.projectId, reference.project!]),
+    ).values()].sort((left, right) => left.title.localeCompare(right.title));
+    const tags = [...new Set(tasks.flatMap((task) => task.tags ?? []))]
+      .sort((left, right) => left.localeCompare(right));
+    const didaProjectIds = new Set(didaProjects.map((project) => project.id));
+    const linkedProjectIds = new Set(linkedProjects.map((project) => project.id));
+    const availableTags = new Set(tags);
+    if (this.taskCollectionFilters.didaProjectId &&
+      !didaProjectIds.has(this.taskCollectionFilters.didaProjectId)) {
+      this.taskCollectionFilters.didaProjectId = undefined;
+    }
+    if (this.taskCollectionFilters.helixProjectId &&
+      this.taskCollectionFilters.helixProjectId !== "unlinked" &&
+      !linkedProjectIds.has(this.taskCollectionFilters.helixProjectId)) {
+      this.taskCollectionFilters.helixProjectId = undefined;
+    }
+    if (this.taskCollectionFilters.tag && !availableTags.has(this.taskCollectionFilters.tag)) {
+      this.taskCollectionFilters.tag = undefined;
+    }
+    this.renderTaskFilterSelect(bar, "helix-task-filter-dida", "滴答清单", this.taskCollectionFilters.didaProjectId ?? "", [
+      ["", "全部清单"],
+      ...didaProjects.map((project): [string, string] => [project.id, project.name]),
+    ], (value) => {
+      this.taskCollectionFilters.didaProjectId = value || undefined;
+    });
+    this.renderTaskFilterSelect(bar, "helix-task-filter-helix", "Helix 项目", this.taskCollectionFilters.helixProjectId ?? "", [
+      ["", "全部项目"],
+      ...linkedProjects.map((project): [string, string] => [project.id, project.title]),
+      ["unlinked", "未关联"],
+    ], (value) => {
+      this.taskCollectionFilters.helixProjectId = value || undefined;
+    });
+    this.renderTaskFilterSelect(bar, "helix-task-filter-tag", "标签", this.taskCollectionFilters.tag ?? "", [
+      ["", "全部标签"],
+      ...tags.map((tag): [string, string] => [tag, `# ${tag}`]),
+    ], (value) => {
+      this.taskCollectionFilters.tag = value || undefined;
+    });
+    this.renderTaskFilterSelect(bar, "helix-task-filter-priority", "优先级", this.taskCollectionFilters.priority ?? "", [
+      ["", "全部优先级"],
+      ["5", "高优先级"],
+      ["3", "中优先级"],
+      ["1", "低优先级"],
+      ["0", "无优先级"],
+    ], (value) => {
+      this.taskCollectionFilters.priority = value
+        ? value as TaskCollectionFilters["priority"]
+        : undefined;
+    });
+    this.renderTaskFilterSelect(bar, "helix-task-filter-date", "日期", this.taskCollectionFilters.date, [
+      ["all", "全部日期"],
+      ["overdue", "已逾期"],
+      ["today", "今天"],
+      ["next-seven-days", "未来 7 天（含今天）"],
+      ["undated", "无日期"],
+    ], (value) => {
+      this.taskCollectionFilters.date = value as TaskCollectionFilters["date"];
+    });
+    const hasFilters = Boolean(
+      this.taskCollectionFilters.didaProjectId ||
+      this.taskCollectionFilters.helixProjectId ||
+      this.taskCollectionFilters.tag ||
+      this.taskCollectionFilters.priority !== undefined ||
+      this.taskCollectionFilters.date !== "all",
+    );
+    if (hasFilters) {
+      const clear = bar.createEl("button", { cls: "helix-task-filter-clear", text: "清除筛选" });
+      clear.addEventListener("click", () => {
+        this.taskCollectionFilters = { date: "all" };
+        this.renderAndRestoreFocus("helix-task-filter-dida");
+      });
+    }
+  }
+
+  private renderTaskFilterSelect(
+    parent: HTMLElement,
+    id: string,
+    label: string,
+    value: string,
+    options: Array<[string, string]>,
+    onChange: (value: string) => void,
+  ): void {
+    const field = parent.createEl("label", { cls: "helix-task-filter-field" });
+    field.createSpan({ text: label });
+    const select = field.createEl("select", { attr: { id, "aria-label": label } });
+    for (const [optionValue, optionLabel] of options) {
+      select.createEl("option", { value: optionValue, text: optionLabel });
+    }
+    select.value = value;
+    select.addEventListener("change", () => {
+      onChange(select.value);
+      this.renderAndRestoreFocus(id);
+    });
+  }
+
+  private renderAndRestoreFocus(id: string): void {
+    void this.render().then(() => {
+      this.containerEl.querySelector<HTMLElement>(`#${id}`)?.focus();
+    });
+  }
+
   private renderTaskViewToolbar(content: HTMLElement): void {
     const toolbar = content.createDiv({ cls: "helix-task-view-toolbar" });
     const modes: Array<{ id: TaskViewMode; label: string }> = [
@@ -914,6 +1057,8 @@ export class HelixView extends ItemView {
       { id: "three-day", label: "3 日" },
       { id: "week", label: "周" },
       { id: "month", label: "月" },
+      { id: "time-block", label: "时间块" },
+      { id: "year", label: "年" },
       { id: "matrix", label: "四象限" },
     ];
     const tabs = toolbar.createDiv({
@@ -969,7 +1114,14 @@ export class HelixView extends ItemView {
 
   private shiftTaskViewDate(direction: -1 | 1): void {
     const next = new Date(this.taskViewDate);
-    if (this.taskViewMode === "month") next.setMonth(next.getMonth() + direction, 1);
+    if (this.taskViewMode === "year") next.setFullYear(next.getFullYear() + direction, 0, 1);
+    else if (this.taskViewMode === "month") next.setMonth(next.getMonth() + direction, 1);
+    else if (this.taskViewMode === "time-block") {
+      const amount = this.taskTimeBlockRangeMode === "week"
+        ? 7
+        : this.taskTimeBlockRangeMode === "three-day" ? 3 : 1;
+      next.setDate(next.getDate() + direction * amount);
+    }
     else if (this.taskViewMode === "week") next.setDate(next.getDate() + direction * 7);
     else if (this.taskViewMode === "three-day") next.setDate(next.getDate() + direction * 3);
     else next.setDate(next.getDate() + direction);
@@ -1073,13 +1225,140 @@ export class HelixView extends ItemView {
     ).open();
   }
 
+  private renderTaskTimeBlockView(
+    content: HTMLElement,
+    tasks: DidaTask[],
+    projects: DidaProject[],
+  ): void {
+    const range = buildTaskDateRange(this.taskTimeBlockRangeMode, this.taskViewDate);
+    const blocks = buildTaskTimeBlocks(tasks, range);
+    const card = content.createDiv({ cls: "helix-card helix-task-time-block" });
+    const heading = card.createDiv({ cls: "helix-task-time-block-heading" });
+    heading.createEl("strong", {
+      text: taskRangeLabel(range, this.taskTimeBlockRangeMode, this.taskViewDate),
+    });
+    const scale = heading.createDiv({ cls: "helix-task-time-scale", attr: { role: "group", "aria-label": "时间块范围" } });
+    for (const [mode, label] of [["day", "日"], ["three-day", "3 日"], ["week", "周"]] as const) {
+      const button = scale.createEl("button", {
+        text: label,
+        cls: this.taskTimeBlockRangeMode === mode ? "is-active" : "",
+        attr: {
+          id: `helix-task-time-scale-${mode}`,
+          "aria-pressed": String(this.taskTimeBlockRangeMode === mode),
+        },
+      });
+      button.addEventListener("click", () => {
+        this.taskTimeBlockRangeMode = mode;
+        this.renderAndRestoreFocus(`helix-task-time-scale-${mode}`);
+      });
+    }
+    const frame = card.createDiv({ cls: "helix-task-time-frame" });
+    const allDayGrid = frame.createDiv({ cls: "helix-task-time-all-day" });
+    allDayGrid.style.setProperty("--helix-time-days", String(range.days.length));
+    allDayGrid.createDiv({ cls: "helix-task-time-all-day-label", text: "全天" });
+    for (const day of range.days) {
+      const cell = allDayGrid.createDiv({ cls: "helix-task-time-all-day-cell" });
+      cell.createEl("strong", { text: `${weekdayLabel(day.date)} ${day.date.getMonth() + 1}/${day.date.getDate()}` });
+      for (const block of (blocks.get(day.key) ?? []).filter((candidate) => candidate.allDay)) {
+        this.renderTaskCalendarChip(
+          cell,
+          block.task,
+          projects.find((project) => project.id === block.task.projectId),
+          true,
+          day.key,
+        );
+      }
+    }
+    const scroll = frame.createDiv({ cls: "helix-task-time-scroll" });
+    const gutter = scroll.createDiv({ cls: "helix-task-time-gutter" });
+    for (let hour = 0; hour < 24; hour += 1) {
+      gutter.createSpan({ text: `${String(hour).padStart(2, "0")}:00` });
+    }
+    const days = scroll.createDiv({ cls: "helix-task-time-days" });
+    days.style.setProperty("--helix-time-days", String(range.days.length));
+    for (const day of range.days) {
+      const column = days.createDiv({ cls: "helix-task-time-day" });
+      for (let hour = 0; hour < 24; hour += 1) column.createDiv({ cls: "helix-task-time-hour" });
+      for (const block of (blocks.get(day.key) ?? []).filter((candidate) => !candidate.allDay)) {
+        const item = column.createEl("button", {
+          cls: `helix-task-time-item${block.task.status === 2 ? " is-completed" : ""}`,
+          attr: {
+            "aria-label": `编辑任务：${block.task.title}，${day.key} ${minuteLabel(block.startMinute)} 至 ${minuteLabel(block.endMinute)}`,
+          },
+        });
+        const top = block.startMinute / 1_440 * 100;
+        const height = Math.max(30, block.endMinute - block.startMinute) / 1_440 * 100;
+        item.style.top = `${top}%`;
+        item.style.height = `${height}%`;
+        item.style.left = `${block.lane / block.laneCount * 100}%`;
+        item.style.width = `${100 / block.laneCount}%`;
+        const project = projects.find((candidate) => candidate.id === block.task.projectId);
+        item.style.setProperty("--helix-task-color", project?.color ?? "#8891a7");
+        item.createSpan({ cls: "helix-task-time-item-title", text: block.task.title });
+        item.createSpan({
+          cls: "helix-task-time-item-time",
+          text: `${minuteLabel(block.startMinute)}–${minuteLabel(block.endMinute)}`,
+        });
+        item.addEventListener("click", () => {
+          if (block.task.id.startsWith("sample-")) this.renderTaskPreviewEditor(block.task);
+          else void this.openTaskEditor(block.task, this.state?.projects ?? []);
+        });
+      }
+    }
+  }
+
+  private renderTaskYearView(content: HTMLElement, tasks: DidaTask[]): void {
+    const summary = buildTaskYearSummary(tasks, this.taskViewDate);
+    const maxScheduled = Math.max(1, ...summary.map((month) => month.scheduled));
+    const card = content.createDiv({ cls: "helix-card helix-task-year" });
+    card.createDiv({
+      cls: "helix-task-year-heading",
+      text: `${this.taskViewDate.getFullYear()} 年`,
+    });
+    const grid = card.createDiv({ cls: "helix-task-year-grid" });
+    for (const month of summary) {
+      const button = grid.createEl("button", {
+        cls: `helix-task-year-month${month.month === new Date().getMonth() + 1 && this.taskViewDate.getFullYear() === new Date().getFullYear() ? " is-current" : ""}`,
+        attr: { "aria-label": `${month.month} 月，${month.scheduled} 项，${month.completed} 项已完成` },
+      });
+      const top = button.createDiv({ cls: "helix-task-year-month-head" });
+      top.createEl("strong", { text: `${month.month} 月` });
+      top.createSpan({ text: `${month.scheduled} 项` });
+      const meter = button.createDiv({ cls: "helix-task-year-meter" });
+      meter.createSpan().style.width = `${month.scheduled / maxScheduled * 100}%`;
+      const stats = button.createDiv({ cls: "helix-task-year-stats" });
+      stats.createSpan({ text: `${month.open} 待完成` });
+      stats.createSpan({ text: `${month.completed} 已完成` });
+      button.addEventListener("click", () => {
+        this.taskViewDate = new Date(this.taskViewDate.getFullYear(), month.month - 1, 1);
+        this.activateTaskViewMode("month");
+      });
+    }
+  }
+
   private renderTaskMatrix(
     content: HTMLElement,
     tasks: DidaTask[],
     projects: DidaProject[],
   ): void {
+    const rules = this.actions.getTaskMatrixRules();
+    const ruleBar = content.createDiv({ cls: "helix-task-matrix-rules" });
+    this.renderMatrixRuleSelect(ruleBar, "helix-task-matrix-important", "重要", String(rules.importantPriorityThreshold), [
+      ["5", "高优先级"],
+      ["3", "中优先级及以上"],
+      ["1", "低优先级及以上"],
+    ], (value) => ({
+      ...this.actions.getTaskMatrixRules(),
+      importantPriorityThreshold: Number(value) as 1 | 3 | 5,
+    }));
+    this.renderMatrixRuleSelect(ruleBar, "helix-task-matrix-urgent", "紧急", String(rules.urgentWithinDays), [
+      ["0", "今天及逾期"],
+      ["1", "未来 1 天内"],
+      ["3", "未来 3 天内"],
+      ["7", "未来 7 天内"],
+    ], (value) => ({ ...this.actions.getTaskMatrixRules(), urgentWithinDays: Number(value) as 0 | 1 | 3 | 7 }));
     const matrix = content.createDiv({ cls: "helix-task-matrix" });
-    for (const quadrant of buildTaskMatrix(tasks, new Date())) {
+    for (const quadrant of buildTaskMatrix(tasks, new Date(), rules)) {
       const card = matrix.createDiv({ cls: `helix-card helix-task-quadrant is-${quadrant.id}` });
       const header = card.createDiv({ cls: "helix-task-quadrant-head" });
       header.createEl("h3", { text: quadrant.title });
@@ -1095,6 +1374,33 @@ export class HelixView extends ItemView {
         );
       }
     }
+  }
+
+  private renderMatrixRuleSelect(
+    parent: HTMLElement,
+    id: string,
+    label: string,
+    value: string,
+    options: Array<[string, string]>,
+    nextRules: (value: string) => TaskMatrixRules,
+  ): void {
+    const field = parent.createEl("label");
+    field.createSpan({ text: label });
+    const select = field.createEl("select", { attr: { id, "aria-label": `四象限${label}规则` } });
+    for (const [optionValue, optionLabel] of options) {
+      select.createEl("option", { value: optionValue, text: optionLabel });
+    }
+    select.value = value;
+    select.addEventListener("change", () => {
+      select.disabled = true;
+      void this.actions.updateTaskMatrixRules(nextRules(select.value))
+        .then(() => this.renderAndRestoreFocus(id))
+        .catch((error) => {
+          select.disabled = false;
+          select.value = value;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
   }
 
   private renderTaskReferenceDiagnostics(
@@ -2475,6 +2781,12 @@ function formatHour(value: string, timeZone?: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--:--";
   return instantToWallDateTime(date.toISOString(), safeTaskTimeZone(timeZone)).slice(11, 16);
+}
+
+function minuteLabel(value: number): string {
+  const minute = Math.max(0, Math.min(1_440, value));
+  if (minute === 1_440) return "24:00";
+  return `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
 }
 
 function displayValue(value: unknown): string {

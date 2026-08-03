@@ -984,6 +984,52 @@
   gap: 8px;
 }
 
+.helix-task-filter-bar {
+  margin: -2px 0 14px;
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 2px 1px 4px;
+}
+
+.helix-task-filter-field {
+  flex: 0 0 auto;
+  min-width: 126px;
+  display: grid;
+  gap: 4px;
+}
+
+.helix-task-filter-field > span,
+.helix-task-matrix-rules label > span {
+  color: var(--helix-muted);
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.helix-task-filter-field select,
+.helix-task-matrix-rules select {
+  height: 32px;
+  margin: 0;
+  border: 1px solid var(--helix-line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--helix-surface-control) 86%, transparent);
+  color: var(--helix-text-strong);
+  box-shadow: none;
+  font-size: 10px;
+}
+
+.helix-task-filter-clear {
+  flex: 0 0 auto;
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--helix-line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--helix-muted);
+  box-shadow: none;
+}
+
 .helix-task-view-toolbar {
   margin-bottom: 14px;
   display: flex;
@@ -1223,6 +1269,234 @@
 .helix-task-quadrant.is-important-not-urgent { border-top: 3px solid #d39a42; }
 .helix-task-quadrant.is-not-important-urgent { border-top: 3px solid #5278d4; }
 .helix-task-quadrant.is-not-important-not-urgent { border-top: 3px solid #7c879a; }
+
+.helix-task-matrix-rules {
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.helix-task-matrix-rules label {
+  min-width: 150px;
+  display: grid;
+  gap: 4px;
+}
+
+.helix-task-time-block {
+  overflow: hidden;
+}
+
+.helix-task-time-frame {
+  overflow-x: auto;
+}
+
+.helix-task-time-block-heading,
+.helix-task-year-heading {
+  min-height: 52px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--helix-line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--helix-text-strong);
+}
+
+.helix-task-time-scale {
+  display: flex;
+  gap: 5px;
+}
+
+.helix-task-time-scale button {
+  min-width: 34px;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--helix-line);
+  border-radius: 8px;
+  background: var(--helix-surface-control);
+  color: var(--helix-muted);
+  box-shadow: none;
+}
+
+.helix-task-time-scale button.is-active {
+  border-color: color-mix(in srgb, var(--helix-accent-ink) 42%, var(--helix-line));
+  background: var(--helix-accent-soft);
+  color: var(--helix-accent-ink);
+}
+
+.helix-task-time-all-day {
+  min-width: calc(58px + var(--helix-time-days) * 160px);
+  display: grid;
+  grid-template-columns: 58px repeat(var(--helix-time-days), minmax(160px, 1fr));
+  border-bottom: 1px solid var(--helix-line);
+}
+
+.helix-task-time-all-day-label {
+  padding: 10px 8px;
+  color: var(--helix-muted);
+  font-size: 9px;
+  text-align: right;
+}
+
+.helix-task-time-all-day-cell {
+  min-width: 0;
+  padding: 7px;
+  border-left: 1px solid var(--helix-line);
+  display: grid;
+  align-content: start;
+  gap: 5px;
+}
+
+.helix-task-time-all-day-cell > strong {
+  color: var(--helix-muted);
+  font-size: 9px;
+}
+
+.helix-task-time-scroll {
+  max-height: 660px;
+  min-width: calc(58px + var(--helix-time-days, 1) * 160px);
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  overflow-y: auto;
+  overflow-x: visible;
+}
+
+.helix-task-time-gutter {
+  height: 1152px;
+  display: grid;
+  grid-template-rows: repeat(24, 48px);
+  color: var(--helix-muted);
+  font-size: 9px;
+}
+
+.helix-task-time-gutter span {
+  padding: 4px 8px 0 0;
+  text-align: right;
+  transform: translateY(-7px);
+}
+
+.helix-task-time-days {
+  min-width: calc(var(--helix-time-days) * 160px);
+  display: grid;
+  grid-template-columns: repeat(var(--helix-time-days), minmax(160px, 1fr));
+}
+
+.helix-task-time-day {
+  position: relative;
+  height: 1152px;
+  border-left: 1px solid var(--helix-line);
+  background-image: linear-gradient(
+    to bottom,
+    transparent 11px,
+    color-mix(in srgb, var(--helix-line) 32%, transparent) 12px
+  );
+  background-size: 100% 12px;
+}
+
+.helix-task-time-hour {
+  height: 48px;
+  border-top: 1px solid color-mix(in srgb, var(--helix-line) 72%, transparent);
+}
+
+.helix-task-time-item {
+  position: absolute;
+  z-index: 1;
+  min-height: 24px;
+  padding: 4px 6px;
+  border: 1px solid color-mix(in srgb, var(--helix-task-color) 70%, var(--helix-line));
+  border-left: 3px solid var(--helix-task-color);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--helix-task-color) 14%, var(--helix-card));
+  color: var(--helix-text-strong);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--helix-shadow) 55%, transparent);
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  overflow: hidden;
+  text-align: left;
+}
+
+.helix-task-time-item:hover,
+.helix-task-time-item:focus-visible {
+  z-index: 3;
+  filter: brightness(1.03);
+}
+
+.helix-task-time-item.is-completed {
+  opacity: .58;
+}
+
+.helix-task-time-item-title {
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-time-item-time {
+  color: var(--helix-muted);
+  font-size: 8px;
+}
+
+.helix-task-year-heading {
+  font-size: 14px;
+  font-weight: 720;
+}
+
+.helix-task-year-grid {
+  padding: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.helix-task-year-month {
+  min-width: 0;
+  min-height: 110px;
+  padding: 12px;
+  border: 1px solid var(--helix-line);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--helix-card) 95%, var(--helix-accent-soft));
+  color: var(--helix-text-strong);
+  box-shadow: none;
+  display: grid;
+  align-content: space-between;
+  gap: 10px;
+  text-align: left;
+}
+
+.helix-task-year-month.is-current {
+  border-color: color-mix(in srgb, var(--helix-accent-ink) 54%, var(--helix-line));
+  box-shadow: inset 0 3px 0 var(--helix-accent-ink);
+}
+
+.helix-task-year-month-head,
+.helix-task-year-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.helix-task-year-month-head span,
+.helix-task-year-stats {
+  color: var(--helix-muted);
+  font-size: 9px;
+}
+
+.helix-task-year-meter {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--helix-surface-control);
+}
+
+.helix-task-year-meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--helix-accent-ink);
+}
 
 .helix-task-composer {
   margin-bottom: 14px;
@@ -3197,6 +3471,11 @@
 .helix-lineage-column-list { display: grid; gap: 10px; }
 
 @media (max-width: 900px) {
+  .helix-task-filter-bar { align-items: stretch; flex-wrap: wrap; overflow-x: visible; }
+  .helix-task-filter-field { flex: 1 1 130px; min-width: 0; }
+  .helix-task-matrix-rules { justify-content: stretch; }
+  .helix-task-matrix-rules label { flex: 1; min-width: 0; }
+  .helix-task-year-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .helix-task-view-toolbar { align-items: stretch; flex-direction: column; }
   .helix-task-view-navigation { justify-content: flex-end; }
   .helix-task-calendar.is-week,

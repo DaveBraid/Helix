@@ -29,6 +29,7 @@ import { HelixService } from "./services/helix-service";
 import { ProjectWorkspaceService } from "./services/project-workspace";
 import { TaskReferenceService } from "./services/task-references";
 import { SerializedRunner } from "./services/serialized-runner";
+import { TaskMatrixRuleUpdater } from "./services/task-view-settings";
 import type {
   ProjectWorkspaceMigrationItem,
   ProjectWorkspaceProject,
@@ -47,7 +48,10 @@ import { HELIX_VIEW_TYPE, HelixView } from "./ui/helix-view";
 import { HelixSettingTab } from "./ui/settings-tab";
 
 export default class HelixPlugin extends Plugin {
-  settings: HelixSettings = { ...DEFAULT_SETTINGS };
+  settings: HelixSettings = {
+    ...DEFAULT_SETTINGS,
+    taskMatrixRules: { ...DEFAULT_SETTINGS.taskMatrixRules },
+  };
   store!: HelixDataStore;
   secrets!: HelixSecretStore;
   service!: HelixService;
@@ -64,6 +68,8 @@ export default class HelixPlugin extends Plugin {
   private projectCanvasRefreshPending = false;
   private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
+  private readonly settingsMutationRunner = new SerializedRunner();
+  private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
 
   async onload(): Promise<void> {
     this.unloaded = false;
@@ -135,6 +141,8 @@ export default class HelixPlugin extends Plugin {
         taskReferences: this.taskReferences,
         mutateProjectWorkspace: (operation) => this.withProjectMutation(operation),
         reviewLegacyMigration: () => this.showLegacyMigrationModal(),
+        getTaskMatrixRules: () => ({ ...this.settings.taskMatrixRules }),
+        updateTaskMatrixRules: (rules) => this.updateTaskMatrixRules(rules),
       }),
     );
     this.addRibbonIcon("orbit", "打开 Helix", () => void this.activateView());
@@ -308,10 +316,38 @@ export default class HelixPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.store.mutate((data) => {
-      data.settings = { ...this.settings };
+    await this.settingsMutationRunner.run(() => {
+      const snapshot = this.settingsSnapshot();
+      return this.store.mutate((data) => {
+        data.settings = snapshot;
+      });
     });
     this.refreshAutoSync();
+  }
+
+  private async updateTaskMatrixRules(rules: HelixSettings["taskMatrixRules"]): Promise<void> {
+    await this.taskMatrixRuleUpdater.update(
+      rules,
+      async (snapshot) => {
+        const settings = {
+          ...this.settingsSnapshot(),
+          taskMatrixRules: { ...snapshot },
+        };
+        await this.store.mutate((data) => {
+          data.settings = settings;
+        });
+      },
+      (snapshot) => {
+        this.settings.taskMatrixRules = { ...snapshot };
+      },
+    );
+  }
+
+  private settingsSnapshot(): HelixSettings {
+    return {
+      ...this.settings,
+      taskMatrixRules: { ...this.settings.taskMatrixRules },
+    };
   }
 
   refreshAutoSync(): void {

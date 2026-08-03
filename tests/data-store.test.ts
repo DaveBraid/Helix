@@ -20,6 +20,45 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("HelixDataStore serialization", () => {
+  it("hydrates valid task matrix display rules and isolates nested defaults", () => {
+    const first = createDefaultData("device-a");
+    const second = createDefaultData("device-b");
+    first.settings.taskMatrixRules.urgentWithinDays = 7;
+    expect(second.settings.taskMatrixRules).toEqual({
+      importantPriorityThreshold: 5,
+      urgentWithinDays: 0,
+    });
+    expect(hydrateData({
+      schemaVersion: 2,
+      settings: {
+        taskMatrixRules: {
+          importantPriorityThreshold: 3,
+          urgentWithinDays: 3,
+        },
+      },
+    }).settings.taskMatrixRules).toEqual({
+      importantPriorityThreshold: 3,
+      urgentWithinDays: 3,
+    });
+  });
+
+  it("rejects malformed task matrix display rules instead of partially applying them", () => {
+    const data = hydrateData({
+      schemaVersion: 2,
+      settings: {
+        taskMatrixRules: {
+          importantPriorityThreshold: 2,
+          urgentWithinDays: 30,
+        },
+      },
+    });
+    expect(data.settings.taskMatrixRules).toEqual({
+      importantPriorityThreshold: 5,
+      urgentWithinDays: 0,
+    });
+    expect(data.recoveryIssues).toContainEqual(expect.stringMatching(/taskMatrixRules/));
+  });
+
   it("salvages malformed collection entries into an explicit read-only recovery state", () => {
     const data = hydrateData({
       schemaVersion: 1,

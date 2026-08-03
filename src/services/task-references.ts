@@ -45,6 +45,27 @@ export interface TaskReferenceSelection {
   stageIds: string[];
 }
 
+export interface TaskReferenceDidaContext {
+  didaProjectId: string;
+}
+
+export function taskReferenceRuntimeIssues(
+  reference: TaskReferenceResolved,
+  task?: { projectId: string },
+): string[] {
+  return [
+    ...reference.issues,
+    reference.project && !reference.project.didaProjectId
+      ? "Helix 项目尚未映射滴答清单"
+      : undefined,
+    task && reference.project?.didaProjectId &&
+      task.projectId !== reference.project.didaProjectId
+      ? "任务所属滴答清单与 Helix 项目映射不一致"
+      : undefined,
+    task ? undefined : `当前同步缓存未包含任务 ${reference.taskId}，不据此推断远端已删除`,
+  ].filter((issue): issue is string => Boolean(issue));
+}
+
 export type TaskReferenceExpectedRevision = Pick<
   TaskReference,
   "refId" | "revisionHash"
@@ -143,6 +164,7 @@ export class TaskReferenceService {
     taskId: string,
     selection: TaskReferenceSelection,
     expected: TaskReferenceExpectedRevision,
+    didaContext?: TaskReferenceDidaContext,
   ): Promise<TaskReferenceWriteResult> {
     assertRemoteIdentity(taskId, "任务 ID");
     if (taskId.startsWith("local-")) {
@@ -164,6 +186,15 @@ export class TaskReferenceService {
     const project = workspace.projects.find((candidate) =>
       candidate.id === selection.projectId);
     if (!project) throw new Error("找不到需要关联的 Helix 项目");
+    if (!didaContext) {
+      throw new Error("建立 Helix 任务关联必须提供经远端复读的滴答清单上下文");
+    }
+    if (!project.didaProjectId) {
+      throw new Error("所选 Helix 项目尚未映射滴答清单，不能建立稳定任务关联");
+    }
+    if (project.didaProjectId !== didaContext.didaProjectId) {
+      throw new Error("任务所属滴答清单与 Helix 项目映射不一致，请先移动任务或调整项目映射");
+    }
     const requestedStageIds = [...new Set(selection.stageIds)];
     if (requestedStageIds.length !== selection.stageIds.length) {
       throw new Error("阶段引用不能重复");
@@ -249,6 +280,7 @@ export class TaskReferenceService {
     previousTaskId: string,
     nextTaskId: string,
     expected: TaskReferenceExpectedRevision,
+    didaContext: TaskReferenceDidaContext,
   ): Promise<void> {
     assertRemoteIdentity(previousTaskId, "旧任务 ID");
     assertRemoteIdentity(nextTaskId, "新任务 ID");
@@ -271,6 +303,14 @@ export class TaskReferenceService {
     }
     assertExpectedReference(previous, expected);
     if (!previous) throw new Error("找不到需要重新绑定的任务关联");
+    const workspace = await this.projectWorkspace.snapshot();
+    const project = workspace.projects.find((candidate) => candidate.id === previous.projectId);
+    if (!project?.didaProjectId) {
+      throw new Error("关联的 Helix 项目尚未映射滴答清单，不能重新绑定任务");
+    }
+    if (project.didaProjectId !== didaContext.didaProjectId) {
+      throw new Error("新任务所属滴答清单与 Helix 项目映射不一致，拒绝重新绑定");
+    }
     if (next && next.refId !== previous.refId) {
       throw new Error("新旧任务 ID 各自已有引用，禁止静默合并");
     }

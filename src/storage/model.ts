@@ -56,6 +56,7 @@ export interface HelixPersistedData {
   didaContractCapabilities?: {
     probeVersion: number;
     taskScheduleMode: Exclude<TaskScheduleMode, "unknown">;
+    boardPlacementVerified: boolean;
     verifiedAt: string;
   };
   lineageConflict?: {
@@ -202,7 +203,9 @@ function validateDidaContractCapabilities(
   if (
     (record.taskScheduleMode !== "point" && record.taskScheduleMode !== "duration") ||
     typeof record.verifiedAt !== "string" ||
-    !Number.isFinite(Date.parse(record.verifiedAt))
+    !Number.isFinite(Date.parse(record.verifiedAt)) ||
+    (record.boardPlacementVerified !== undefined &&
+      typeof record.boardPlacementVerified !== "boolean")
   ) {
     issues.push("滴答合同能力缓存字段无效，已忽略并进入只读恢复模式");
     return undefined;
@@ -210,6 +213,7 @@ function validateDidaContractCapabilities(
   return {
     probeVersion: DIDA_CONTRACT_PROBE_VERSION,
     taskScheduleMode: record.taskScheduleMode,
+    boardPlacementVerified: record.boardPlacementVerified ?? false,
     verifiedAt: record.verifiedAt,
   };
 }

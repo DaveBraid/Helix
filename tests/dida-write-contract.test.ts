@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { DidaProject, DidaTask } from "../src/domain/entities";
+import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
-import { DidaWriteContractRunner } from "../src/integrations/dida/write-contract";
+import {
+  DidaWriteContractRunner,
+  verifiedBoardPlacementCapability,
+} from "../src/integrations/dida/write-contract";
 
 class ContractApiFake {
   projects = new Map<string, DidaProject>([
@@ -25,10 +28,13 @@ class ContractApiFake {
   sourceTombstoneReads = 0;
   throwAfterComplete = false;
   updateOutcome: "success" | "applied-unknown" | "not-applied-unknown" = "success";
+  placementOutcome: "success" | "applied-unknown" | "not-applied-unknown" = "success";
   updateCalls = 0;
+  updatePayloads: Partial<DidaTask>[] = [];
   failUpdateRereadOnce = false;
   returnWrongIdOnUpdateReread = false;
   corruptUpdatedAllDay = false;
+  corruptPlacementContent = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
   throwAfterDelete = false;
@@ -38,12 +44,25 @@ class ContractApiFake {
   collapseScheduleToPoint = false;
   corruptSchedule = false;
   keepTaskOnDelete = false;
+  injectForeignColumnOnTaskDelete = false;
+  renameKnownColumnOnTaskDelete = false;
+  corruptCreateColumnResponse = false;
+  throwAfterColumnCreate = false;
+  injectConcurrentColumnOnKanbanData = false;
   private staleProjects = new Map<string, { value: DidaProject; remaining: number }>();
   private staleTasks = new Map<string, { value: DidaTask; remaining: number }>();
   private moveSourceTombstones = new Map<string, DidaTask>();
   private moveSourceCollectionGhosts = new Map<string, DidaTask>();
   private projectSequence = 0;
   private taskSequence = 0;
+  projectReadCount = 0;
+  renameProjectOnRead?: number;
+  changeProjectViewModeOnRead?: number;
+  updateProjectCalls = 0;
+  forceProjectDataListMode = false;
+  startWithoutColumns = false;
+  private readonly columns = new Map<string, DidaColumn[]>();
+  private columnSequence = 0;
   private updateRereadPending = false;
   private wrongUpdateIdPending = false;
 
@@ -71,6 +90,7 @@ class ContractApiFake {
   }
 
   async getProject(projectId: string): Promise<DidaProject> {
+    this.projectReadCount += 1;
     const project = this.projects.get(projectId);
     if (!project) {
       const stale = this.staleProjects.get(projectId);
@@ -78,15 +98,85 @@ class ContractApiFake {
       stale.remaining -= 1;
       return { ...stale.value };
     }
+    if (this.renameProjectOnRead === this.projectReadCount) {
+      const renamed = { ...project, name: "并发改名" };
+      this.projects.set(projectId, renamed);
+      return renamed;
+    }
+    if (this.changeProjectViewModeOnRead === this.projectReadCount) {
+      const changed = { ...project, viewMode: project.viewMode === "list" ? "kanban" : "list" };
+      this.projects.set(projectId, changed);
+      return changed;
+    }
     return { ...project };
+  }
+
+  async updateProject(projectId: string, value: Partial<DidaProject>): Promise<DidaProject> {
+    this.updateProjectCalls += 1;
+    const current = this.projects.get(projectId);
+    if (!current) throw notFound();
+    const updated = { ...current, ...value, id: projectId };
+    this.projects.set(projectId, updated);
+    return { ...updated };
+  }
+
+  async getColumns(projectId: string): Promise<DidaColumn[]> {
+    if (!this.projects.has(projectId)) throw notFound();
+    const stored = this.columns.get(projectId);
+    if (stored) return stored.map((column) => ({ ...column }));
+    if (this.startWithoutColumns) return [];
+    return [
+      { id: `${projectId}-todo`, projectId, name: "待处理" },
+      { id: `${projectId}-doing`, projectId, name: "进行中" },
+      { id: `${projectId}-done`, projectId, name: "已完成" },
+    ];
+  }
+
+  async createColumn(projectId: string, value: Pick<DidaColumn, "name">): Promise<DidaColumn> {
+    this.columnSequence += 1;
+    const column = { id: `test-column-${this.columnSequence}`, projectId, name: value.name };
+    this.columns.set(projectId, [...await this.getColumns(projectId), column]);
+    if (this.throwAfterColumnCreate) {
+      throw new DidaHttpError("unknown-outcome", "column create unknown", 503, undefined, true);
+    }
+    return this.corruptCreateColumnResponse
+      ? { ...column, projectId: "wrong-project" }
+      : { ...column };
+  }
+
+  async updateColumn(
+    projectId: string,
+    columnId: string,
+    value: Pick<DidaColumn, "name">,
+  ): Promise<DidaColumn> {
+    const columns = await this.getColumns(projectId);
+    const current = columns.find((column) => column.id === columnId);
+    if (!current) throw notFound();
+    const updated = { ...current, name: value.name };
+    this.columns.set(projectId, columns.map((column) =>
+      column.id === columnId ? updated : column));
+    return { ...updated };
   }
 
   async getProjectData(projectId: string): Promise<{
     project: DidaProject;
     tasks: DidaTask[];
+    columns: Array<{ id: string; projectId: string; name: string }>;
   }> {
+    if (
+      this.injectConcurrentColumnOnKanbanData &&
+      this.projects.get(projectId)?.viewMode === "kanban"
+    ) {
+      this.injectConcurrentColumnOnKanbanData = false;
+      this.columns.set(projectId, [
+        ...await this.getColumns(projectId),
+        { id: "concurrent-kanban-column", projectId, name: "用户竞争分栏" },
+      ]);
+    }
     return {
-      project: await this.getProject(projectId),
+      project: this.forceProjectDataListMode
+        ? { ...await this.getProject(projectId), viewMode: "list" }
+        : await this.getProject(projectId),
       tasks: [
         ...[...this.tasks.values()].filter(
           (task) => task.projectId === projectId && task.status !== 2,
@@ -95,6 +185,7 @@ class ContractApiFake {
           (task) => task.projectId === projectId && task.status !== 2,
         ),
       ],
+      columns: await this.getColumns(projectId),
     };
   }
 
@@ -185,9 +276,13 @@ class ContractApiFake {
 
   async updateTask(taskId: string, value: Partial<DidaTask>): Promise<DidaTask> {
     this.updateCalls += 1;
+    this.updatePayloads.push({ ...value });
     const current = this.tasks.get(taskId);
     if (!current) throw notFound();
-    if (this.updateOutcome === "not-applied-unknown") {
+    const placement = Object.prototype.hasOwnProperty.call(value, "columnId") &&
+      !Object.prototype.hasOwnProperty.call(value, "title");
+    const outcome = placement ? this.placementOutcome : this.updateOutcome;
+    if (outcome === "not-applied-unknown") {
       if (this.failUpdateRereadOnce) this.updateRereadPending = true;
       throw new DidaHttpError("unknown-outcome", "update unknown", 503, undefined, true);
     }
@@ -195,8 +290,9 @@ class ContractApiFake {
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
     if (this.corruptSchedule) updated.dueDate = "2030-01-01T00:00:00.000Z";
     if (this.corruptUpdatedAllDay) updated.isAllDay = true;
+    if (placement && this.corruptPlacementContent) updated.content = "被归栏意外改写";
     this.tasks.set(taskId, updated);
-    if (this.updateOutcome === "applied-unknown") {
+    if (outcome === "applied-unknown") {
       if (this.failUpdateRereadOnce) this.updateRereadPending = true;
       if (this.returnWrongIdOnUpdateReread) this.wrongUpdateIdPending = true;
       throw new DidaHttpError("unknown-outcome", "update unknown", 503, undefined, true);
@@ -254,6 +350,17 @@ class ContractApiFake {
     const task = await this.getTask(projectId, taskId);
     this.deletedTasks.push(taskId);
     if (!this.keepTaskOnDelete) this.tasks.delete(taskId);
+    if (this.injectForeignColumnOnTaskDelete) {
+      this.columns.set(projectId, [
+        ...await this.getColumns(projectId),
+        { id: "foreign-column", projectId, name: "用户新增分栏" },
+      ]);
+    }
+    if (this.renameKnownColumnOnTaskDelete) {
+      const columns = await this.getColumns(projectId);
+      this.columns.set(projectId, columns.map((column, index) =>
+        index === 0 ? { ...column, name: "用户并发改名" } : column));
+    }
     if (this.staleReadsAfterDelete > 0) {
       this.staleTasks.set(`${projectId}:${taskId}`, {
         value: { ...task },
@@ -265,6 +372,105 @@ class ContractApiFake {
 }
 
 describe("DidaWriteContractRunner", () => {
+  it("never unlocks production placement while test artifacts may remain", () => {
+    expect(verifiedBoardPlacementCapability({
+      boardPlacementVerified: true,
+      remoteArtifactsRemaining: true,
+    })).toBe(false);
+    expect(verifiedBoardPlacementCapability({
+      boardPlacementVerified: true,
+      remoteArtifactsRemaining: false,
+    })).toBe(true);
+  });
+  it("does not absorb a concurrently added column after switching to kanban", async () => {
+    const api = new ContractApiFake();
+    api.injectConcurrentColumnOnKanbanData = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-kanban-baseline-race",
+      fixedNow,
+    ).run();
+    expect(report.status).toBe("failed");
+    expect(report.failure).toMatch(/切换看板后列基线出现未知变化/);
+    expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(api.projects.has("test-project-1")).toBe(true);
+  });
+
+  it("refuses to delete a test project whose column set changed concurrently", async () => {
+    const api = new ContractApiFake();
+    api.injectForeignColumnOnTaskDelete = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-column-race",
+      fixedNow,
+    ).run();
+    expect(report.status).toBe("failed");
+    expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(report.cleanupErrors.join(" ")).toMatch(/分栏集合.*未知变化/);
+    expect(api.projects.has("test-project-2")).toBe(true);
+    expect(api.projects.has("original-project")).toBe(true);
+  });
+
+  it("refuses to delete a test project after a same-ID column rename", async () => {
+    const api = new ContractApiFake();
+    api.renameKnownColumnOnTaskDelete = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-column-rename-race",
+      fixedNow,
+    ).run();
+    expect(report.status).toBe("failed");
+    expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(report.cleanupErrors.join(" ")).toMatch(/分栏集合.*未知变化/);
+    expect(api.projects.has("test-project-2")).toBe(true);
+  });
+
+  it.each([
+    ["invalid response", (api: ContractApiFake) => { api.corruptCreateColumnResponse = true; }],
+    ["unknown outcome", (api: ContractApiFake) => { api.throwAfterColumnCreate = true; }],
+  ])("keeps the marked project for manual review after %s from column create", async (_label, arrange) => {
+    const api = new ContractApiFake();
+    api.startWithoutColumns = true;
+    arrange(api);
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-column-create-failure",
+      fixedNow,
+    ).run();
+    expect(report.status).toBe("failed");
+    expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(api.projects.has("test-project-1")).toBe(true);
+    expect(api.projects.has("original-project")).toBe(true);
+  });
+
+  it("refuses to overwrite a run-created project renamed before the first view-mode write", async () => {
+    const api = new ContractApiFake();
+    api.renameProjectOnRead = 3;
+    const report = await new DidaWriteContractRunner(api, () => "run-view-race", fixedNow).run();
+    expect(report.status).toBe("failed");
+    expect(report.failureStage).toBe("验证专用清单列表与看板默认视图");
+    expect(report.failure).toMatch(/身份、标记或视图基线已变化/);
+    expect(api.updateProjectCalls).toBe(0);
+  });
+
+  it("does not accept stale columns after the detail project has returned to list mode", async () => {
+    const api = new ContractApiFake();
+    api.forceProjectDataListMode = true;
+    const report = await new DidaWriteContractRunner(api, () => "run-stale-columns", fixedNow).run();
+    expect(report.status).toBe("failed");
+    expect(report.failureStage).toBe("验证专用清单列表与看板默认视图");
+    expect(report.failure).toMatch(/视图状态不一致/);
+  });
+
+  it("refuses to overwrite a concurrent view-mode change between verified steps", async () => {
+    const api = new ContractApiFake();
+    api.changeProjectViewModeOnRead = 5;
+    const report = await new DidaWriteContractRunner(api, () => "run-view-baseline", fixedNow).run();
+    expect(report.status).toBe("failed");
+    expect(report.failureStage).toBe("验证专用清单列表与看板默认视图");
+    expect(report.failure).toMatch(/视图基线已变化/);
+    expect(api.updateProjectCalls).toBe(1);
+  });
   const fixedNow = () => new Date("2026-07-31T00:00:00.000Z");
 
   it("tests only run-created IDs and removes every temporary artifact", async () => {
@@ -276,12 +482,27 @@ describe("DidaWriteContractRunner", () => {
       cleanupErrors: [],
       remoteArtifactsRemaining: false,
     });
+    expect(report.steps.join(" ")).toMatch(/列表→看板→列表.*3 个看板列/);
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");
     expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.deletedTasks).toEqual(["test-task-1"]);
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
+  });
+
+  it("creates and renames uniquely marked columns when a new board has none", async () => {
+    const api = new ContractApiFake();
+    api.startWithoutColumns = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-empty-board",
+      fixedNow,
+    ).run();
+    expect(report.status).toBe("passed");
+    expect(report.boardPlacementVerified).toBe(true);
+    expect(report.steps.join(" ")).toMatch(/复读 2 个看板列/);
+    expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
   });
 
   it("does not let a progress observer interrupt cleanup", async () => {
@@ -340,8 +561,72 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(report.steps.join(" ")).toMatch(/未重发.*精确复读已证明字段生效/);
-    expect(api.updateCalls).toBe(1);
+    expect(api.updateCalls).toBe(2);
     expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it("places a task with only identity and column fields while preserving every other field", async () => {
+    const api = new ContractApiFake();
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-minimal-placement",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(api.updatePayloads[1]).toEqual({
+      id: "test-task-1",
+      projectId: "test-project-1",
+      columnId: "test-project-1-doing",
+    });
+    expect(report.steps.join(" ")).toMatch(/最小白名单归栏.*其他任务字段未变化/);
+  });
+
+  it("fails and cleans up when a minimal board placement changes another task field", async () => {
+    const api = new ContractApiFake();
+    api.corruptPlacementContent = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-placement-corruption",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.boardPlacementVerified).toBe(false);
+    expect(report.failureStage).toBe("以最小载荷验证测试任务看板归栏");
+    expect(report.failure).toMatch(/分栏以外的任务字段/);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+  });
+
+  it("does not resend an unknown minimal placement when an exact reread proves it", async () => {
+    const api = new ContractApiFake();
+    api.placementOutcome = "applied-unknown";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-placement-applied-unknown",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.boardPlacementVerified).toBe(true);
+    expect(api.updatePayloads.filter((payload) => "columnId" in payload)).toHaveLength(1);
+    expect(report.steps.join(" ")).toMatch(/归栏响应未知.*未重发/);
+  });
+
+  it("does not resend or accept an unknown minimal placement that was not applied", async () => {
+    const api = new ContractApiFake();
+    api.placementOutcome = "not-applied-unknown";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-placement-not-applied-unknown",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.failureStage).toBe("以最小载荷验证测试任务看板归栏");
+    expect(report.failure).toMatch(/未证明安全写入.*未重发/);
+    expect(api.updatePayloads.filter((payload) => "columnId" in payload)).toHaveLength(1);
+    expect(report.remoteArtifactsRemaining).toBe(false);
   });
 
   it("fails without resending when an exact reread cannot prove an unknown update", async () => {

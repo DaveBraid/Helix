@@ -601,14 +601,40 @@ describe("HelixDataStore serialization", () => {
       didaContractCapabilities: {
         probeVersion: 2,
         taskScheduleMode: "point",
+        boardPlacementVerified: true,
         verifiedAt: "2026-07-31T00:00:00.000Z",
       },
     });
     expect(valid.didaContractCapabilities).toEqual({
       probeVersion: 2,
       taskScheduleMode: "point",
+      boardPlacementVerified: true,
       verifiedAt: "2026-07-31T00:00:00.000Z",
     });
+
+    const legacy = hydrateData({
+      schemaVersion: 2,
+      didaContractCapabilities: {
+        probeVersion: 2,
+        taskScheduleMode: "point",
+        verifiedAt: "2026-07-31T00:00:00.000Z",
+      },
+    });
+    expect(legacy.didaContractCapabilities?.boardPlacementVerified).toBe(false);
+
+    const invalidBoardCapability = hydrateData({
+      schemaVersion: 2,
+      didaContractCapabilities: {
+        probeVersion: 2,
+        taskScheduleMode: "point",
+        boardPlacementVerified: "yes",
+        verifiedAt: "2026-07-31T00:00:00.000Z",
+      },
+    });
+    expect(invalidBoardCapability.didaContractCapabilities).toBeUndefined();
+    expect(invalidBoardCapability.recoveryIssues).toEqual(expect.arrayContaining([
+      expect.stringMatching(/滴答合同能力缓存字段无效/),
+    ]));
 
     const invalid = hydrateData({
       schemaVersion: 2,

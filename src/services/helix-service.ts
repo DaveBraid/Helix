@@ -23,12 +23,16 @@ import {
   type HelixEvent,
 } from "../domain/events";
 import { challengeProgress, rotatingChallenges } from "../domain/gamification";
+import { stableHash } from "../domain/stable";
 import { DidaApi, type DidaCapabilities } from "../integrations/dida/api";
 import {
   DidaFocusService,
   DidaHabitService,
   DidaProjectAdapter,
   DidaTaskAdapter,
+  sameTaskBoardPlacementInvariant,
+  taskBoardPlacementPayload,
+  taskSyncProjection,
 } from "../integrations/dida/adapters";
 import { ObsidianHttpTransport } from "../integrations/dida/http";
 import {
@@ -38,6 +42,7 @@ import {
 } from "../integrations/dida/normalization";
 import {
   DidaWriteContractRunner,
+  verifiedBoardPlacementCapability,
   type DidaWriteContractProgress,
   type DidaWriteContractReport,
 } from "../integrations/dida/write-contract";
@@ -45,6 +50,7 @@ import { OfflineQueue } from "../sync/offline-queue";
 import { ingestRemoteRecords } from "../sync/remote-ingest";
 import { createSnapshot } from "../sync/snapshots";
 import { SyncEngine, type ResolvedConflict } from "../sync/sync-engine";
+import { buildConflictFields } from "../sync/three-way-merge";
 import type {
   ResolutionChoice,
   SyncConflict,
@@ -80,6 +86,7 @@ export interface HelixRuntimeState {
   inProgress: InProgressEntry[];
   capabilities: DidaCapabilities | null;
   taskScheduleMode: TaskScheduleMode;
+  boardPlacementVerified: boolean;
   demoMode: boolean;
   syncWarnings: string[];
   lastSyncAt?: string;
@@ -105,6 +112,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   inProgress: [],
   capabilities: null,
   taskScheduleMode: "unknown",
+  boardPlacementVerified: false,
   demoMode: false,
   syncWarnings: [],
   attentionCount: 0,
@@ -123,6 +131,7 @@ export class HelixService {
   private syncPromise: Promise<void> | null = null;
   private readonly conflictApplications = new Map<string, Promise<void>>();
   private readonly remoteWriteGate = new RemoteWriteGate();
+  private readonly boardPlacementWrites = new Map<string, Promise<void>>();
   private contractTestRunning = false;
   private secretMutationAuthorized = false;
   private disposed = false;
@@ -204,6 +213,8 @@ export class HelixService {
       authorizationConfigured,
       taskScheduleMode:
         data.didaContractCapabilities?.taskScheduleMode ?? "unknown",
+      boardPlacementVerified:
+        data.didaContractCapabilities?.boardPlacementVerified ?? false,
       demoMode:
         !authorizationConfigured &&
         !hasCachedDidaData &&
@@ -257,6 +268,7 @@ export class HelixService {
         authorizationConfigured: Boolean(this.secrets.getDidaToken()),
         capabilities: null,
         taskScheduleMode: "unknown",
+        boardPlacementVerified: false,
         demoMode:
           !this.secrets.getDidaToken() &&
           this.state.projects.length === 0 &&
@@ -558,11 +570,16 @@ export class HelixService {
         onProgress,
       ).run();
       if (report.taskScheduleMode !== "unknown") {
-        this.patch({ taskScheduleMode: report.taskScheduleMode });
+        const boardPlacementVerified = verifiedBoardPlacementCapability(report);
+        this.patch({
+          taskScheduleMode: report.taskScheduleMode,
+          boardPlacementVerified,
+        });
         await this.store.mutate((data) => {
           data.didaContractCapabilities = {
             probeVersion: DIDA_CONTRACT_PROBE_VERSION,
             taskScheduleMode: report.taskScheduleMode as Exclude<TaskScheduleMode, "unknown">,
+            boardPlacementVerified,
             verifiedAt: new Date().toISOString(),
           };
         });
@@ -579,6 +596,17 @@ export class HelixService {
     this.assertActive();
     return this.withAuthorizationLease(() =>
       this.verifyRemoteTaskWithAuthorizationLease(projectId, taskId));
+  }
+
+  async verifyRemoteProject(projectId: string): Promise<DidaProject> {
+    this.assertActive();
+    return this.withAuthorizationLease(async () => {
+      const project = normalizeProject(await this.api.getProject(projectId));
+      if (project.id !== projectId) {
+        throw new Error("滴答复读返回的清单身份与待映射目标不一致");
+      }
+      return project;
+    });
   }
 
   private async verifyRemoteTaskWithAuthorizationLease(
@@ -849,6 +877,199 @@ export class HelixService {
     } finally {
       releaseAuthorizationLease();
     }
+  }
+
+  async moveTaskToBoardColumn(
+    projectId: string,
+    taskId: string,
+    targetColumnId: string,
+  ): Promise<void> {
+    this.assertWritable();
+    if (!this.state.boardPlacementVerified) {
+      throw new Error("当前滴答账号尚未通过看板归栏合同测试");
+    }
+    const previous = this.boardPlacementWrites.get(taskId) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      const releaseExclusive = this.remoteWriteGate.enterExclusive("看板卡片归栏");
+      try {
+        if (this.syncPromise || this.state.loading) {
+          throw new Error("同步正在进行，请完成后再移动看板卡片");
+        }
+        const project = this.state.projects.find((candidate) => candidate.id === projectId);
+        const task = this.state.tasks.find((candidate) => candidate.id === taskId);
+        if (!project || !task || task.projectId !== projectId) throw new Error("找不到看板任务或清单");
+        if (task.columnId === targetColumnId) return;
+        if (!this.state.connected) throw new Error("离线时不能移动看板卡片，请恢复连接后重试");
+        if (project.permission && project.permission !== "write") throw new Error("该清单没有写入权限");
+        if (project.boardStale) throw new Error("看板详情已过期，请先同步");
+        const persistedBefore = await this.store.snapshot();
+        if (persistedBefore.queue.some((candidate) =>
+          candidate.kind === "task" && candidate.entityId === taskId)) {
+          throw new Error("该任务仍有待处理或待核对的普通同步操作，请先在冲突中心处理");
+        }
+        if (persistedBefore.conflicts.some((candidate) =>
+          candidate.kind === "task" && candidate.entityId === taskId &&
+          candidate.status !== "resolved" && candidate.status !== "superseded")) {
+          throw new Error("该任务已有逐字段冲突，请先在冲突中心处理");
+        }
+        const baselineColumns = normalizeColumns(project.columns);
+        if (!baselineColumns.some((column) => column.id === targetColumnId)) {
+          throw new Error("目标分栏已不在当前看板快照中");
+        }
+        const data = await this.api.getProjectData(projectId);
+        const remoteProject = normalizeProject(data.project);
+        if (remoteProject.id !== projectId) throw new Error("看板写前清单身份复读不一致");
+        const remoteColumns = normalizeColumns(data.columns);
+        if (!sameColumns(remoteColumns, baselineColumns)) {
+          throw new Error("看板分栏在操作期间已经变化，请同步后人工核对");
+        }
+        const detailTask = (Array.isArray(data.tasks) ? data.tasks : [])
+          .map(normalizeTask)
+          .find((candidate) => candidate.id === taskId);
+        if (!detailTask || detailTask.projectId !== projectId) {
+          throw new Error("任务在操作期间已离开当前清单，请同步后人工核对");
+        }
+        const remoteTask = normalizeTask(await this.api.getTask(projectId, taskId));
+        if (remoteTask.id !== taskId || remoteTask.projectId !== projectId) {
+          throw new Error("任务写前精确复读的身份或清单不一致");
+        }
+        if ((detailTask.columnId ?? null) !== (task.columnId ?? null) ||
+          (detailTask.columnId ?? null) !== (remoteTask.columnId ?? null)) {
+          throw new Error("看板详情、精确任务与本地快照的原分栏不一致，请同步后人工核对");
+        }
+        if ((remoteTask.columnId ?? null) !== (task.columnId ?? null)) {
+          throw new Error("任务分栏在操作期间已经变化，请同步后人工核对");
+        }
+        if (remoteTask.columnId === targetColumnId) return;
+        const baselineCapturedAt = project.boardCapturedAt;
+        await this.store.mutate((draft) => {
+          const board = draft.boardSnapshots[projectId];
+          if (!board || board.stale || board.capturedAt !== baselineCapturedAt ||
+            !sameColumns(board.columns, baselineColumns) ||
+            (board.taskColumnIds[taskId] ?? null) !== (task.columnId ?? null)) {
+            throw new Error("本地看板基线在写入前已经变化，请重新同步");
+          }
+          board.stale = true;
+        });
+        this.patch({
+          projects: this.state.projects.map((candidate) =>
+            candidate.id === projectId ? { ...candidate, boardStale: true } : candidate),
+        });
+        try {
+          await this.api.updateTask(
+            taskId,
+            taskBoardPlacementPayload(remoteTask, targetColumnId),
+          );
+        } catch (error) {
+          if (!hasUnknownRemoteOutcome(error)) {
+            throw new Error(
+              `看板归栏被远端拒绝；未重发，看板已冻结等待同步核对：` +
+              `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          let reconciled: DidaTask;
+          try {
+            reconciled = normalizeTask(await this.api.getTask(projectId, taskId));
+          } catch {
+            throw new Error("归栏写入结果未知且精确复读失败；未重发，看板已冻结等待同步核对");
+          }
+          if (reconciled.id !== taskId || reconciled.projectId !== projectId ||
+            reconciled.columnId !== targetColumnId) {
+            throw new Error("归栏写入结果未知且复读未证明目标分栏；未重发，看板已冻结等待同步核对");
+          }
+        }
+        let reread: DidaTask;
+        try {
+          reread = normalizeTask(await this.api.getTask(projectId, taskId));
+        } catch {
+          throw new Error("远端可能已完成归栏，但写后复读失败；看板已冻结等待同步核对");
+        }
+        if (reread.id !== taskId || reread.projectId !== projectId ||
+          reread.columnId !== targetColumnId) {
+          throw new Error("看板卡片移动后未在目标分栏精确复读");
+        }
+        if (!sameTaskBoardPlacementInvariant(remoteTask, reread)) {
+          await this.recordBoardPlacementConflict(remoteTask, reread);
+          throw new Error("归栏改变了分栏以外的任务字段；看板已冻结，请逐字段处理冲突");
+        }
+        try {
+          await this.store.mutate((draft) => {
+            const board = draft.boardSnapshots[projectId];
+            if (!board || !board.stale || board.capturedAt !== baselineCapturedAt ||
+              !sameColumns(board.columns, baselineColumns) ||
+              (board.taskColumnIds[taskId] ?? null) !== (task.columnId ?? null)) {
+              throw new Error("本地看板核对意图在远端写入期间已经变化");
+            }
+            board.taskColumnIds[taskId] = targetColumnId;
+            board.stale = false;
+          });
+        } catch {
+          throw new Error("远端归栏已成功，但本地结果保存失败；看板保持冻结，请立即同步核对");
+        }
+        this.patch({
+          tasks: this.state.tasks.map((candidate) =>
+            candidate.id === taskId ? { ...candidate, columnId: targetColumnId } : candidate),
+          projects: this.state.projects.map((candidate) =>
+            candidate.id === projectId
+              ? { ...candidate, boardStale: false }
+              : candidate),
+        });
+      } finally {
+        releaseExclusive();
+      }
+    });
+    this.boardPlacementWrites.set(taskId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.boardPlacementWrites.get(taskId) === operation) {
+        this.boardPlacementWrites.delete(taskId);
+      }
+    }
+  }
+
+  private async recordBoardPlacementConflict(baseValue: DidaTask, remoteValue: DidaTask): Promise<void> {
+    const capturedAt = new Date().toISOString();
+    const baseProjection = taskSyncProjection(baseValue);
+    const remoteProjection = taskSyncProjection(remoteValue);
+    const base = createSnapshot("task", baseProjection.id, baseProjection, { capturedAt });
+    const local = createSnapshot("task", baseProjection.id, baseProjection, { capturedAt });
+    const remote = createSnapshot("task", remoteProjection.id, remoteProjection, { capturedAt });
+    await this.store.mutate((draft) => {
+      const existing = draft.conflicts.find((conflict) =>
+        conflict.kind === "task" && conflict.entityId === baseValue.id &&
+        conflict.status !== "resolved" && conflict.status !== "superseded");
+      if (existing) {
+        existing.remote = remote;
+        existing.fields = buildConflictFields(existing.base.value, existing.local.value, remote.value);
+        existing.status = "open";
+        existing.updatedAt = capturedAt;
+        return;
+      }
+      draft.conflicts.push({
+        id: `conflict-${stableHash(["task", baseValue.id, base.stamp.hash, remote.stamp.hash])}`,
+        kind: "task",
+        entityId: baseValue.id,
+        title: baseValue.title,
+        createdAt: capturedAt,
+        updatedAt: capturedAt,
+        status: "open",
+        base,
+        local,
+        remote,
+        fields: buildConflictFields(base.value, local.value, remote.value),
+        remoteRecheckCount: 0,
+        sourceDeviceId: draft.deviceId,
+      });
+    });
+    const data = await this.store.snapshot();
+    this.patch({
+      attentionCount: data.queue.filter(needsAttention).length +
+        data.conflicts.filter((conflict) => conflict.status !== "resolved" &&
+          conflict.status !== "superseded").length +
+        data.recoveryIssues.length +
+        (data.lineageConflict ? 1 : 0),
+    });
   }
 
   private async queueTaskUpdateWithAuthorizationLease(
@@ -1763,6 +1984,15 @@ function needsAttention(operation: SyncQueueOperation): boolean {
     operation.status === "failed" ||
     operation.status === "blocked"
   );
+}
+
+function sameColumns(left: DidaColumn[], right: DidaColumn[]): boolean {
+  return left.length === right.length && left.every((column, index) => {
+    const other = right[index];
+    return !!other && column.id === other.id && column.projectId === other.projectId &&
+      column.name === other.name && column.sortOrder === other.sortOrder &&
+      column.sortOrderUnsafe === other.sortOrderUnsafe;
+  });
 }
 
 function matchesCreatedTask(local: DidaTask, remote: DidaTask): boolean {

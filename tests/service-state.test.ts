@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DidaTask } from "../src/domain/entities";
+import type { DidaProject, DidaTask } from "../src/domain/entities";
 import { HelixService } from "../src/services/helix-service";
 import { HelixDataStore, type PluginDataPort } from "../src/storage/data-store";
 import { createDefaultData, hydrateData } from "../src/storage/model";
@@ -9,6 +9,125 @@ import type { SyncQueueOperation } from "../src/sync/types";
 import { buildConflictFields } from "../src/sync/three-way-merge";
 import { deterministicEventId, type HelixEvent } from "../src/domain/events";
 import { rotatingChallenges } from "../src/domain/gamification";
+import { stableHash } from "../src/domain/stable";
+import { taskSyncProjection } from "../src/integrations/dida/adapters";
+import { normalizeTask } from "../src/integrations/dida/normalization";
+
+async function createBoardMoveHarness(): Promise<{
+  service: HelixService;
+  project: DidaProject;
+  task: DidaTask;
+  control: {
+    detailColumn: string;
+    remoteTask: DidaTask;
+    updateOutcome: "success" | "applied-unknown" | "not-applied-unknown" | "rejected";
+    corruptContent: boolean;
+    failSaveCall?: number;
+    saveCalls: number;
+    updateCalls: number;
+    projectDataCalls: number;
+    getTaskCalls: number;
+  };
+  persisted: () => ReturnType<typeof createDefaultData>;
+}> {
+  const data = createDefaultData("device-board-harness");
+  data.didaContractCapabilities = {
+    probeVersion: 2,
+    taskScheduleMode: "point",
+    boardPlacementVerified: true,
+    verifiedAt: "2026-08-03T00:00:00.000Z",
+  };
+  const project: DidaProject = {
+    id: "project-board-harness",
+    name: "Board",
+    viewMode: "kanban",
+    permission: "write",
+  };
+  const task: DidaTask = {
+    id: "task-board-harness",
+    projectId: project.id,
+    title: "Move safely",
+    content: "keep me",
+    status: 0,
+    sortOrder: 10,
+  };
+  const projectBase = createSnapshot("project", project.id, project);
+  const taskBase = createSnapshot("task", task.id, task);
+  data.baseSnapshots[`project:${project.id}`] = projectBase;
+  data.localSnapshots[`project:${project.id}`] = projectBase;
+  data.baseSnapshots[`task:${task.id}`] = taskBase;
+  data.localSnapshots[`task:${task.id}`] = taskBase;
+  data.boardSnapshots[project.id] = {
+    projectId: project.id,
+    capturedAt: "2026-08-03T00:00:00.000Z",
+    stale: false,
+    columns: [
+      { id: "todo", projectId: project.id, name: "To do", sortOrder: 10 },
+      { id: "doing", projectId: project.id, name: "Doing", sortOrder: 20 },
+    ],
+    taskColumnIds: { [task.id]: "todo" },
+  };
+  let persisted = structuredClone(data);
+  const control = {
+    detailColumn: "todo",
+    remoteTask: { ...task, columnId: "todo" } as DidaTask,
+    updateOutcome: "success" as "success" | "applied-unknown" | "not-applied-unknown" | "rejected",
+    corruptContent: false,
+    failSaveCall: undefined as number | undefined,
+    saveCalls: 0,
+    updateCalls: 0,
+    projectDataCalls: 0,
+    getTaskCalls: 0,
+  };
+  const service = new HelixService(
+    new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) {
+        control.saveCalls += 1;
+        if (control.failSaveCall === control.saveCalls) throw new Error("save failed");
+        persisted = structuredClone(value) as typeof persisted;
+      },
+    }),
+    { getDidaToken: () => "token" } as HelixSecretStore,
+  );
+  await service.initialize();
+  (service as unknown as { patch(value: { connected: boolean }): void }).patch({ connected: true });
+  const api = (service as unknown as { api: Record<string, unknown> }).api;
+  Object.assign(api, {
+    async getProjects() { return [project]; },
+    async filterTasks() { return [{ ...control.remoteTask }]; },
+    async getCompletedTasks() { return []; },
+    async listHabits() { return []; },
+    async listFocus() { return []; },
+    async getProjectData() {
+      control.projectDataCalls += 1;
+      return {
+        project,
+        tasks: [{ ...control.remoteTask, columnId: control.detailColumn }],
+        columns: persisted.boardSnapshots[project.id]!.columns,
+      };
+    },
+    async getTask() {
+      control.getTaskCalls += 1;
+      return { ...control.remoteTask };
+    },
+    async updateTask(_taskId: string, payload: Partial<DidaTask>) {
+      control.updateCalls += 1;
+      if (control.updateOutcome === "not-applied-unknown") {
+        throw Object.assign(new Error("unknown"), { remoteOutcomeUnknown: true });
+      }
+      if (control.updateOutcome === "rejected") throw new Error("rejected");
+      control.remoteTask = { ...control.remoteTask, ...payload };
+      if (typeof payload.columnId === "string") control.detailColumn = payload.columnId;
+      if (control.corruptContent) control.remoteTask.content = "changed remotely";
+      if (control.updateOutcome === "applied-unknown") {
+        throw Object.assign(new Error("unknown"), { remoteOutcomeUnknown: true });
+      }
+      return { ...control.remoteTask };
+    },
+  });
+  return { service, project, task, control, persisted: () => structuredClone(persisted) };
+}
 
 describe("HelixService runtime recovery", () => {
   it("does not cover a configured account or real cache with sample data", async () => {
@@ -77,6 +196,7 @@ describe("HelixService runtime recovery", () => {
     data.didaContractCapabilities = {
       probeVersion: 2,
       taskScheduleMode: "point",
+      boardPlacementVerified: true,
       verifiedAt: "2026-07-31T00:00:00.000Z",
     };
     let persisted = structuredClone(data);
@@ -100,10 +220,12 @@ describe("HelixService runtime recovery", () => {
 
     await service.initialize();
     expect(service.snapshot().taskScheduleMode).toBe("point");
+    expect(service.snapshot().boardPlacementVerified).toBe(true);
     expect(service.snapshot().authorizationConfigured).toBe(true);
 
     await service.clearDidaToken();
     expect(service.snapshot().taskScheduleMode).toBe("unknown");
+    expect(service.snapshot().boardPlacementVerified).toBe(false);
     expect(service.snapshot().authorizationConfigured).toBe(false);
     expect(service.snapshot().demoMode).toBe(true);
     expect(persisted.didaContractCapabilities).toBeUndefined();
@@ -773,6 +895,7 @@ describe("HelixService runtime recovery", () => {
     );
     await service.initialize();
     let returnedProjectId = "project-1";
+    let returnedListId = "project-1";
     Object.defineProperty(service, "api", {
       value: {
         async getTask(projectId: string, taskId: string): Promise<DidaTask> {
@@ -785,6 +908,10 @@ describe("HelixService runtime recovery", () => {
             status: 0,
           };
         },
+        async getProject(projectId: string): Promise<DidaProject> {
+          expect(projectId).toBe("project-1");
+          return { id: returnedListId, name: "Verified list" };
+        },
       },
     });
 
@@ -793,6 +920,11 @@ describe("HelixService runtime recovery", () => {
     returnedProjectId = "project-other";
     await expect(service.verifyRemoteTask("project-1", "task-1"))
       .rejects.toThrow(/身份或清单/);
+    await expect(service.verifyRemoteProject("project-1"))
+      .resolves.toMatchObject({ id: "project-1", name: "Verified list" });
+    returnedListId = "project-other";
+    await expect(service.verifyRemoteProject("project-1"))
+      .rejects.toThrow(/清单身份/);
   });
 
   it("migrates an in-progress marker after an ordinary queued create succeeds", async () => {
@@ -1054,6 +1186,306 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.queue).toMatchObject([{ kind: "project", entityId: project.id, status: "pending" }]);
     expect(await service.getDidaProjectViewModeSyncStatus(project.id)).toBe("pending");
     expect(service.snapshot().projects[0]?.viewMode).toBe("kanban");
+  });
+
+  it("moves one board task only after exact remote column preflight", async () => {
+    const data = createDefaultData("device-board-move");
+    data.didaContractCapabilities = {
+      probeVersion: 2,
+      taskScheduleMode: "point",
+      boardPlacementVerified: true,
+      verifiedAt: "2026-08-03T00:00:00.000Z",
+    };
+    const project: DidaProject = {
+      id: "project-board-move",
+      name: "Board",
+      viewMode: "kanban",
+      permission: "write",
+    };
+    const task: DidaTask = {
+      id: "task-board-move",
+      projectId: project.id,
+      title: "Move me",
+      status: 0,
+    };
+    const projectBase = createSnapshot("project", project.id, project);
+    const taskBase = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`project:${project.id}`] = projectBase;
+    data.localSnapshots[`project:${project.id}`] = projectBase;
+    data.baseSnapshots[`task:${task.id}`] = taskBase;
+    data.localSnapshots[`task:${task.id}`] = taskBase;
+    data.boardSnapshots[project.id] = {
+      projectId: project.id,
+      capturedAt: "2026-08-03T00:00:00.000Z",
+      stale: false,
+      columns: [
+        { id: "todo", projectId: project.id, name: "To do", sortOrder: 10 },
+        { id: "doing", projectId: project.id, name: "Doing", sortOrder: 20 },
+      ],
+      taskColumnIds: { [task.id]: "todo" },
+    };
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    (service as unknown as { patch(value: { connected: boolean }): void }).patch({ connected: true });
+    let updatePayload: Partial<DidaTask> | undefined;
+    let remoteTask: DidaTask = { ...task, columnId: "todo" };
+    Object.defineProperty(service, "api", { value: {
+      async getProjectData() {
+        return {
+          project,
+          tasks: [remoteTask],
+          columns: persisted.boardSnapshots[project.id]!.columns,
+        };
+      },
+      async updateTask(_taskId: string, payload: Partial<DidaTask>) {
+        updatePayload = payload;
+        remoteTask = { ...remoteTask, ...payload };
+        return remoteTask;
+      },
+      async getTask() { return remoteTask; },
+    } });
+
+    await service.moveTaskToBoardColumn(project.id, task.id, "doing");
+
+    expect(updatePayload).toEqual({ id: task.id, projectId: project.id, columnId: "doing" });
+    expect(persisted.boardSnapshots[project.id]?.taskColumnIds[task.id]).toBe("doing");
+    expect(service.snapshot().tasks.find((candidate) => candidate.id === task.id)?.columnId)
+      .toBe("doing");
+  });
+
+  it("blocks board placement for an unverified account before any remote access", async () => {
+    const { service, project, task, control } = await createBoardMoveHarness();
+    (service as unknown as {
+      patch(value: { boardPlacementVerified: boolean }): void;
+    }).patch({ boardPlacementVerified: false });
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/当前滴答账号尚未通过/);
+    expect(control.projectDataCalls).toBe(0);
+    expect(control.getTaskCalls).toBe(0);
+    expect(control.updateCalls).toBe(0);
+  });
+
+  it("treats a repeated move to the current column as a zero-write no-op", async () => {
+    const { service, project, task, control } = await createBoardMoveHarness();
+
+    await service.moveTaskToBoardColumn(project.id, task.id, "todo");
+
+    expect(control.projectDataCalls).toBe(0);
+    expect(control.getTaskCalls).toBe(0);
+    expect(control.updateCalls).toBe(0);
+  });
+
+  it("refuses a board move when the remote task already changed columns", async () => {
+    const data = createDefaultData("device-board-race");
+    data.didaContractCapabilities = {
+      probeVersion: 2,
+      taskScheduleMode: "point",
+      boardPlacementVerified: true,
+      verifiedAt: "2026-08-03T00:00:00.000Z",
+    };
+    const project: DidaProject = { id: "project-board-race", name: "Board", permission: "write" };
+    const task: DidaTask = { id: "task-board-race", projectId: project.id, title: "Race", status: 0 };
+    const projectBase = createSnapshot("project", project.id, project);
+    const taskBase = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`project:${project.id}`] = projectBase;
+    data.localSnapshots[`project:${project.id}`] = projectBase;
+    data.baseSnapshots[`task:${task.id}`] = taskBase;
+    data.localSnapshots[`task:${task.id}`] = taskBase;
+    data.boardSnapshots[project.id] = {
+      projectId: project.id,
+      capturedAt: "2026-08-03T00:00:00.000Z",
+      stale: false,
+      columns: [
+        { id: "todo", projectId: project.id, name: "To do" },
+        { id: "doing", projectId: project.id, name: "Doing" },
+      ],
+      taskColumnIds: { [task.id]: "todo" },
+    };
+    const service = new HelixService(
+      new HelixDataStore({ async loadData() { return structuredClone(data); }, async saveData() {} }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    (service as unknown as { patch(value: { connected: boolean }): void }).patch({ connected: true });
+    let writes = 0;
+    Object.defineProperty(service, "api", { value: {
+      async getProjectData() {
+        return {
+          project,
+          tasks: [{ ...task, columnId: "doing" }],
+          columns: data.boardSnapshots[project.id]!.columns,
+        };
+      },
+      async getTask() { return { ...task, columnId: "doing" }; },
+      async updateTask() { writes += 1; },
+    } });
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/原分栏不一致/);
+    expect(writes).toBe(0);
+  });
+
+  it("refuses a board move when detail and exact task endpoints disagree", async () => {
+    const { service, project, task, control } = await createBoardMoveHarness();
+    control.detailColumn = "doing";
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/详情、精确任务与本地快照.*不一致/);
+    expect(control.updateCalls).toBe(0);
+  });
+
+  it("reconciles one applied unknown board move without resending", async () => {
+    const { service, project, task, control, persisted } = await createBoardMoveHarness();
+    control.updateOutcome = "applied-unknown";
+
+    await service.moveTaskToBoardColumn(project.id, task.id, "doing");
+
+    expect(control.updateCalls).toBe(1);
+    expect(persisted().boardSnapshots[project.id]?.stale).toBe(false);
+    expect(persisted().boardSnapshots[project.id]?.taskColumnIds[task.id]).toBe("doing");
+    expect(persisted().boardSnapshots[project.id]?.capturedAt)
+      .toBe("2026-08-03T00:00:00.000Z");
+  });
+
+  it("keeps the board frozen when an unknown board move was not applied", async () => {
+    const { service, project, task, control, persisted } = await createBoardMoveHarness();
+    control.updateOutcome = "not-applied-unknown";
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/结果未知.*未重发.*冻结/);
+
+    expect(control.updateCalls).toBe(1);
+    expect(persisted().boardSnapshots[project.id]?.stale).toBe(true);
+    expect(persisted().boardSnapshots[project.id]?.taskColumnIds[task.id]).toBe("todo");
+  });
+
+  it("keeps the board frozen after a deterministic remote rejection", async () => {
+    const { service, project, task, control, persisted } = await createBoardMoveHarness();
+    control.updateOutcome = "rejected";
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/远端拒绝.*未重发.*冻结/);
+    expect(control.updateCalls).toBe(1);
+    expect(persisted().boardSnapshots[project.id]?.stale).toBe(true);
+  });
+
+  it("opens a field conflict and keeps the board frozen if placement changes other fields", async () => {
+    const { service, project, task, control, persisted } = await createBoardMoveHarness();
+    control.corruptContent = true;
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/分栏以外.*逐字段处理冲突/);
+
+    expect(control.updateCalls).toBe(1);
+    expect(persisted().boardSnapshots[project.id]?.stale).toBe(true);
+    expect(persisted().conflicts).toHaveLength(1);
+    expect(persisted().conflicts[0]?.fields.map((field) => field.path)).toContain("content");
+    expect(persisted().conflicts[0]?.base.value).not.toHaveProperty("columnId");
+    expect(persisted().conflicts[0]?.local.value).not.toHaveProperty("columnId");
+    expect(persisted().conflicts[0]?.remote.value).not.toHaveProperty("columnId");
+    expect(service.snapshot()).toMatchObject({ attentionCount: 1 });
+    expect(service.snapshot().projects.find((candidate) => candidate.id === project.id))
+      .toMatchObject({ boardStale: true });
+
+    control.corruptContent = false;
+    const conflictId = persisted().conflicts[0]!.id;
+    expect(taskSyncProjection(normalizeTask(control.remoteTask)))
+      .toEqual(persisted().conflicts[0]!.remote.value);
+    await service.chooseConflict(conflictId, "content", "local");
+    expect(taskSyncProjection(normalizeTask(control.remoteTask)))
+      .toEqual(persisted().conflicts[0]!.remote.value);
+    expect(persisted().conflicts[0]!.remote.stamp.hash)
+      .toBe(stableHash(persisted().conflicts[0]!.remote.value));
+    await service.applyConflict(conflictId);
+
+    expect(persisted().conflicts).toEqual([]);
+    expect(persisted().boardSnapshots[project.id]?.stale).toBe(false);
+    expect(persisted().boardSnapshots[project.id]?.taskColumnIds[task.id]).toBe("doing");
+    expect(service.snapshot().attentionCount).toBe(0);
+    expect(service.snapshot().projects.find((candidate) => candidate.id === project.id))
+      .toMatchObject({ boardStale: false });
+  });
+
+  it("keeps the first persisted stale intent if the final local board save fails", async () => {
+    const { service, project, task, control, persisted } = await createBoardMoveHarness();
+    control.failSaveCall = control.saveCalls + 2;
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/本地结果保存失败.*保持冻结/);
+
+    expect(control.updateCalls).toBe(1);
+    expect(persisted().boardSnapshots[project.id]?.stale).toBe(true);
+    expect(persisted().boardSnapshots[project.id]?.taskColumnIds[task.id]).toBe("todo");
+  });
+
+  it("refuses board placement while another authorized remote read is active", async () => {
+    const { service, project, task, control } = await createBoardMoveHarness();
+    let releaseRead!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const api = (service as unknown as { api: { getTask(): Promise<DidaTask> } }).api;
+    api.getTask = async () => {
+      markStarted();
+      await gate;
+      return { ...control.remoteTask };
+    };
+    const read = service.verifyRemoteTask(project.id, task.id);
+    await started;
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/已有滴答远端访问.*看板卡片归栏/);
+    expect(control.updateCalls).toBe(0);
+
+    releaseRead();
+    await expect(read).resolves.toMatchObject({ id: task.id });
+  });
+
+  it("blocks an open task conflict before any board read but allows a resolved record", async () => {
+    const { service, project, task, control } = await createBoardMoveHarness();
+    const base = createSnapshot("task", task.id, task);
+    const remoteValue = { ...task, content: "remote conflict" };
+    const remote = createSnapshot("task", task.id, remoteValue);
+    const store = (service as unknown as { store: HelixDataStore }).store;
+    await store.mutate((draft) => {
+      draft.conflicts.push({
+        id: "conflict-board-gate",
+        kind: "task",
+        entityId: task.id,
+        title: task.title,
+        createdAt: "2026-08-03T00:00:00.000Z",
+        updatedAt: "2026-08-03T00:00:00.000Z",
+        status: "open",
+        base,
+        local: base,
+        remote,
+        fields: buildConflictFields(base.value, base.value, remote.value),
+        remoteRecheckCount: 0,
+        sourceDeviceId: draft.deviceId,
+      });
+    });
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/已有逐字段冲突/);
+    expect(control.projectDataCalls).toBe(0);
+    expect(control.getTaskCalls).toBe(0);
+    expect(control.updateCalls).toBe(0);
+
+    await store.mutate((draft) => {
+      draft.conflicts[0]!.status = "resolved";
+    });
+    await service.moveTaskToBoardColumn(project.id, task.id, "doing");
+    expect(control.projectDataCalls).toBe(1);
+    expect(control.getTaskCalls).toBeGreaterThanOrEqual(2);
+    expect(control.updateCalls).toBe(1);
   });
 
   it("refuses view-mode writes for a read-only list before queueing", async () => {

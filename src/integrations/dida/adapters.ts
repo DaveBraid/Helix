@@ -5,6 +5,7 @@ import type {
   DidaProject,
   DidaTask,
 } from "../../domain/entities";
+import { deepEqual } from "../../domain/stable";
 import {
   validateTaskScheduleWrite,
   type TaskScheduleMode,
@@ -31,7 +32,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
   async get(entityId: string, context?: { projectId?: string }): Promise<DidaTask | null> {
     if (!context?.projectId) throw new Error("Task lookup requires projectId");
     try {
-      return taskSyncValue(normalizeTask(await this.api.getTask(context.projectId, entityId)));
+      return taskSyncProjection(normalizeTask(await this.api.getTask(context.projectId, entityId)));
     } catch (error) {
       if (isNotFound(error)) return null;
       throw error;
@@ -40,7 +41,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
 
   async create(value: DidaTask): Promise<DidaTask> {
     validateTaskScheduleWrite(value, this.scheduleMode());
-    return taskSyncValue(normalizeTask(await this.api.createTask(taskCreatePayload(value))));
+    return taskSyncProjection(normalizeTask(await this.api.createTask(taskCreatePayload(value))));
   }
 
   async update(
@@ -90,7 +91,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
       current = await this.get(entityId, { projectId: value.projectId });
       if (current?.status !== 2) throw new Error("任务完成后远端状态未变为已完成");
     }
-    return taskSyncValue(normalizeTask(current));
+    return taskSyncProjection(normalizeTask(current));
   }
 
   async delete(entityId: string, context?: { projectId?: string }): Promise<void> {
@@ -188,8 +189,6 @@ function taskCreatePayload(value: DidaTask): Partial<DidaTask> & Pick<DidaTask, 
     startDate: serializeDidaDate(value.startDate, "任务开始日期"),
     dueDate: serializeDidaDate(value.dueDate, "任务截止日期"),
     timeZone: value.timeZone,
-    reminders: value.reminders,
-    repeatFlag: value.repeatFlag,
     priority: value.priority,
     sortOrder: value.sortOrderUnsafe ? undefined : value.sortOrder,
     items: serializeDidaChecklistItems(value.items),
@@ -209,13 +208,39 @@ function taskUpdatePayload(value: DidaTask): Partial<DidaTask> {
     startDate: serializeDidaDate(clearedAs(value, "startDate", null), "任务开始日期"),
     dueDate: serializeDidaDate(clearedAs(value, "dueDate", null), "任务截止日期"),
     timeZone: clearedAs(value, "timeZone", null),
-    reminders: clearedAs(value, "reminders", []),
-    repeatFlag: clearedAs(value, "repeatFlag", null),
     priority: clearedAs(value, "priority", 0),
     sortOrder: value.sortOrderUnsafe ? undefined : clearedAs(value, "sortOrder", 0),
     items: serializeDidaChecklistItems(clearedAs(value, "items", [])),
     tags: clearedAs(value, "tags", []),
   };
+}
+
+export function taskBoardPlacementPayload(
+  value: DidaTask,
+  columnId: string,
+): Partial<DidaTask> {
+  if (!columnId.trim()) throw new Error("看板列 ID 不能为空");
+  return {
+    id: value.id,
+    projectId: value.projectId,
+    columnId,
+  };
+}
+
+export function taskBoardPlacementInvariant(
+  task: DidaTask,
+): Omit<DidaTask, "columnId" | "etag" | "modifiedTime"> {
+  const {
+    columnId: _columnId,
+    etag: _etag,
+    modifiedTime: _modifiedTime,
+    ...invariant
+  } = task;
+  return invariant;
+}
+
+export function sameTaskBoardPlacementInvariant(left: DidaTask, right: DidaTask): boolean {
+  return deepEqual(taskBoardPlacementInvariant(left), taskBoardPlacementInvariant(right));
 }
 
 function clearedAs<T extends object, K extends keyof T>(
@@ -239,7 +264,7 @@ function projectWritePayload(value: DidaProject): Partial<DidaProject> & Pick<Di
   };
 }
 
-function taskSyncValue(value: DidaTask): DidaTask {
+export function taskSyncProjection(value: DidaTask): DidaTask {
   const { columnId: _columnId, ...syncValue } = value;
   return syncValue;
 }

@@ -63,6 +63,10 @@ describe("DidaApi non-idempotent safety", () => {
 
   it.each([
     ["update", (api: DidaApi) => api.updateTask("task-1", { title: "updated" })],
+    ["project update", (api: DidaApi) => api.updateProject("project-1", { viewMode: "kanban" })],
+    ["column create", (api: DidaApi) => api.createColumn("project-1", { name: "Doing" })],
+    ["column update", (api: DidaApi) =>
+      api.updateColumn("project-1", "column-1", { name: "Done" })],
     ["move", (api: DidaApi) => api.moveTask({
       fromProjectId: "project-1",
       toProjectId: "project-2",

@@ -94,6 +94,14 @@ export interface ProjectWorkspaceProjectStatusUpdatePlan {
   currentStatus: ProjectWorkspaceProjectStatus;
 }
 
+export interface ProjectWorkspaceDidaMappingUpdatePlan {
+  kind: "project-dida-mapping";
+  entityId: string;
+  notePath: string;
+  revisionHash: string;
+  currentDidaProjectId?: string;
+}
+
 export interface ProjectWorkspaceCycleStatusUpdatePlan {
   kind: "cycle";
   entityId: string;
@@ -1057,6 +1065,83 @@ export class ProjectWorkspaceService {
       revision,
       patchManagedFrontmatter(revision.content, {
         "helix-color": normalizedColor,
+        "helix-updated": new Date().toISOString(),
+      }),
+      () => this.assertActive(generation),
+    );
+    return this.snapshot();
+  }
+
+  async prepareProjectDidaMappingUpdate(
+    projectId: string,
+  ): Promise<ProjectWorkspaceDidaMappingUpdatePlan> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("找不到需要映射滴答清单的项目");
+    const revision = await this.repository.read(project.notePath);
+    if (!revision) throw new Error("项目 Markdown 已不存在");
+    const frontmatter = frontmatterFromContent(revision.content);
+    const current = typeof frontmatter?.["helix-dida-project-id"] === "string" &&
+      frontmatter["helix-dida-project-id"].trim()
+      ? frontmatter["helix-dida-project-id"].trim()
+      : undefined;
+    if (
+      frontmatter?.["helix-kind"] !== "helix-project" ||
+      frontmatter["helix-id"] !== project.id ||
+      current !== project.didaProjectId
+    ) {
+      throw new Error("项目 Markdown 身份或滴答映射已变化，请重新打开映射编辑");
+    }
+    this.assertActive(generation);
+    return {
+      kind: "project-dida-mapping",
+      entityId: project.id,
+      notePath: project.notePath,
+      revisionHash: revision.hash,
+      currentDidaProjectId: project.didaProjectId,
+    };
+  }
+
+  async updateProjectDidaMapping(
+    plan: ProjectWorkspaceDidaMappingUpdatePlan,
+    didaProjectId?: string,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const nextId = didaProjectId?.trim() || undefined;
+    if (nextId?.startsWith("local-project-")) {
+      throw new Error("待核对的本地临时清单不能成为项目映射");
+    }
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === plan.entityId);
+    if (!project) throw new Error("找不到需要映射滴答清单的项目");
+    if (project.didaProjectId !== plan.currentDidaProjectId) {
+      throw new Error("项目滴答映射在确认期间已经变化，请重新打开");
+    }
+    const owner = nextId && snapshot.projects.find((candidate) =>
+      candidate.id !== project.id && candidate.didaProjectId === nextId);
+    if (owner) throw new Error(`该滴答清单已映射到另一 Helix 项目：${owner.title}`);
+    const revision = await this.repository.read(plan.notePath);
+    if (!revision) throw new Error("项目 Markdown 已不存在");
+    const frontmatter = frontmatterFromContent(revision.content);
+    const current = typeof frontmatter?.["helix-dida-project-id"] === "string" &&
+      frontmatter["helix-dida-project-id"].trim()
+      ? frontmatter["helix-dida-project-id"].trim()
+      : undefined;
+    if (
+      plan.kind !== "project-dida-mapping" ||
+      revision.hash !== plan.revisionHash ||
+      frontmatter?.["helix-kind"] !== "helix-project" ||
+      frontmatter["helix-id"] !== plan.entityId ||
+      current !== plan.currentDidaProjectId
+    ) {
+      throw new Error("项目 Markdown 在映射确认期间已经变化，请重新打开");
+    }
+    this.assertActive(generation);
+    await this.repository.compareAndWrite(
+      revision,
+      patchManagedFrontmatter(revision.content, {
+        "helix-dida-project-id": nextId,
         "helix-updated": new Date().toISOString(),
       }),
       () => this.assertActive(generation),
@@ -2433,7 +2518,11 @@ export class ProjectWorkspaceService {
     const generation = this.beginOperation();
     const normalizedTitle = title.trim();
     const normalizedColor = normalizeProjectColor(color);
+    const normalizedDidaProjectId = didaProjectId?.trim() || undefined;
     if (!normalizedTitle) throw new Error("请输入项目名称");
+    if (normalizedDidaProjectId?.startsWith("local-project-")) {
+      throw new Error("本地临时清单尚未取得稳定远端 ID，不能建立项目映射");
+    }
     assertSingleLineTitle(normalizedTitle, "项目名称");
     const folderName = sanitizeFileName(normalizedTitle);
     const folder = normalizePath(`${this.rootFolder()}/Projects/${folderName}`);
@@ -2447,8 +2536,8 @@ export class ProjectWorkspaceService {
     }
     const before = await this.ensureCanvas();
     if (
-      didaProjectId &&
-      before.projects.some((project) => project.didaProjectId === didaProjectId)
+      normalizedDidaProjectId &&
+      before.projects.some((project) => project.didaProjectId === normalizedDidaProjectId)
     ) {
       throw new Error("该滴答清单已映射到另一个 Helix 项目");
     }
@@ -2465,7 +2554,7 @@ export class ProjectWorkspaceService {
           id: projectId,
           title: normalizedTitle,
           createdAt: now,
-          didaProjectId,
+          didaProjectId: normalizedDidaProjectId,
           color: normalizedColor,
         }),
         () => this.assertActive(generation),
@@ -2487,7 +2576,7 @@ export class ProjectWorkspaceService {
         title: normalizedTitle,
         status: "active",
         notePath: projectPath,
-        didaProjectId,
+        didaProjectId: normalizedDidaProjectId,
         color: normalizedColor,
         cycles: [{
           id: cycleId,

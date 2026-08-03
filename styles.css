@@ -518,6 +518,22 @@
   white-space: nowrap;
 }
 
+.helix-task-title[role="button"] {
+  cursor: text;
+}
+
+.helix-task-title-input {
+  width: 100%;
+  min-height: 28px;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--helix-accent-ink) 42%, var(--helix-line));
+  border-radius: 6px;
+  background: var(--helix-surface-control);
+  color: var(--helix-text-strong);
+  font: inherit;
+  font-weight: 650;
+}
+
 .helix-task-meta {
   min-width: 0;
   margin-top: 5px;
@@ -1696,6 +1712,61 @@
   font-size: 12px;
 }
 
+.helix-task-composer,
+.helix-task-edit-modal {
+  position: relative;
+}
+
+.helix-task-quick-suggestions {
+  position: absolute;
+  z-index: var(--layer-popover);
+  display: grid;
+  min-width: min(320px, calc(100% - 32px));
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--background-primary) 94%, transparent);
+  box-shadow: var(--shadow-s);
+  backdrop-filter: blur(14px);
+}
+
+.helix-task-quick-suggestion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 36px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-normal);
+  text-align: left;
+}
+
+.helix-task-quick-suggestion:hover,
+.helix-task-quick-suggestion.is-active {
+  background: var(--background-modifier-hover);
+}
+
+.helix-task-quick-token {
+  font-weight: 650;
+}
+
+.helix-task-quick-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.helix-task-readonly-property {
+  max-width: 280px;
+  color: var(--text-normal);
+  font-weight: 600;
+  text-align: right;
+}
+
 .helix-task-quick-preview:empty {
   display: none;
 }
@@ -1844,6 +1915,50 @@
 .helix-project-tabs small {
   color: var(--helix-muted);
   font-size: 9px;
+}
+
+.helix-project-dida-mapping {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 10px 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--background-secondary) 72%, transparent);
+}
+
+.helix-project-dida-mapping > div:first-child,
+.helix-project-dida-mapping-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.helix-project-dida-mapping > div:first-child span {
+  color: var(--text-muted);
+}
+
+.helix-project-mapping-confirm {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--background-secondary);
+}
+
+@media (max-width: 700px) {
+  .helix-project-dida-mapping {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .helix-project-dida-mapping-controls select {
+    min-width: 0;
+    flex: 1;
+  }
 }
 
 .helix-project-workspace {
@@ -2585,6 +2700,21 @@
   border: 1px solid color-mix(in srgb, var(--helix-line) 84%, transparent);
   border-radius: 10px;
   background: var(--helix-card);
+}
+
+.helix-task-board-card.is-draggable {
+  cursor: grab;
+}
+
+.helix-task-board-card.is-dragging {
+  opacity: 0.42;
+  cursor: grabbing;
+}
+
+.helix-task-board-column.is-drop-target {
+  border-color: color-mix(in srgb, var(--helix-accent-ink) 58%, var(--helix-line));
+  background: color-mix(in srgb, var(--helix-accent-soft) 48%, var(--helix-card));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--helix-accent-ink) 20%, transparent);
 }
 
 .helix-task-board-card .helix-task-row {

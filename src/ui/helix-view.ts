@@ -15,6 +15,18 @@ import {
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { DidaProject, DidaTask } from "../domain/entities";
+import {
+  commitInlineTaskTitle,
+  inlineTaskTitleKeyIntent,
+  TaskSubmissionGate,
+} from "../domain/task-interactions";
+import {
+  commitTaskBoardMove,
+  taskBoardColumnLabels,
+  taskBoardDropTarget,
+  taskBoardKeyboardTarget,
+  taskBoardMoveAvailability,
+} from "../domain/task-board-move";
 import { CYCLE_RELATION_LABELS } from "../domain/cycle-graph";
 import type { HelixEvent } from "../domain/events";
 import { aggregateAnalytics } from "../domain/analytics";
@@ -40,7 +52,14 @@ import {
   taskScheduleForSubmission,
   type TaskScheduleMode,
 } from "../domain/task-schedule";
-import { parseTaskQuickEntry } from "../domain/task-quick-entry";
+import { presentDidaReminders, presentDidaRepeat } from "../domain/task-reminders";
+import {
+  applyTaskQuickSuggestion,
+  parseTaskQuickEntry,
+  shouldSubmitTaskQuickEntryOnKey,
+  taskQuickSuggestions,
+  type TaskQuickSuggestion,
+} from "../domain/task-quick-entry";
 import {
   buildTaskBoard,
   buildTaskDateRange,
@@ -71,6 +90,7 @@ import type {
 } from "../services/project-workspace";
 import {
   TaskReferenceConflictError,
+  taskReferenceRuntimeIssues,
   type TaskReferenceExpectedRevision,
   type TaskReferenceResolved,
   type TaskReferenceSelection,
@@ -177,6 +197,7 @@ export class HelixView extends ItemView {
   private unsubscribe: (() => void) | null = null;
   private charts: echarts.ECharts[] = [];
   private chartObservers: ResizeObserver[] = [];
+  private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -574,7 +595,24 @@ export class HelixView extends ItemView {
       attr: { "aria-label": `完成 ${task.title}` },
     });
     const body = row.createDiv({ cls: "helix-task-copy" });
-    body.createDiv({ cls: "helix-task-title", text: task.title });
+    const title = body.createDiv({
+      cls: "helix-task-title",
+      text: task.title,
+      attr: {
+        role: "button",
+        tabindex: "0",
+        draggable: "false",
+        title: "单击修改任务标题",
+        "aria-label": `修改任务标题：${task.title}`,
+      },
+    });
+    const startTitleEdit = () => this.startInlineTaskTitleEdit(title, task);
+    title.addEventListener("click", startTitleEdit);
+    title.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      startTitleEdit();
+    });
     const meta = body.createDiv({ cls: "helix-task-meta" });
     const reference = this.taskReferenceSnapshot?.byTaskId.get(task.id);
     const dot = meta.createSpan({ cls: "helix-project-dot" });
@@ -654,6 +692,7 @@ export class HelixView extends ItemView {
           this.app,
           task,
           SAMPLE_PROJECTS,
+          this.previewTasks.flatMap((candidate) => candidate.tags ?? []),
           [],
           undefined,
           [],
@@ -671,6 +710,68 @@ export class HelixView extends ItemView {
       });
     }
     if (task.status === 2) check.disabled = true;
+  }
+
+  private startInlineTaskTitleEdit(container: HTMLElement, task: DidaTask): void {
+    if (container.querySelector("input")) return;
+    container.empty();
+    container.removeAttribute("role");
+    container.removeAttribute("tabindex");
+    const input = container.createEl("input", {
+      cls: "helix-task-title-input",
+      type: "text",
+      value: task.title,
+      attr: { "aria-label": "任务标题", draggable: "false" },
+    });
+    let settled = false;
+    const restore = () => {
+      container.empty();
+      container.setText(task.title);
+      container.setAttribute("role", "button");
+      container.setAttribute("tabindex", "0");
+    };
+    const save = async () => {
+      if (settled) return;
+      settled = true;
+      input.disabled = true;
+      try {
+        const result = await commitInlineTaskTitle(task.title, input.value, async (title) => {
+          if (task.id.startsWith("sample-")) {
+            this.previewTasks = this.previewTasks.map((candidate) =>
+              candidate.id === task.id ? { ...candidate, title } : candidate);
+          } else {
+            await this.service.queueTaskUpdate({ ...task, title });
+            new Notice("任务标题已加入同步队列");
+          }
+        });
+        if (result === "unchanged") {
+          restore();
+          return;
+        }
+        await this.render();
+      } catch (error) {
+        settled = false;
+        input.disabled = false;
+        new Notice(messageOf(error), 8_000);
+        input.focus();
+      }
+    };
+    input.addEventListener("click", (event) => event.stopPropagation());
+    input.addEventListener("keydown", (event) => {
+      const intent = inlineTaskTitleKeyIntent(event.key);
+      if (intent === "commit") {
+        event.preventDefault();
+        input.blur();
+      } else if (intent === "cancel") {
+        event.preventDefault();
+        settled = true;
+        restore();
+        container.focus();
+      }
+    });
+    input.addEventListener("blur", () => { void save(); });
+    input.focus();
+    input.select();
   }
 
   private async refreshTaskReferenceSnapshot(token: number): Promise<void> {
@@ -723,6 +824,7 @@ export class HelixView extends ItemView {
       this.app,
       task,
       didaProjects,
+      (this.state?.tasks ?? []).flatMap((candidate) => candidate.tags ?? []),
       workspaceProjects,
       references?.byTaskId.get(task.id),
       references?.blockingIssues ?? [],
@@ -733,10 +835,14 @@ export class HelixView extends ItemView {
         void this.render();
       },
       async (selection, expected) => {
+        const verified = selection.projectId
+          ? await this.service.verifyRemoteTask(task.projectId, task.id)
+          : undefined;
         const result = await this.actions.taskReferences.saveTaskReference(
           task.id,
           selection,
           expected,
+          selection.projectId && verified ? { didaProjectId: verified.projectId } : undefined,
         );
         await this.refreshTaskReferencesAfterCommit("Helix 关联");
         return result.reference;
@@ -948,7 +1054,7 @@ export class HelixView extends ItemView {
       });
       const preview = composer.createDiv({ cls: "helix-task-quick-preview" });
       let parsingEnabled = true;
-      let writing = false;
+      const submission = new TaskSubmissionGate();
       const quickResult = () => parsingEnabled
         ? parseTaskQuickEntry(input.value, writableProjects)
         : {
@@ -961,7 +1067,7 @@ export class HelixView extends ItemView {
       const renderQuickPreview = (): void => {
         preview.empty();
         const parsed = quickResult();
-        submit.disabled = writing || parsed.issues.length > 0;
+        submit.disabled = submission.isWriting || parsed.issues.length > 0;
         if (!input.value.trim()) return;
         if (!parsingEnabled) {
           preview.addClass("is-disabled");
@@ -1002,6 +1108,7 @@ export class HelixView extends ItemView {
         });
       };
       const create = (): void => {
+        if (submission.isWriting) return;
         const parsed = quickResult();
         if (parsed.issues.length > 0) {
           new Notice(parsed.issues.join("；"));
@@ -1029,27 +1136,33 @@ export class HelixView extends ItemView {
           void this.render();
           return;
         }
-        writing = true;
         submit.disabled = true;
-        void this.service.createTask(title, targetProjectId, {
+        void submission.run(() => this.service.createTask(title, targetProjectId, {
           priority: parsed.priority,
           tags: parsed.tags,
-        })
-          .then(() => {
+        }))
+          .then((created) => {
+            if (!created) return;
             input.value = "";
             new Notice("任务已安全写入同步队列");
           })
           .catch((error) => new Notice(error instanceof Error ? error.message : String(error), 8_000))
           .finally(() => {
-            writing = false;
             submit.disabled = false;
             void this.render();
           });
       };
       submit.addEventListener("click", create);
       input.addEventListener("input", renderQuickPreview);
+      bindTaskQuickSuggestions(
+        input,
+        composer,
+        writableProjects,
+        tasks.flatMap((task) => task.tags ?? []),
+        renderQuickPreview,
+      );
       input.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") create();
+        if (shouldSubmitTaskQuickEntryOnKey(event.key, event.isComposing)) create();
       });
     }
     this.renderTaskFilterToolbar(content, tasks, projects);
@@ -1106,15 +1219,40 @@ export class HelixView extends ItemView {
     project: DidaProject,
     tasks: DidaTask[],
   ): void {
+    const boardState = {
+      connected: !!this.state?.connected,
+      demoMode: !!this.state?.demoMode,
+      boardPlacementVerified: !!this.state?.boardPlacementVerified,
+    };
+    const boardAvailability = taskBoardMoveAvailability(
+      boardState,
+      project,
+      tasks[0]?.columnId,
+    );
     const status = content.createDiv({ cls: "helix-task-board-status" });
     const lock = status.createSpan();
     setIcon(lock, project.boardStale ? "cloud-off" : "lock-keyhole");
     status.createSpan({
       text: project.boardStale
         ? `详情已过期 · ${formatBoardCapturedAt(project.boardCapturedAt)} · 看板写入已禁用`
-        : `滴答看板快照 · ${formatBoardCapturedAt(project.boardCapturedAt)} · 暂不支持拖动列与卡片`,
+        : boardAvailability.enabled
+          ? `已同步滴答分栏 · ${formatBoardCapturedAt(project.boardCapturedAt)} · 拖动卡片即可同步归栏`
+          : `已同步滴答分栏 · ${formatBoardCapturedAt(project.boardCapturedAt)} · ${boardAvailability.reason}`,
     });
+    const columnLabels = taskBoardColumnLabels(project.columns ?? []);
     const board = content.createDiv({ cls: "helix-task-board" });
+    const moveTask = (taskId: string, targetColumnId: string): void => {
+      void commitTaskBoardMove(
+        targetColumnId,
+        (columnId) => this.service.moveTaskToBoardColumn(project.id, taskId, columnId),
+        async () => {
+          new Notice("任务分栏已与滴答同步");
+          await this.render();
+        },
+      ).catch((error) => {
+        new Notice(messageOf(error), 8_000);
+      });
+    };
     for (const column of buildTaskBoard(project, tasks)) {
       const lane = board.createEl("section", {
         cls: `helix-task-board-column${column.source ? "" : " is-unassigned"}`,
@@ -1122,14 +1260,86 @@ export class HelixView extends ItemView {
       });
       const heading = lane.createDiv({ cls: "helix-task-board-column-head" });
       heading.createEl("h3", {
-        text: column.title,
+        text: column.source ? columnLabels.get(column.source.id) ?? column.title : column.title,
         attr: { id: `helix-task-board-column-${column.id}` },
       });
       heading.createSpan({ text: String(column.tasks.length) });
       const items = lane.createDiv({ cls: "helix-task-board-items" });
+      const targetColumnId = column.source?.id;
+      lane.addEventListener("dragover", (event) => {
+        const target = taskBoardDropTarget(this.taskBoardDrag?.sourceColumnId, targetColumnId);
+        if (!this.taskBoardDrag || !target) return;
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+        lane.addClass("is-drop-target");
+      });
+      lane.addEventListener("dragleave", (event) => {
+        if (event.relatedTarget instanceof Node && lane.contains(event.relatedTarget)) return;
+        lane.removeClass("is-drop-target");
+      });
+      lane.addEventListener("drop", (event) => {
+        event.preventDefault();
+        lane.removeClass("is-drop-target");
+        const dragged = this.taskBoardDrag;
+        this.taskBoardDrag = null;
+        const target = taskBoardDropTarget(dragged?.sourceColumnId, targetColumnId);
+        if (!dragged || !target) return;
+        moveTask(dragged.taskId, target);
+      });
       if (column.tasks.length === 0) items.createDiv({ cls: "helix-task-board-empty", text: "暂无任务" });
       for (const task of column.tasks) {
         const card = items.createDiv({ cls: "helix-task-board-card" });
+        const availability = taskBoardMoveAvailability(
+          boardState,
+          project,
+          task.columnId,
+        );
+        card.draggable = availability.enabled;
+        card.setAttribute("title", availability.reason);
+        if (availability.enabled) {
+          card.addClass("is-draggable");
+          card.setAttribute("role", "group");
+          card.setAttribute("tabindex", "0");
+          card.setAttribute("aria-keyshortcuts", "Alt+ArrowLeft Alt+ArrowRight");
+          card.setAttribute(
+            "aria-label",
+            `任务“${task.title}”，当前${task.columnId
+              ? columnLabels.get(task.columnId) ?? "未知分栏"
+              : "未分栏"}。可拖动；按 Alt 加左右方向键移动到相邻分栏`,
+          );
+          card.addEventListener("dragstart", (event) => {
+            this.taskBoardDrag = { taskId: task.id, sourceColumnId: task.columnId };
+            card.addClass("is-dragging");
+            if (event.dataTransfer) {
+              event.dataTransfer.effectAllowed = "move";
+              event.dataTransfer.setData("text/plain", task.id);
+            }
+          });
+          card.addEventListener("dragend", () => {
+            this.taskBoardDrag = null;
+            card.removeClass("is-dragging");
+            board.querySelectorAll(".is-drop-target")
+              .forEach((element) => element.removeClass("is-drop-target"));
+          });
+          card.addEventListener("keydown", (event) => {
+            if (
+              event.target !== card ||
+              !event.altKey ||
+              (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+            ) return;
+            event.preventDefault();
+            const target = taskBoardKeyboardTarget(
+              project.columns ?? [],
+              task.columnId,
+              event.key === "ArrowLeft" ? "left" : "right",
+            );
+            if (!target) {
+              new Notice(event.key === "ArrowLeft" ? "已经位于最左分栏" : "已经位于最右分栏");
+              return;
+            }
+            moveTask(task.id, target);
+          });
+        }
         this.renderTaskRow(card, task, project, false);
       }
     }
@@ -1549,6 +1759,7 @@ export class HelixView extends ItemView {
       this.app,
       task,
       this.previewProjects,
+      this.previewTasks.flatMap((candidate) => candidate.tags ?? []),
       [],
       undefined,
       [],
@@ -1737,7 +1948,7 @@ export class HelixView extends ItemView {
     if (!snapshot) return;
     const taskById = new Map(tasks.map((task) => [task.id, task]));
     const affected = snapshot.references.filter((reference) =>
-      reference.issues.length > 0 || !taskById.has(reference.taskId));
+      taskReferenceRuntimeIssues(reference, taskById.get(reference.taskId)).length > 0);
     if (snapshot.blockingIssues.length === 0 && affected.length === 0) return;
     const card = content.createDiv({
       cls: "helix-card helix-task-reference-diagnostics",
@@ -1755,29 +1966,27 @@ export class HelixView extends ItemView {
       });
     }
     for (const reference of affected) {
+      const currentTask = taskById.get(reference.taskId);
       const row = card.createDiv({ cls: "helix-task-reference-diagnostic" });
       const copy = row.createDiv();
       copy.createEl("strong", {
         text: reference.project?.title ?? reference.projectId,
       });
-      const issues = [
-        ...reference.issues,
-        taskById.has(reference.taskId)
-          ? undefined
-          : `当前同步缓存未包含任务 ${reference.taskId}，不据此推断远端已删除`,
-      ].filter((issue): issue is string => Boolean(issue));
+      const issues = taskReferenceRuntimeIssues(reference, currentTask);
       copy.createDiv({ text: issues.join("；") });
       const actions = row.createDiv({ cls: "helix-task-reference-diagnostic-actions" });
-      const currentTask = taskById.get(reference.taskId);
       if (currentTask) {
         const repair = actions.createEl("button", { text: "打开并修复" });
         repair.addEventListener("click", () => {
           void this.openTaskEditor(currentTask, this.state?.projects ?? []);
         });
       } else {
+        const mappedDidaProjectId = reference.project?.didaProjectId;
         const candidates = tasks.filter((task) =>
           !task.id.startsWith("local-") &&
-          !snapshot.byTaskId.has(task.id));
+          !snapshot.byTaskId.has(task.id) &&
+          !!mappedDidaProjectId &&
+          task.projectId === mappedDidaProjectId);
         const rebind = actions.createEl("button", { text: "重新绑定" });
         rebind.disabled = candidates.length === 0;
         rebind.addEventListener("click", () => {
@@ -1788,7 +1997,13 @@ export class HelixView extends ItemView {
             async (nextTaskId) => {
               const target = candidates.find((task) => task.id === nextTaskId);
               if (!target) throw new Error("待绑定任务已不在候选列表");
-              await this.service.verifyRemoteTask(target.projectId, target.id);
+              if (
+                reference.project?.didaProjectId &&
+                target.projectId !== reference.project.didaProjectId
+              ) {
+                throw new Error("新任务所属清单与 Helix 项目映射不一致，拒绝重绑");
+              }
+              const verified = await this.service.verifyRemoteTask(target.projectId, target.id);
               await this.actions.taskReferences.rebindTaskId(
                 reference.taskId,
                 nextTaskId,
@@ -1796,6 +2011,7 @@ export class HelixView extends ItemView {
                   refId: reference.refId,
                   revisionHash: reference.revisionHash,
                 },
+                { didaProjectId: verified.projectId },
               );
               await this.refreshTaskReferencesAfterCommit("任务关联重绑");
               new Notice("任务关联已重新绑定");
@@ -1885,6 +2101,7 @@ export class HelixView extends ItemView {
     ) {
       this.selectedProjectId = workspace.projects[0]!.id;
     }
+    this.renderProjectDidaMappingBar(content, workspace);
     const lifecycleGeneration = this.viewGeneration;
     this.renderNativeRelationCandidates(
       content,
@@ -2051,6 +2268,80 @@ export class HelixView extends ItemView {
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
     this.projectWorkbench.render(content);
+  }
+
+  private renderProjectDidaMappingBar(
+    content: HTMLElement,
+    workspace: ProjectWorkspaceSnapshot,
+  ): void {
+    if (!this.selectedProjectId) return;
+    const project = workspace.projects.find((candidate) =>
+      candidate.id === this.selectedProjectId);
+    if (!project) return;
+    const remoteProjects = (this.state?.projects ?? []).filter((candidate) =>
+      !candidate.id.startsWith("local-project-"));
+    const mappedByOther = new Set(workspace.projects
+      .filter((candidate) => candidate.id !== project.id && candidate.didaProjectId)
+      .map((candidate) => candidate.didaProjectId!));
+    const bar = content.createDiv({ cls: "helix-project-dida-mapping" });
+    const copy = bar.createDiv();
+    copy.createEl("strong", { text: "滴答清单" });
+    copy.createSpan({
+      text: project.didaProjectId
+        ? remoteProjects.find((candidate) => candidate.id === project.didaProjectId)?.name ??
+          `已断开 · ${project.didaProjectId}`
+        : "未映射",
+    });
+    const controls = bar.createDiv({ cls: "helix-project-dida-mapping-controls" });
+    const select = controls.createEl("select", { attr: { "aria-label": "项目滴答清单映射" } });
+    select.createEl("option", { value: "", text: "不映射" });
+    for (const remote of remoteProjects) {
+      const option = select.createEl("option", { value: remote.id, text: remote.name });
+      if (mappedByOther.has(remote.id)) option.disabled = true;
+    }
+    if (
+      project.didaProjectId &&
+      !remoteProjects.some((candidate) => candidate.id === project.didaProjectId)
+    ) {
+      select.createEl("option", {
+        value: project.didaProjectId,
+        text: `已断开 · ${project.didaProjectId}`,
+      });
+    }
+    select.value = project.didaProjectId ?? "";
+    const save = controls.createEl("button", { text: "保存映射" });
+    save.disabled = true;
+    select.addEventListener("change", () => {
+      save.disabled = select.value === (project.didaProjectId ?? "");
+    });
+    save.addEventListener("click", () => {
+      save.disabled = true;
+      const nextId = select.value || undefined;
+      void this.actions.mutateProjectWorkspace(() =>
+        this.actions.projectWorkspace.prepareProjectDidaMappingUpdate(project.id))
+        .then((plan) => {
+          new ProjectDidaMappingConfirmModal(
+            this.app,
+            project,
+            remoteProjects.find((candidate) => candidate.id === nextId),
+            nextId,
+            async () => {
+              if (nextId) await this.service.verifyRemoteProject(nextId);
+              await this.actions.mutateProjectWorkspace(() =>
+                this.actions.projectWorkspace.updateProjectDidaMapping(plan, nextId));
+              new Notice(nextId ? "项目滴答清单映射已保存" : "项目滴答清单映射已解除");
+              await this.render();
+            },
+            () => {
+              save.disabled = select.value === (project.didaProjectId ?? "");
+            },
+          ).open();
+        })
+        .catch((error) => {
+          save.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
   }
 
   private renderNativeRelationCandidates(
@@ -3366,6 +3657,7 @@ class TaskEditModal extends Modal {
     app: HelixView["app"],
     private readonly task: DidaTask,
     private readonly didaProjects: DidaProject[],
+    private readonly tagChoices: string[],
     private readonly helixProjects: ProjectWorkspaceProject[],
     reference: TaskReferenceResolved | undefined,
     private readonly referenceBlockingIssues: string[],
@@ -3442,6 +3734,17 @@ class TaskEditModal extends Modal {
         if (quickEntryEl) quickEntryEl.value = "";
         quickEntry = "";
       }));
+    if (quickEntryEl) {
+      bindTaskQuickSuggestions(
+        quickEntryEl,
+        this.contentEl,
+        writableDidaProjects,
+        this.tagChoices,
+        () => {
+          quickEntry = quickEntryEl?.value ?? "";
+        },
+      );
+    }
     new Setting(this.contentEl)
       .setName("内容")
       .addTextArea((text) =>
@@ -3533,6 +3836,24 @@ class TaskEditModal extends Modal {
           this.timeZone = value;
         });
       });
+    const reminderPresentations = presentDidaReminders(this.task.reminders);
+    const reminderSetting = new Setting(this.contentEl)
+      .setName("提醒")
+      .setDesc("当前只读；完成专用合同验证后开放修改与清空。");
+    reminderSetting.controlEl.createSpan({
+      cls: "helix-task-readonly-property",
+      text: reminderPresentations.length > 0
+        ? reminderPresentations.map((item) => item.label).join("、")
+        : "无",
+    });
+    const repeatPresentation = presentDidaRepeat(this.task.repeatFlag);
+    const repeatSetting = new Setting(this.contentEl)
+      .setName("重复")
+      .setDesc("当前只读；不会把未知规则静默改写为预设。");
+    repeatSetting.controlEl.createSpan({
+      cls: "helix-task-readonly-property",
+      text: repeatPresentation.label,
+    });
     new Setting(this.contentEl)
       .setName("标签")
       .setDesc("多个标签使用空格或逗号分隔。")
@@ -3833,6 +4154,53 @@ class ChallengeDetailModal extends Modal {
   }
 }
 
+class ProjectDidaMappingConfirmModal extends Modal {
+  constructor(
+    app: HelixView["app"],
+    private readonly project: ProjectWorkspaceProject,
+    private readonly didaProject: DidaProject | undefined,
+    private readonly nextDidaProjectId: string | undefined,
+    private readonly submit: () => Promise<void>,
+    private readonly closed: () => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle(this.nextDidaProjectId ? "确认项目映射" : "确认解除映射");
+    const summary = this.contentEl.createDiv({ cls: "helix-project-mapping-confirm" });
+    summary.createEl("strong", { text: this.project.title });
+    summary.createSpan({ text: "→" });
+    summary.createEl("strong", {
+      text: this.nextDidaProjectId
+        ? this.didaProject?.name ?? this.nextDidaProjectId
+        : "不映射滴答清单",
+    });
+    this.contentEl.createEl("p", {
+      text: this.nextDidaProjectId
+        ? "后续项目行动只能稳定关联到该清单中的滴答任务；不会按标题自动猜测或移动现有任务。"
+        : "已有任务引用会保留稳定 ID 并显示映射断开，不会被静默删除。",
+    });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { cls: "mod-cta", text: "确认保存" });
+    confirm.addEventListener("click", () => {
+      confirm.disabled = true;
+      void this.submit()
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.closed();
+    this.contentEl.empty();
+  }
+}
+
 function detailPair(label: string, value: string): HTMLElement {
   const item = document.createElement("div");
   item.createEl("dt", { text: label });
@@ -3852,6 +4220,150 @@ function challengeMetricLabel(metric: ChallengeDefinition["metric"]): string {
 
 function taskPriorityLabel(priority: 0 | 1 | 3 | 5): string {
   return { 0: "无", 1: "低", 3: "中", 5: "高" }[priority];
+}
+
+function bindTaskQuickSuggestions(
+  input: HTMLInputElement,
+  parent: HTMLElement,
+  projects: DidaProject[],
+  tags: string[],
+  onApplied: () => void,
+): void {
+  const menuId = `helix-task-quick-menu-${crypto.randomUUID()}`;
+  const menu = parent.createDiv({
+    cls: "helix-task-quick-suggestions",
+    attr: { id: menuId, role: "listbox", "aria-label": "快捷属性候选" },
+  });
+  let suggestions: TaskQuickSuggestion[] = [];
+  let activeIndex = -1;
+  let composing = false;
+  const positionMenu = (): void => {
+    const inputRect = input.getBoundingClientRect();
+    const parentRect = parent.getBoundingClientRect();
+    menu.style.top = `${inputRect.bottom - parentRect.top + parent.scrollTop + 6}px`;
+    menu.style.left = `${inputRect.left - parentRect.left + parent.scrollLeft}px`;
+    menu.style.width = `${Math.max(220, inputRect.width)}px`;
+  };
+  const hide = (): void => {
+    suggestions = [];
+    activeIndex = -1;
+    menu.empty();
+    menu.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+  };
+  const apply = (suggestion: TaskQuickSuggestion): void => {
+    const current = taskQuickSuggestions(
+      input.value,
+      input.selectionStart ?? input.value.length,
+      projects,
+      tags,
+    );
+    if (!current.some((candidate) =>
+      candidate.kind === suggestion.kind && candidate.token === suggestion.token
+    )) {
+      hide();
+      return;
+    }
+    const applied = applyTaskQuickSuggestion(
+      input.value,
+      input.selectionStart ?? input.value.length,
+      suggestion,
+    );
+    input.value = applied.value;
+    input.setSelectionRange(applied.cursor, applied.cursor);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    onApplied();
+    hide();
+    input.focus();
+  };
+  const paint = (): void => {
+    menu.empty();
+    if (suggestions.length === 0) {
+      hide();
+      return;
+    }
+    positionMenu();
+    menu.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    suggestions.forEach((suggestion, index) => {
+      const option = menu.createEl("button", {
+        cls: `helix-task-quick-suggestion${index === activeIndex ? " is-active" : ""}`,
+        attr: {
+          id: `helix-task-quick-${crypto.randomUUID()}`,
+          role: "option",
+          "aria-selected": String(index === activeIndex),
+          type: "button",
+        },
+      });
+      option.createSpan({ cls: "helix-task-quick-token", text: suggestion.token });
+      option.createSpan({ cls: "helix-task-quick-detail", text: suggestion.detail ?? suggestion.label });
+      option.addEventListener("mousedown", (event) => event.preventDefault());
+      option.addEventListener("click", () => apply(suggestion));
+      if (index === activeIndex) input.setAttribute("aria-activedescendant", option.id);
+    });
+  };
+  const refresh = (): void => {
+    if (composing) {
+      hide();
+      return;
+    }
+    suggestions = taskQuickSuggestions(
+      input.value,
+      input.selectionStart ?? input.value.length,
+      projects,
+      tags,
+    ).slice(0, 8);
+    activeIndex = suggestions.length > 0 ? 0 : -1;
+    paint();
+  };
+  input.setAttribute("role", "combobox");
+  input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-controls", menuId);
+  input.setAttribute("aria-expanded", "false");
+  input.addEventListener("input", refresh);
+  input.addEventListener("click", refresh);
+  input.addEventListener("select", refresh);
+  input.addEventListener("compositionstart", () => {
+    composing = true;
+    hide();
+  });
+  input.addEventListener("compositionend", () => {
+    composing = false;
+    refresh();
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.isComposing || composing) {
+      if (event.key === "Enter") event.stopImmediatePropagation();
+      return;
+    }
+    if (suggestions.length === 0) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      activeIndex = (activeIndex + delta + suggestions.length) % suggestions.length;
+      paint();
+      return;
+    }
+    if ((event.key === "Enter" || event.key === "Tab") && activeIndex >= 0) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      apply(suggestions[activeIndex]!);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      hide();
+    }
+  });
+  input.addEventListener("keyup", (event) => {
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) refresh();
+  });
+  parent.addEventListener("scroll", positionMenu, { passive: true });
+  input.addEventListener("blur", () => globalThis.setTimeout(hide, 0));
+  hide();
 }
 
 function formatDateTime(value: string): string {

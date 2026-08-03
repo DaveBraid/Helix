@@ -24,6 +24,20 @@ function normalizedStrings(values: string[] | undefined): string[] {
   );
 }
 
+function preservedStrings(values: string[] | undefined, label: string): string[] {
+  if (values === undefined) return [];
+  if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !value)) {
+    throw new Error(`Dida ${label}不是有效字符串数组`);
+  }
+  return [...values];
+}
+
+function preservedOptionalString(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") throw new Error(`Dida ${label}不是字符串`);
+  return value;
+}
+
 function normalizeChecklist(items: DidaChecklistItem[] | undefined): DidaChecklistItem[] {
   return (items ?? [])
     .map((item) => {
@@ -79,8 +93,8 @@ export function normalizeTask(task: DidaTask): DidaTask {
     createdTime: normalizedDate(task.createdTime, "任务创建日期") ?? undefined,
     isAllDay: task.isAllDay ?? false,
     priority: task.priority ?? 0,
-    reminders: normalizedStrings(task.reminders),
-    repeatFlag: task.repeatFlag?.trim() || null,
+    reminders: preservedStrings(task.reminders, "任务 reminders"),
+    repeatFlag: preservedOptionalString(task.repeatFlag, "任务 repeatFlag"),
     tags: normalizedStrings(task.tags),
     items: normalizeChecklist(task.items),
     parentId: task.parentId || null,

@@ -99,7 +99,35 @@ export class DidaApi {
   }
 
   updateProject(projectId: string, project: Partial<DidaProject>): Promise<DidaProject> {
-    return this.request(`/project/${encodeURIComponent(projectId)}`, "POST", project);
+    return this.request(`/project/${encodeURIComponent(projectId)}`, "POST", project, {
+      outcomeUnknownOnNetworkFailure: true,
+    });
+  }
+
+  getColumns(projectId: string): Promise<DidaColumn[]> {
+    return this.request(`/project/${encodeURIComponent(projectId)}/column`);
+  }
+
+  createColumn(projectId: string, column: Pick<DidaColumn, "name">): Promise<DidaColumn> {
+    return this.request(
+      `/project/${encodeURIComponent(projectId)}/column`,
+      "POST",
+      column,
+      { outcomeUnknownOnNetworkFailure: true },
+    );
+  }
+
+  updateColumn(
+    projectId: string,
+    columnId: string,
+    column: Pick<DidaColumn, "name">,
+  ): Promise<DidaColumn> {
+    return this.request(
+      `/project/${encodeURIComponent(projectId)}/column/${encodeURIComponent(columnId)}`,
+      "POST",
+      column,
+      { outcomeUnknownOnNetworkFailure: true },
+    );
   }
 
   deleteProject(projectId: string): Promise<void> {

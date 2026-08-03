@@ -406,9 +406,11 @@ export default class HelixPlugin extends Plugin {
     }
     new ProjectPromptModal(
       this.app,
-      this.service.snapshot().projects,
+      this.service.snapshot().projects.filter((project) =>
+        !project.id.startsWith("local-project-")),
       async (title, didaProjectId, color) => {
         this.assertWritable();
+        if (didaProjectId) await this.service.verifyRemoteProject(didaProjectId);
         const created = await this.withProjectMutation(() =>
           this.projectWorkspace.createProject(title, didaProjectId, color));
         onCreated?.(created.id);

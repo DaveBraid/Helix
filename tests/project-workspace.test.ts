@@ -927,6 +927,29 @@ describe("ProjectWorkspaceService", () => {
     repo.failCreatePath = "Helix/Projects/事务失败/Stage-01.md";
     await expect(service.createProject("事务失败")).rejects.toThrow(/废纸篓/);
     expect(repo.paths().some((path) => path.includes("事务失败"))).toBe(false);
+    await expect(service.createProject("临时映射", " local-project-pending "))
+      .rejects.toThrow(/本地临时清单/);
+    expect(repo.paths().some((path) => path.includes("临时映射"))).toBe(false);
+  });
+
+  it("updates a stable Dida project mapping with revision and uniqueness checks", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const plan = await service.prepareProjectDidaMappingUpdate("project-1");
+    const updated = await service.updateProjectDidaMapping(plan, "dida-project-1");
+    expect(updated.projects.find((project) => project.id === "project-1")?.didaProjectId)
+      .toBe("dida-project-1");
+    expect((await repo.read("Helix/Projects/Alpha/Project.md"))?.content)
+      .toContain('helix-dida-project-id: "dida-project-1"');
+    await expect(service.updateProjectDidaMapping(plan, "dida-project-2"))
+      .rejects.toThrow(/确认期间已经变化|映射确认期间已经变化/);
+
+    await service.createProject("映射竞争", "dida-project-2");
+    const nextPlan = await service.prepareProjectDidaMappingUpdate("project-1");
+    await expect(service.updateProjectDidaMapping(nextPlan, "dida-project-2"))
+      .rejects.toThrow(/已映射到另一 Helix 项目/);
+    await expect(service.updateProjectDidaMapping(nextPlan, "local-project-pending"))
+      .rejects.toThrow(/本地临时清单/);
   });
 
   it("creates new stages with stage-only product metadata while keeping legacy nodes readable", async () => {

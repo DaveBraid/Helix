@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { DidaTask } from "../src/domain/entities";
-import { DidaProjectAdapter, DidaTaskAdapter } from "../src/integrations/dida/adapters";
+import {
+  DidaProjectAdapter,
+  DidaTaskAdapter,
+  taskBoardPlacementPayload,
+} from "../src/integrations/dida/adapters";
 import type { DidaApi } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
 import {
@@ -21,6 +25,13 @@ class FakeTaskApi {
   failMoveAfterApply = false;
   failCompleteAfterApply = false;
   lastUpdate: Partial<DidaTask> | null = null;
+  lastCreate: Partial<DidaTask> | null = null;
+
+  async createTask(value: Partial<DidaTask> & Pick<DidaTask, "title" | "projectId">): Promise<DidaTask> {
+    this.calls.push("create");
+    this.lastCreate = structuredClone(value);
+    return { ...value, id: "created-task", status: 0 };
+  }
 
   async getTask(projectId: string): Promise<DidaTask> {
     this.calls.push(`get:${projectId}`);
@@ -78,6 +89,22 @@ function desiredTask(status: number): DidaTask {
 }
 
 describe("DidaTaskAdapter", () => {
+  it("adds columnId only to the dedicated board placement payload", () => {
+    const payload = taskBoardPlacementPayload({
+      id: "task-1",
+      projectId: "project-1",
+      title: "Board task",
+      status: 0,
+      content: "keep",
+      reminders: ["TRIGGER:PT0S"],
+      repeatFlag: "RRULE:FREQ=DAILY",
+    }, "doing");
+    expect(payload).toEqual({
+      id: "task-1",
+      projectId: "project-1",
+      columnId: "doing",
+    });
+  });
   it("keeps board placement out of writable task snapshots", async () => {
     const api = new FakeTaskApi();
     api.task = { ...api.task, columnId: "todo" };
@@ -204,6 +231,36 @@ describe("DidaTaskAdapter", () => {
       { projectId: desired.projectId },
     );
     expect(api.lastUpdate?.sortOrder).toBeUndefined();
+  });
+
+  it("keeps reminder and repeat fields out of ordinary task updates", async () => {
+    const api = new FakeTaskApi();
+    const desired = {
+      ...desiredTask(0),
+      reminders: [" TRIGGER:CUSTOM "],
+      repeatFlag: " ERULE:CUSTOM ",
+    };
+    await new DidaTaskAdapter(api as unknown as DidaApi).update(
+      desired.id,
+      desired,
+      { projectId: "project-old" },
+    );
+    expect(api.lastUpdate).not.toHaveProperty("reminders");
+    expect(api.lastUpdate).not.toHaveProperty("repeatFlag");
+  });
+
+  it("keeps reminder and repeat fields out of ordinary task creation", async () => {
+    const api = new FakeTaskApi();
+    await new DidaTaskAdapter(api as unknown as DidaApi).create({
+      id: "local-task",
+      projectId: "project-old",
+      title: "新任务",
+      status: 0,
+      reminders: ["TRIGGER:PT0S"],
+      repeatFlag: "RRULE:FREQ=DAILY;INTERVAL=1",
+    });
+    expect(api.lastCreate).not.toHaveProperty("reminders");
+    expect(api.lastCreate).not.toHaveProperty("repeatFlag");
   });
 
   it("serializes task dates in the documented Dida write format", async () => {

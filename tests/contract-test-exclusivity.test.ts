@@ -179,6 +179,7 @@ describe("HelixService contract-test exclusivity", () => {
     persisted.didaContractCapabilities = {
       probeVersion: 2,
       taskScheduleMode: "duration",
+      boardPlacementVerified: true,
       verifiedAt: "2026-07-31T00:00:00.000Z",
     };
     let failSave = false;
@@ -207,6 +208,7 @@ describe("HelixService contract-test exclusivity", () => {
     expect(secrets.getDidaToken()).toBe("initial-contract-token");
     expect(persisted.didaContractCapabilities?.taskScheduleMode).toBe("duration");
     expect(service.snapshot().taskScheduleMode).toBe("duration");
+    expect(service.snapshot().boardPlacementVerified).toBe(true);
   });
 
   it("rejects credential switching while a synchronization read is in flight", async () => {

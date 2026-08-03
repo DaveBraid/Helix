@@ -38,7 +38,7 @@ describe("Dida normalization", () => {
     expect(() => normalizeColumns(undefined)).toThrow(/字段缺失/);
   });
 
-  it("normalizes date forms, set ordering, empty values, and checklist ordering", () => {
+  it("normalizes deterministic fields while preserving reminder wire order", () => {
     const first = normalizeTask({
       id: "task-1",
       projectId: "project-1",
@@ -65,7 +65,11 @@ describe("Dida normalization", () => {
         { id: "b", title: "second", status: 0 },
       ],
     });
-    expect(first).toEqual(second);
+    expect(first.reminders).toEqual(["later", "before"]);
+    expect(second.reminders).toEqual(["before", "later"]);
+    const { reminders: _firstReminders, ...firstComparable } = first;
+    const { reminders: _secondReminders, ...secondComparable } = second;
+    expect(firstComparable).toEqual(secondComparable);
   });
 
   it("rejects invalid task, checklist, focus, and habit-checkin dates", () => {

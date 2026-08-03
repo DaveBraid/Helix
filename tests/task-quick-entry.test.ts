@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseTaskQuickEntry } from "../src/domain/task-quick-entry";
+import {
+  applyTaskQuickSuggestion,
+  parseTaskQuickEntry,
+  shouldSubmitTaskQuickEntryOnKey,
+  taskQuickSuggestions,
+} from "../src/domain/task-quick-entry";
 
 const projects = [
   { id: "research", name: "科研" },
@@ -7,6 +12,66 @@ const projects = [
 ];
 
 describe("parseTaskQuickEntry", () => {
+  it("never submits the composer while an IME composition is active", () => {
+    expect(shouldSubmitTaskQuickEntryOnKey("Enter", true)).toBe(false);
+    expect(shouldSubmitTaskQuickEntryOnKey("Enter", false)).toBe(true);
+    expect(shouldSubmitTaskQuickEntryOnKey("Tab", false)).toBe(false);
+  });
+  it("suggests projects, existing tags, and priorities for the active token", () => {
+    expect(taskQuickSuggestions("读论文 ~科", 6, projects, [])).toMatchObject([
+      { kind: "project", label: "科研", token: "~科研" },
+    ]);
+    expect(taskQuickSuggestions("#实", 2, projects, ["实验", "阅读", "实验"])).toMatchObject([
+      { kind: "tag", label: "实验", token: "#实验" },
+    ]);
+    expect(taskQuickSuggestions("!高", 2, projects, [])).toMatchObject([
+      { kind: "priority", label: "高", token: "!高" },
+    ]);
+  });
+
+  it("replaces only the active token and returns the next caret position", () => {
+    expect(applyTaskQuickSuggestion("写作 ~De 后续", 6, {
+      kind: "project",
+      label: "Deep Work",
+      token: "~\"Deep Work\"",
+    })).toEqual({ value: "写作 ~\"Deep Work\" 后续", cursor: 15 });
+    expect(applyTaskQuickSuggestion("#实验 后续", 2, {
+      kind: "tag",
+      label: "实验",
+      token: "#实验",
+    })).toEqual({ value: "#实验 后续", cursor: 3 });
+    expect(applyTaskQuickSuggestion("#实验", 0, {
+      kind: "tag",
+      label: "实验",
+      token: "#实验",
+    })).toEqual({ value: "#实验 ", cursor: 4 });
+    expect(applyTaskQuickSuggestion("~科研", 3, {
+      kind: "tag",
+      label: "实验",
+      token: "#实验",
+    })).toEqual({ value: "~科研", cursor: 3 });
+  });
+
+  it("only offers tokens that round-trip through the shared parser", () => {
+    const candidates = taskQuickSuggestions("~", 1, [
+      ...projects,
+      { id: "duplicate", name: "科研" },
+      { id: "quoted", name: '含"引号' },
+      { id: "special", name: "方法 #2" },
+    ], []);
+    expect(candidates.map((candidate) => candidate.label)).toEqual(["Deep Work", "方法 #2"]);
+    for (const candidate of candidates) {
+      const applied = applyTaskQuickSuggestion("任务 ~", 4, candidate);
+      expect(parseTaskQuickEntry(applied.value, [
+        ...projects,
+        { id: "duplicate", name: "科研" },
+        { id: "quoted", name: '含"引号' },
+        { id: "special", name: "方法 #2" },
+      ]).issues).toEqual([]);
+    }
+    expect(taskQuickSuggestions("#", 1, projects, ["实验", "有 空格", "坏#标签"]))
+      .toMatchObject([{ label: "实验", token: "#实验" }]);
+  });
   it("extracts verified list, tag and priority tokens", () => {
     expect(parseTaskQuickEntry("复现实验 ~科研 #论文 #实验 !高", projects)).toEqual({
       title: "复现实验",

@@ -1,8 +1,12 @@
-import type { DidaProject, DidaTask } from "../../domain/entities";
+import type { DidaColumn, DidaProject, DidaTask } from "../../domain/entities";
 import type { TaskScheduleMode } from "../../domain/task-schedule";
 import type { DidaApi } from "./api";
+import {
+  sameTaskBoardPlacementInvariant,
+  taskBoardPlacementPayload,
+} from "./adapters";
 import { DidaHttpError } from "./http-contract";
-import { normalizeProject, normalizeTask } from "./normalization";
+import { normalizeColumns, normalizeProject, normalizeTask } from "./normalization";
 import { serializeDidaDate } from "./serialization";
 
 type ContractApi = Pick<
@@ -11,6 +15,10 @@ type ContractApi = Pick<
   | "getProjects"
   | "getProject"
   | "getProjectData"
+  | "updateProject"
+  | "getColumns"
+  | "createColumn"
+  | "updateColumn"
   | "deleteProject"
   | "createTask"
   | "getTask"
@@ -39,11 +47,20 @@ export interface DidaWriteContractReport {
   cleanupErrors: string[];
   remoteArtifactsRemaining: boolean;
   taskScheduleMode: TaskScheduleMode;
+  boardPlacementVerified: boolean;
+}
+
+export function verifiedBoardPlacementCapability(
+  report: Pick<DidaWriteContractReport, "boardPlacementVerified" | "remoteArtifactsRemaining">,
+): boolean {
+  return report.boardPlacementVerified && !report.remoteArtifactsRemaining;
 }
 
 interface CreatedProject {
   id: string;
   name: string;
+  viewMode?: DidaProject["viewMode"];
+  expectedColumns: DidaColumn[];
 }
 
 interface CreatedTask {
@@ -56,6 +73,7 @@ interface CreatedTask {
 export class DidaWriteContractRunner {
   private untrackedCreateOutcome = false;
   private taskScheduleMode: TaskScheduleMode = "unknown";
+  private boardPlacementVerified = false;
   private currentStage = "准备合同测试";
   private readonly timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
@@ -71,6 +89,7 @@ export class DidaWriteContractRunner {
   async run(): Promise<DidaWriteContractReport> {
     this.untrackedCreateOutcome = false;
     this.taskScheduleMode = "unknown";
+    this.boardPlacementVerified = false;
     this.currentStage = "准备合同测试";
     const runId = this.createRunId();
     const marker = `[Helix 合同测试 ${runId}]`;
@@ -108,6 +127,68 @@ export class DidaWriteContractRunner {
         forbiddenProjectIds,
       );
       steps.push("创建并复读专用清单 B");
+
+      this.beginStage("验证专用清单列表与看板默认视图");
+      await this.updateAndVerifyProjectViewMode(projectA, "list");
+      await this.updateAndVerifyProjectViewMode(projectA, "kanban");
+      const kanbanData = await this.api.getProjectData(projectA.id);
+      const kanbanProject = normalizeProject(kanbanData.project);
+      if (
+        kanbanProject.id !== projectA.id ||
+        kanbanProject.name !== projectA.name ||
+        kanbanProject.viewMode !== "kanban"
+      ) {
+        throw new Error("看板详情复读的清单身份、名称或视图状态不一致");
+      }
+      let columns = normalizeColumns(kanbanData.columns);
+      const directlyReadColumns = normalizeColumns(await this.api.getColumns(projectA.id));
+      this.assertExactColumns(
+        columns,
+        directlyReadColumns,
+        "切换看板后的详情列与列端点复读不一致",
+      );
+      this.assertExactColumns(
+        columns,
+        projectA.expectedColumns,
+        "切换看板后列基线出现未知变化",
+      );
+      if (columns.length === 0) {
+        const firstColumnName = `${marker} 待处理`;
+        const secondColumnName = `${marker} 进行中`;
+        projectA.expectedColumns = columns;
+        const firstColumn = await this.createAndVerifyColumn(
+          projectA,
+          firstColumnName,
+        );
+        const renameTarget = await this.createAndVerifyColumn(
+          projectA,
+          secondColumnName,
+        );
+        const renamed = `${marker} 验证中`;
+        await this.updateAndVerifyColumn(projectA, renameTarget, renamed);
+        columns = projectA.expectedColumns;
+        if (!columns.some((column) => column.id === firstColumn.id)) {
+          throw new Error("首个测试分栏在后续列操作中消失");
+        }
+      }
+      const columnIds = new Set<string>();
+      for (const column of columns) {
+        if (
+          !column ||
+          typeof column.id !== "string" ||
+          !column.id ||
+          column.projectId !== projectA.id ||
+          typeof column.name !== "string" ||
+          !column.name.trim() ||
+          columnIds.has(column.id)
+        ) {
+          throw new Error("专用清单默认列的身份、名称或归属无效");
+        }
+        columnIds.add(column.id);
+      }
+      projectA.expectedColumns = columns;
+      await this.updateAndVerifyProjectViewMode(projectA, "list");
+      steps.push(`验证列表→看板→列表，并复读 ${columnIds.size} 个看板列`);
 
       const firstStart = this.futureInstant(86_400_000);
       const firstDue = this.futureInstant(90_000_000);
@@ -186,6 +267,26 @@ export class DidaWriteContractRunner {
           : "编辑任务并复读验证字段",
       );
 
+      this.beginStage("以最小载荷验证测试任务看板归栏");
+      this.assertExactColumns(
+        normalizeColumns(await this.api.getColumns(projectA.id)),
+        projectA.expectedColumns,
+        "写入任务归栏前的完整列基线已变化",
+      );
+      const beforePlacement = normalizeTask(await this.api.getTask(projectA.id, created.id));
+      this.assertTaskIdentity(beforePlacement, created.id, projectA.id, marker);
+      const reconciledUnknownPlacement = await this.placeAndVerifyTask(
+        beforePlacement,
+        columns[0]!.id,
+        marker,
+      );
+      this.boardPlacementVerified = true;
+      steps.push(
+        reconciledUnknownPlacement
+          ? "归栏响应未知；未重发，精确复读证明目标分栏且其他字段未变化"
+          : "以最小白名单归栏并证明其他任务字段未变化",
+      );
+
       this.beginStage("移动测试任务并核对来源清单");
       await this.api.moveTask({
         fromProjectId: projectA.id,
@@ -248,6 +349,7 @@ export class DidaWriteContractRunner {
       cleanupErrors,
       remoteArtifactsRemaining: cleanupErrors.length > 0 || this.untrackedCreateOutcome,
       taskScheduleMode: this.taskScheduleMode,
+      boardPlacementVerified: this.boardPlacementVerified,
     };
   }
 
@@ -300,6 +402,51 @@ export class DidaWriteContractRunner {
     return unknownOutcome !== undefined;
   }
 
+  private async placeAndVerifyTask(
+    before: DidaTask,
+    targetColumnId: string,
+    marker: string,
+  ): Promise<boolean> {
+    let unknownOutcome: unknown;
+    try {
+      await this.api.updateTask(
+        before.id,
+        taskBoardPlacementPayload(before, targetColumnId),
+      );
+    } catch (error) {
+      if (!isUnknownRemoteOutcome(error)) throw error;
+      unknownOutcome = error;
+    }
+
+    let reread: DidaTask;
+    try {
+      reread = normalizeTask(await this.api.getTask(before.projectId, before.id));
+    } catch (error) {
+      if (!unknownOutcome) throw error;
+      throw new Error(
+        `归栏响应未知且精确复读失败；未重发。原始错误：${messageOf(unknownOutcome)}；` +
+        `复读错误：${messageOf(error)}`,
+      );
+    }
+
+    try {
+      this.assertTaskIdentity(reread, before.id, before.projectId, marker);
+      if (reread.columnId !== targetColumnId) {
+        throw new Error("任务 columnId 写后复读与目标分栏不一致");
+      }
+      if (!sameTaskBoardPlacementInvariant(before, reread)) {
+        throw new Error("最小归栏写入改变了分栏以外的任务字段");
+      }
+    } catch (error) {
+      if (!unknownOutcome) throw error;
+      throw new Error(
+        `归栏响应未知，精确复读未证明安全写入；未重发。原始错误：` +
+        `${messageOf(unknownOutcome)}；核对错误：${messageOf(error)}`,
+      );
+    }
+    return unknownOutcome !== undefined;
+  }
+
   private async createAndVerifyProject(
     name: string,
     tracked: CreatedProject[],
@@ -320,14 +467,97 @@ export class DidaWriteContractRunner {
       this.untrackedCreateOutcome = true;
       throw new Error("新建清单返回了测试前已存在或本轮已使用的 ID，拒绝继续");
     }
-    const project = { id: created.id, name };
+    const project: CreatedProject = { id: created.id, name, expectedColumns: [] };
     tracked.push(project);
     forbiddenIds.add(created.id);
     const reread = normalizeProject(await this.api.getProject(created.id));
     if (reread.id !== created.id || reread.name !== name) {
       throw new Error("新建清单复读身份与本轮唯一标记不一致");
     }
+    project.viewMode = reread.viewMode;
+    const initialColumns = normalizeColumns(await this.api.getColumns(project.id));
+    if (initialColumns.some((column) => column.projectId !== project.id)) {
+      throw new Error("新建清单的初始分栏归属与清单 ID 不一致");
+    }
+    project.expectedColumns = initialColumns;
     return project;
+  }
+
+  private async createAndVerifyColumn(
+    project: CreatedProject,
+    name: string,
+  ): Promise<DidaColumn> {
+    this.assertExactColumns(
+      normalizeColumns(await this.api.getColumns(project.id)),
+      project.expectedColumns,
+      "创建分栏前的完整列基线已变化",
+    );
+    const created = normalizeColumns([await this.api.createColumn(project.id, { name })])[0]!;
+    if (
+      created.projectId !== project.id ||
+      created.name !== name ||
+      project.expectedColumns.some((column) => column.id === created.id)
+    ) {
+      throw new Error("创建分栏响应的 ID、归属、名称或唯一性无效");
+    }
+    const expected = normalizeColumns([...project.expectedColumns, created]);
+    const reread = normalizeColumns(await this.api.getColumns(project.id));
+    this.assertExactColumns(reread, expected, "创建分栏后的同 ID 复读不一致");
+    project.expectedColumns = reread;
+    return created;
+  }
+
+  private async updateAndVerifyColumn(
+    project: CreatedProject,
+    column: DidaColumn,
+    name: string,
+  ): Promise<void> {
+    const before = normalizeColumns(await this.api.getColumns(project.id));
+    this.assertExactColumns(before, project.expectedColumns, "改名分栏前的完整列基线已变化");
+    const current = before.find((candidate) => candidate.id === column.id);
+    if (!current || current.name !== column.name || current.projectId !== project.id) {
+      throw new Error("改名目标分栏的 ID、旧名称或归属已变化");
+    }
+    const updated = normalizeColumns([
+      await this.api.updateColumn(project.id, column.id, { name }),
+    ])[0]!;
+    if (updated.id !== column.id || updated.projectId !== project.id || updated.name !== name) {
+      throw new Error("改名分栏响应的 ID、归属或名称无效");
+    }
+    const expected = normalizeColumns(before.map((candidate) =>
+      candidate.id === column.id ? updated : candidate));
+    const reread = normalizeColumns(await this.api.getColumns(project.id));
+    this.assertExactColumns(reread, expected, "改名分栏后的同 ID 复读不一致");
+    project.expectedColumns = reread;
+  }
+
+  private async updateAndVerifyProjectViewMode(
+    project: CreatedProject,
+    viewMode: "list" | "kanban",
+  ): Promise<void> {
+    const before = normalizeProject(await this.api.getProject(project.id));
+    if (
+      before.id !== project.id ||
+      before.name !== project.name ||
+      !before.name.includes("[Helix 合同测试 ") ||
+      before.viewMode !== project.viewMode
+    ) {
+      throw new Error("修改清单视图前的身份、标记或视图基线已变化，拒绝覆盖");
+    }
+    await this.api.updateProject(project.id, {
+      id: project.id,
+      name: project.name,
+      viewMode,
+    });
+    const reread = normalizeProject(await this.api.getProject(project.id));
+    if (
+      reread.id !== project.id ||
+      reread.name !== project.name ||
+      reread.viewMode !== viewMode
+    ) {
+      throw new Error(`清单默认视图写后复读不一致：预期 ${viewMode}`);
+    }
+    project.viewMode = viewMode;
   }
 
   private assertTaskIdentity(
@@ -446,6 +676,11 @@ export class DidaWriteContractRunner {
     if (completedTasks.length > 0) {
       throw new Error("测试清单仍有已完成任务，拒绝删除清单");
     }
+    this.assertExactColumns(
+      normalizeColumns(await this.api.getColumns(project.id)),
+      project.expectedColumns,
+      "测试清单分栏集合在运行期间出现未知变化，拒绝删除清单",
+    );
     try {
       await this.api.deleteProject(project.id);
     } catch (error) {
@@ -596,6 +831,25 @@ export class DidaWriteContractRunner {
     } catch (error) {
       if (isNotFound(error)) return;
       throw error;
+    }
+  }
+
+  private assertExactColumns(
+    actual: DidaColumn[],
+    expected: DidaColumn[],
+    message: string,
+  ): void {
+    if (
+      actual.length !== expected.length ||
+      actual.some((column, index) => {
+        const baseline = expected[index];
+        return !baseline || column.id !== baseline.id ||
+          column.projectId !== baseline.projectId || column.name !== baseline.name ||
+          column.sortOrder !== baseline.sortOrder ||
+          column.sortOrderUnsafe !== baseline.sortOrderUnsafe;
+      })
+    ) {
+      throw new Error(message);
     }
   }
 

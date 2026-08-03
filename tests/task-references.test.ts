@@ -3,10 +3,42 @@ import { stableHash } from "../src/domain/stable";
 import {
   TaskReferenceConflictError,
   TaskReferenceService,
+  taskReferenceRuntimeIssues,
 } from "../src/services/task-references";
 import type { VaultRevision } from "../src/storage/vault-repository";
 
 describe("TaskReferenceService", () => {
+  const didaContext = { didaProjectId: "dida-list-1" } as const;
+
+  it("requires an explicit matching Dida list context for stable project actions", async () => {
+    const repo = new MemoryReferenceRepository();
+    const mapped = taskReferences(repo, "dida-list-1", false);
+    await expect(mapped.saveTaskReference(
+      "task-remote-missing-context",
+      { projectId: "project-1", stageIds: [] },
+      null,
+    )).rejects.toThrow(/必须提供.*滴答清单上下文/);
+    await expect(mapped.saveTaskReference(
+      "task-remote-1",
+      { projectId: "project-1", stageIds: [] },
+      null,
+      { didaProjectId: "dida-other" },
+    )).rejects.toThrow(/所属滴答清单.*映射不一致/);
+    await expect(mapped.saveTaskReference(
+      "task-remote-1",
+      { projectId: "project-1", stageIds: [] },
+      null,
+      { didaProjectId: "dida-list-1" },
+    )).resolves.toMatchObject({ committed: true });
+
+    const unmapped = taskReferences(new MemoryReferenceRepository(), "", false);
+    await expect(unmapped.saveTaskReference(
+      "task-remote-2",
+      { projectId: "project-1", stageIds: [] },
+      null,
+      { didaProjectId: "dida-list-1" },
+    )).rejects.toThrow(/尚未映射滴答清单/);
+  });
   it("stores only stable identities and Obsidian links in one Markdown note", async () => {
     const repo = new MemoryReferenceRepository();
     const service = taskReferences(repo);
@@ -136,7 +168,7 @@ describe("TaskReferenceService", () => {
     await service.rebindTaskId("task-old", "task-new", {
       refId: before.refId,
       revisionHash: before.revisionHash,
-    });
+    }, { didaProjectId: "dida-list-1" });
     const after = (await service.snapshot()).references[0]!;
 
     expect(after).toMatchObject({
@@ -147,10 +179,61 @@ describe("TaskReferenceService", () => {
     await expect(service.rebindTaskId("task-old", "task-new", {
       refId: before.refId,
       revisionHash: before.revisionHash,
-    })).resolves.toBeUndefined();
+    }, { didaProjectId: "dida-list-1" })).resolves.toBeUndefined();
   });
 
-  it("can rebind a task ID while preserving a separately broken project link", async () => {
+  it("rejects rebind to a task from another mapped list", async () => {
+    const repo = new MemoryReferenceRepository();
+    const service = taskReferences(repo);
+    const created = await service.saveTaskReference(
+      "task-old",
+      { projectId: "project-1", stageIds: [] },
+      null,
+    );
+    await expect(service.rebindTaskId(
+      "task-old",
+      "task-other-list",
+      {
+        refId: created.reference!.refId,
+        revisionHash: created.reference!.revisionHash,
+      },
+      { didaProjectId: "dida-list-2" },
+    )).rejects.toThrow(/映射不一致/);
+    expect((await service.snapshot()).byTaskId.has("task-old")).toBe(true);
+  });
+
+  it("projects mapping disconnects and external task moves into runtime diagnostics", async () => {
+    const mappedReference = {
+      refId: "ref-1",
+      provider: "dida" as const,
+      taskId: "task-1",
+      projectId: "project-1",
+      stageIds: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      notePath: "reference.md",
+      revisionHash: "hash",
+      project: {
+        id: "project-1",
+        title: "Alpha",
+        status: "active" as const,
+        notePath: "Project.md",
+        didaProjectId: "dida-list-1",
+        cycles: [],
+      },
+      stages: [],
+      issues: [],
+    };
+    expect(taskReferenceRuntimeIssues(mappedReference, { projectId: "dida-list-2" }))
+      .toContain("任务所属滴答清单与 Helix 项目映射不一致");
+    expect(taskReferenceRuntimeIssues({
+      ...mappedReference,
+      project: { ...mappedReference.project, didaProjectId: undefined },
+    }, { projectId: "dida-list-1" }))
+      .toContain("Helix 项目尚未映射滴答清单");
+  });
+
+  it("rejects rebind when the referenced Helix project no longer exists", async () => {
     const repo = new MemoryReferenceRepository();
     const service = taskReferences(repo);
     const created = await service.saveTaskReference(
@@ -167,14 +250,13 @@ describe("TaskReferenceService", () => {
     );
     const broken = (await service.snapshot()).byTaskId.get("task-old")!;
 
-    await service.rebindTaskId("task-old", "task-new", {
+    await expect(service.rebindTaskId("task-old", "task-new", {
       refId: broken.refId,
       revisionHash: broken.revisionHash,
-    });
-    const rebound = (await service.snapshot()).byTaskId.get("task-new")!;
-    expect(rebound.refId).toBe(broken.refId);
-    expect(rebound.projectId).toBe("project-missing");
-    expect(rebound.issues).toContain("关联的 Helix 项目已不存在");
+    }, { didaProjectId: "dida-list-1" })).rejects.toThrow(/尚未映射滴答清单/);
+    const preserved = (await service.snapshot()).byTaskId.get("task-old")!;
+    expect(preserved.refId).toBe(broken.refId);
+    expect(preserved.projectId).toBe("project-missing");
   });
 
   it("blocks writes when duplicate or broken reference structure exists", async () => {
@@ -371,13 +453,18 @@ describe("TaskReferenceService", () => {
   });
 });
 
-function taskReferences(repo: MemoryReferenceRepository): TaskReferenceService {
+function taskReferences(
+  repo: MemoryReferenceRepository,
+  didaProjectId = "dida-list-1",
+  supplyVerifiedContext = true,
+): TaskReferenceService {
   const projectSnapshot = {
     projects: [{
       id: "project-1",
       title: "Alpha",
       status: "active",
       notePath: "Helix/Projects/Alpha/Project.md",
+      didaProjectId,
       cycles: [
         {
           id: "stage-1",
@@ -396,7 +483,7 @@ function taskReferences(repo: MemoryReferenceRepository): TaskReferenceService {
       ],
     }],
   };
-  return new TaskReferenceService(
+  const service = new TaskReferenceService(
     {
       vault: {
         getMarkdownFiles: () => repo.paths().map((path) => ({ path })),
@@ -406,6 +493,17 @@ function taskReferences(repo: MemoryReferenceRepository): TaskReferenceService {
     { snapshot: async () => projectSnapshot } as never,
     () => "Helix",
   );
+  if (supplyVerifiedContext) {
+    const save = service.saveTaskReference.bind(service);
+    service.saveTaskReference = ((taskId, selection, expected, context) =>
+      save(
+        taskId,
+        selection,
+        expected,
+        context ?? (selection.projectId ? { didaProjectId: "dida-list-1" } : undefined),
+      )) as TaskReferenceService["saveTaskReference"];
+  }
+  return service;
 }
 
 class MemoryReferenceRepository {

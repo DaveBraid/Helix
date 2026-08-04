@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DidaProject, DidaTask } from "../src/domain/entities";
+import type { DidaFocusRecord, DidaProject, DidaTask } from "../src/domain/entities";
 import { HelixService } from "../src/services/helix-service";
 import { HelixDataStore, type PluginDataPort } from "../src/storage/data-store";
 import { createDefaultData, hydrateData } from "../src/storage/model";
@@ -144,6 +144,66 @@ async function createBoardMoveHarness(): Promise<{
 }
 
 describe("HelixService runtime recovery", () => {
+  it("replaces a persisted erroneous focus event with corrected milliseconds on sync", async () => {
+    const record: DidaFocusRecord = {
+      id: "focus-corrected",
+      type: 1,
+      duration: 2_827_000,
+      startTime: "2026-08-04T09:00:00.000Z",
+      endTime: "2026-08-04T09:47:08.000Z",
+    };
+    const occurredAt = record.endTime!;
+    const data = createDefaultData("device-focus-correction");
+    const erroneous: HelixEvent = {
+      id: deterministicEventId({
+        type: "focus-completed",
+        entityId: record.id,
+        occurrenceKey: record.id,
+        occurredAt,
+      }),
+      type: "focus-completed",
+      entityId: record.id,
+      occurrenceKey: record.id,
+      occurredAt,
+      minutes: 47_117,
+    };
+    data.events = [erroneous];
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "api", {
+      value: {
+        async getProjects() { return []; },
+        async filterTasks() { return []; },
+        async getCompletedTasks() { return []; },
+      },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", {
+      value: { async list() { return [record]; } },
+    });
+
+    await service.pullOnlySync();
+
+    const completed = persisted.events.filter((event): event is HelixEvent =>
+      !!event && typeof event === "object" &&
+      (event as HelixEvent).type === "focus-completed" &&
+      (event as HelixEvent).entityId === record.id,
+    );
+    expect(completed).toEqual([expect.objectContaining({ minutes: 47 })]);
+    expect(service.snapshot().events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: erroneous.id, minutes: 47 }),
+    ]));
+  });
+
   it("does not cover a configured account or real cache with sample data", async () => {
     const configuredData = createDefaultData("device-configured");
     const configured = new HelixService(

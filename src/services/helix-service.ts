@@ -23,6 +23,7 @@ import {
   isHelixEvent,
   type HelixEvent,
 } from "../domain/events";
+import { focusMinutes } from "../domain/focus-duration";
 import { challengeProgress, rotatingChallenges } from "../domain/gamification";
 import { stableHash } from "../domain/stable";
 import { DidaApi, type DidaCapabilities } from "../integrations/dida/api";
@@ -455,7 +456,8 @@ export class HelixService {
           coverageFrom: from,
           coverageTo: now,
         })) {
-          ledger.append(event);
+          if (event.type === "focus-completed") ledger.refreshDerivedFocusCompleted(event);
+          else ledger.append(event);
         }
         appendEarnedChallengeAwards(ledger, capturedAt);
         data.events = ledger.list();
@@ -2068,17 +2070,6 @@ function toIsoTime(value: string | number): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) throw new Error("Dida 事件时间格式无效");
   return date.toISOString();
-}
-
-function focusMinutes(record: DidaFocusRecord): number {
-  if (typeof record.duration === "number") return Math.max(0, Math.round(record.duration / 60));
-  if (record.startTime && record.endTime) {
-    return Math.max(
-      0,
-      Math.round((new Date(record.endTime).getTime() - new Date(record.startTime).getTime()) / 60_000),
-    );
-  }
-  return 0;
 }
 
 function needsAttention(operation: SyncQueueOperation): boolean {

@@ -204,6 +204,19 @@ export function challengeProgress(
     .reduce((sum, contribution) => sum + contribution.value, 0);
 }
 
+/** 历史领奖事件只在当前进度仍达标时才代表已领取，支持远端派生事实纠正。 */
+export function challengeClaimed(
+  challenge: ChallengeDefinition,
+  events: HelixEvent[],
+): boolean {
+  return challengeProgress(challenge, events) >= challenge.target &&
+    events.some((event) =>
+      event.type === "challenge-completed" &&
+      event.entityId === challenge.id &&
+      event.occurrenceKey === challenge.id,
+    );
+}
+
 export interface ChallengeContribution {
   label: string;
   occurredAt: string;

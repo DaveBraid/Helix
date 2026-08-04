@@ -3,6 +3,7 @@ import { aggregateAnalytics } from "../src/domain/analytics";
 import { deterministicEventId, EventLedger, type HelixEvent } from "../src/domain/events";
 import {
   challengeContributions,
+  challengeClaimed,
   challengeProgress,
   deriveProgress,
   rotatingChallenges,
@@ -28,6 +29,54 @@ describe("in progress registry", () => {
       "task-3",
     ]);
     expect(registry.list()).toHaveLength(4);
+  });
+});
+
+describe("derived focus event refresh", () => {
+  it("replaces only the same deterministic focus event with corrected remote-derived minutes", () => {
+    const completed: HelixEvent = {
+      id: deterministicEventId({
+        type: "focus-completed",
+        entityId: "focus-1",
+        occurrenceKey: "focus-1",
+        occurredAt: "2026-08-04T09:47:08.000Z",
+      }),
+      type: "focus-completed",
+      entityId: "focus-1",
+      occurrenceKey: "focus-1",
+      occurredAt: "2026-08-04T09:47:08.000Z",
+      minutes: 47_117,
+      projectId: "project-keep",
+      metadata: { taskId: "task-keep" },
+    };
+    const task: HelixEvent = {
+      id: "task-immutable",
+      type: "task-completed",
+      entityId: "task-1",
+      occurredAt: "2026-08-04T09:00:00.000Z",
+    };
+    const ledger = new EventLedger([completed, task]);
+    expect(ledger.refreshDerivedFocusCompleted({
+      ...completed,
+      minutes: 47,
+      occurredAt: "2026-08-04T10:00:00.000Z",
+      projectId: "project-try-overwrite",
+      metadata: { taskId: "task-try-overwrite" },
+    })).toBe(true);
+    expect(ledger.list()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: completed.id,
+        minutes: 47,
+        occurredAt: completed.occurredAt,
+        projectId: "project-keep",
+        metadata: { taskId: "task-keep" },
+      }),
+      task,
+    ]));
+    expect(ledger.refreshDerivedFocusCompleted({ ...completed, occurrenceKey: "different", minutes: 30 })).toBe(false);
+    expect(() => ledger.refreshDerivedFocusCompleted({ ...task, id: "not-focus" }))
+      .toThrow(/仅允许刷新专注完成事件/);
+    expect(ledger.append({ ...task, id: "task-immutable-new", difficulty: 5 })).toBe(false);
   });
 });
 
@@ -199,6 +248,41 @@ describe("event analytics and rewards", () => {
     expect(deriveProgress([...completed, award, reopened]).xp).toBe(
       deriveProgress([...completed, reopened]).xp,
     );
+  });
+
+  it("does not expose a historical challenge award after corrected focus falls below target", () => {
+    let challenge = rotatingChallenges(new Date("2026-07-01T12:00:00Z"))[1]!;
+    for (let offset = 0; challenge.metric !== "focus-minutes"; offset += 31) {
+      challenge = rotatingChallenges(new Date(2026, 6 + offset, 1, 12))[1]!;
+    }
+    const focus: HelixEvent = {
+      id: "corrected-focus",
+      type: "focus-completed",
+      entityId: "focus-1",
+      occurrenceKey: "focus-1",
+      occurredAt: new Date(new Date(challenge.startsAt).getTime() + 60_000).toISOString(),
+      minutes: 47,
+    };
+    const award: HelixEvent = {
+      id: "historical-award",
+      type: "challenge-completed",
+      entityId: challenge.id,
+      occurrenceKey: challenge.id,
+      occurredAt: focus.occurredAt,
+      metadata: {
+        rewardXp: challenge.rewardXp,
+        ruleVersion: 1,
+        title: challenge.title,
+        metric: challenge.metric,
+        target: challenge.target,
+        period: challenge.period,
+        startsAt: challenge.startsAt,
+        endsAt: challenge.endsAt,
+      },
+    };
+    expect(challengeProgress(challenge, [focus])).toBeLessThan(challenge.target);
+    expect(challengeClaimed(challenge, [focus, award])).toBe(false);
+    expect(deriveProgress([focus, award]).xp).toBe(deriveProgress([focus]).xp);
   });
 
   it("projects reversals outside the requested month into the original heatmap", () => {

@@ -9,6 +9,7 @@ import {
   filterTaskCollection,
   groupTasksByViewDay,
   taskViewDateKeys,
+  todayOpenTasks,
 } from "../src/domain/task-views";
 import { normalizeTask } from "../src/integrations/dida/normalization";
 
@@ -92,6 +93,17 @@ describe("task view projections", () => {
       completedTime: instant,
       timeZone: "America/Los_Angeles",
     }))).toEqual(["2026-08-02"]);
+  });
+
+  it("uses the day-view projection for today tasks, including task time zones", () => {
+    const today = new Date(2026, 7, 3, 12);
+    expect(todayOpenTasks([
+      task({ id: "today", title: "今天", dueDate: "2026-08-03T09:00:00+08:00" }),
+      task({ id: "west", title: "西海岸仍是昨天", dueDate: "2026-08-03T00:30:00.000Z", timeZone: "America/Los_Angeles" }),
+      task({ id: "done", title: "今天完成", status: 2, completedTime: "2026-08-03T09:00:00+08:00" }),
+      task({ id: "later", title: "明天", dueDate: "2026-08-04T09:00:00+08:00" }),
+      task({ id: "undated", title: "无日期" }),
+    ], today).map((item) => item.id)).toEqual(["today"]);
   });
 
   it("expands task-zone dates correctly across the spring DST boundary", () => {

@@ -169,6 +169,15 @@ export function groupTasksByViewDay(
   return grouped;
 }
 
+/** 首页与日视图共用同一日期／时区投影；首页仅保留今天仍待推进的任务。 */
+export function todayOpenTasks(tasks: DidaTask[], anchor: Date): DidaTask[] {
+  const range = buildTaskDateRange("day", anchor);
+  const key = range.days[0]?.key;
+  if (!key) return [];
+  return (groupTasksByViewDay(tasks, range).get(key) ?? [])
+    .filter((task) => task.status !== 2);
+}
+
 export function buildTaskMatrix(
   tasks: DidaTask[],
   anchor: Date,

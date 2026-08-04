@@ -36,6 +36,7 @@ import type { HelixEvent } from "../domain/events";
 import { aggregateAnalytics } from "../domain/analytics";
 import { localDateKey, localDateKeyFromInstant } from "../domain/local-date";
 import {
+  challengeClaimed,
   challengeContributions,
   challengeProgress,
   deriveProgress,
@@ -73,11 +74,13 @@ import {
   buildTaskYearSummary,
   filterTaskCollection,
   groupTasksByViewDay,
+  todayOpenTasks,
   type TaskCollectionFilters,
   type TaskDateRange,
   type TaskMatrixRules,
   type TaskViewMode,
 } from "../domain/task-views";
+import { homeGreeting } from "../domain/home-dashboard";
 import type {
   DidaProjectViewModeSyncStatus,
   HelixRuntimeState,
@@ -472,12 +475,13 @@ export class HelixView extends ItemView {
     await this.refreshTaskReferenceSnapshot(token);
     if (token !== this.renderToken) return;
     const state = this.displayState();
+    const now = new Date();
     const hero = content.createDiv({ cls: "helix-today-heading" });
     const copy = hero.createDiv();
-    copy.createEl("p", { cls: "helix-eyebrow", text: formatFullDate(new Date()) });
-    copy.createEl("h2", { text: "早上好，今天推进什么？" });
+    copy.createEl("p", { cls: "helix-eyebrow", text: formatFullDate(now) });
+    copy.createEl("h2", { text: homeGreeting(now) });
     const score = hero.createDiv({ cls: "helix-score" });
-    const today = localDateKey(new Date());
+    const today = localDateKey(now);
     const activity = aggregateAnalytics(this.state?.events ?? [], {
       from: today,
       to: today,
@@ -488,7 +492,7 @@ export class HelixView extends ItemView {
     const grid = content.createDiv({ cls: "helix-dashboard-grid" });
     const primary = grid.createDiv({ cls: "helix-dashboard-primary" });
     this.renderInProgress(primary, state.tasks, state.projects);
-    this.renderTodayTasks(primary, state.tasks, state.projects);
+    this.renderTodayTasks(primary, state.tasks, state.projects, now);
     const rail = grid.createDiv({ cls: "helix-dashboard-rail" });
     this.renderTimeline(rail, state.tasks, state.projects);
     const lower = content.createDiv({ cls: "helix-dashboard-lower" });
@@ -572,14 +576,24 @@ export class HelixView extends ItemView {
     for (const item of items) this.renderTaskRow(list, item.task, item.project, true);
   }
 
-  private renderTodayTasks(parent: HTMLElement, tasks: DidaTask[], projects: DidaProject[]): void {
+  private renderTodayTasks(
+    parent: HTMLElement,
+    tasks: DidaTask[],
+    projects: DidaProject[],
+    now: Date,
+  ): void {
     const card = parent.createDiv({ cls: "helix-card" });
     const header = card.createDiv({ cls: "helix-section-header" });
     const title = header.createDiv();
     title.createEl("h3", { text: "今日任务" });
-    title.createEl("p", { text: `${tasks.filter((task) => task.status !== 2).length} 项待推进` });
+    const todayTasks = todayOpenTasks(tasks, now);
+    title.createEl("p", { text: `${todayTasks.length} 项待推进` });
+    if (todayTasks.length === 0) {
+      card.createDiv({ cls: "helix-empty", text: "今天没有待推进任务，留一点空间给真正重要的事。" });
+      return;
+    }
     const list = card.createDiv({ cls: "helix-task-list" });
-    for (const task of tasks.filter((candidate) => candidate.status !== 2).slice(0, 6)) {
+    for (const task of todayTasks.slice(0, 6)) {
       this.renderTaskRow(
         list,
         task,
@@ -4198,11 +4212,7 @@ class ChallengeDetailModal extends Modal {
     this.setTitle(this.challenge.title);
     const current = challengeProgress(this.challenge, this.events);
     const remaining = Math.max(0, this.challenge.target - current);
-    const claimed = this.events.some(
-      (event) =>
-        event.type === "challenge-completed" &&
-        event.entityId === this.challenge.id,
-    );
+    const claimed = challengeClaimed(this.challenge, this.events);
     const summary = this.contentEl.createDiv({ cls: "helix-challenge-detail-summary" });
     summary.createDiv({ text: this.challenge.description });
     const metrics = summary.createDiv({ cls: "helix-challenge-detail-metrics" });

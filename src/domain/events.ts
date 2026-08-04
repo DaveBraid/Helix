@@ -84,6 +84,38 @@ export class EventLedger {
     return true;
   }
 
+  /**
+   * 专注记录是远端只读事实派生出的本地事件。同步覆盖到同一记录时，
+   * 允许用相同确定性身份更新分钟数；绝不用于任务、挑战等不可变事件。
+   */
+  refreshDerivedFocusCompleted(event: HelixEvent): boolean {
+    if (event.type !== "focus-completed") {
+      throw new Error("仅允许刷新专注完成事件");
+    }
+    const existing = this.events.get(event.id);
+    if (!existing) {
+      if (event.id !== deterministicEventId(event)) {
+        throw new Error("仅允许刷新具有确定性身份的专注完成事件");
+      }
+      return this.append(event);
+    }
+    if (
+      existing.type !== "focus-completed" ||
+      existing.entityId !== event.entityId ||
+      existing.occurrenceKey !== event.occurrenceKey ||
+      deterministicEventId(existing) !== event.id
+    ) {
+      return false;
+    }
+    if (typeof event.minutes !== "number" || !Number.isFinite(event.minutes) || event.minutes < 0) {
+      return false;
+    }
+    if (existing.minutes === event.minutes) return false;
+    // 只纠正远端派生分钟数；发生时间、归属和元数据仍以既有账本为准。
+    this.events.set(event.id, { ...existing, minutes: event.minutes });
+    return true;
+  }
+
   list(): HelixEvent[] {
     return [...this.events.values()]
       .map((event) => structuredClone(event))

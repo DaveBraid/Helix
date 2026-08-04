@@ -69,7 +69,8 @@ describe("ProjectWorkspaceService", () => {
       () => CANVAS,
       async (requests) => {
         batches.push(requests.map(({ kind, values }) => `${kind}:${values.title}`));
-        return requests.map(({ values }) => `正文：${values.title}`);
+        return requests.map(({ values }) =>
+          `# 本阶段问题聚焦\n\n正文：${values.title}\n\n## 下一阶段聚焦问题`);
       },
     );
 
@@ -1194,6 +1195,160 @@ describe("ProjectWorkspaceService", () => {
     await expect(service.connectCycles(plan)).rejects.toThrow(/已经变化/);
   });
 
+  it("derives, removes and restores a target focus block with its Canvas relation", async () => {
+    const repo = baseRepository();
+    const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const targetPath = "Helix/Projects/Alpha/Cycle-02.md";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace(
+      "## 下一阶段聚焦问题\n",
+      "## 下一阶段聚焦问题\n验证聚焦桥接\n",
+    ));
+    repo.set(targetPath, cycle("cycle-2", "project-1", 2).replace(
+      "# 本阶段问题聚焦\n",
+      "# 本阶段问题聚焦\n用户前言\n",
+    ));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+
+    await service.connectCycles(await service.planConnection("cycle-1", "cycle-2"));
+    const connected = (await repo.read(targetPath))!.content;
+    expect(connected).toContain("sourceId=cycle-1");
+    expect(connected).toContain("> 验证聚焦桥接");
+    expect(connected).toContain("用户前言");
+    const relationId = (await service.snapshot()).relations[0]!.id;
+
+    await service.deleteRelation(relationId);
+    const disconnected = (await repo.read(targetPath))!.content;
+    expect(disconnected).not.toContain("helix-focus-bridge");
+    expect(disconnected).toContain("用户前言");
+    await service.undoLastWorkspaceChange();
+    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-1");
+  });
+
+  it("creates an inherited stage with its predecessor focus already derived", async () => {
+    const repo = baseRepository();
+    const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace(
+      "## 下一阶段聚焦问题\n",
+      "## 下一阶段聚焦问题\n直接进入新阶段\n",
+    ));
+    const created = await workspace(repo).createCycle(
+      "project-1",
+      "inherit",
+      ["cycle-1"],
+      { stageTitle: "聚焦继承" },
+    );
+    const markdown = (await repo.read(created.notePath))!.content;
+    expect(markdown).toContain("sourceId=cycle-1");
+    expect(markdown).toContain("> 直接进入新阶段");
+  });
+
+  it("keeps Canvas byte-identical when connection focus headings or markers are invalid", async () => {
+    for (const damage of ["target-heading", "source-heading", "target-marker"] as const) {
+      const repo = baseRepository();
+      const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+      const targetPath = "Helix/Projects/Alpha/Cycle-02.md";
+      repo.set(targetPath, cycle("cycle-2", "project-1", 2));
+      if (damage === "target-heading") {
+        repo.set(targetPath, repo.take(targetPath)!.replace("# 本阶段问题聚焦", "# 手工改名"));
+      } else if (damage === "source-heading") {
+        repo.set(sourcePath, repo.take(sourcePath)!.replace("## 下一阶段聚焦问题", "## 手工改名"));
+      } else {
+        repo.set(targetPath, repo.take(targetPath)!.replace(
+          "# 本阶段问题聚焦\n",
+          "# 本阶段问题聚焦\n <!-- helix-focus-bridge:start version=1 -->\n",
+        ));
+      }
+      const canvas = repo.json(CANVAS);
+      canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+      repo.set(CANVAS, JSON.stringify(canvas));
+      const service = workspace(repo);
+      const plan = await service.planConnection("cycle-1", "cycle-2");
+      const before = (await repo.read(CANVAS))!.content;
+      await expect(service.connectCycles(plan)).rejects.toThrow(/标题|标记|包络/);
+      expect((await repo.read(CANVAS))!.content).toBe(before);
+    }
+  });
+
+  it("keeps a native edge untouched when its target focus section is missing", async () => {
+    const repo = baseRepository();
+    const targetPath = "Helix/Projects/Alpha/Cycle-02.md";
+    repo.set(targetPath, cycle("cycle-2", "project-1", 2).replace(
+      "# 本阶段问题聚焦",
+      "# 已改名聚焦",
+    ));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+    canvas.edges.push({ id: "native-focus", fromNode: "cycle-node", toNode: "cycle-2-node" });
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const candidate = (await service.snapshot()).nativeRelationCandidates[0]!;
+    const before = (await repo.read(CANVAS))!.content;
+    await expect(service.adoptNativeRelation(candidate)).rejects.toThrow(/缺少标题/);
+    expect((await repo.read(CANVAS))!.content).toBe(before);
+    expect(repo.json(CANVAS).edges[0]).not.toHaveProperty("helixManaged");
+  });
+
+  it("refuses a relation mutation that would overwrite an edited derived block", async () => {
+    const repo = baseRepository();
+    const targetPath = "Helix/Projects/Alpha/Cycle-02.md";
+    repo.set(targetPath, cycle("cycle-2", "project-1", 2));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    await service.connectCycles(await service.planConnection("cycle-1", "cycle-2"));
+    const relationId = (await service.snapshot()).relations[0]!.id;
+    repo.set(targetPath, repo.take(targetPath)!.replace("|阶段标题 1]]", "|用户编辑来源]]"));
+    const before = (await repo.read(CANVAS))!.content;
+    await expect(service.deleteRelation(relationId)).rejects.toThrow(/已被编辑/);
+    expect((await repo.read(CANVAS))!.content).toBe(before);
+  });
+
+  it("does not create a stage when its predecessor source heading is missing", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    await service.ensureCanvas();
+    const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace(
+      "## 下一阶段聚焦问题",
+      "## 已改名下一阶段",
+    ));
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    await expect(service.createCycle(
+      "project-1",
+      "inherit",
+      ["cycle-1"],
+      { stageTitle: "不得创建" },
+    )).rejects.toThrow(/缺少标题/);
+    expect((await repo.read(CANVAS))!.content).toBe(canvasBefore);
+    expect(await repo.read("Helix/Projects/Alpha/Stage-02.md")).toBeNull();
+  });
+
+  it("rolls back journaled stage creation when Canvas write fails", async () => {
+    const repo = baseRepository();
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const failCanvas = (path: string): void => {
+      if (path !== CANVAS) {
+        repo.beforeCompare = failCanvas;
+        return;
+      }
+      throw new Error("injected Canvas failure");
+    };
+    repo.beforeCompare = failCanvas;
+    await expect(workspace(repo).createCycle(
+      "project-1",
+      "inherit",
+      ["cycle-1"],
+      { stageTitle: "事务回滚" },
+    )).rejects.toThrow(/injected Canvas failure/);
+    expect((await repo.read(CANVAS))!.content).toBe(canvasBefore);
+    expect(await repo.read("Helix/Projects/Alpha/Stage-02.md")).toBeNull();
+    expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
+  });
+
   it("treats managed edge endpoints as truth and repairs only derived metadata", async () => {
     const repo = baseRepository();
     repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
@@ -1416,6 +1571,11 @@ describe("ProjectWorkspaceService", () => {
         helixMergeGroupId: "helix-merge-cycle-3",
       }),
     ]);
+    const targetMarkdown = (await repo.read("Helix/Projects/Alpha/Cycle-03.md"))!.content;
+    expect(targetMarkdown).toContain("sourceId=cycle-1");
+    expect(targetMarkdown).toContain("sourceId=cycle-2");
+    expect(targetMarkdown.indexOf("sourceId=cycle-1"))
+      .toBeLessThan(targetMarkdown.indexOf("sourceId=cycle-2"));
   });
 
   it("persists completed-project collapse without changing physical nodes or edges", async () => {

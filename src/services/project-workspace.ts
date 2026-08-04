@@ -36,6 +36,10 @@ import {
 } from "../domain/project-graph";
 import { assertProjectMappingsUnique } from "../domain/project-mapping";
 import { stableHash } from "../domain/stable";
+import {
+  planStageFocusBridge,
+  type FocusSource,
+} from "../domain/stage-focus-bridge";
 import { patchManagedFrontmatter } from "../storage/frontmatter";
 import {
   VaultDeletionClaimError,
@@ -292,10 +296,19 @@ export interface ProjectWorkspaceMarkdownUpdate {
   afterContent: string;
 }
 
+export interface ProjectWorkspaceMarkdownCreation {
+  path: string;
+  kind: "project" | "stage";
+  entityId: string;
+  projectId: string;
+  content: string;
+}
+
 export interface ProjectWorkspaceAtomicChange {
   label: string;
   canvasBeforeHash: string;
   canvasAfterContent: string;
+  markdownCreations?: readonly ProjectWorkspaceMarkdownCreation[];
   markdownUpdates: readonly ProjectWorkspaceMarkdownUpdate[];
 }
 
@@ -417,6 +430,31 @@ export class ProjectWorkspaceService {
     const seen = new Set<string>();
     const projectRoot = `${normalizePath(this.rootFolder())}/Projects/`;
     const transitions: ProjectWorkspaceHistoryFileTransition[] = [];
+    for (const creation of change.markdownCreations ?? []) {
+      const path = normalizePath(creation.path);
+      if (
+        path !== creation.path ||
+        seen.has(path) ||
+        !path.startsWith(projectRoot) ||
+        !path.endsWith(".md") ||
+        !creation.entityId ||
+        !creation.projectId ||
+        await this.repository.read(path)
+      ) {
+        throw new Error(`跨文件事务包含无效或已占用的新建路径：${creation.path}`);
+      }
+      seen.add(path);
+      const transition: ProjectWorkspaceHistoryFileTransition = {
+        path,
+        kind: creation.kind,
+        entityId: creation.entityId,
+        projectId: creation.projectId,
+        fromContent: null,
+        toContent: creation.content,
+      };
+      this.assertHistoryStageIdentity(creation.content, transition);
+      transitions.push(transition);
+    }
     for (const update of change.markdownUpdates) {
       const path = normalizePath(update.path);
       if (
@@ -457,6 +495,83 @@ export class ProjectWorkspaceService {
     await this.applyHistoryEntry(entry, "redo");
     this.recordHistoryEntry(entry);
     return this.snapshot();
+  }
+
+  private async focusMarkdownUpdates(
+    snapshot: ProjectWorkspaceSnapshot,
+    relations: readonly CycleRelation[],
+    targetCycleIds: readonly string[],
+  ): Promise<ProjectWorkspaceMarkdownUpdate[]> {
+    const cycles = snapshot.projects.flatMap((project) => project.cycles.map((cycle) => ({
+      ...cycle,
+      projectId: project.id,
+    })));
+    const cycleById = new Map(cycles.map((cycle) => [cycle.id, cycle]));
+    const revisionById = new Map<string, VaultRevision>();
+    const readCycle = async (id: string): Promise<{ cycle: typeof cycles[number]; revision: VaultRevision }> => {
+      const cycle = cycleById.get(id);
+      if (!cycle) throw new Error(`找不到聚焦问题引用的阶段：${id}`);
+      let revision = revisionById.get(id);
+      if (!revision) {
+        const current = await this.repository.read(cycle.notePath);
+        if (!current) throw new Error(`聚焦问题引用的阶段 Markdown 已不存在：${cycle.notePath}`);
+        revision = current;
+        revisionById.set(id, current);
+      }
+      return { cycle, revision };
+    };
+    const updates: ProjectWorkspaceMarkdownUpdate[] = [];
+    for (const targetId of [...new Set(targetCycleIds)].sort()) {
+      const { cycle: target, revision: targetRevision } = await readCycle(targetId);
+      const sourceIds = [...new Set(relations
+        .filter((relation) => relation.toCycleId === targetId)
+        .flatMap((relation) => relation.fromCycleIds))];
+      const sources = new Map<string, FocusSource>();
+      for (const sourceId of sourceIds) {
+        const { cycle, revision } = await readCycle(sourceId);
+        sources.set(sourceId, {
+          id: cycle.id,
+          notePath: cycle.notePath.replace(/\.md$/i, ""),
+          title: cycle.title,
+          stageCode: cycle.stageCode,
+          markdown: revision.content,
+        });
+      }
+      const plan = planStageFocusBridge(sourceIds, sources, targetRevision.content);
+      if (plan.action === "noop") continue;
+      updates.push({
+        path: target.notePath,
+        kind: "stage",
+        entityId: target.id,
+        projectId: target.projectId,
+        beforeHash: targetRevision.hash,
+        afterContent: plan.markdown,
+      });
+    }
+    return updates;
+  }
+
+  private async focusNewStageMarkdown(
+    markdown: string,
+    sourceIds: readonly string[],
+    snapshot: ProjectWorkspaceSnapshot,
+  ): Promise<string> {
+    const cycles = snapshot.projects.flatMap((project) => project.cycles);
+    const sources = new Map<string, FocusSource>();
+    for (const sourceId of sourceIds) {
+      const cycle = cycles.find((candidate) => candidate.id === sourceId);
+      if (!cycle) throw new Error(`找不到新阶段的前置阶段：${sourceId}`);
+      const revision = await this.repository.read(cycle.notePath);
+      if (!revision) throw new Error(`新阶段的前置 Markdown 已不存在：${cycle.notePath}`);
+      sources.set(sourceId, {
+        id: cycle.id,
+        notePath: cycle.notePath.replace(/\.md$/i, ""),
+        title: cycle.title,
+        stageCode: cycle.stageCode,
+        markdown: revision.content,
+      });
+    }
+    return planStageFocusBridge(sourceIds, sources, markdown).markdown;
   }
 
   async observeCanvasChange(): Promise<void> {
@@ -1598,11 +1713,16 @@ export class ProjectWorkspaceService {
     );
     applyManagedLayout(canvas.document, snapshot, physical, affected);
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation, {
+    return this.applyAtomicWorkspaceChange({
       label: "建立阶段连接",
-      markdownTransitions: [],
+      canvasBeforeHash: canvas.revision.hash,
+      canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+      markdownUpdates: await this.focusMarkdownUpdates(
+        snapshot,
+        normalized.relations,
+        [canonicalPlan.targetCycleId],
+      ),
     });
-    return this.snapshot();
   }
 
   async adoptNativeRelation(
@@ -1663,11 +1783,16 @@ export class ProjectWorkspaceService {
     );
     applyManagedLayout(canvas.document, snapshot, physical, affected);
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation, {
+    return this.applyAtomicWorkspaceChange({
       label: "纳管原生阶段连线",
-      markdownTransitions: [],
+      canvasBeforeHash: canvas.revision.hash,
+      canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+      markdownUpdates: await this.focusMarkdownUpdates(
+        snapshot,
+        normalized.relations,
+        [canonical.toCycleId],
+      ),
     });
-    return this.snapshot();
   }
 
   async planNativeRelationAdoption(
@@ -2324,7 +2449,7 @@ export class ProjectWorkspaceService {
           continue;
         }
         if (current.hash !== stableHash(transition.fromContent)) {
-          throw new Error(`撤销事务 Markdown 同时偏离起点和终点：${transition.path}`);
+          throw new Error(`撤销事务 Markdown 已变化并同时偏离起点和终点：${transition.path}`);
         }
         this.assertHistoryStageIdentity(current.content, transition);
       }
@@ -2754,11 +2879,16 @@ export class ProjectWorkspaceService {
     );
     applyNormalizedManagedEdges(canvas.document, normalized.edges);
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation, {
+    return this.applyAtomicWorkspaceChange({
       label: replacement ? "修改阶段关系" : "删除阶段关系",
-      markdownTransitions: [],
+      canvasBeforeHash: canvas.revision.hash,
+      canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+      markdownUpdates: await this.focusMarkdownUpdates(
+        snapshot,
+        normalized.relations,
+        [current.toCycleId],
+      ),
     });
-    return this.snapshot();
   }
 
   async acknowledgeLegacyMigration(
@@ -3154,20 +3284,22 @@ export class ProjectWorkspaceService {
         throw new Error(`阶段已经存在：${spec.path}`);
       }
     }
-    const createdRevisions: VaultRevision[] = [];
-    try {
-      const bodies = await this.renderTemplateBodies(specs.map((spec) => ({
-        kind: "stage" as const,
-        values: {
-            title: spec.stageTitle,
-            project: project.title,
-            stage: spec.stageTitle,
-        },
-      })));
-      for (const [index, spec] of specs.entries()) {
-        const body = bodies[index];
-        const revision = await this.repository.create(
-          spec.path,
+    const bodies = await this.renderTemplateBodies(specs.map((spec) => ({
+      kind: "stage" as const,
+      values: {
+        title: spec.stageTitle,
+        project: project.title,
+        stage: spec.stageTitle,
+      },
+    })));
+    const plannedCreations: ProjectWorkspaceMarkdownCreation[] = [];
+    for (const [index, spec] of specs.entries()) {
+      plannedCreations.push({
+        path: spec.path,
+        kind: "stage",
+        entityId: spec.id,
+        projectId,
+        content: await this.focusNewStageMarkdown(
           cycleTemplate({
             id: spec.id,
             projectId,
@@ -3177,16 +3309,13 @@ export class ProjectWorkspaceService {
             startedAt: new Date().toISOString(),
             status: "idea",
             stageTitle: spec.stageTitle,
-          }, body),
-          () => this.assertActive(generation),
-        );
-        createdRevisions.push(revision);
-      }
-    } catch (error) {
-      await this.rollbackCreatedFiles(createdRevisions, error);
+          }, bodies[index]),
+          predecessors,
+          snapshot,
+        ),
+      });
     }
-    let canvasWritten = false;
-    const convertedCodeRevisions: Array<{ before: VaultRevision; after: VaultRevision }> = [];
+    const convertedCodeRevisions: Array<{ before: VaultRevision; afterContent: string }> = [];
     try {
       for (const conversion of stageCodeConversions) {
         const before = await this.repository.read(conversion.cycle.notePath);
@@ -3207,12 +3336,7 @@ export class ProjectWorkspaceService {
           conversion.cycle.stageCode,
           conversion.stageCode,
         );
-        const after = await this.repository.compareAndWrite(
-          before,
-          nextContent,
-          () => this.assertActive(generation),
-        );
-        convertedCodeRevisions.push({ before, after });
+        convertedCodeRevisions.push({ before, afterContent: nextContent });
       }
       const plannedCycles = specs.map((spec) => ({
       id: spec.id,
@@ -3415,34 +3539,22 @@ export class ProjectWorkspaceService {
         affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
       );
       this.assertActive(generation);
-      const markdownTransitions: ProjectWorkspaceHistoryFileTransition[] = [
-        ...createdRevisions.map((revision, index): ProjectWorkspaceHistoryFileTransition => ({
-          path: revision.path,
-          kind: "stage",
-          entityId: specs[index]!.id,
-          projectId,
-          fromContent: null,
-          toContent: revision.content,
-        })),
-        ...convertedCodeRevisions.map((revision): ProjectWorkspaceHistoryFileTransition => ({
+      await this.applyAtomicWorkspaceChange({
+        label: specs.length > 1 ? `创建 ${specs.length} 个阶段` : "创建阶段",
+        canvasBeforeHash: canvas.revision.hash,
+        canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+        markdownCreations: plannedCreations,
+        markdownUpdates: convertedCodeRevisions.map((revision) => ({
           path: revision.before.path,
-          kind: "stage",
+          kind: "stage" as const,
           entityId: stageCodeConversions.find((conversion) =>
             conversion.cycle.notePath === revision.before.path)!.cycle.id,
           projectId,
-          fromContent: revision.before.content,
-          toContent: revision.after.content,
+          beforeHash: revision.before.hash,
+          afterContent: revision.afterContent,
         })),
-      ];
-      await this.writeCanvas(canvas, generation, {
-        label: specs.length > 1 ? `创建 ${specs.length} 个阶段` : "创建阶段",
-        markdownTransitions,
       });
-      canvasWritten = true;
     } catch (error) {
-      if (!canvasWritten) {
-        await this.rollbackCycleCreation(createdRevisions, convertedCodeRevisions, error, generation);
-      }
       throw error;
     }
     const created = (await this.snapshot()).projects
@@ -3483,40 +3595,6 @@ export class ProjectWorkspaceService {
       throw new Error(failure);
     }
     throw new Error(`阶段操作失败，已将新建文件移入废纸篓：${message}`);
-  }
-
-  /** 先恢复既有阶段的受控改码，再清理新文件；任一竞争立即冻结工作区。 */
-  private async rollbackCycleCreation(
-    created: VaultRevision[],
-    converted: Array<{ before: VaultRevision; after: VaultRevision }>,
-    cause: unknown,
-    generation: number,
-  ): Promise<void> {
-    const failures: string[] = [];
-    for (const revision of [...converted].reverse()) {
-      try {
-        await this.repository.compareAndWrite(
-          revision.after,
-          revision.before.content,
-          () => this.assertActive(generation),
-        );
-      } catch (error) {
-        failures.push(error instanceof Error ? error.message : String(error));
-      }
-    }
-    for (const revision of [...created].reverse()) {
-      try {
-        await this.repository.trashIfUnchanged(revision, () => this.assertActive(generation));
-      } catch (error) {
-        failures.push(error instanceof Error ? error.message : String(error));
-      }
-    }
-    if (failures.length > 0) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      const failure = `阶段创建失败且回滚遇到竞争，工作区已冻结：${message}；${failures.join("；")}`;
-      this.freezePendingStageDeletion(failure);
-      throw new Error(failure);
-    }
   }
 
   private async readCanvas(

@@ -1,14 +1,14 @@
 # 当前开发状态
 
 最后更新：2026-08-04
-当前基线提交：`0d68c76 docs: checkpoint stage board phase`
-工作树状态：阶段 3A/3B 的计划、领域协议、可恢复事务、测试及文档尚未提交；Vault 文件与运行态 `data.json` 不纳入 Git。
-当前阶段：阶段 3A/3B 已完成；准备接入 3C 关系命令。
+当前基线提交：`90fa0ec feat: add recoverable stage focus bridge foundation`
+工作树状态：3C 的默认 Stage 正文、关系桥接服务、专项测试及本快照尚未提交；Vault 文件与运行态 `data.json` 不纳入 Git。
+当前阶段：阶段 3C 关系命令接入进行中；删除阶段尚未接入。
 
 ## 本轮目标
 
-- 完成聚焦问题纯领域协议，以及 Canvas 与多份既有 Markdown 共用的可恢复 CAS 事务。
-- 非目标：本轮不接入关系命令、监听、冲突 UI、滴答同步、远端发布或迁移。
+- 让新建、连接、纳管、替换和断开关系只按 Canvas 托管入边派生 Stage 聚焦引用，并与 Canvas 同事务。
+- 非目标：本批不接删除阶段、监听、冲突 UI、滴答同步、发布或迁移。
 
 ## 当前事实
 
@@ -24,11 +24,9 @@
 
 ## 本轮改动
 
-- `src/domain/stage-focus-bridge.ts`：新增明确 H1/H2、fence 感知的小节解析，受管包络／来源子块渲染与解析，以及仅接受 Canvas 派生来源 ID 的零写入计划函数。
-- `tests/stage-focus-bridge.test.ts`：覆盖空内容、多来源顺序、嵌套引用／列表、代码围栏、CRLF、损坏标记、重复来源、受管内容被编辑和冲突冻结。
-- `docs/plans/03-stage-focus-bridge/PLAN.md`：将阶段 3 拆为纯领域协议、跨文件事务、关系接入、监听冲突和 CLI 实机验收五段。
-- `src/services/project-workspace.ts`：workspace-history v2 增加 phase、既有 Markdown 转换、纯 Markdown 事务、逐写日志守卫、启动补全／回滚与 v1 兼容。
-- `tests/project-workspace.test.ts`：覆盖正常应用、撤销重做、崩溃相位、日志竞争、未知状态冻结、纯 Markdown 与 v1 恢复。
+- `src/services/project-workspace.ts`：关系入口生成聚焦更新；新 Stage 与受控改码改用 v2 日志原子创建，不再提前落盘。
+- `src/domain/projects.ts`：内置 Stage 兜底正文与当前默认模板结构一致。
+- `tests/project-workspace.test.ts`：覆盖继承／合并、连线／断线／撤销、缺标题、损坏标记、受管编辑、创建回滚和 Canvas 零写。
 
 ## 相关约束
 
@@ -40,8 +38,9 @@
 
 ## 当前验证
 
-- 已通过：全量 58 个测试文件、619 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿；3A 专项 27/27、3B 项目工作区专项 98/98。
+- 已通过：全量 58 个测试文件、626 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿。
 - 审查：3A P0/P1/P2=0，3B P0/P1=0；两段均未接入 UI。
+- 3C 第一批：专项 145/145、看门狗 P0/P1/P2=0；新建／连线／纳管／替换／断开已通过，删除阶段尚未接入，故完整 3C 仍未完成。
 - 实机（提交基线）：Obsidian 1.13.4 深色模式五列横排／独立横滚正常；隔离 Stage 跨列写入与计数一致，同列拖拽零写，键盘和 ARIA 正常，`dev:errors` 为 0。
 - 实机：临时 Project/Stage 已移入 Obsidian 废纸篓并移除空目录；当时既有 Project/Stage、模板和 Canvas 前后哈希一致。
 - 实机：3A/3B 尚未接入 UI，不适用；阶段 3C 接入后统一用 Obsidian CLI 验收。

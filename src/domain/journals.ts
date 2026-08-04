@@ -34,7 +34,7 @@ const QUESTIONS: Record<JournalPeriod, Array<[string, string]>> = {
   ],
 };
 
-export function journalTemplate(input: JournalTemplateInput): string {
+export function journalTemplate(input: JournalTemplateInput, body?: string): string {
   const prompts = QUESTIONS[input.period]
     .map(([title, question]) => `> [!question] ${title}\n> ${question}\n`)
     .join("\n");
@@ -49,15 +49,15 @@ helix-projects: []
 
 # ${input.title}
 
-${prompts}
 ## 自动摘要
 
 <!-- helix:summary:start -->
 Helix 将在这里维护任务、习惯、专注与项目数据摘要。
 <!-- helix:summary:end -->
 
-## 自由记录
+${body ?? `${prompts}## 自由记录
 
+`}
 `;
 }
 

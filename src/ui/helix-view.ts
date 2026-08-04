@@ -28,6 +28,10 @@ import {
   taskBoardMoveAvailability,
 } from "../domain/task-board-move";
 import { CYCLE_RELATION_LABELS } from "../domain/cycle-graph";
+import {
+  WORKBENCH_NAVIGATION,
+  type WorkbenchSection,
+} from "../domain/workbench-navigation";
 import type { HelixEvent } from "../domain/events";
 import { aggregateAnalytics } from "../domain/analytics";
 import { localDateKey, localDateKeyFromInstant } from "../domain/local-date";
@@ -117,17 +121,19 @@ echarts.use([
 ]);
 
 export const HELIX_VIEW_TYPE = "helix-productivity-workbench";
-type Section = "today" | "tasks" | "projects" | "reviews" | "analytics" | "challenges" | "conflicts";
+type Section = WorkbenchSection;
 
-const NAV: Array<{ id: Section; label: string; icon: IconName }> = [
-  { id: "today", label: "今日", icon: "sun" },
-  { id: "tasks", label: "任务", icon: "circle-check-big" },
-  { id: "projects", label: "项目", icon: "folder-kanban" },
-  { id: "reviews", label: "复盘", icon: "notebook-pen" },
-  { id: "analytics", label: "分析", icon: "chart-no-axes-combined" },
-  { id: "challenges", label: "挑战", icon: "trophy" },
-  { id: "conflicts", label: "冲突", icon: "git-compare-arrows" },
-];
+const NAV_ICONS: Record<Section, IconName> = {
+  today: "sun",
+  projects: "folder-kanban",
+  tasks: "circle-check-big",
+  reviews: "notebook-pen",
+  challenges: "trophy",
+  conflicts: "git-compare-arrows",
+};
+
+const NAV: Array<{ id: Section; label: string; icon: IconName }> = WORKBENCH_NAVIGATION
+  .map((item) => ({ ...item, icon: NAV_ICONS[item.id] }));
 
 const PROJECT_STATUS_OPTIONS: Array<{
   value: ProjectWorkspaceProjectStatus;
@@ -286,7 +292,6 @@ export class HelixView extends ItemView {
     else if (this.section === "tasks") await this.renderTasks(content, token);
     else if (this.section === "projects") await this.renderProjects(content, token);
     else if (this.section === "reviews") this.renderReviews(content);
-    else if (this.section === "analytics") this.renderAnalytics(content);
     else if (this.section === "challenges") this.renderChallenges(content);
     else await this.renderConflicts(content, token);
   }
@@ -2557,10 +2562,14 @@ export class HelixView extends ItemView {
           .catch((error) => new Notice(error instanceof Error ? error.message : String(error)));
       });
     }
+    const recall = content.createDiv({ cls: "helix-review-recall" });
+    recall.createEl("h2", { text: "数据回顾" });
+    recall.createEl("p", { text: "从任务、专注与习惯记录中回看本周期的投入和节律。" });
+    this.renderAnalytics(recall, false);
   }
 
-  private renderAnalytics(content: HTMLElement): void {
-    this.renderPageTitle(content, "数据分析");
+  private renderAnalytics(content: HTMLElement, includeTitle = true): void {
+    if (includeTitle) this.renderPageTitle(content, "数据分析");
     const to = localDateKey(new Date());
     const fromDate = new Date();
     fromDate.setDate(fromDate.getDate() - 13);

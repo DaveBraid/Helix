@@ -98,6 +98,24 @@ export class HelixSettingTab extends PluginSettingTab {
         }),
       );
 
+    let templateFolder = this.plugin.settings.templateFolder;
+    new Setting(this.containerEl)
+      .setName("Helix 模板目录")
+      .setDesc("项目、阶段、日／周／月／年复盘只读取此目录下的 Helix 模板。默认 Template，文件位于 Template/Helix/；只补齐缺失文件，不覆盖你的模板。")
+      .addText((text) => text.setValue(templateFolder).onChange((value) => { templateFolder = value; }))
+      .addButton((button) => button.setButtonText("保存并补齐默认模板").onClick(async () => {
+        button.setDisabled(true).setButtonText("处理中…");
+        try {
+          const created = await this.plugin.saveTemplateFolderAndEnsure(templateFolder);
+          new Notice(created.length > 0 ? `已补齐 ${created.length} 份默认模板` : "默认模板已齐全，未覆盖既有文件");
+          this.display();
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        } finally {
+          button.setDisabled(false).setButtonText("保存并补齐默认模板");
+        }
+      }));
+
     // 写入合同和能力探测只服务开发验证；默认折叠，不干扰日常授权、拉取与同步配置。
     // 原生 details/summary 自带键盘可达和展开状态；展开仅限本次设置页会话，不作持久化。
     const developmentTests = this.containerEl.createEl("details", {

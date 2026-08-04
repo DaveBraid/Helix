@@ -588,6 +588,18 @@ describe("HelixDataStore serialization", () => {
     ]));
   });
 
+  it("hydrates template setup as a one-time migration for existing settings and rejects unsafe template paths", () => {
+    const migrated = hydrateData({ schemaVersion: 2, settings: { rootFolder: "Helix" } });
+    expect(migrated.settings).toMatchObject({ templateFolder: "Template", templateSetupCompleted: true });
+    const fresh = hydrateData({ schemaVersion: 2 });
+    expect(fresh.settings).toMatchObject({ templateFolder: "Template", templateSetupCompleted: false });
+    for (const path of ["../outside", "/absolute", "\\\\server\\share", "C:\\Template", "Template/./Nested", "Template/../Nested", "~/Template", "Template\0evil"]) {
+      const unsafe = hydrateData({ schemaVersion: 2, settings: { templateFolder: path } });
+      expect(unsafe.settings.templateFolder).toBe("Template");
+      expect(unsafe.recoveryIssues.join(" ")).toMatch(/templateFolder/);
+    }
+  });
+
   it("rejects invalid and newer schema versions", () => {
     expect(() => hydrateData({ schemaVersion: 0 })).toThrow(/schemaVersion 无效/);
     expect(() => hydrateData({ schemaVersion: 1.5 })).toThrow(/schemaVersion 无效/);

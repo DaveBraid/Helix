@@ -21,9 +21,14 @@ import {
   DEFAULT_TASK_MATRIX_RULES,
   type TaskMatrixRules,
 } from "../domain/task-views";
+import { normalizeTemplateFolder } from "../domain/template-path";
 
 export interface HelixSettings {
   rootFolder: string;
+  /** 模板根目录；实际 Helix 文件位于 <templateFolder>/Helix/。 */
+  templateFolder: string;
+  /** false 仅用于真正首次安装，要求用户先确认模板目录。 */
+  templateSetupCompleted: boolean;
   autoSync: boolean;
   syncIntervalMinutes: number;
   showSampleDataWhenDisconnected: boolean;
@@ -33,6 +38,8 @@ export interface HelixSettings {
 
 export const DEFAULT_SETTINGS: HelixSettings = {
   rootFolder: "Helix",
+  templateFolder: "Template",
+  templateSetupCompleted: false,
   autoSync: true,
   syncIntervalMinutes: 10,
   showSampleDataWhenDisconnected: true,
@@ -246,6 +253,23 @@ function hydrateSettings(
   if (raw.rootFolder !== undefined) {
     if (isSafeVaultPath(raw.rootFolder, false)) settings.rootFolder = raw.rootFolder.trim();
     else issues.push("rootFolder 设置无效，已恢复默认值并进入只读恢复模式");
+  }
+  if (raw.templateFolder !== undefined) {
+    try {
+      settings.templateFolder = normalizeTemplateFolder(raw.templateFolder);
+    } catch {
+      issues.push("templateFolder 设置无效，已恢复默认值并进入只读恢复模式");
+    }
+  }
+  if (raw.templateSetupCompleted !== undefined) {
+    if (typeof raw.templateSetupCompleted === "boolean") {
+      settings.templateSetupCompleted = raw.templateSetupCompleted;
+    } else {
+      issues.push("templateSetupCompleted 设置无效，已恢复默认值并进入只读恢复模式");
+    }
+  } else if (Object.keys(raw).length > 0) {
+    // 已有安装缺少该字段按既有授权迁移至 Template，避免首次安装弹窗重复出现。
+    settings.templateSetupCompleted = true;
   }
   if (raw.lineageCanvasPath !== undefined) {
     if (isSafeVaultPath(raw.lineageCanvasPath, true)) {

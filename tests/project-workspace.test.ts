@@ -9,6 +9,77 @@ const DELETE_JOURNAL = "Helix/.transactions/stage-delete.json";
 const HISTORY_JOURNAL = "Helix/.transactions/workspace-history.json";
 
 describe("ProjectWorkspaceService", () => {
+  it("consumes template bodies for new project and initial stage while retaining Helix envelopes", async () => {
+    const repo = baseRepository();
+    const calls: string[] = [];
+    const service = new ProjectWorkspaceService(
+      { vault: { getMarkdownFiles: () => repo.paths().filter((path) => path.endsWith(".md")).map(fileFromPath) } } as never,
+      repo as never,
+      () => "Helix",
+      () => CANVAS,
+      async (requests) => {
+        calls.push(...requests.map(({ kind, values }) => `${kind}:${values.title}`));
+        return requests.map(({ kind }) =>
+          kind === "project" ? "自定义项目正文 {{unknown}}" : "自定义阶段正文");
+      },
+    );
+
+    const created = await service.createProject("模板项目");
+    const project = await repo.read(created.notePath);
+    const stage = await repo.read(created.cycles[0]!.notePath);
+
+    expect(calls).toEqual(["project:模板项目", "stage:项目启动"]);
+    expect(project?.content).toContain("helix-kind: helix-project");
+    expect(project?.content).toContain("# 模板项目");
+    expect(project?.content).toContain("自定义项目正文 {{unknown}}");
+    expect(stage?.content).toContain("helix-kind: helix-stage");
+    expect(stage?.content).toContain("# 阶段 1 · 项目启动");
+    expect(stage?.content).toContain("自定义阶段正文");
+  });
+
+  it.each([
+    "尚未确认 Helix 模板目录",
+    "模板渲染失败",
+  ])("does not create an empty Canvas or Markdown when project templates fail: %s", async (message) => {
+    const repo = new MemoryRepository({});
+    const service = new ProjectWorkspaceService(
+      { vault: { getMarkdownFiles: () => repo.paths().filter((path) => path.endsWith(".md")).map(fileFromPath) } } as never,
+      repo as never,
+      () => "Helix",
+      () => CANVAS,
+      async () => { throw new Error(message); },
+    );
+
+    await expect(service.createProject("不会落盘")).rejects.toThrow(message);
+    expect(repo.paths()).toEqual([]);
+    await expect(repo.read(CANVAS)).resolves.toBeNull();
+  });
+
+  it("renders all simultaneously-created branch stages in one template batch", async () => {
+    const repo = baseRepository();
+    const batches: string[][] = [];
+    const service = new ProjectWorkspaceService(
+      { vault: { getMarkdownFiles: () => repo.paths().filter((path) => path.endsWith(".md")).map(fileFromPath) } } as never,
+      repo as never,
+      () => "Helix",
+      () => CANVAS,
+      async (requests) => {
+        batches.push(requests.map(({ kind, values }) => `${kind}:${values.title}`));
+        return requests.map(({ values }) => `正文：${values.title}`);
+      },
+    );
+
+    await service.createCycle("project-1", "branch", ["cycle-1"], {
+      confirmBranchConversion: true,
+      stageTitle: "路径 A",
+      secondaryStageTitle: "路径 B",
+    });
+
+    expect(batches).toEqual([["stage:路径 A", "stage:路径 B"]]);
+    expect((await repo.read("Helix/Projects/Alpha/Stage-02.md"))?.content).toContain("正文：路径 A");
+    expect((await repo.read("Helix/Projects/Alpha/Stage-03.md"))?.content).toContain("正文：路径 B");
+  });
+
   it("uses stable IDs to repair renamed paths and writes real text-card summaries", async () => {
     const repo = new MemoryRepository({
       "Helix/Projects/Renamed/Project.md": project("project-1", "重命名项目"),

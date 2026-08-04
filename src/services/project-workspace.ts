@@ -9,6 +9,9 @@ import {
   type CycleRelationKind,
 } from "../domain/cycle-graph";
 import { cycleTemplate, projectTemplate } from "../domain/projects";
+import type {
+  HelixTemplateRenderRequest,
+} from "./template-manager";
 import {
   affectedWeakComponent,
   normalizeProjectGraph,
@@ -307,6 +310,9 @@ export class ProjectWorkspaceService {
     private readonly repository: HelixVaultRepository,
     private readonly rootFolder: () => string,
     private readonly canvasPath: () => string,
+    private readonly templateBodies?: (
+      requests: readonly HelixTemplateRenderRequest[],
+    ) => Promise<string[]>,
   ) {}
 
   dispose(): void {
@@ -2534,6 +2540,11 @@ export class ProjectWorkspaceService {
     if (await this.repository.read(cyclePath)) {
       throw new Error(`阶段文件已经存在：${cyclePath}`);
     }
+    // 模板不可用时不得为一次尚未创建的项目留下空 Canvas 或 Markdown。
+    const [projectBody, stageBody] = await this.renderTemplateBodies([
+      { kind: "project", values: { title: normalizedTitle, project: normalizedTitle } },
+      { kind: "stage", values: { title: "项目启动", project: normalizedTitle, stage: "项目启动" } },
+    ]);
     const before = await this.ensureCanvas();
     if (
       normalizedDidaProjectId &&
@@ -2556,7 +2567,7 @@ export class ProjectWorkspaceService {
           createdAt: now,
           didaProjectId: normalizedDidaProjectId,
           color: normalizedColor,
-        }),
+        }, projectBody),
         () => this.assertActive(generation),
       ));
       createdRevisions.push(await this.repository.create(
@@ -2568,7 +2579,7 @@ export class ProjectWorkspaceService {
           sequence: 1,
           startedAt: now,
           stageTitle: "项目启动",
-        }),
+        }, stageBody),
         () => this.assertActive(generation),
       ));
       const plannedProject: ProjectWorkspaceProject = {
@@ -2752,7 +2763,16 @@ export class ProjectWorkspaceService {
     }
     const createdRevisions: VaultRevision[] = [];
     try {
-      for (const spec of specs) {
+      const bodies = await this.renderTemplateBodies(specs.map((spec) => ({
+        kind: "stage" as const,
+        values: {
+            title: spec.stageTitle,
+            project: project.title,
+            stage: spec.stageTitle,
+        },
+      })));
+      for (const [index, spec] of specs.entries()) {
+        const body = bodies[index];
         const revision = await this.repository.create(
           spec.path,
           cycleTemplate({
@@ -2762,7 +2782,7 @@ export class ProjectWorkspaceService {
             sequence: spec.sequence,
             startedAt: new Date().toISOString(),
             stageTitle: spec.stageTitle,
-          }),
+          }, body),
           () => this.assertActive(generation),
         );
         createdRevisions.push(revision);
@@ -2988,6 +3008,17 @@ export class ProjectWorkspaceService {
       ?.cycles.find((cycle) => cycle.id === specs[0]!.id);
     if (!created) throw new Error("阶段已写入，但重新扫描未找到");
     return created;
+  }
+
+  private async renderTemplateBodies(
+    requests: readonly HelixTemplateRenderRequest[],
+  ): Promise<Array<string | undefined>> {
+    if (!this.templateBodies) return requests.map(() => undefined);
+    const bodies = await this.templateBodies(requests);
+    if (bodies.length !== requests.length) {
+      throw new Error("模板渲染结果数量不一致，已取消创建以避免混用模板目录");
+    }
+    return bodies;
   }
 
   private async rollbackCreatedFiles(

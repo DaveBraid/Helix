@@ -34,7 +34,7 @@ export function projectTemplate(input: {
   createdAt: string;
   didaProjectId?: string;
   color?: string;
-}): string {
+}, body?: string): string {
   return `---
 helix-kind: ${PROJECT_KIND}
 helix-id: ${input.id}
@@ -47,7 +47,7 @@ helix-updated: ${input.createdAt}
 
 # ${input.title}
 
-> [!info] 项目背景
+${body ?? `> [!info] 项目背景
 > 这个项目为什么值得开展？它解决什么问题？
 
 ## 当前状态
@@ -58,7 +58,7 @@ helix-updated: ${input.createdAt}
 
 ## 项目资料
 
-`;
+`}`;
 }
 
 export function cycleTemplate(input: {
@@ -69,7 +69,7 @@ export function cycleTemplate(input: {
   startedAt: string;
   status?: HelixCycle["status"];
   stageTitle?: string;
-}): string {
+}, body?: string): string {
   const stageTitle = input.stageTitle?.trim() || "未命名阶段";
   return `---
 helix-kind: ${STAGE_KIND}
@@ -83,7 +83,7 @@ helix-started: ${input.startedAt}
 
 # 阶段 ${input.sequence} · ${stageTitle}
 
-> [!question] 本轮起因
+${body ?? `> [!question] 本轮起因
 > 哪个观察、问题或上一轮结论触发了本轮？
 
 > [!todo] 开展计划
@@ -101,7 +101,7 @@ helix-started: ${input.startedAt}
 > [!tip] 下一步计划
 > 下一轮保留、调整或停止什么？
 
-`;
+`}`;
 }
 
 export function assertCycleTransition(

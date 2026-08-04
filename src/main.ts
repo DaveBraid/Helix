@@ -6,11 +6,11 @@ import {
   TFile,
   WorkspaceLeaf,
   normalizePath,
+  type App,
 } from "obsidian";
 import {
   journalPath,
   journalPeriodBounds,
-  journalTemplate,
 } from "./domain/journals";
 import {
   CYCLE_RELATION_LABELS,
@@ -45,6 +45,12 @@ import {
 import { DEFAULT_SETTINGS, type HelixSettings } from "./storage/model";
 import { HelixSecretStore } from "./storage/secrets";
 import { HelixVaultRepository } from "./storage/vault-repository";
+import {
+  HelixTemplateManager,
+} from "./services/template-manager";
+import { runTemplateStartup, templateStartupAction } from "./services/template-setup";
+import { createJournalDocument } from "./services/journal-creation";
+import { configureTemplateSettings } from "./services/template-settings-coordinator";
 import { HELIX_VIEW_TYPE, HelixView } from "./ui/helix-view";
 import { HelixSettingTab } from "./ui/settings-tab";
 import { DidaWriteContractConfirmationGate } from "./ui/dida-write-contract-confirmation";
@@ -59,6 +65,7 @@ export default class HelixPlugin extends Plugin {
   secrets!: HelixSecretStore;
   service!: HelixService;
   vaultRepository!: HelixVaultRepository;
+  templateManager!: HelixTemplateManager;
   projectWorkspace!: ProjectWorkspaceService;
   taskReferences!: TaskReferenceService;
   /** 设置页和命令面板使用同一确认规则，但绝不允许跨入口确认。 */
@@ -85,11 +92,17 @@ export default class HelixPlugin extends Plugin {
     this.store = new HelixDataStore(this, this.dataGeneration);
     this.secrets = new HelixSecretStore(this.app);
     this.vaultRepository = new HelixVaultRepository(this.app.vault);
+    this.templateManager = new HelixTemplateManager(
+      this.vaultRepository,
+      () => this.settings.templateFolder,
+      () => this.settings.templateSetupCompleted,
+    );
     this.projectWorkspace = new ProjectWorkspaceService(
       this.app,
       this.vaultRepository,
       () => this.settings.rootFolder,
       () => this.settings.lineageCanvasPath,
+      (requests) => this.templateManager.renderMany(requests),
     );
     this.taskReferences = new TaskReferenceService(
       this.app,
@@ -129,9 +142,19 @@ export default class HelixPlugin extends Plugin {
         this.recoveryMode = true;
         new Notice(message, 0);
       }
+      if (templateStartupAction(this.recoveryMode, this.settings.templateSetupCompleted) === "ensure-existing") {
+        try {
+          await runTemplateStartup("ensure-existing", this.templateManager);
+        } catch (error) {
+          new Notice(`Helix 默认模板未完全补齐：${error instanceof Error ? error.message : String(error)}`, 10_000);
+        }
+      }
     }
     this.service = new HelixService(this.store, this.secrets);
     await this.service.initialize();
+    if (templateStartupAction(this.recoveryMode, this.settings.templateSetupCompleted) === "prompt") {
+      this.showInitialTemplateFolderPrompt();
+    }
     this.didaWriteContractCommands = new DidaWriteContractCommandController(
       this.didaWriteContractCommandConfirmation,
       {
@@ -355,6 +378,41 @@ export default class HelixPlugin extends Plugin {
       });
     });
     this.refreshAutoSync(runImmediately);
+  }
+
+  async saveTemplateFolderAndEnsure(folder: string): Promise<string[]> {
+    this.assertWritable();
+    return configureTemplateSettings({
+      recoveryMode: this.recoveryMode,
+      folder,
+      manager: this.templateManager,
+      persist: async (candidate) => {
+        let committed!: HelixSettings;
+        await this.settingsMutationRunner.run(() => {
+          return this.store.mutate((data) => {
+            committed = {
+              ...data.settings,
+              taskMatrixRules: { ...data.settings.taskMatrixRules },
+              templateFolder: candidate,
+              templateSetupCompleted: true,
+            };
+            data.settings = committed;
+          });
+        });
+        return committed;
+      },
+      publish: (next) => {
+        this.settings.templateFolder = next.templateFolder;
+        this.settings.templateSetupCompleted = next.templateSetupCompleted;
+      },
+    });
+  }
+
+  private showInitialTemplateFolderPrompt(): void {
+    new TemplateFolderSetupModal(this.app, this.settings.templateFolder, async (folder) => {
+      const created = await this.saveTemplateFolderAndEnsure(folder);
+      new Notice(created.length > 0 ? `已创建 ${created.length} 份 Helix 默认模板` : "Helix 默认模板已就绪");
+    }).open();
   }
 
   private async updateTaskMatrixRules(rules: HelixSettings["taskMatrixRules"]): Promise<void> {
@@ -669,15 +727,14 @@ export default class HelixPlugin extends Plugin {
         `- 专注时长：${summary.totalFocusMinutes} 分钟`,
         `- 活跃天数：${summary.activeDays}`,
       ].join("\n");
-      const content = journalTemplate({
+      const content = await createJournalDocument({
         period,
         title: names[period],
         periodStart: bounds.start,
         periodEnd: bounds.end,
-      }).replace(
-        "Helix 将在这里维护任务、习惯、专注与项目数据摘要。",
         generatedSummary,
-      );
+        renderTemplate: (kind, values) => this.templateManager.render(kind, values),
+      });
       await this.vaultRepository.create(
         path,
         content,
@@ -840,6 +897,44 @@ export default class HelixPlugin extends Plugin {
     const leaf: WorkspaceLeaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(file);
   }
+}
+
+class TemplateFolderSetupModal extends Modal {
+  private folder: string;
+
+  constructor(
+    app: App,
+    initialFolder: string,
+    private readonly submit: (folder: string) => Promise<void>,
+  ) {
+    super(app);
+    this.folder = initialFolder;
+  }
+
+  onOpen(): void {
+    this.setTitle("设置 Helix 模板目录");
+    this.contentEl.createEl("p", {
+      text: "Helix 首次使用需要创建项目、阶段和四种复盘模板。默认目录为 Template，实际文件只会创建在 Template/Helix/ 下；已有同名文件绝不覆盖。",
+    });
+    new Setting(this.contentEl)
+      .setName("模板目录")
+      .setDesc("Vault 内相对路径，例如 Template；不能包含 .. 或绝对路径。")
+      .addText((text) => text.setValue(this.folder).onChange((value) => { this.folder = value; }));
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { cls: "mod-cta", text: "创建默认模板" });
+    confirm.addEventListener("click", () => {
+      confirm.disabled = true;
+      void this.submit(this.folder)
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void { this.contentEl.empty(); }
 }
 
 class ProjectPromptModal extends Modal {

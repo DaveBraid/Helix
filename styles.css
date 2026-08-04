@@ -26,6 +26,9 @@
   background: var(--helix-bg);
   color: var(--helix-ink);
   container-type: inline-size;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden !important;
 }
 
 .helix-root :where(button, input, select, textarea) {
@@ -33,17 +36,18 @@
 }
 
 .helix-shell {
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden !important;
   display: grid;
   grid-template-columns: 176px minmax(0, 1fr);
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 .helix-sidebar {
-  position: sticky;
-  top: 0;
   height: 100%;
-  min-height: 720px;
+  min-height: 0;
+  overflow: hidden !important;
   padding: 22px 14px 18px;
   border-right: 1px solid var(--helix-line);
   background: var(--helix-surface-subtle);
@@ -123,7 +127,8 @@
   padding: 16px 2px 4px;
   border-top: 1px solid var(--helix-line);
   min-height: 0;
-  overflow-y: auto;
+  flex: 1 1 auto;
+  overflow: hidden !important;
 }
 
 .helix-sidebar-lists-head {
@@ -292,9 +297,15 @@
 
 .helix-main {
   min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .helix-header {
+  flex: 0 0 66px;
   height: 66px;
   padding: 0 28px;
   border-bottom: 1px solid var(--helix-line);
@@ -369,10 +380,32 @@
 }
 
 .helix-content {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
   width: 100%;
   max-width: none;
   margin: 0;
   padding: 30px;
+}
+
+.helix-review-recall {
+  margin-top: 34px;
+  padding-top: 24px;
+  border-top: 1px solid color-mix(in srgb, var(--helix-line) 88%, transparent);
+}
+
+.helix-review-recall > h2 {
+  margin: 0;
+  color: var(--helix-text-strong);
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.helix-review-recall > p {
+  margin: 6px 0 18px;
+  color: var(--helix-muted);
+  font-size: 12px;
 }
 
 .helix-today-heading {

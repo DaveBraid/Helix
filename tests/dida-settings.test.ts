@@ -42,5 +42,6 @@ describe("Dida settings contract", () => {
     expect(source).toMatch(/new Setting\(developmentContent\)[\s\S]*\.setName\("写入合同测试"\)/);
     expect(source).toMatch(/scheduleModeSetting = new Setting\(developmentContent\)/);
     expect(source).toMatch(/new Setting\(this\.containerEl\)[\s\S]*\.setName\("自动同步"\)/);
+    expect(source).toMatch(/\.setName\("Helix 模板目录"\)[\s\S]*保存并补齐默认模板/);
   });
 });

@@ -1,9 +1,18 @@
 import type { DidaColumn, DidaProject, DidaTask } from "../../domain/entities";
+import {
+  didaTaskDifferenceFields,
+  didaTaskWithoutRemoteMetadata,
+  sameDidaTaskExcept,
+} from "../../domain/dida-task-metadata";
 import type { TaskScheduleMode } from "../../domain/task-schedule";
-import type { DidaApi } from "./api";
+import { deepEqual } from "../../domain/stable";
+import type { DidaApi, DidaTaskUpdateWirePayload } from "./api";
 import {
   sameTaskBoardPlacementInvariant,
   taskBoardPlacementPayload,
+  taskCreatePayload,
+  taskUpdatePayload,
+  type DidaTaskWriteCapabilities,
 } from "./adapters";
 import { DidaHttpError } from "./http-contract";
 import { normalizeColumns, normalizeProject, normalizeTask } from "./normalization";
@@ -48,6 +57,17 @@ export interface DidaWriteContractReport {
   remoteArtifactsRemaining: boolean;
   taskScheduleMode: TaskScheduleMode;
   boardPlacementVerified: boolean;
+  taskCrudVerified: boolean;
+  reminderWriteVerified: boolean;
+  repeatWriteVerified: boolean;
+  parentTaskVerified: boolean;
+  manualCleanupRequired?: {
+    taskId: string;
+    marker: string;
+    candidateProjectIds: string[];
+    reason: string;
+  };
+  capabilityFailures: string[];
 }
 
 export function verifiedBoardPlacementCapability(
@@ -74,6 +94,11 @@ export class DidaWriteContractRunner {
   private untrackedCreateOutcome = false;
   private taskScheduleMode: TaskScheduleMode = "unknown";
   private boardPlacementVerified = false;
+  private taskCrudVerified = false;
+  private reminderWriteVerified = false;
+  private repeatWriteVerified = false;
+  private parentTaskVerified = false;
+  private manualCleanupRequired: DidaWriteContractReport["manualCleanupRequired"];
   private currentStage = "准备合同测试";
   private readonly timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
@@ -90,6 +115,11 @@ export class DidaWriteContractRunner {
     this.untrackedCreateOutcome = false;
     this.taskScheduleMode = "unknown";
     this.boardPlacementVerified = false;
+    this.taskCrudVerified = false;
+    this.reminderWriteVerified = false;
+    this.repeatWriteVerified = false;
+    this.parentTaskVerified = false;
+    this.manualCleanupRequired = undefined;
     this.currentStage = "准备合同测试";
     const runId = this.createRunId();
     const marker = `[Helix 合同测试 ${runId}]`;
@@ -97,9 +127,12 @@ export class DidaWriteContractRunner {
     const projectBName = `${marker} 清单 B`;
     const steps: string[] = [];
     const cleanupErrors: string[] = [];
+    const capabilityFailures: string[] = [];
     const projects: CreatedProject[] = [];
     const forbiddenProjectIds = new Set<string>();
     let task: CreatedTask | null = null;
+    let childTask: CreatedTask | null = null;
+    const optionalTasks: CreatedTask[] = [];
     let failure: string | undefined;
     let failureStage: string | undefined;
 
@@ -267,37 +300,200 @@ export class DidaWriteContractRunner {
           : "编辑任务并复读验证字段",
       );
 
+      this.beginStage("独立验证测试任务提醒写入与清空");
+      const reminder = "TRIGGER:-PT10M";
+      const reminderTask = await this.createCapabilityTask(
+        projectA.id,
+        marker,
+        "提醒能力任务",
+        optionalTasks,
+      );
+      this.reminderWriteVerified = await this.probeTaskField(
+        reminderTask.id,
+        projectA.id,
+        marker,
+        "reminders",
+        [reminder],
+        [],
+        { reminderWriteVerified: true },
+        capabilityFailures,
+      );
+      await this.deleteVerifiedTask(reminderTask, marker);
+      optionalTasks.splice(optionalTasks.indexOf(reminderTask), 1);
+      steps.push(this.reminderWriteVerified
+        ? "独立写入并清空 10 分钟前提醒"
+        : "当前账号未通过提醒写入合同，保持生产只读");
+
+      this.beginStage("独立验证测试任务重复规则写入与清空");
+      const repeatFlag = "RRULE:FREQ=DAILY;INTERVAL=1";
+      const repeatTask = await this.createCapabilityTask(
+        projectA.id,
+        marker,
+        "重复能力任务",
+        optionalTasks,
+      );
+      this.repeatWriteVerified = await this.probeTaskField(
+        repeatTask.id,
+        projectA.id,
+        marker,
+        "repeatFlag",
+        repeatFlag,
+        null,
+        { repeatWriteVerified: true },
+        capabilityFailures,
+      );
+      await this.deleteVerifiedTask(repeatTask, marker);
+      optionalTasks.splice(optionalTasks.indexOf(repeatTask), 1);
+      steps.push(this.repeatWriteVerified
+        ? "独立写入并清空每日重复规则"
+        : "当前账号未通过重复规则写入合同，保持生产只读");
+
+      this.beginStage("创建并验证父子任务关系");
+      const parentTask = await this.createCapabilityTask(
+        projectA.id,
+        marker,
+        "父子能力父任务",
+        optionalTasks,
+      );
+      let createdChild: DidaTask | null = null;
+      try {
+        try {
+          createdChild = normalizeTask(await this.api.createTask(taskCreatePayload({
+          id: "pending-contract-child",
+          projectId: projectA.id,
+          parentId: parentTask.id,
+          title: `${marker} 子任务`,
+          content: `${marker} parent-contract`,
+          priority: 0,
+          status: 0,
+          }, { parentTaskVerified: true })));
+        } catch (error) {
+          if (isUnknownRemoteOutcome(error)) this.untrackedCreateOutcome = true;
+          throw error;
+        }
+        childTask = {
+        id: createdChild.id,
+        projectId: projectA.id,
+        candidateProjectIds: [projectA.id],
+        state: "open",
+      };
+        this.assertTaskIdentity(createdChild, createdChild.id, projectA.id, marker);
+        const rereadChild = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
+        this.assertTaskIdentity(rereadChild, createdChild.id, projectA.id, marker);
+        if (rereadChild.parentId !== parentTask.id) throw new Error("子任务 parentId 未指向测试父任务");
+        await this.updateAndVerifyTaskProperties(createdChild.id, projectA.id, marker,
+        taskUpdatePayload({ ...rereadChild, parentId: null }, { parentTaskVerified: true }, ["parentId"]),
+        (reread) => {
+        if (reread.parentId !== null ||
+          !sameDidaTaskExcept(rereadChild, reread, ["parentId"])) {
+          throw new Error(
+            "子任务解除父级后 parentId 未清空或其他字段发生变化：" +
+            didaTaskDifferenceFields(rereadChild, reread, ["parentId"]).join("、"),
+          );
+        }
+      });
+        const detachedChild = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
+        await this.updateAndVerifyTaskProperties(createdChild.id, projectA.id, marker,
+        taskUpdatePayload({ ...detachedChild, parentId: parentTask.id }, { parentTaskVerified: true }, ["parentId"]),
+        (reread) => {
+        if (reread.parentId !== parentTask.id ||
+          !sameDidaTaskExcept(detachedChild, reread, ["parentId"])) {
+          throw new Error("子任务重新挂接后 parentId 不一致或其他字段发生变化");
+        }
+      });
+        this.parentTaskVerified = true;
+        steps.push("创建子任务并验证挂接→解除→重新挂接");
+        this.beginStage("删除并核对子任务");
+        await this.deleteVerifiedTask(childTask, marker);
+        childTask = null;
+        await this.deleteVerifiedTask(parentTask, marker);
+        optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
+        steps.push("先删除测试子任务并验证不存在");
+      } catch (error) {
+        if (this.untrackedCreateOutcome) throw error;
+        if (isUnprovenRemoteOutcome(error)) throw error;
+        if (childTask) {
+          const current = normalizeTask(await this.api.getTask(projectA.id, childTask.id));
+          this.assertTaskIdentity(current, childTask.id, projectA.id, marker);
+          if (createdChild && !sameDidaTaskExcept(createdChild, current, ["parentId"])) {
+            throw new Error(
+              `parentId 合同失败且子任务出现非目标变更：${messageOf(error)}；` +
+              `当前差异字段 ${differenceFieldsLabel(didaTaskDifferenceFields(createdChild, current, ["parentId"]))}`,
+            );
+          }
+          await this.cleanupTask(childTask, marker);
+          childTask = null;
+        }
+        await this.cleanupTask(parentTask, marker);
+        optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
+        this.parentTaskVerified = false;
+        capabilityFailures.push(capabilityFailureSummary("parentTask"));
+        steps.push("当前账号未通过父子任务合同，保持生产只读");
+      }
+
       this.beginStage("以最小载荷验证测试任务看板归栏");
       this.assertExactColumns(
         normalizeColumns(await this.api.getColumns(projectA.id)),
         projectA.expectedColumns,
         "写入任务归栏前的完整列基线已变化",
       );
-      const beforePlacement = normalizeTask(await this.api.getTask(projectA.id, created.id));
-      this.assertTaskIdentity(beforePlacement, created.id, projectA.id, marker);
-      const reconciledUnknownPlacement = await this.placeAndVerifyTask(
-        beforePlacement,
-        columns[0]!.id,
+      const boardTask = await this.createCapabilityTask(
+        projectA.id,
         marker,
+        "看板归栏能力任务",
+        optionalTasks,
       );
-      this.boardPlacementVerified = true;
-      steps.push(
-        reconciledUnknownPlacement
-          ? "归栏响应未知；未重发，精确复读证明目标分栏且其他字段未变化"
-          : "以最小白名单归栏并证明其他任务字段未变化",
-      );
+      const beforePlacement = normalizeTask(await this.api.getTask(projectA.id, boardTask.id));
+      this.assertTaskIdentity(beforePlacement, boardTask.id, projectA.id, marker);
+      try {
+        const reconciledUnknownPlacement = await this.placeAndVerifyTask(
+          beforePlacement,
+          columns[0]!.id,
+          marker,
+        );
+        this.boardPlacementVerified = true;
+        steps.push(
+          reconciledUnknownPlacement
+            ? "归栏响应未知；未重发，精确复读证明目标分栏且其他字段未变化"
+            : "以最小白名单归栏并证明其他任务字段未变化",
+        );
+      } catch (error) {
+        const current = normalizeTask(await this.api.getTask(projectA.id, boardTask.id));
+        this.assertTaskIdentity(current, boardTask.id, projectA.id, marker);
+        if (!sameTaskBoardPlacementInvariant(beforePlacement, current)) {
+          const differences = didaTaskDifferenceFields(beforePlacement, current, ["columnId", "columnName"]);
+          throw new Error(
+            "看板归栏合同失败：归栏修改出现非目标字段；" +
+            `差异字段 ${differenceFieldsLabel(differences)}`,
+          );
+        }
+        if (isUnprovenRemoteOutcome(error)) throw error;
+        this.boardPlacementVerified = false;
+        capabilityFailures.push(capabilityFailureSummary("boardPlacement"));
+        steps.push("当前账号未通过看板归栏合同，保持生产只读");
+      }
+      await this.deleteVerifiedTask(boardTask, marker);
+      optionalTasks.splice(optionalTasks.indexOf(boardTask), 1);
 
       this.beginStage("移动测试任务并核对来源清单");
-      await this.api.moveTask({
-        fromProjectId: projectA.id,
-        toProjectId: projectB.id,
-        taskId: created.id,
-      });
+      const beforeMove = normalizeTask(await this.api.getTask(projectA.id, created.id));
+      this.assertTaskIdentity(beforeMove, created.id, projectA.id, marker);
+      const move = await this.moveAndVerifyTask(
+        beforeMove,
+        projectA.id,
+        projectB.id,
+        marker,
+      );
+      if (!move.applied) {
+        task.projectId = projectA.id;
+        throw new Error("移动复读确认任务仍在来源清单；已停止继续流程且未重发");
+      }
       task.projectId = projectB.id;
-      const rereadMoved = normalizeTask(await this.api.getTask(projectB.id, created.id));
-      this.assertTaskIdentity(rereadMoved, created.id, projectB.id, marker);
-      await this.waitForTaskAbsentFromProjectData(projectA.id, created.id);
-      steps.push("移动任务并验证原清单已无该任务");
+      steps.push(
+        move.responseUnknown
+          ? "移动响应未知；未重发，目标清单精确复读且来源清单确认移出"
+          : "移动任务并验证目标身份及原清单已无该任务",
+      );
 
       this.beginStage("完成并复读测试任务");
       task.state = "unknown";
@@ -311,6 +507,7 @@ export class DidaWriteContractRunner {
       this.beginStage("删除并核对测试任务");
       await this.deleteVerifiedTask(task, marker);
       task = null;
+      this.taskCrudVerified = true;
       steps.push("删除测试任务并验证不存在");
 
       this.beginStage("核对并删除空测试清单");
@@ -324,14 +521,34 @@ export class DidaWriteContractRunner {
       failure = `${failureStage}：${messageOf(error)}`;
     } finally {
       let taskCleanupFailed = false;
-      if (task) {
+      if (this.manualCleanupRequired) {
+        cleanupErrors.push(
+          "移动结果未决：已停止自动清理，请按报告中的任务 ID、唯一标记与候选清单人工核对",
+        );
+      } else if (childTask) {
+        this.reportProgress("安全清理测试子任务");
+        await this.cleanupTask(childTask, marker).catch((error) => {
+          taskCleanupFailed = true;
+          cleanupErrors.push(`测试子任务：${messageOf(error)}`);
+        });
+      }
+      if (!this.manualCleanupRequired) {
+        for (const optionalTask of [...optionalTasks].reverse()) {
+          this.reportProgress("安全清理可选能力测试任务");
+          await this.cleanupTask(optionalTask, marker).catch((error) => {
+            taskCleanupFailed = true;
+            cleanupErrors.push(`可选能力测试任务：${messageOf(error)}`);
+          });
+        }
+      }
+      if (!this.manualCleanupRequired && task) {
         this.reportProgress("安全清理测试任务");
         await this.cleanupTask(task, marker).catch((error) => {
           taskCleanupFailed = true;
           cleanupErrors.push(`测试任务：${messageOf(error)}`);
         });
       }
-      if (!taskCleanupFailed) {
+      if (!this.manualCleanupRequired && !taskCleanupFailed) {
         this.reportProgress("安全清理测试清单");
         for (const project of [...projects].reverse()) {
           await this.cleanupProject(project, marker).catch((error) => {
@@ -350,7 +567,131 @@ export class DidaWriteContractRunner {
       remoteArtifactsRemaining: cleanupErrors.length > 0 || this.untrackedCreateOutcome,
       taskScheduleMode: this.taskScheduleMode,
       boardPlacementVerified: this.boardPlacementVerified,
+      taskCrudVerified: this.taskCrudVerified,
+      reminderWriteVerified: this.reminderWriteVerified,
+      repeatWriteVerified: this.repeatWriteVerified,
+      parentTaskVerified: this.parentTaskVerified,
+      manualCleanupRequired: this.manualCleanupRequired,
+      capabilityFailures,
     };
+  }
+
+  private async updateAndVerifyTaskProperties(
+    taskId: string,
+    projectId: string,
+    marker: string,
+    payload: DidaTaskUpdateWirePayload,
+    verify: (reread: DidaTask) => void,
+  ): Promise<boolean> {
+    let unknownOutcome: unknown;
+    try {
+      await this.api.updateTask(taskId, payload);
+    } catch (error) {
+      if (!isUnknownRemoteOutcome(error)) throw error;
+      unknownOutcome = error;
+    }
+    let reread: DidaTask;
+    try {
+      reread = normalizeTask(await this.api.getTask(projectId, taskId));
+      this.assertTaskIdentity(reread, taskId, projectId, marker);
+      verify(reread);
+    } catch (error) {
+      if (!unknownOutcome) throw error;
+      throw new UnprovenRemoteOutcomeError("属性写入", unknownOutcome, error);
+    }
+    return unknownOutcome !== undefined;
+  }
+
+  private async probeTaskField<K extends "reminders" | "repeatFlag">(
+    taskId: string,
+    projectId: string,
+    marker: string,
+    field: K,
+    writtenValue: DidaTask[K],
+    clearedValue: DidaTask[K],
+    capabilities: DidaTaskWriteCapabilities,
+    failures: string[],
+  ): Promise<boolean> {
+    const before = normalizeTask(await this.api.getTask(projectId, taskId));
+    this.assertTaskIdentity(before, taskId, projectId, marker);
+    try {
+      await this.updateAndVerifyTaskProperties(
+        taskId,
+        projectId,
+        marker,
+        taskUpdatePayload({ ...before, [field]: writtenValue }, capabilities, [field]),
+        (reread) => {
+          if (!deepEqual(reread[field], writtenValue) ||
+            !sameDidaTaskExcept(before, reread, [field])) {
+            throw new Error(
+              `${field} 写后复读不一致或其他字段发生变化：` +
+              didaTaskDifferenceFields(before, reread, [field]).join("、"),
+            );
+          }
+        },
+      );
+      const written = normalizeTask(await this.api.getTask(projectId, taskId));
+      await this.updateAndVerifyTaskProperties(
+        taskId,
+        projectId,
+        marker,
+        taskUpdatePayload({ ...written, [field]: clearedValue }, capabilities, [field]),
+        (reread) => {
+          if (!deepEqual(reread[field], clearedValue) ||
+            !sameDidaTaskExcept(written, reread, [field])) {
+            throw new Error(
+              `${field} 清空后复读不一致或其他字段发生变化：` +
+              `差异字段 ${differenceFieldsLabel(didaTaskDifferenceFields(written, reread, [field]))}`,
+            );
+          }
+        },
+      );
+      return true;
+    } catch (error) {
+      if (isUnprovenRemoteOutcome(error)) throw error;
+      const current = normalizeTask(await this.api.getTask(projectId, taskId));
+      this.assertTaskIdentity(current, taskId, projectId, marker);
+      const differences = didaTaskDifferenceFields(before, current);
+      if (differences.some((difference) => difference !== field)) {
+        throw new Error(
+          `${field} 合同失败且未恢复到安全基线：${messageOf(error)}；` +
+          `当前差异字段 ${differenceFieldsLabel(differences)}`,
+        );
+      }
+      failures.push(capabilityFailureSummary(field));
+      return false;
+    }
+  }
+
+  private async createCapabilityTask(
+    projectId: string,
+    marker: string,
+    label: string,
+    tracking: CreatedTask[],
+  ): Promise<CreatedTask> {
+    let created: DidaTask;
+    try {
+      created = normalizeTask(await this.api.createTask({
+        projectId,
+        title: `${marker} ${label}`,
+        content: `${marker} capability-probe`,
+        priority: 0,
+      }));
+    } catch (error) {
+      if (isUnknownRemoteOutcome(error)) this.untrackedCreateOutcome = true;
+      throw error;
+    }
+    this.assertTaskIdentity(created, created.id, projectId, marker);
+    const reread = normalizeTask(await this.api.getTask(projectId, created.id));
+    this.assertTaskIdentity(reread, created.id, projectId, marker);
+    const task: CreatedTask = {
+      id: created.id,
+      projectId,
+      candidateProjectIds: [projectId],
+      state: "open",
+    };
+    tracking.push(task);
+    return task;
   }
 
   private async updateAndVerifyTask(
@@ -374,10 +715,7 @@ export class DidaWriteContractRunner {
       reread = normalizeTask(await this.api.getTask(projectId, taskId));
     } catch (error) {
       if (!unknownOutcome) throw error;
-      throw new Error(
-        `编辑响应未知且精确复读失败；未重发。原始错误：${messageOf(unknownOutcome)}；` +
-        `复读错误：${messageOf(error)}`,
-      );
+      throw new UnprovenRemoteOutcomeError("编辑", unknownOutcome, error, true);
     }
 
     try {
@@ -394,10 +732,7 @@ export class DidaWriteContractRunner {
       this.assertScheduleForMode(reread, expectedStart, expectedDue);
     } catch (error) {
       if (!unknownOutcome) throw error;
-      throw new Error(
-        `编辑响应未知，精确复读未证明写入生效；未重发。原始错误：` +
-        `${messageOf(unknownOutcome)}；核对错误：${messageOf(error)}`,
-      );
+      throw new UnprovenRemoteOutcomeError("编辑", unknownOutcome, error);
     }
     return unknownOutcome !== undefined;
   }
@@ -423,10 +758,7 @@ export class DidaWriteContractRunner {
       reread = normalizeTask(await this.api.getTask(before.projectId, before.id));
     } catch (error) {
       if (!unknownOutcome) throw error;
-      throw new Error(
-        `归栏响应未知且精确复读失败；未重发。原始错误：${messageOf(unknownOutcome)}；` +
-        `复读错误：${messageOf(error)}`,
-      );
+      throw new UnprovenRemoteOutcomeError("看板归栏", unknownOutcome, error, true, true);
     }
 
     try {
@@ -435,16 +767,128 @@ export class DidaWriteContractRunner {
         throw new Error("任务 columnId 写后复读与目标分栏不一致");
       }
       if (!sameTaskBoardPlacementInvariant(before, reread)) {
-        throw new Error("最小归栏写入改变了分栏以外的任务字段");
+        throw new Error(
+          "最小归栏写入改变了分栏以外的任务字段：差异字段 " +
+          differenceFieldsLabel(didaTaskDifferenceFields(before, reread, ["columnId", "columnName"])),
+        );
       }
     } catch (error) {
       if (!unknownOutcome) throw error;
-      throw new Error(
-        `归栏响应未知，精确复读未证明安全写入；未重发。原始错误：` +
-        `${messageOf(unknownOutcome)}；核对错误：${messageOf(error)}`,
-      );
+      throw new UnprovenRemoteOutcomeError("看板归栏", unknownOutcome, error, false, true);
     }
     return unknownOutcome !== undefined;
+  }
+
+  private async moveAndVerifyTask(
+    before: DidaTask,
+    fromProjectId: string,
+    toProjectId: string,
+    marker: string,
+  ): Promise<{ applied: boolean; responseUnknown: boolean }> {
+    let unknownOutcome: unknown;
+    try {
+      await this.api.moveTask({ fromProjectId, toProjectId, taskId: before.id });
+    } catch (error) {
+      if (!isUnknownRemoteOutcome(error)) throw error;
+      unknownOutcome = error;
+    }
+
+    try {
+      return await this.reconcileMovedTaskLocation(
+        before,
+        fromProjectId,
+        toProjectId,
+        marker,
+        unknownOutcome !== undefined,
+      );
+    } catch (error) {
+      this.manualCleanupRequired = {
+        taskId: before.id,
+        marker,
+        candidateProjectIds: [fromProjectId, toProjectId],
+        reason: messageOf(error),
+      };
+      if (!unknownOutcome) throw error;
+      throw new Error(
+        "移动响应未知，复读未能同时证明目标清单身份与来源清单移出；未重发。" +
+        `原始错误：${messageOf(unknownOutcome)}；核对错误：${messageOf(error)}`,
+      );
+    }
+  }
+
+  /**
+   * 移动端点的 2xx 正文并不稳定，唯一可信结果是两个候选清单的只读任务集合。
+   * 只发出一次移动写入；项目身份、数组或字段歧义都停止自动清理并交由人工。
+   */
+  private async reconcileMovedTaskLocation(
+    before: DidaTask,
+    fromProjectId: string,
+    toProjectId: string,
+    marker: string,
+    responseUnknown: boolean,
+  ): Promise<{ applied: boolean; responseUnknown: boolean }> {
+    const deadline = this.monotonicNow() + CONSISTENCY_RETRY_BUDGET_MS;
+    let pending: "both" | "none" | undefined;
+    for (let attempt = 0; attempt < ABSENCE_CHECK_ATTEMPTS; attempt += 1) {
+      this.reportProgress("复读移动任务位置", attempt + 1, ABSENCE_CHECK_ATTEMPTS);
+      const sourceData = await this.api.getProjectData(fromProjectId);
+      const targetData = await this.api.getProjectData(toProjectId);
+      const sourceProject = normalizeProject(sourceData.project);
+      const targetProject = normalizeProject(targetData.project);
+      if (sourceProject.id !== fromProjectId || targetProject.id !== toProjectId) {
+        throw new Error("移动复读的候选清单项目身份不匹配");
+      }
+      if (!Array.isArray(sourceData.tasks) || !Array.isArray(targetData.tasks)) {
+        throw new Error("移动复读的候选清单任务列表不是数组");
+      }
+      const source = sourceData.tasks.map(normalizeTask).filter((task) => task.id === before.id);
+      const target = targetData.tasks.map(normalizeTask).filter((task) => task.id === before.id);
+      if (source.length === 0 && target.length === 1) {
+        this.assertMovedTask(before, target[0]!, toProjectId, marker);
+        return { applied: true, responseUnknown };
+      }
+      if (source.length === 1 && target.length === 0) {
+        this.assertMovedTask(before, source[0]!, fromProjectId, marker);
+        const remaining = deadline - this.monotonicNow();
+        if (attempt === ABSENCE_CHECK_ATTEMPTS - 1 || remaining <= 0) {
+          return { applied: false, responseUnknown };
+        }
+        await this.sleep(Math.min(ABSENCE_CHECK_DELAY_MS, remaining));
+        continue;
+      }
+      if (source.length > 1 || target.length > 1) {
+        throw new Error("候选清单内出现重复任务 ID，拒绝猜测移动位置");
+      }
+      if (source.length === 1 && target.length === 1) {
+        pending = "both";
+      } else if (source.length === 0 && target.length === 0) {
+        pending = "none";
+      } else {
+        throw new Error("移动复读出现无法分类的位置状态");
+      }
+      const remaining = deadline - this.monotonicNow();
+      if (attempt === ABSENCE_CHECK_ATTEMPTS - 1 || remaining <= 0) {
+        throw new Error(
+          pending === "both"
+            ? "任务持续同时存在于两个候选清单集合，超过一致性预算"
+            : "任务持续不在任一候选清单集合，超过一致性预算",
+        );
+      }
+      await this.sleep(Math.min(ABSENCE_CHECK_DELAY_MS, remaining));
+    }
+    throw new Error("移动位置复读超出一致性预算");
+  }
+
+  private assertMovedTask(
+    before: DidaTask,
+    actual: DidaTask,
+    projectId: string,
+    marker: string,
+  ): void {
+    this.assertTaskIdentity(actual, before.id, projectId, marker);
+    if (!deepEqual(taskMoveInvariant(before), taskMoveInvariant(actual))) {
+      throw new Error("跨清单移动改变了清单归属以外的任务字段");
+    }
   }
 
   private async createAndVerifyProject(
@@ -782,12 +1226,16 @@ export class DidaWriteContractRunner {
         await check();
         return;
       } catch (error) {
-        if (!(error instanceof ConsistencyPendingError)) throw error;
+        const rateLimited = error instanceof DidaHttpError && error.category === "rate-limit";
+        if (!(error instanceof ConsistencyPendingError) && !rateLimited) throw error;
         lastError = error;
         if (attempt < ABSENCE_CHECK_ATTEMPTS - 1) {
           const remaining = deadline - this.monotonicNow();
           if (remaining <= 0) break;
-          await this.sleep(Math.min(ABSENCE_CHECK_DELAY_MS, remaining));
+          await this.sleep(Math.min(
+            rateLimited ? error.retryAfterMs ?? 60_000 : ABSENCE_CHECK_DELAY_MS,
+            remaining,
+          ));
         }
       }
     }
@@ -869,6 +1317,27 @@ export class DidaWriteContractRunner {
 
 class ConsistencyPendingError extends Error {}
 
+class UnprovenRemoteOutcomeError extends Error {
+  readonly remoteOutcomeUnknown = true;
+
+  constructor(
+    operation: string,
+    original: unknown,
+    proof: unknown,
+    rereadFailed = false,
+    safeWrite = false,
+  ) {
+    super(
+      rereadFailed
+        ? `${operation}响应未知且精确复读失败；未重发。` +
+          `原始错误：${messageOf(original)}；复读错误：${messageOf(proof)}`
+        : `${operation}响应未知，精确复读未证明${safeWrite ? "安全写入" : "写入生效"}；未重发。` +
+          `原始错误：${messageOf(original)}；核对错误：${messageOf(proof)}`,
+    );
+    this.name = "UnprovenRemoteOutcomeError";
+  }
+}
+
 function isNotFound(error: unknown): boolean {
   return !!error && typeof error === "object" && "statusCode" in error && error.statusCode === 404;
 }
@@ -881,8 +1350,31 @@ function isUnknownRemoteOutcome(error: unknown): boolean {
     "remoteOutcomeUnknown" in error && error.remoteOutcomeUnknown === true;
 }
 
+function isUnprovenRemoteOutcome(error: unknown): boolean {
+  return error instanceof UnprovenRemoteOutcomeError ||
+    (!!error && typeof error === "object" &&
+      "remoteOutcomeUnknown" in error && error.remoteOutcomeUnknown === true);
+}
+
+function capabilityFailureSummary(
+  capability: "reminders" | "repeatFlag" | "parentTask" | "boardPlacement",
+): string {
+  const name = {
+    reminders: "提醒",
+    repeatFlag: "重复规则",
+    parentTask: "父子任务",
+    boardPlacement: "看板归栏",
+  }[capability];
+  return `${name}：未通过写入合同，保持只读`;
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** 诊断只披露字段名，避免把临时合同任务内容写入日志或界面。 */
+function differenceFieldsLabel(fields: string[]): string {
+  return fields.length > 0 ? fields.join("、") : "无可枚举字段";
 }
 
 function scheduleMismatch(task: DidaTask, expectedStart: string, expectedDue: string): Error {
@@ -895,6 +1387,19 @@ function scheduleMismatch(task: DidaTask, expectedStart: string, expectedDue: st
 
 function sameInstant(actual: string | null | undefined, expected: string): boolean {
   return !!actual && Date.parse(actual) === Date.parse(expected);
+}
+
+function taskMoveInvariant(task: DidaTask): Omit<
+  DidaTask,
+  "projectId" | "columnId" | "etag" | "modifiedTime" | "etimestamp"
+> {
+  const withoutMetadata = didaTaskWithoutRemoteMetadata(task);
+  const {
+    projectId: _projectId,
+    columnId: _columnId,
+    ...invariant
+  } = withoutMetadata;
+  return invariant;
 }
 
 function delay(milliseconds: number): Promise<void> {

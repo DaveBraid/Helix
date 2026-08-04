@@ -1,3 +1,4 @@
+import { DIDA_TASK_REMOTE_METADATA_FIELDS } from "../domain/dida-task-metadata";
 import { cloneValue, deepEqual } from "../domain/stable";
 import type { ConflictField, ResolutionChoice, SyncConflict } from "./types";
 
@@ -24,11 +25,16 @@ const FIELD_LABELS: Record<string, string> = {
 };
 
 const IGNORED_FIELDS = new Set([
-  "etag",
-  "modifiedTime",
+  ...DIDA_TASK_REMOTE_METADATA_FIELDS,
   "createdTime",
   "sortOrderUnsafe",
   "columnId",
+  // 只读的服务端派生展示字段，不参加 Base/Local/Remote 冲突或回写。
+  "columnName",
+  // 本阶段任务状态由滴答 App 管理。完成仍通过独立 complete 队列，
+  // 绝不在普通逐字段冲突中 local/custom 写回。
+  "status",
+  "completedTime",
 ]);
 const TEXT_FIELDS = new Set(["content", "desc", "note", "encouragement"]);
 const SCHEDULE_FIELDS = new Set([

@@ -3,11 +3,17 @@ import type HelixPlugin from "../main";
 import {
   DIDA_TOKEN_MENU_PATH,
   DIDA_WEB_URL,
+  DIDA_WRITE_CONTRACT_VERSION_LABEL,
+  DIDA_WRITE_CONTRACT_SAFE_FAILURE,
+  didaWriteContractSafeSummary,
 } from "./dida-settings-contract";
 import { openInDefaultBrowser } from "./default-browser";
+import {
+  HELIX_DEVELOPMENT_TESTS_LABEL,
+  HELIX_DEVELOPMENT_TESTS_WARNING,
+} from "./settings-development-tests";
 
 export class HelixSettingTab extends PluginSettingTab {
-  private writeTestArmed = false;
   private writeTestResult: string | null = null;
 
   constructor(app: App, private readonly plugin: HelixPlugin) {
@@ -92,19 +98,36 @@ export class HelixSettingTab extends PluginSettingTab {
         }),
       );
 
+    // 写入合同和能力探测只服务开发验证；默认折叠，不干扰日常授权、拉取与同步配置。
+    // 原生 details/summary 自带键盘可达和展开状态；展开仅限本次设置页会话，不作持久化。
+    const developmentTests = this.containerEl.createEl("details", {
+      cls: "helix-settings-development-tests",
+      attr: { "aria-label": HELIX_DEVELOPMENT_TESTS_LABEL },
+    });
+    developmentTests.createEl("summary", { text: HELIX_DEVELOPMENT_TESTS_LABEL });
+    developmentTests.createEl("p", {
+      cls: "setting-item-description helix-settings-development-warning",
+      text: HELIX_DEVELOPMENT_TESTS_WARNING,
+    });
+    const developmentContent = developmentTests.createDiv({
+      cls: "helix-settings-development-content",
+    });
     let scheduleModeSetting: Setting | null = null;
-    const writeTestSetting = new Setting(this.containerEl)
+    const writeTestSetting = new Setting(developmentContent)
       .setName("写入合同测试")
       .setDesc(this.writeTestDescription())
       .addButton((button) =>
-        button.setButtonText(this.writeTestArmed ? "再次点击开始" : "运行专用测试").onClick(async () => {
-          if (!this.writeTestArmed) {
-            this.writeTestArmed = true;
+        button.setButtonText(this.plugin.didaWriteContractSettingsConfirmation.isArmed() ? "再次点击开始" : "运行专用测试").onClick(async () => {
+          const confirmation = this.plugin.didaWriteContractSettingsConfirmation.request(() => {
+            button.buttonEl.removeClass("mod-warning");
+            button.setButtonText("运行专用测试");
+            new Notice("写入合同测试的二次确认已超时失效。", 6_000);
+          });
+          if (confirmation === "armed") {
             button.setButtonText("再次点击开始").setWarning();
-            new Notice("再次点击后将创建并清理专用测试清单；不会操作既有清单或任务", 8_000);
+            new Notice("已武装：请在 15 秒内再次点击，才会创建并清理专用测试对象。", 8_000);
             return;
           }
-          this.writeTestArmed = false;
           this.writeTestResult = "最近结果：测试运行中，其他远端写入与口令变更已冻结。";
           writeTestSetting.setDesc(this.writeTestDescription());
           button.setDisabled(true).setButtonText("测试中…");
@@ -116,20 +139,12 @@ export class HelixSettingTab extends PluginSettingTab {
               this.writeTestResult = `最近结果：测试运行中 · ${progress.stage}${attempt}。其他远端写入与口令变更已冻结。`;
               writeTestSetting.setDesc(this.writeTestDescription());
             });
-            if (report.status === "passed" && !report.remoteArtifactsRemaining) {
-              this.writeTestResult = `最近结果：通过。${report.steps.join("；")}；测试对象已全部清理。`;
-              new Notice(`滴答写入合同测试通过：${report.steps.join("；")}`, 12_000);
-            } else {
-              const cleanup = report.remoteArtifactsRemaining
-                ? `；远端可能有测试残留：${report.cleanupErrors.join("；")}`
-                : "；测试对象已安全清理";
-              this.writeTestResult = `最近结果：未通过。${report.failure ?? "未知错误"}${cleanup}`;
-              new Notice(`滴答写入合同测试未通过：${report.failure ?? "未知错误"}${cleanup}`, 20_000);
-            }
+            const summary = didaWriteContractSafeSummary(report);
+            this.writeTestResult = `最近结果：${summary}`;
+            new Notice(summary, report.status === "passed" ? 12_000 : 20_000);
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.writeTestResult = `最近结果：无法运行。${message}`;
-            new Notice(`无法运行写入合同测试：${message}`, 12_000);
+            this.writeTestResult = `最近结果：${DIDA_WRITE_CONTRACT_SAFE_FAILURE}`;
+            new Notice(DIDA_WRITE_CONTRACT_SAFE_FAILURE, 12_000);
           } finally {
             writeTestSetting.setDesc(this.writeTestDescription());
             scheduleModeSetting?.setDesc(this.scheduleModeDescription());
@@ -139,7 +154,7 @@ export class HelixSettingTab extends PluginSettingTab {
         }),
       );
 
-    scheduleModeSetting = new Setting(this.containerEl)
+    scheduleModeSetting = new Setting(developmentContent)
       .setName("任务时间能力")
       .setDesc(this.scheduleModeDescription());
 
@@ -167,7 +182,7 @@ export class HelixSettingTab extends PluginSettingTab {
   }
 
   private writeTestDescription(): string {
-    const scope = "只创建带唯一标记的两个临时清单及其中一个任务；每次删除前复读身份，绝不操作既有数据。";
+    const scope = `${DIDA_WRITE_CONTRACT_VERSION_LABEL}。只创建带唯一标记的两个临时清单和按能力隔离的临时任务；逐项验证后按身份安全清理，绝不操作既有数据。`;
     return this.writeTestResult ? `${scope} ${this.writeTestResult}` : scope;
   }
 

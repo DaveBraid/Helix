@@ -49,6 +49,33 @@ describe("three-way conflict fields", () => {
     expect(fields.map((field) => field.path)).toEqual(["title"]);
   });
 
+  it("excludes server-derived columnName from ordinary three-way comparison", () => {
+    const fields = buildConflictFields(
+      { title: "Base", columnName: "待办" },
+      { title: "Base", columnName: "待办" },
+      { title: "Base", columnName: "进行中" },
+    );
+    expect(fields).toEqual([]);
+  });
+
+  it("excludes App-owned completion fields from writable conflict choices", () => {
+    const fields = buildConflictFields(
+      { title: "Base", status: 0, completedTime: null },
+      { title: "Base", status: 2, completedTime: "2026-08-04T00:00:00Z" },
+      { title: "Base", status: 0, completedTime: null },
+    );
+    expect(fields).toEqual([]);
+  });
+
+  it("does not create a field conflict for server-managed etimestamp", () => {
+    const fields = buildConflictFields(
+      { title: "Base", etimestamp: 10 },
+      { title: "Local", etimestamp: 10 },
+      { title: "Base", etimestamp: 11 },
+    );
+    expect(fields.map((field) => field.path)).toEqual(["title"]);
+  });
+
   it("distinguishes local-only, remote-only, same, and divergent changes", () => {
     const fields = buildConflictFields(
       { title: "base", priority: 1, status: 0, content: "old" },
@@ -65,11 +92,7 @@ describe("three-way conflict fields", () => {
       remoteChanged: true,
       suggestedChoice: "remote",
     });
-    expect(fields.find((field) => field.path === "status")).toMatchObject({
-      localChanged: true,
-      remoteChanged: true,
-      sameResult: true,
-    });
+    expect(fields.find((field) => field.path === "status")).toBeUndefined();
     expect(fields.find((field) => field.path === "content")).toMatchObject({
       localChanged: true,
       remoteChanged: true,

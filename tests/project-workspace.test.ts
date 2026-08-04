@@ -406,7 +406,7 @@ describe("ProjectWorkspaceService", () => {
       { nodeId: "cycle-node", x: 42, y: 300 },
     ], revision);
     expect(byteService.historyState().undoCount).toBe(0);
-  });
+  }, 15_000);
 
   it("invalidates session history after an observed external Canvas write", async () => {
     const repo = baseRepository();

@@ -5,6 +5,8 @@ import { createSnapshot } from "../src/sync/snapshots";
 import { buildConflictFields } from "../src/sync/three-way-merge";
 import { deterministicEventId } from "../src/domain/events";
 import { stableStringify } from "../src/domain/stable";
+import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
+import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import { rotatingChallenges } from "../src/domain/gamification";
 import {
   beginDataGeneration,
@@ -599,33 +601,42 @@ describe("HelixDataStore serialization", () => {
     const valid = hydrateData({
       schemaVersion: 2,
       didaContractCapabilities: {
-        probeVersion: 2,
+        probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+        authorizationBinding: didaAuthorizationBinding("token"),
         taskScheduleMode: "point",
         boardPlacementVerified: true,
         verifiedAt: "2026-07-31T00:00:00.000Z",
       },
     });
     expect(valid.didaContractCapabilities).toEqual({
-      probeVersion: 2,
+      probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+      authorizationBinding: didaAuthorizationBinding("token"),
       taskScheduleMode: "point",
       boardPlacementVerified: true,
+      taskCrudVerified: false,
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
       verifiedAt: "2026-07-31T00:00:00.000Z",
     });
 
-    const legacy = hydrateData({
+    const v3 = hydrateData({
       schemaVersion: 2,
       didaContractCapabilities: {
-        probeVersion: 2,
+        probeVersion: 3,
+        authorizationBinding: didaAuthorizationBinding("token"),
         taskScheduleMode: "point",
         verifiedAt: "2026-07-31T00:00:00.000Z",
       },
     });
-    expect(legacy.didaContractCapabilities?.boardPlacementVerified).toBe(false);
+    expect(v3.didaContractCapabilities).toBeUndefined();
+    expect(v3.recoveryIssues).toEqual([]);
 
     const invalidBoardCapability = hydrateData({
       schemaVersion: 2,
       didaContractCapabilities: {
-        probeVersion: 2,
+        probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+        authorizationBinding: didaAuthorizationBinding("token"),
         taskScheduleMode: "point",
         boardPlacementVerified: "yes",
         verifiedAt: "2026-07-31T00:00:00.000Z",
@@ -639,7 +650,8 @@ describe("HelixDataStore serialization", () => {
     const invalid = hydrateData({
       schemaVersion: 2,
       didaContractCapabilities: {
-        probeVersion: 2,
+        probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+        authorizationBinding: didaAuthorizationBinding("token"),
         taskScheduleMode: "unknown",
         verifiedAt: "not-a-date",
       },

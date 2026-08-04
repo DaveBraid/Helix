@@ -21,6 +21,16 @@ export interface DidaCapabilities {
 
 export type TokenProvider = () => string | null;
 
+/**
+ * 滴答任务更新的线上载荷。领域模型把“无提醒”规范为 []，但公开更新接口
+ * 以 null 表示显式清空；该差异不得渗入领域快照或三方合并。
+ */
+export type DidaTaskWriteWirePayload = Omit<Partial<DidaTask>, "columnName">;
+
+export type DidaTaskUpdateWirePayload = Omit<DidaTaskWriteWirePayload, "reminders"> & {
+  reminders?: DidaTask["reminders"] | null;
+};
+
 export interface DidaRequestPolicy {
   timeoutMs?: number;
   maxAttempts?: number;
@@ -31,13 +41,16 @@ export class DidaApi {
     private readonly transport: HttpTransport,
     private readonly tokenProvider: TokenProvider,
     private readonly requestPolicy: DidaRequestPolicy = {},
+    private readonly sleep: (milliseconds: number) => Promise<void> = delay,
   ) {}
 
   withRequestPolicy(policy: DidaRequestPolicy): DidaApi {
-    return new DidaApi(this.transport, this.tokenProvider, {
-      ...this.requestPolicy,
-      ...policy,
-    });
+    return new DidaApi(
+      this.transport,
+      this.tokenProvider,
+      { ...this.requestPolicy, ...policy },
+      this.sleep,
+    );
   }
 
   async probeCapabilities(): Promise<DidaCapabilities> {
@@ -131,7 +144,9 @@ export class DidaApi {
   }
 
   deleteProject(projectId: string): Promise<void> {
-    return this.request(`/project/${encodeURIComponent(projectId)}`, "DELETE");
+    return this.request(`/project/${encodeURIComponent(projectId)}`, "DELETE", undefined, {
+      outcomeUnknownOnNetworkFailure: true,
+    });
   }
 
   getTask(projectId: string, taskId: string): Promise<DidaTask> {
@@ -140,11 +155,11 @@ export class DidaApi {
     );
   }
 
-  createTask(task: Partial<DidaTask> & Pick<DidaTask, "title" | "projectId">): Promise<DidaTask> {
+  createTask(task: DidaTaskWriteWirePayload & Pick<DidaTask, "title" | "projectId">): Promise<DidaTask> {
     return this.request("/task", "POST", task, { outcomeUnknownOnNetworkFailure: true });
   }
 
-  updateTask(taskId: string, task: Partial<DidaTask>): Promise<DidaTask> {
+  updateTask(taskId: string, task: DidaTaskUpdateWirePayload): Promise<DidaTask> {
     return this.request(`/task/${encodeURIComponent(taskId)}`, "POST", task, {
       outcomeUnknownOnNetworkFailure: true,
     });
@@ -154,8 +169,10 @@ export class DidaApi {
     fromProjectId: string;
     toProjectId: string;
     taskId: string;
-  }): Promise<{ id: string; etag?: string }> {
-    return this.request("/task/move", "POST", input, {
+  }): Promise<unknown> {
+    // DidaSync 的 MIT 实现及本地 CLI 核对均使用单元素数组。移动响应本身
+    // 不作为成功依据；调用方必须通过只读复读确认位置，绝不以对象载荷重发。
+    return this.request("/task/move", "POST", [input], {
       outcomeUnknownOnNetworkFailure: true,
     });
   }
@@ -173,6 +190,8 @@ export class DidaApi {
     return this.request(
       `/project/${encodeURIComponent(projectId)}/task/${encodeURIComponent(taskId)}`,
       "DELETE",
+      undefined,
+      { outcomeUnknownOnNetworkFailure: true },
     );
   }
 
@@ -197,7 +216,12 @@ export class DidaApi {
   }
 
   updateHabit(habitId: string, habit: Partial<DidaHabit>): Promise<DidaHabit> {
-    return this.request(`/habit/${encodeURIComponent(habitId)}`, "POST", habit);
+    return this.request(
+      `/habit/${encodeURIComponent(habitId)}`,
+      "POST",
+      habit,
+      { outcomeUnknownOnNetworkFailure: true },
+    );
   }
 
   createHabitCheckin(habitId: string, checkin: DidaHabitCheckin): Promise<DidaHabitCheckin> {
@@ -237,6 +261,8 @@ export class DidaApi {
     return this.request(
       `/focus/${encodeURIComponent(focusId)}?${params.toString()}`,
       "DELETE",
+      undefined,
+      { outcomeUnknownOnNetworkFailure: true },
     );
   }
 
@@ -273,12 +299,15 @@ export class DidaApi {
           response.status,
           `Dida API ${response.status}: ${sanitize(response.text)}`,
           response.headers,
+          response.text,
         );
         if (error.category !== "transient" && error.category !== "rate-limit") throw error;
-        if (options.outcomeUnknownOnNetworkFailure && error.category === "transient") {
+        if (options.outcomeUnknownOnNetworkFailure) {
           throw new DidaHttpError(
             "unknown-outcome",
-            "服务器错误发生在写入请求之后，无法确认远端结果；已转入待核对状态",
+            error.category === "rate-limit"
+              ? "查询限流发生在写入请求之后，无法确认远端结果；已转入待核对状态"
+              : "服务器错误发生在写入请求之后，无法确认远端结果；已转入待核对状态",
             response.status,
             undefined,
             true,
@@ -286,12 +315,25 @@ export class DidaApi {
         }
         lastError = error;
         if (attempt < maxAttempts - 1) {
-          await delay(error.retryAfterMs ?? 1_000 * 2 ** attempt);
+          await this.sleep(error.retryAfterMs ?? 1_000 * 2 ** attempt);
         }
         continue;
       } catch (error) {
         if (error instanceof DidaHttpError && error.category === "unknown-outcome") {
           throw error;
+        }
+        if (
+          options.outcomeUnknownOnNetworkFailure &&
+          error instanceof DidaHttpError &&
+          error.category === "rate-limit"
+        ) {
+          throw new DidaHttpError(
+            "unknown-outcome",
+            "查询限流发生在写入请求之后，无法确认远端结果；已转入待核对状态",
+            error.statusCode,
+            undefined,
+            true,
+          );
         }
         if (error instanceof DidaHttpError) {
           if (error.category !== "transient" && error.category !== "rate-limit") throw error;
@@ -308,7 +350,13 @@ export class DidaApi {
           }
           lastError = error;
         }
-        if (attempt < maxAttempts - 1) await delay(1_000 * 2 ** attempt);
+        if (attempt < maxAttempts - 1) {
+          await this.sleep(
+            error instanceof DidaHttpError && error.category === "rate-limit"
+              ? error.retryAfterMs ?? 60_000
+              : 1_000 * 2 ** attempt,
+          );
+        }
       }
     }
     if (lastError instanceof DidaHttpError && lastError.category === "rate-limit") {

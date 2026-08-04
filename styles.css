@@ -565,6 +565,43 @@
   flex: 1 1 160px;
 }
 
+/* 设置页：合同与探测是开发工具，默认折叠并以低对比边界区别日常设置。 */
+.helix-settings-development-tests {
+  margin: 20px 0 10px;
+  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 72%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background-secondary) 38%, transparent);
+}
+
+.helix-settings-development-tests > summary {
+  padding: 9px 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.9em;
+  font-weight: 600;
+  user-select: none;
+}
+
+.helix-settings-development-tests > summary:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+  border-radius: 9px;
+}
+
+.helix-settings-development-warning {
+  margin: 0 12px 8px;
+  color: var(--text-muted);
+  font-size: 0.84em;
+}
+
+.helix-settings-development-content {
+  padding: 0 12px 4px;
+}
+
+.helix-settings-development-content .setting-item {
+  border-top-color: color-mix(in srgb, var(--background-modifier-border) 58%, transparent);
+}
+
 .helix-task-edit-modal .setting-item-control {
   flex: 1 1 320px;
   min-width: 0;

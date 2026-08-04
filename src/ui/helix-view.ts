@@ -52,6 +52,7 @@ import {
   taskScheduleForSubmission,
   type TaskScheduleMode,
 } from "../domain/task-schedule";
+import { taskEditWriteFields } from "../domain/task-edit-fields";
 import { presentDidaReminders, presentDidaRepeat } from "../domain/task-reminders";
 import {
   applyTaskQuickSuggestion,
@@ -698,6 +699,7 @@ export class HelixView extends ItemView {
           [],
           undefined,
           "duration",
+          { reminderWriteVerified: true, repeatWriteVerified: true },
           async (updated) => {
             this.previewTasks = this.previewTasks.map((candidate) =>
               candidate.id === updated.id ? updated : candidate,
@@ -740,7 +742,7 @@ export class HelixView extends ItemView {
             this.previewTasks = this.previewTasks.map((candidate) =>
               candidate.id === task.id ? { ...candidate, title } : candidate);
           } else {
-            await this.service.queueTaskUpdate({ ...task, title });
+            await this.service.queueTaskUpdate({ ...task, title }, "update", ["title"]);
             new Notice("任务标题已加入同步队列");
           }
         });
@@ -830,8 +832,14 @@ export class HelixView extends ItemView {
       references?.blockingIssues ?? [],
       unavailableReasons.join("；") || undefined,
       this.state?.taskScheduleMode ?? "unknown",
-      async (updated) => {
-        await this.service.queueTaskUpdate(updated);
+      {
+        reminderWriteVerified: (this.state?.taskCrudVerified ?? false) &&
+          (this.state?.reminderWriteVerified ?? false),
+        repeatWriteVerified: (this.state?.taskCrudVerified ?? false) &&
+          (this.state?.repeatWriteVerified ?? false),
+      },
+      async (updated, writeFields) => {
+        await this.service.queueTaskUpdate(updated, "update", writeFields);
         void this.render();
       },
       async (selection, expected) => {
@@ -1765,6 +1773,7 @@ export class HelixView extends ItemView {
       [],
       undefined,
       "duration",
+      { reminderWriteVerified: true, repeatWriteVerified: true },
       async (updated) => {
         this.previewTasks = this.previewTasks.map((candidate) =>
           candidate.id === updated.id ? updated : candidate,
@@ -2790,16 +2799,7 @@ export class HelixView extends ItemView {
       });
       if (operation.operation !== "create") {
         const actions = card.createDiv({ cls: "helix-reconciliation-actions" });
-        const continueWrite = actions.createEl("button", {
-          cls: "helix-primary-button",
-          text: "核对远端并继续",
-        });
-        continueWrite.addEventListener("click", () => {
-          void this.service
-            .resolveUnknownWrite(operation.id, "continue")
-            .then(() => this.render())
-            .catch((error) => new Notice(error instanceof Error ? error.message : String(error), 8_000));
-        });
+        actions.createEl("p", { text: "请在滴答 App 核对；Helix 不会重发结果未知的写入。" });
         const adopt = actions.createEl("button", {
           cls: "helix-secondary-button",
           text: "采用当前远端，放弃本次写入",
@@ -2818,16 +2818,7 @@ export class HelixView extends ItemView {
         attr: { "aria-label": "滴答远端记录 ID" },
       });
       const actions = card.createDiv({ cls: "helix-reconciliation-actions" });
-      const retry = actions.createEl("button", {
-        cls: "helix-secondary-button",
-        text: "我已确认未创建，安全重试",
-      });
-      retry.addEventListener("click", () => {
-        void this.service
-          .resolveUnknownCreate(operation.id, "not-created")
-          .then(() => this.render())
-          .catch((error) => new Notice(error instanceof Error ? error.message : String(error)));
-      });
+      actions.createEl("p", { text: "结果未知时不提供重试；请在滴答 App 核对后绑定已创建记录。" });
       const bind = actions.createEl("button", {
         cls: "helix-primary-button",
         text: "核对并绑定远端记录",
@@ -2963,7 +2954,7 @@ export class HelixView extends ItemView {
     if (applying) {
       const recovery = card.createDiv({ cls: "helix-conflict-recovery" });
       recovery.createEl("p", {
-        text: "上次写回的远端结果未知。请先在滴答中核对：已经生效则复读采纳；确认未写入才可解锁重试。若本次是重建且产生了新记录，请填写新记录 ID。",
+        text: "上次写回的远端结果未知。请前往滴答 App 核对；仅在确认已生效后复读采纳。未确认前将保持只读冻结，不能解锁或重发。若本次是重建且产生了新记录，请填写新记录 ID。",
       });
       const remoteId = recovery.createEl("input", {
         type: "text",
@@ -2976,25 +2967,10 @@ export class HelixView extends ItemView {
       });
       adopt.addEventListener("click", () => {
         adopt.disabled = true;
-        unlock.disabled = true;
         void this.service.adoptAppliedConflict(conflict.id, remoteId.value)
           .then(() => this.render())
           .catch((error) => {
             adopt.disabled = false;
-            unlock.disabled = false;
-            new Notice(error instanceof Error ? error.message : String(error), 8_000);
-          });
-      });
-      const unlock = recovery.createEl("button", {
-        cls: "helix-secondary-button",
-        text: "我已确认远端未写入，解锁重新合并",
-      });
-      unlock.addEventListener("click", () => {
-        unlock.disabled = true;
-        void this.service.releaseApplyingConflict(conflict.id)
-          .then(() => this.render())
-          .catch((error) => {
-            unlock.disabled = false;
             new Notice(error instanceof Error ? error.message : String(error), 8_000);
           });
       });
@@ -3638,6 +3614,32 @@ class DidaProjectCreateModal extends Modal {
   }
 }
 
+const REMINDER_PRESETS = new Set([
+  "TRIGGER:PT0S",
+  "TRIGGER:-PT5M",
+  "TRIGGER:-PT10M",
+  "TRIGGER:-PT30M",
+  "TRIGGER:-PT1H",
+  "TRIGGER:-P1D",
+]);
+
+const REPEAT_PRESETS = new Set([
+  "RRULE:FREQ=DAILY;INTERVAL=1",
+  "RRULE:FREQ=WEEKLY;INTERVAL=1",
+  "RRULE:FREQ=MONTHLY;INTERVAL=1",
+  "RRULE:FREQ=YEARLY;INTERVAL=1",
+]);
+
+function knownReminderPreset(reminders: string[]): string | "none" | null {
+  if (reminders.length === 0) return "none";
+  return reminders.length === 1 && REMINDER_PRESETS.has(reminders[0]!) ? reminders[0]! : null;
+}
+
+function knownRepeatPreset(repeatFlag: string | null): string | "none" | null {
+  if (repeatFlag === null || repeatFlag === "") return "none";
+  return REPEAT_PRESETS.has(repeatFlag) ? repeatFlag : null;
+}
+
 class TaskEditModal extends Modal {
   private title: string;
   private didaProjectId: string;
@@ -3648,10 +3650,16 @@ class TaskEditModal extends Modal {
   private timeZone: string;
   private priority: number;
   private tags: string[];
+  private reminders: string[];
+  private repeatFlag: string | null;
+  private remindersDirty = false;
+  private repeatFlagDirty = false;
+  private titleDirty = false;
   private helixProjectId: string;
   private readonly helixStageIds: Set<string>;
   private stageChoicesEl: HTMLElement | null = null;
   private currentReference: TaskReferenceResolved | undefined;
+  private readonly initialEditable: Record<string, unknown>;
 
   constructor(
     app: HelixView["app"],
@@ -3663,7 +3671,11 @@ class TaskEditModal extends Modal {
     private readonly referenceBlockingIssues: string[],
     private readonly associationUnavailableReason: string | undefined,
     private readonly scheduleMode: TaskScheduleMode,
-    private readonly submitTask: (task: DidaTask) => Promise<void>,
+    private readonly writeCapabilities: {
+      reminderWriteVerified: boolean;
+      repeatWriteVerified: boolean;
+    },
+    private readonly submitTask: (task: DidaTask, writeFields: string[]) => Promise<void>,
     private readonly submitReference?: (
       selection: TaskReferenceSelection,
       expected: TaskReferenceExpectedRevision,
@@ -3680,6 +3692,18 @@ class TaskEditModal extends Modal {
     this.isAllDay = task.isAllDay ?? false;
     this.priority = task.priority ?? 0;
     this.tags = [...(task.tags ?? [])];
+    this.reminders = [...(task.reminders ?? [])];
+    this.repeatFlag = task.repeatFlag ?? null;
+    this.initialEditable = {
+      title: this.title,
+      content: this.content,
+      startDate: this.startDate,
+      dueDate: this.dueDate,
+      isAllDay: this.isAllDay,
+      timeZone: this.timeZone,
+      priority: this.priority,
+      tags: this.tags,
+    };
     this.currentReference = reference;
     this.helixProjectId = reference?.projectId ?? "";
     this.helixStageIds = new Set(reference?.stageIds ?? []);
@@ -3699,6 +3723,7 @@ class TaskEditModal extends Modal {
         titleInputEl = text.inputEl;
         text.setValue(this.title).onChange((value) => {
           this.title = value;
+          this.titleDirty = true;
         });
       });
     let quickEntry = "";
@@ -3837,23 +3862,59 @@ class TaskEditModal extends Modal {
         });
       });
     const reminderPresentations = presentDidaReminders(this.task.reminders);
-    const reminderSetting = new Setting(this.contentEl)
-      .setName("提醒")
-      .setDesc("当前只读；完成专用合同验证后开放修改与清空。");
-    reminderSetting.controlEl.createSpan({
-      cls: "helix-task-readonly-property",
-      text: reminderPresentations.length > 0
-        ? reminderPresentations.map((item) => item.label).join("、")
-        : "无",
-    });
+    const reminderSetting = new Setting(this.contentEl).setName("提醒");
+    if (this.writeCapabilities.reminderWriteVerified) {
+      reminderSetting.addDropdown((dropdown) => {
+        const currentKey = knownReminderPreset(this.reminders);
+        if (currentKey === null) dropdown.addOption("keep", `保持：${reminderPresentations.map((item) => item.label).join("、") || "无"}`);
+        dropdown
+          .addOption("none", "无")
+          .addOption("TRIGGER:PT0S", "任务时间")
+          .addOption("TRIGGER:-PT5M", "提前 5 分钟")
+          .addOption("TRIGGER:-PT10M", "提前 10 分钟")
+          .addOption("TRIGGER:-PT30M", "提前 30 分钟")
+          .addOption("TRIGGER:-PT1H", "提前 1 小时")
+          .addOption("TRIGGER:-P1D", "提前 1 天")
+          .setValue(currentKey ?? "keep")
+          .onChange((value) => {
+            if (value === "keep") return;
+            this.reminders = value === "none" ? [] : [value];
+            this.remindersDirty = true;
+          });
+      });
+    } else {
+      reminderSetting.setDesc("写入合同尚未通过，当前保持只读。");
+      reminderSetting.controlEl.createSpan({
+        cls: "helix-task-readonly-property",
+        text: reminderPresentations.map((item) => item.label).join("、") || "无",
+      });
+    }
     const repeatPresentation = presentDidaRepeat(this.task.repeatFlag);
-    const repeatSetting = new Setting(this.contentEl)
-      .setName("重复")
-      .setDesc("当前只读；不会把未知规则静默改写为预设。");
-    repeatSetting.controlEl.createSpan({
-      cls: "helix-task-readonly-property",
-      text: repeatPresentation.label,
-    });
+    const repeatSetting = new Setting(this.contentEl).setName("重复");
+    if (this.writeCapabilities.repeatWriteVerified) {
+      repeatSetting.addDropdown((dropdown) => {
+        const currentKey = knownRepeatPreset(this.repeatFlag);
+        if (currentKey === null) dropdown.addOption("keep", `保持：${repeatPresentation.label}`);
+        dropdown
+          .addOption("none", "不重复")
+          .addOption("RRULE:FREQ=DAILY;INTERVAL=1", "每天")
+          .addOption("RRULE:FREQ=WEEKLY;INTERVAL=1", "每周")
+          .addOption("RRULE:FREQ=MONTHLY;INTERVAL=1", "每月")
+          .addOption("RRULE:FREQ=YEARLY;INTERVAL=1", "每年")
+          .setValue(currentKey ?? "keep")
+          .onChange((value) => {
+            if (value === "keep") return;
+            this.repeatFlag = value === "none" ? null : value;
+            this.repeatFlagDirty = true;
+          });
+      });
+    } else {
+      repeatSetting.setDesc("写入合同尚未通过，当前保持只读。");
+      repeatSetting.controlEl.createSpan({
+        cls: "helix-task-readonly-property",
+        text: repeatPresentation.label,
+      });
+    }
     new Setting(this.contentEl)
       .setName("标签")
       .setDesc("多个标签使用空格或逗号分隔。")
@@ -3885,8 +3946,8 @@ class TaskEditModal extends Modal {
       text: this.preview ? "保存演示任务" : "保存滴答任务",
     });
     saveTask.addEventListener("click", () => {
-      const title = this.title.trim();
-      if (!title) {
+      const title = this.titleDirty ? this.title.trim() : this.task.title;
+      if (!title.trim()) {
         new Notice("任务标题不能为空");
         return;
       }
@@ -3915,7 +3976,7 @@ class TaskEditModal extends Modal {
         scheduleEditorMode,
       );
       saveTask.disabled = true;
-      void this.submitTask({
+      const updatedTask: DidaTask = {
         ...this.task,
         title,
         projectId: this.didaProjectId,
@@ -3923,7 +3984,38 @@ class TaskEditModal extends Modal {
         ...schedule,
         priority: this.priority,
         tags: this.tags,
-      })
+      };
+      if (this.remindersDirty) updatedTask.reminders = this.reminders;
+      if (this.repeatFlagDirty) updatedTask.repeatFlag = this.repeatFlag;
+      // 清单迁移是独立的远端动作，不能由“业务字段未变”短路掉。
+      // projectId 只作为迁移上下文，绝不进入普通 update 载荷。
+      const projectChanged = this.didaProjectId !== this.task.projectId;
+      const writeFields = taskEditWriteFields(this.initialEditable, {
+        title,
+        content: this.content,
+        startDate: this.startDate,
+        dueDate: this.dueDate,
+        isAllDay: this.isAllDay,
+        timeZone: this.timeZone,
+        priority: this.priority,
+        tags: this.tags,
+      }, {
+        reminders: this.remindersDirty,
+        repeatFlag: this.repeatFlagDirty,
+      });
+      if (writeFields.length === 0 && !projectChanged) {
+        this.close();
+        return;
+      }
+      // safeTaskTimeZone 只服务于墙上时间的显示/换算。用户未编辑日程时，
+      // 绝不能把设备时区写回原本缺失的远端字段或本地同步基线。
+      if (!writeFields.some((field) => ["startDate", "dueDate", "isAllDay", "timeZone"].includes(field))) {
+        updatedTask.startDate = this.task.startDate;
+        updatedTask.dueDate = this.task.dueDate;
+        updatedTask.isAllDay = this.task.isAllDay;
+        updatedTask.timeZone = this.task.timeZone;
+      }
+      void this.submitTask(updatedTask, writeFields)
         .then(() => {
           new Notice(this.preview ? "演示任务已保存" : "滴答任务已加入同步队列");
           this.close();

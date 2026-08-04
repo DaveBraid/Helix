@@ -9,6 +9,7 @@ import type {
   SnapshotRepository,
   SyncConflict,
   SyncQueueOperation,
+  RemoteWriteContext,
 } from "../src/sync/types";
 
 class MemoryRepository implements SnapshotRepository, ConflictRepository {
@@ -59,6 +60,8 @@ class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
   value: DidaTask | null;
   getCount = 0;
   updateCount = 0;
+  lastContext: RemoteWriteContext | undefined;
+  advanceEtimestampOnUpdate = false;
 
   constructor(value: DidaTask | null) {
     this.value = value;
@@ -71,10 +74,20 @@ class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
     this.value = { ...value, id: value.id || "restored" };
     return structuredClone(this.value);
   }
-  async update(_entityId: string, value: DidaTask): Promise<DidaTask> {
+  async update(
+    _entityId: string,
+    value: DidaTask,
+    context?: RemoteWriteContext,
+  ): Promise<DidaTask> {
     this.updateCount += 1;
-    this.value = structuredClone(value);
-    return structuredClone(value);
+    this.lastContext = structuredClone(context);
+    this.value = {
+      ...structuredClone(value),
+      ...(this.advanceEtimestampOnUpdate
+        ? { etimestamp: Number(value.etimestamp ?? 0) + 1 }
+        : {}),
+    };
+    return structuredClone(this.value);
   }
   async delete(): Promise<void> {
     this.value = null;
@@ -121,6 +134,150 @@ describe("SyncEngine safety gates", () => {
     expect(result.outcome).toBe("pushed");
     expect(adapter.value?.title).toBe("queued-rename");
     expect((repository.local?.value as DidaTask).title).toBe("queued-rename");
+  });
+
+  it("passes persisted explicit field intent from queue processing to the adapter", async () => {
+    const baseTask = { ...task("base"), reminders: ["TRIGGER:CUSTOM"] };
+    const localTask = { ...baseTask, reminders: ["TRIGGER:-PT10M"] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(baseTask);
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+    const queued = operation(localTask, base);
+    queued.writeFields = ["reminders"];
+
+    await engine.process(queued);
+
+    expect(adapter.lastContext).toEqual({
+      projectId: "project-1",
+      writeFields: ["reminders"],
+    });
+  });
+
+  it("passes local and custom empty reminder resolutions through conflict apply with explicit intent", async () => {
+    for (const choice of ["local", "custom"] as const) {
+      const baseTask = { ...task("base"), reminders: ["TRIGGER:BASE"] };
+      const localTask = { ...baseTask, reminders: [] as string[] };
+      const remoteTask = { ...baseTask, reminders: ["TRIGGER:REMOTE"] };
+      const base = createSnapshot("task", "task-1", baseTask);
+      const repository = new MemoryRepository();
+      repository.base = base;
+      repository.local = createSnapshot("task", "task-1", localTask);
+      const adapter = new TaskAdapter(remoteTask);
+      const engine = new SyncEngine({
+        adapter,
+        snapshots: repository,
+        conflicts: repository,
+        deviceId: "device-a",
+      });
+
+      const result = await engine.process(operation(localTask, base));
+      expect(result.outcome).toBe("conflict");
+      if (result.outcome !== "conflict") throw new Error("expected reminder conflict");
+      await engine.choose(result.conflict.id, "reminders", choice, choice === "custom" ? [] : undefined);
+      const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+
+      expect(applied.outcome).toBe("resolved");
+      expect(adapter.lastContext).toEqual({ projectId: "project-1", writeFields: ["reminders"] });
+      expect((adapter.value as DidaTask).reminders).toEqual([]);
+      expect((repository.base?.value as DidaTask).reminders).toEqual([]);
+      expect((repository.local?.value as DidaTask).reminders).toEqual([]);
+    }
+  });
+
+  it("normalizes a locally chosen checklist-item conflict to the root items write intent", async () => {
+    const baseTask = { ...task("base"), items: [{ id: "item-1", title: "base", status: 0 }] };
+    const localTask = { ...baseTask, items: [{ id: "item-1", title: "local", status: 0 }] };
+    const remoteTask = { ...baseTask, items: [{ id: "item-1", title: "remote", status: 0 }] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process(operation(localTask, base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected items conflict");
+    const field = result.conflict.fields.find((candidate) => candidate.path.startsWith("items"));
+    expect(field).toBeDefined();
+    await engine.choose(result.conflict.id, field!.path, "local");
+    await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(adapter.lastContext?.writeFields).toEqual(["items"]);
+  });
+
+  it("keeps App-owned remote completion when applying a local title resolution", async () => {
+    const baseTask = { ...task("base"), status: 0, completedTime: null };
+    const localTask = { ...baseTask, title: "local" };
+    const remoteTask = {
+      ...baseTask,
+      status: 2,
+      completedTime: "2026-08-04T08:00:00.000Z",
+    };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    let remote = structuredClone(remoteTask);
+    let updateContext: RemoteWriteContext | undefined;
+    const adapter: RemoteEntityAdapter<DidaTask> = {
+      kind: "task",
+      async get() { return structuredClone(remote); },
+      async create(value) { return structuredClone(value); },
+      async update(_id, value, context) {
+        updateContext = structuredClone(context);
+        // 模拟真实适配器的白名单 wire：只有 title 进入本次更新，状态留给滴答 App。
+        if (context?.writeFields?.includes("title")) remote.title = value.title;
+        return structuredClone(remote);
+      },
+      async delete() { throw new Error("not used"); },
+    };
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process(operation(localTask, base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    expect(result.conflict.fields.map((field) => field.path)).toEqual(["title"]);
+    await engine.choose(result.conflict.id, "title", "local");
+    const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+
+    expect(applied.outcome).toBe("resolved");
+    expect(updateContext?.writeFields).toEqual(["title"]);
+    expect((applied as { snapshot: EntitySnapshot<DidaTask> }).snapshot.value).toMatchObject({
+      title: "local",
+      status: 2,
+      completedTime: "2026-08-04T08:00:00.000Z",
+    });
+    expect(repository.conflicts).toEqual([]);
+  });
+
+  it("accepts a production update when only server etimestamp advances", async () => {
+    const baseTask = { ...task("base"), etimestamp: 10 };
+    const localTask = { ...baseTask, title: "local" };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(baseTask);
+    adapter.advanceEtimestampOnUpdate = true;
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+
+    const result = await engine.process(operation(localTask, base));
+
+    expect(result.outcome).toBe("pushed");
+    expect(adapter.updateCount).toBe(1);
+    expect(adapter.value).toMatchObject({ title: "local", etimestamp: 11 });
+    expect(repository.conflicts).toHaveLength(0);
   });
 
   it("opens a conflict instead of writing when remote changes during preflight", async () => {

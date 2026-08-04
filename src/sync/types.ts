@@ -59,6 +59,13 @@ export interface SyncQueueOperation<T = unknown> {
   projectId?: string;
   conflictId?: string;
   lastError?: string;
+  /** 由用户显式修改的字段；禁止通过本地/远端值差异反推。 */
+  writeFields?: string[];
+}
+
+export interface RemoteWriteContext {
+  projectId?: string;
+  writeFields?: string[];
 }
 
 export interface ResolutionAuditEntry {
@@ -83,10 +90,10 @@ export interface SyncSummary {
 
 export interface RemoteEntityAdapter<T> {
   readonly kind: EntityKind;
-  get(entityId: string, context?: { projectId?: string }): Promise<T | null>;
+  get(entityId: string, context?: RemoteWriteContext): Promise<T | null>;
   create(value: T): Promise<T>;
-  update(entityId: string, value: T, context?: { projectId?: string }): Promise<T>;
-  delete(entityId: string, context?: { projectId?: string }): Promise<void>;
+  update(entityId: string, value: T, context?: RemoteWriteContext): Promise<T>;
+  delete(entityId: string, context?: RemoteWriteContext): Promise<void>;
 }
 
 export type SyncErrorCategory =

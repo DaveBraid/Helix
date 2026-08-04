@@ -65,6 +65,8 @@ export interface DidaTask {
   status: number;
   sortOrder?: number;
   columnId?: string | null;
+  /** 看板归栏后由服务端派生的列名；仅用于读取与归栏后验证，禁止写回。 */
+  columnName?: string | null;
   sortOrderUnsafe?: boolean;
   items?: DidaChecklistItem[];
   tags?: string[];
@@ -73,6 +75,8 @@ export interface DidaTask {
   kind?: "TASK" | "NOTE" | "CHECKLIST" | string;
   etag?: string;
   modifiedTime?: string;
+  /** 滴答服务端生成的写入时间戳；不进入业务字段比较或写载荷。 */
+  etimestamp?: string | number;
   createdTime?: string;
 }
 

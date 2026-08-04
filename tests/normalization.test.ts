@@ -72,6 +72,32 @@ describe("Dida normalization", () => {
     expect(firstComparable).toEqual(secondComparable);
   });
 
+  it("canonicalizes a missing childIds field as an empty child list", () => {
+    expect(normalizeTask({
+      id: "task-child-ids",
+      projectId: "project-1",
+      title: "No children",
+      status: 0,
+    }).childIds).toEqual([]);
+  });
+
+  it("keeps a server-derived columnName readable while normalizing null and whitespace", () => {
+    expect(normalizeTask({
+      id: "task-column-name",
+      projectId: "project-1",
+      title: "Column name",
+      status: 0,
+      columnName: "  进行中  ",
+    }).columnName).toBe("进行中");
+    expect(normalizeTask({
+      id: "task-column-name-null",
+      projectId: "project-1",
+      title: "Column name null",
+      status: 0,
+      columnName: null,
+    }).columnName).toBeNull();
+  });
+
   it("rejects invalid task, checklist, focus, and habit-checkin dates", () => {
     expect(() => normalizeTask({
       id: "task-column-invalid",
@@ -80,6 +106,13 @@ describe("Dida normalization", () => {
       status: 0,
       columnId: 7 as unknown as string,
     })).toThrow(/columnId/);
+    expect(() => normalizeTask({
+      id: "task-column-name-invalid",
+      projectId: "project-1",
+      title: "Bad column name",
+      status: 0,
+      columnName: 7 as unknown as string,
+    })).toThrow(/columnName/);
     expect(() => normalizeTask({
       id: "task-1",
       projectId: "project-1",

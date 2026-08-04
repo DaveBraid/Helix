@@ -12,6 +12,25 @@ import { rotatingChallenges } from "../src/domain/gamification";
 import { stableHash } from "../src/domain/stable";
 import { taskSyncProjection } from "../src/integrations/dida/adapters";
 import { normalizeTask } from "../src/integrations/dida/normalization";
+import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
+
+function grantTaskCrud(
+  data: ReturnType<typeof createDefaultData>,
+  taskScheduleMode: "point" | "duration" = "duration",
+): void {
+  data.didaContractCapabilities = {
+    probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+    authorizationBinding: didaAuthorizationBinding("token"),
+    taskScheduleMode,
+    boardPlacementVerified: true,
+    taskCrudVerified: true,
+    reminderWriteVerified: true,
+    repeatWriteVerified: true,
+    parentTaskVerified: true,
+    verifiedAt: "2026-08-03T00:00:00.000Z",
+  };
+}
+import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 
 async function createBoardMoveHarness(): Promise<{
   service: HelixService;
@@ -31,12 +50,7 @@ async function createBoardMoveHarness(): Promise<{
   persisted: () => ReturnType<typeof createDefaultData>;
 }> {
   const data = createDefaultData("device-board-harness");
-  data.didaContractCapabilities = {
-    probeVersion: 2,
-    taskScheduleMode: "point",
-    boardPlacementVerified: true,
-    verifiedAt: "2026-08-03T00:00:00.000Z",
-  };
+  grantTaskCrud(data, "point");
   const project: DidaProject = {
     id: "project-board-harness",
     name: "Board",
@@ -193,8 +207,10 @@ describe("HelixService runtime recovery", () => {
 
   it("restores the verified schedule mode and clears it when authorization changes", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     data.didaContractCapabilities = {
-      probeVersion: 2,
+      probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+      authorizationBinding: didaAuthorizationBinding("token"),
       taskScheduleMode: "point",
       boardPlacementVerified: true,
       verifiedAt: "2026-07-31T00:00:00.000Z",
@@ -231,8 +247,171 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.didaContractCapabilities).toBeUndefined();
   });
 
+  it("fails closed for a matching-token v3 contract cache after the probe version upgrade", async () => {
+    const data = createDefaultData("device-v3-contract-cache");
+    data.didaContractCapabilities = {
+      probeVersion: 3,
+      authorizationBinding: didaAuthorizationBinding("token"),
+      taskScheduleMode: "duration",
+      boardPlacementVerified: true,
+      taskCrudVerified: true,
+      reminderWriteVerified: true,
+      repeatWriteVerified: true,
+      parentTaskVerified: true,
+      verifiedAt: "2026-08-04T00:00:00.000Z",
+    };
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(data); },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+
+    await service.initialize();
+
+    expect(service.snapshot()).toMatchObject({
+      authorizationConfigured: true,
+      taskScheduleMode: "unknown",
+      boardPlacementVerified: false,
+      taskCrudVerified: false,
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
+    });
+    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 4.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
+  });
+
+  it("does not reuse another authorization's cached write capabilities", async () => {
+    const data = createDefaultData("device-auth-binding");
+    data.didaContractCapabilities = {
+      probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+      authorizationBinding: didaAuthorizationBinding("account-a-token"),
+      taskScheduleMode: "duration",
+      boardPlacementVerified: true,
+      taskCrudVerified: true,
+      reminderWriteVerified: true,
+      repeatWriteVerified: true,
+      parentTaskVerified: true,
+      verifiedAt: "2026-08-03T00:00:00.000Z",
+    };
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(data); },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "account-b-token" } as HelixSecretStore,
+    );
+
+    await service.initialize();
+
+    expect(service.snapshot()).toMatchObject({
+      taskScheduleMode: "unknown",
+      boardPlacementVerified: false,
+      taskCrudVerified: false,
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
+    });
+  });
+
+  it("blocks unverified task create update and complete before API or queue access", async () => {
+    const data = createDefaultData("device-unverified-task-write");
+    const task: DidaTask = {
+      id: "task-unverified",
+      projectId: "project-1",
+      title: "Blocked",
+      status: 0,
+    };
+    const snapshot = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`task:${task.id}`] = snapshot;
+    data.localSnapshots[`task:${task.id}`] = snapshot;
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    const api = (service as unknown as { api: { createTask: () => Promise<never> } }).api;
+    let apiCalls = 0;
+    api.createTask = async () => {
+      apiCalls += 1;
+      throw new Error("must not run");
+    };
+
+    await expect(service.createTask("Blocked", "project-1")).rejects.toThrow(/基础写入合同/);
+    await expect(service.queueTaskUpdate({ ...task, title: "Edited" }))
+      .rejects.toThrow(/基础写入合同/);
+    await expect(service.completeTask(task.id)).rejects.toThrow(/基础写入合同/);
+    expect(apiCalls).toBe(0);
+    expect(persisted.queue).toEqual([]);
+  });
+
+  it("blocks task and project conflict writes when board is verified but task CRUD is not", async () => {
+    const data = createDefaultData("device-unverified-conflicts");
+    data.didaContractCapabilities = {
+      probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+      authorizationBinding: didaAuthorizationBinding("token"),
+      taskScheduleMode: "point",
+      boardPlacementVerified: true,
+      taskCrudVerified: false,
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
+      verifiedAt: "2026-08-04T00:00:00.000Z",
+    };
+    const taskBase = createSnapshot("task", "task-conflict", {
+      id: "task-conflict", projectId: "project-1", title: "Base", status: 0,
+    });
+    const projectBase = createSnapshot("project", "project-conflict", {
+      id: "project-conflict", name: "Base",
+    });
+    data.conflicts = [
+      {
+        id: "task-conflict", kind: "task", entityId: "task-conflict", title: "Task",
+        createdAt: "2026-08-04T00:00:00.000Z", updatedAt: "2026-08-04T00:00:00.000Z",
+        status: "staged", base: taskBase,
+        local: createSnapshot("task", "task-conflict", { ...taskBase.value, title: "Local" }),
+        remote: taskBase,
+        fields: buildConflictFields(taskBase.value, { ...taskBase.value, title: "Local" }, taskBase.value)
+          .map((field) => ({ ...field, choice: "local" as const })),
+        remoteRecheckCount: 0, sourceDeviceId: "device-a",
+      },
+      {
+        id: "project-conflict", kind: "project", entityId: "project-conflict", title: "Project",
+        createdAt: "2026-08-04T00:00:00.000Z", updatedAt: "2026-08-04T00:00:00.000Z",
+        status: "staged", base: projectBase,
+        local: createSnapshot("project", "project-conflict", { ...projectBase.value, name: "Local" }),
+        remote: projectBase,
+        fields: buildConflictFields(projectBase.value, { ...projectBase.value, name: "Local" }, projectBase.value)
+          .map((field) => ({ ...field, choice: "local" as const })),
+        remoteRecheckCount: 0, sourceDeviceId: "device-a",
+      },
+    ];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    let apiCalls = 0;
+    const api = (service as unknown as { api: Record<string, () => void> }).api;
+    api.getTask = () => { apiCalls += 1; throw new Error("must not run"); };
+    api.getProject = () => { apiCalls += 1; throw new Error("must not run"); };
+
+    expect(() => service.applyConflict("task-conflict")).toThrow(/完整有效的写入合同/);
+    expect(() => service.applyConflict("project-conflict")).toThrow(/完整有效的写入合同/);
+    expect(apiCalls).toBe(0);
+    expect(persisted.conflicts.map((conflict) => conflict.status)).toEqual(["staged", "staged"]);
+  });
+
   it("rejects a new duration before queueing when the account is in point mode", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data, "point");
     const baseTask: DidaTask = {
       id: "task-schedule",
       projectId: "project-1",
@@ -266,6 +445,7 @@ describe("HelixService runtime recovery", () => {
 
   it("rejects moving an existing task into a list without a remote identity", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const task: DidaTask = {
       id: "task-existing",
       projectId: "project-remote",
@@ -929,6 +1109,7 @@ describe("HelixService runtime recovery", () => {
 
   it("migrates an in-progress marker after an ordinary queued create succeeds", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const local: DidaTask = {
       id: "local-ordinary",
       projectId: "project-1",
@@ -992,6 +1173,7 @@ describe("HelixService runtime recovery", () => {
 
   it("runs concurrent applications of the same conflict only once", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const baseTask: DidaTask = {
       id: "task-1",
       projectId: "project-1",
@@ -1070,6 +1252,7 @@ describe("HelixService runtime recovery", () => {
 
   it("keeps the in-progress project current after a task move", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const task: DidaTask = {
       id: "task-move",
       projectId: "project-old",
@@ -1099,9 +1282,11 @@ describe("HelixService runtime recovery", () => {
       { getDidaToken: () => "token" } as HelixSecretStore,
     );
     await service.initialize();
+    let processed: SyncQueueOperation<DidaTask> | undefined;
     Object.defineProperty(service, "taskEngine", {
       value: {
         async process(operation: SyncQueueOperation<DidaTask>) {
+          processed = structuredClone(operation);
           return { outcome: "pushed", snapshot: operation.local };
         },
       },
@@ -1109,6 +1294,12 @@ describe("HelixService runtime recovery", () => {
 
     await service.queueTaskUpdate({ ...task, projectId: "project-new" });
 
+    expect(processed).toMatchObject({
+      operation: "update",
+      projectId: "project-old",
+      writeFields: [],
+      local: { value: { projectId: "project-new" } },
+    });
     expect(persisted.inProgress[0]?.projectId).toBe("project-new");
     expect(service.snapshot().inProgress[0]?.projectId).toBe("project-new");
     expect(service.visibleInProgress(false)[0]?.project).toBeUndefined();
@@ -1116,6 +1307,7 @@ describe("HelixService runtime recovery", () => {
 
   it("queues a remote view-mode update without putting board cache into project truth", async () => {
     const data = createDefaultData("device-project-view");
+    grantTaskCrud(data);
     const project = { id: "project-view", name: "Board", viewMode: "list", permission: "write" } as const;
     const base = createSnapshot("project", project.id, project);
     data.baseSnapshots[`project:${project.id}`] = base;
@@ -1160,6 +1352,7 @@ describe("HelixService runtime recovery", () => {
 
   it("keeps a view-mode update pending while offline and reports its sync state", async () => {
     const data = createDefaultData("device-project-view-offline");
+    grantTaskCrud(data);
     const project = { id: "project-offline", name: "Offline", viewMode: "list", permission: "write" } as const;
     const base = createSnapshot("project", project.id, project);
     data.baseSnapshots[`project:${project.id}`] = base;
@@ -1190,12 +1383,7 @@ describe("HelixService runtime recovery", () => {
 
   it("moves one board task only after exact remote column preflight", async () => {
     const data = createDefaultData("device-board-move");
-    data.didaContractCapabilities = {
-      probeVersion: 2,
-      taskScheduleMode: "point",
-      boardPlacementVerified: true,
-      verifiedAt: "2026-08-03T00:00:00.000Z",
-    };
+    grantTaskCrud(data, "point");
     const project: DidaProject = {
       id: "project-board-move",
       name: "Board",
@@ -1273,6 +1461,22 @@ describe("HelixService runtime recovery", () => {
     expect(control.updateCalls).toBe(0);
   });
 
+  it("blocks board placement before reads when only the historic board capability remains", async () => {
+    const { service, project, task, control, persisted } = await createBoardMoveHarness();
+    const before = structuredClone(persisted());
+    (service as unknown as {
+      patch(value: { boardPlacementVerified: boolean; taskCrudVerified: boolean }): void;
+    }).patch({ boardPlacementVerified: true, taskCrudVerified: false });
+
+    await expect(service.moveTaskToBoardColumn(project.id, task.id, "doing"))
+      .rejects.toThrow(/完整有效的写入合同/);
+
+    expect(control.projectDataCalls).toBe(0);
+    expect(control.getTaskCalls).toBe(0);
+    expect(control.updateCalls).toBe(0);
+    expect(persisted()).toEqual(before);
+  });
+
   it("treats a repeated move to the current column as a zero-write no-op", async () => {
     const { service, project, task, control } = await createBoardMoveHarness();
 
@@ -1285,12 +1489,7 @@ describe("HelixService runtime recovery", () => {
 
   it("refuses a board move when the remote task already changed columns", async () => {
     const data = createDefaultData("device-board-race");
-    data.didaContractCapabilities = {
-      probeVersion: 2,
-      taskScheduleMode: "point",
-      boardPlacementVerified: true,
-      verifiedAt: "2026-08-03T00:00:00.000Z",
-    };
+    grantTaskCrud(data, "point");
     const project: DidaProject = { id: "project-board-race", name: "Board", permission: "write" };
     const task: DidaTask = { id: "task-board-race", projectId: project.id, title: "Race", status: 0 };
     const projectBase = createSnapshot("project", project.id, project);
@@ -1490,6 +1689,7 @@ describe("HelixService runtime recovery", () => {
 
   it("refuses view-mode writes for a read-only list before queueing", async () => {
     const data = createDefaultData("device-project-read-only");
+    grantTaskCrud(data);
     const project = { id: "project-read", name: "Shared", viewMode: "list", permission: "read" } as const;
     const base = createSnapshot("project", project.id, project);
     data.baseSnapshots[`project:${project.id}`] = base;
@@ -1511,6 +1711,7 @@ describe("HelixService runtime recovery", () => {
 
   it("records a verified completion immediately after the queue write succeeds", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const task: DidaTask = {
       id: "task-complete",
       projectId: "project-1",
@@ -1598,8 +1799,9 @@ describe("HelixService runtime recovery", () => {
     await expect(
       service.chooseConflict("conflict-applying", "title", "remote"),
     ).rejects.toThrow(/不可修改字段选择/);
-    await service.releaseApplyingConflict("conflict-applying");
-    expect(persisted.conflicts[0]?.status).toBe("staged");
+    await expect(service.releaseApplyingConflict("conflict-applying"))
+      .rejects.toThrow(/不得解锁重试/);
+    expect(persisted.conflicts[0]?.status).toBe("applying");
   });
 
   it("changes only the schedule field explicitly selected by the user", async () => {
@@ -1699,6 +1901,7 @@ describe("HelixService runtime recovery", () => {
 
   it("finalizes an explicitly chosen deletion without persisting null caches", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const task: DidaTask = {
       id: "task-delete",
       projectId: "project-1",
@@ -1903,6 +2106,7 @@ describe("HelixService runtime recovery", () => {
 
   it("does not finalize an in-flight queue result after service disposal", async () => {
     const data = createDefaultData("device-a");
+    grantTaskCrud(data);
     const task: DidaTask = {
       id: "task-dispose",
       projectId: "project-1",

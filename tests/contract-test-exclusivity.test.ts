@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 import type { App } from "obsidian";
 import type { DidaApi } from "../src/integrations/dida/api";
 import type { DidaProject, DidaTask } from "../src/domain/entities";
@@ -8,6 +9,7 @@ import { createDefaultData } from "../src/storage/model";
 import { HelixSecretStore } from "../src/storage/secrets";
 import { createSnapshot } from "../src/sync/snapshots";
 import type { SyncQueueOperation } from "../src/sync/types";
+import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 
 describe("HelixService contract-test exclusivity", () => {
   it("preserves quick-entry task attributes through the normal create queue", async () => {
@@ -174,10 +176,98 @@ describe("HelixService contract-test exclusivity", () => {
     expect(secrets.getDidaToken()).toBe("replacement-token");
   });
 
+  it("persists contract invalidation before a failed run and remains read-only after reload", async () => {
+    const { service, secrets, store, reload } = await serviceFixture();
+    const api = serviceApi(service);
+    api.getProjects = async () => [];
+    api.createProject = async () => {
+      throw new Error("contract runner intentionally stopped");
+    };
+
+    const report = await service.runDidaWriteContractTest();
+
+    expect(report.status).toBe("failed");
+    expect((await store.snapshot()).didaContractCapabilities).toBeUndefined();
+    expect(service.snapshot()).toMatchObject({
+      taskScheduleMode: "unknown",
+      taskCrudVerified: false,
+      boardPlacementVerified: false,
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
+    });
+    const reloaded = await reload();
+    expect(reloaded.snapshot()).toMatchObject({
+      authorizationConfigured: true,
+      taskScheduleMode: "unknown",
+      taskCrudVerified: false,
+      boardPlacementVerified: false,
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
+    });
+    expect(secrets.getDidaToken()).toBe("initial-contract-token");
+  });
+
+  it("pulls read-only data after invalidation without draining pending task or project writes", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    // 通过真实服务路径使当前 runtime 与持久缓存同时失效。
+    api.getProjects = async () => [];
+    api.createProject = async () => { throw new Error("contract runner intentionally stopped"); };
+    await service.runDidaWriteContractTest();
+    const pendingTask: DidaTask = {
+      id: "pending-task", projectId: "project-1", title: "Pending task", status: 0,
+    };
+    const pendingProject: DidaProject = { id: "pending-project", name: "Pending project" };
+    const taskBase = createSnapshot("task", pendingTask.id, pendingTask);
+    const projectBase = createSnapshot("project", pendingProject.id, pendingProject);
+    await store.mutate((data) => {
+      data.queue = [
+        {
+          id: "pending-task-update", kind: "task", entityId: pendingTask.id,
+          projectId: pendingTask.projectId, operation: "update", createdAt: "2026-08-04T00:00:00Z",
+          updatedAt: "2026-08-04T00:00:00Z", attempts: 0, status: "pending", base: taskBase,
+          local: createSnapshot("task", pendingTask.id, { ...pendingTask, title: "Local task" }),
+          writeFields: ["title"],
+        },
+        {
+          id: "pending-project-update", kind: "project", entityId: pendingProject.id,
+          operation: "update", createdAt: "2026-08-04T00:00:01Z", updatedAt: "2026-08-04T00:00:01Z",
+          attempts: 0, status: "pending", base: projectBase,
+          local: createSnapshot("project", pendingProject.id, { ...pendingProject, name: "Local project" }),
+          writeFields: ["name"],
+        },
+      ];
+    });
+    // 模拟一次完全只读拉取；任意生产写入或队列引擎调用都应使测试失败。
+    let readCalls = 0;
+    let writeCalls = 0;
+    api.getProjects = async () => { readCalls += 1; return []; };
+    api.filterTasks = async () => { readCalls += 1; return []; };
+    api.getCompletedTasks = async () => { readCalls += 1; return []; };
+    api.listHabits = async () => { readCalls += 1; return []; };
+    api.listFocus = async () => { readCalls += 1; return []; };
+    api.updateTask = async () => { writeCalls += 1; throw new Error("must not write"); };
+    api.updateProject = async () => { writeCalls += 1; throw new Error("must not write"); };
+    Object.defineProperty(service, "taskEngine", { value: { async process() { writeCalls += 1; throw new Error("must not drain"); } } });
+    Object.defineProperty(service, "projectEngine", { value: { async process() { writeCalls += 1; throw new Error("must not drain"); } } });
+
+    await service.sync();
+
+    expect(readCalls).toBeGreaterThanOrEqual(3);
+    expect(writeCalls).toBe(0);
+    expect((await store.snapshot()).queue).toMatchObject([
+      { id: "pending-task-update", status: "pending", attempts: 0 },
+      { id: "pending-project-update", status: "pending", attempts: 0 },
+    ]);
+  });
+
   it("keeps the old credential when capability invalidation cannot be persisted", async () => {
     let persisted = createDefaultData("authorization-test-device");
     persisted.didaContractCapabilities = {
-      probeVersion: 2,
+      probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+      authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
       taskScheduleMode: "duration",
       boardPlacementVerified: true,
       verifiedAt: "2026-07-31T00:00:00.000Z",
@@ -307,8 +397,21 @@ describe("HelixService contract-test exclusivity", () => {
 async function serviceFixture(): Promise<{
   service: HelixService;
   secrets: HelixSecretStore;
+  store: HelixDataStore;
+  reload: () => Promise<HelixService>;
 }> {
   let persisted = createDefaultData("contract-test-device");
+  persisted.didaContractCapabilities = {
+    probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+    authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+    taskScheduleMode: "duration",
+    boardPlacementVerified: true,
+    taskCrudVerified: true,
+    reminderWriteVerified: true,
+    repeatWriteVerified: true,
+    parentTaskVerified: true,
+    verifiedAt: "2026-08-03T00:00:00.000Z",
+  };
   const port: PluginDataPort = {
     async loadData() {
       return structuredClone(persisted);
@@ -326,9 +429,19 @@ async function serviceFixture(): Promise<{
   } as unknown as App;
   const secrets = new HelixSecretStore(app);
   secrets.setDidaToken("initial-contract-token");
-  const service = new HelixService(new HelixDataStore(port), secrets);
+  const store = new HelixDataStore(port);
+  const service = new HelixService(store, secrets);
   await service.initialize();
-  return { service, secrets };
+  return {
+    service,
+    secrets,
+    store,
+    async reload() {
+      const replacement = new HelixService(new HelixDataStore(port), secrets);
+      await replacement.initialize();
+      return replacement;
+    },
+  };
 }
 
 function serviceApi(service: HelixService): DidaApi {

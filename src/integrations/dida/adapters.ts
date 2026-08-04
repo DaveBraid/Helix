@@ -5,13 +5,14 @@ import type {
   DidaProject,
   DidaTask,
 } from "../../domain/entities";
+import { didaTaskWithoutRemoteMetadata } from "../../domain/dida-task-metadata";
 import { deepEqual } from "../../domain/stable";
 import {
   validateTaskScheduleWrite,
   type TaskScheduleMode,
 } from "../../domain/task-schedule";
-import type { RemoteEntityAdapter } from "../../sync/types";
-import { DidaApi } from "./api";
+import type { RemoteEntityAdapter, RemoteWriteContext } from "../../sync/types";
+import { DidaApi, type DidaTaskUpdateWirePayload, type DidaTaskWriteWirePayload } from "./api";
 import {
   normalizeFocus,
   normalizeHabit,
@@ -27,6 +28,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
   constructor(
     private readonly api: DidaApi,
     private readonly scheduleMode: () => TaskScheduleMode = () => "duration",
+    private readonly writeCapabilities: () => DidaTaskWriteCapabilities = () => ({}),
   ) {}
 
   async get(entityId: string, context?: { projectId?: string }): Promise<DidaTask | null> {
@@ -40,15 +42,19 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
   }
 
   async create(value: DidaTask): Promise<DidaTask> {
+    this.assertTaskCrudVerified();
     validateTaskScheduleWrite(value, this.scheduleMode());
-    return taskSyncProjection(normalizeTask(await this.api.createTask(taskCreatePayload(value))));
+    return taskSyncProjection(normalizeTask(await this.api.createTask(
+      taskCreatePayload(value, this.writeCapabilities()),
+    )));
   }
 
   async update(
     entityId: string,
     value: DidaTask,
-    context?: { projectId?: string },
+    context?: RemoteWriteContext,
   ): Promise<DidaTask> {
+    this.assertTaskCrudVerified();
     let remoteBeforeWrite = await this.get(entityId, { projectId: value.projectId });
     let scheduleValidated = false;
     if (context?.projectId && context.projectId !== value.projectId) {
@@ -78,7 +84,17 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     if (!scheduleValidated) {
       validateTaskScheduleWrite(value, this.scheduleMode(), remoteBeforeWrite);
     }
-    await this.api.updateTask(entityId, taskUpdatePayload(value));
+    const verified = this.writeCapabilities();
+    const writeFields = new Set(context?.writeFields ?? []);
+    const changedCapabilities: DidaTaskWriteCapabilities = {
+      reminderWriteVerified: verified.reminderWriteVerified === true && writeFields.has("reminders"),
+      repeatWriteVerified: verified.repeatWriteVerified === true && writeFields.has("repeatFlag"),
+      parentTaskVerified: verified.parentTaskVerified === true && writeFields.has("parentId"),
+    };
+    // 纯跨清单迁移已由 moveTask 表达；不得再发送只有身份字段的空业务更新。
+    if (writeFields.size > 0) {
+      await this.api.updateTask(entityId, taskUpdatePayload(value, changedCapabilities, writeFields));
+    }
     let current = await this.get(entityId, { projectId: value.projectId });
     if (!current) throw new Error("任务更新后无法复读");
     if (value.status === 2 && current.status !== 2) {
@@ -94,9 +110,16 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     return taskSyncProjection(normalizeTask(current));
   }
 
-  async delete(entityId: string, context?: { projectId?: string }): Promise<void> {
+  async delete(entityId: string, context?: RemoteWriteContext): Promise<void> {
+    this.assertTaskCrudVerified();
     if (!context?.projectId) throw new Error("Task deletion requires projectId");
     await this.api.deleteTask(context.projectId, entityId);
+  }
+
+  private assertTaskCrudVerified(): void {
+    if (this.writeCapabilities().taskCrudVerified !== true) {
+      throw new Error("当前滴答账号尚未通过任务基础写入合同测试");
+    }
   }
 }
 
@@ -179,7 +202,17 @@ function isNotFound(error: unknown): boolean {
   return !!error && typeof error === "object" && "statusCode" in error && error.statusCode === 404;
 }
 
-function taskCreatePayload(value: DidaTask): Partial<DidaTask> & Pick<DidaTask, "title" | "projectId"> {
+export interface DidaTaskWriteCapabilities {
+  taskCrudVerified?: boolean;
+  reminderWriteVerified?: boolean;
+  repeatWriteVerified?: boolean;
+  parentTaskVerified?: boolean;
+}
+
+export function taskCreatePayload(
+  value: DidaTask,
+  capabilities: DidaTaskWriteCapabilities = {},
+): DidaTaskWriteWirePayload & Pick<DidaTask, "title" | "projectId"> {
   return {
     title: value.title,
     projectId: value.projectId,
@@ -193,32 +226,67 @@ function taskCreatePayload(value: DidaTask): Partial<DidaTask> & Pick<DidaTask, 
     sortOrder: value.sortOrderUnsafe ? undefined : value.sortOrder,
     items: serializeDidaChecklistItems(value.items),
     tags: value.tags,
+    ...(capabilities.reminderWriteVerified && Object.hasOwn(value, "reminders")
+      ? { reminders: value.reminders }
+      : {}),
+    ...(capabilities.repeatWriteVerified && Object.hasOwn(value, "repeatFlag")
+      ? { repeatFlag: value.repeatFlag }
+      : {}),
+    ...(capabilities.parentTaskVerified && Object.hasOwn(value, "parentId")
+      ? { parentId: value.parentId }
+      : {}),
   };
 }
 
-function taskUpdatePayload(value: DidaTask): Partial<DidaTask> {
+export function taskUpdatePayload(
+  value: DidaTask,
+  capabilities: DidaTaskWriteCapabilities = {},
+  explicitWriteFields: Iterable<string> = [],
+): DidaTaskUpdateWirePayload {
+  const writeFields = new Set(explicitWriteFields);
   return {
     id: value.id,
     projectId: value.projectId,
-    parentId: clearedAs(value, "parentId", null),
-    title: value.title,
-    content: clearedAs(value, "content", ""),
-    desc: clearedAs(value, "desc", ""),
-    isAllDay: clearedAs(value, "isAllDay", false),
-    startDate: serializeDidaDate(clearedAs(value, "startDate", null), "任务开始日期"),
-    dueDate: serializeDidaDate(clearedAs(value, "dueDate", null), "任务截止日期"),
-    timeZone: clearedAs(value, "timeZone", null),
-    priority: clearedAs(value, "priority", 0),
-    sortOrder: value.sortOrderUnsafe ? undefined : clearedAs(value, "sortOrder", 0),
-    items: serializeDidaChecklistItems(clearedAs(value, "items", [])),
-    tags: clearedAs(value, "tags", []),
+    ...(writeFields.has("title") ? { title: value.title } : {}),
+    ...(writeFields.has("content") ? { content: clearedAs(value, "content", "") } : {}),
+    ...(writeFields.has("desc") ? { desc: clearedAs(value, "desc", "") } : {}),
+    ...(writeFields.has("isAllDay") ? { isAllDay: clearedAs(value, "isAllDay", false) } : {}),
+    ...(writeFields.has("startDate")
+      ? { startDate: serializeDidaDate(clearedAs(value, "startDate", null), "任务开始日期") }
+      : {}),
+    ...(writeFields.has("dueDate")
+      ? { dueDate: serializeDidaDate(clearedAs(value, "dueDate", null), "任务截止日期") }
+      : {}),
+    ...(writeFields.has("timeZone") ? { timeZone: value.timeZone } : {}),
+    ...(writeFields.has("priority") ? { priority: clearedAs(value, "priority", 0) } : {}),
+    // 缺失或不安全的远端排序值绝不是“清零”意图。
+    ...(writeFields.has("sortOrder") && !value.sortOrderUnsafe && value.sortOrder !== undefined
+      ? { sortOrder: value.sortOrder }
+      : {}),
+    ...(writeFields.has("items")
+      ? { items: serializeDidaChecklistItems(clearedAs(value, "items", [])) }
+      : {}),
+    ...(writeFields.has("tags") ? { tags: clearedAs(value, "tags", []) } : {}),
+    ...(writeFields.has("reminders") && capabilities.reminderWriteVerified && Object.hasOwn(value, "reminders")
+      ? {
+        reminders: Array.isArray(value.reminders) && value.reminders.length === 0
+          ? null
+          : value.reminders,
+      }
+      : {}),
+    ...(writeFields.has("repeatFlag") && capabilities.repeatWriteVerified && Object.hasOwn(value, "repeatFlag")
+      ? { repeatFlag: clearedAs(value, "repeatFlag", null) }
+      : {}),
+    ...(writeFields.has("parentId") && capabilities.parentTaskVerified && Object.hasOwn(value, "parentId")
+      ? { parentId: clearedAs(value, "parentId", null) }
+      : {}),
   };
 }
 
 export function taskBoardPlacementPayload(
   value: DidaTask,
   columnId: string,
-): Partial<DidaTask> {
+): DidaTaskWriteWirePayload {
   if (!columnId.trim()) throw new Error("看板列 ID 不能为空");
   return {
     id: value.id,
@@ -229,13 +297,13 @@ export function taskBoardPlacementPayload(
 
 export function taskBoardPlacementInvariant(
   task: DidaTask,
-): Omit<DidaTask, "columnId" | "etag" | "modifiedTime"> {
+): Omit<DidaTask, "columnId" | "columnName" | "etag" | "modifiedTime" | "etimestamp"> {
+  const withoutMetadata = didaTaskWithoutRemoteMetadata(task);
   const {
     columnId: _columnId,
-    etag: _etag,
-    modifiedTime: _modifiedTime,
+    columnName: _columnName,
     ...invariant
-  } = task;
+  } = withoutMetadata;
   return invariant;
 }
 
@@ -265,6 +333,9 @@ function projectWritePayload(value: DidaProject): Partial<DidaProject> & Pick<Di
 }
 
 export function taskSyncProjection(value: DidaTask): DidaTask {
-  const { columnId: _columnId, ...syncValue } = value;
+  const withoutMetadata = didaTaskWithoutRemoteMetadata(value);
+  // columnName 是服务端随看板详情派生的展示字段；它不属于任务三方同步
+  // 的业务真值，更不能变成可写冲突。
+  const { columnId: _columnId, columnName: _columnName, ...syncValue } = withoutMetadata;
   return syncValue;
 }

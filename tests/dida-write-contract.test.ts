@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
+import type { DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
 import {
   DidaWriteContractRunner,
@@ -23,21 +24,45 @@ class ContractApiFake {
   injectForeignTaskOnMove = false;
   injectForeignCompletedTaskOnMove = false;
   throwAfterMove = false;
+  moveNotAppliedUnknown = false;
+  moveResponse: unknown = undefined;
+  moveCollectionVisibility: "normal" | "both-once" | "none-once" | "both-always" | "none-always" = "normal";
+  moveProjectIdentityMismatch?: "source" | "target";
+  corruptMovedContent = false;
+  failTargetReadAfterMove = false;
+  failTargetCollectionReadAfterMove = false;
+  failSourceCollectionReadAfterMove = false;
+  moveCalls = 0;
   returnMoveTombstoneAtSource = false;
   duplicateSourceCollectionAfterMove = false;
   sourceTombstoneReads = 0;
   throwAfterComplete = false;
   updateOutcome: "success" | "applied-unknown" | "not-applied-unknown" = "success";
   placementOutcome: "success" | "applied-unknown" | "not-applied-unknown" = "success";
+  reminderUpdateOutcome?: "applied-unknown" | "not-applied-unknown";
+  parentUpdateOutcome?: "applied-unknown" | "not-applied-unknown";
   updateCalls = 0;
-  updatePayloads: Partial<DidaTask>[] = [];
+  updatePayloads: DidaTaskUpdateWirePayload[] = [];
   failUpdateRereadOnce = false;
   returnWrongIdOnUpdateReread = false;
   corruptUpdatedAllDay = false;
   corruptPlacementContent = false;
+  placementColumnNameAfterMutation?: string;
+  placementContentAfterMutation?: string;
+  placementErrorAfterMutation?: string;
+  rejectReminderWrites: false | string = false;
+  ignoreReminderClear = false;
+  addEmptyChildIdsWhenClearingReminder = false;
+  replaceChildIdsWhenClearingReminder = false;
+  returnStaleReminderOnClearRead = false;
+  rejectRepeatWrites: false | string = false;
+  advanceEtimestampOnUpdate = false;
+  rejectParentCreate: false | string = false;
+  rejectPlacementWrites: false | string = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
   throwAfterDelete = false;
+  rateLimitProjectCollectionAfterDeleteOnce = false;
   staleReadsAfterDelete = 0;
   completedVisibilityDelay = 0;
   throwCompletedReads = false;
@@ -65,8 +90,19 @@ class ContractApiFake {
   private columnSequence = 0;
   private updateRereadPending = false;
   private wrongUpdateIdPending = false;
+  private staleReminderClearRead?: DidaTask;
+  private projectCollectionRateLimited = false;
+  private moveCollectionReadRound = 0;
 
   async getProjects(): Promise<DidaProject[]> {
+    if (
+      this.rateLimitProjectCollectionAfterDeleteOnce &&
+      this.deletedProjects.length > 0 &&
+      !this.projectCollectionRateLimited
+    ) {
+      this.projectCollectionRateLimited = true;
+      throw new DidaHttpError("rate-limit", "查询限流，稍后只读复核", 500, 60_000);
+    }
     const projects = [...this.projects.values()].map((project) => ({ ...project }));
     for (const stale of this.staleProjects.values()) {
       if (stale.remaining <= 0) continue;
@@ -164,6 +200,20 @@ class ContractApiFake {
     columns: Array<{ id: string; projectId: string; name: string }>;
   }> {
     if (
+      this.failTargetCollectionReadAfterMove &&
+      projectId === "test-project-2" &&
+      this.tasks.get("test-task-1")?.projectId === projectId
+    ) {
+      throw new Error("target collection reread unavailable");
+    }
+    if (
+      this.failSourceCollectionReadAfterMove &&
+      projectId === "test-project-1" &&
+      this.tasks.get("test-task-1")?.projectId === "test-project-2"
+    ) {
+      throw new Error("source collection reread unavailable");
+    }
+    if (
       this.injectConcurrentColumnOnKanbanData &&
       this.projects.get(projectId)?.viewMode === "kanban"
     ) {
@@ -173,18 +223,41 @@ class ContractApiFake {
         { id: "concurrent-kanban-column", projectId, name: "用户竞争分栏" },
       ]);
     }
-    return {
-      project: this.forceProjectDataListMode
+    if (this.moveCalls > 0 && projectId === "test-project-1") this.moveCollectionReadRound += 1;
+    const isMoveCollection = this.moveCalls > 0 &&
+      (projectId === "test-project-1" || projectId === "test-project-2");
+    const visibility = this.moveCollectionVisibility;
+    const transient = (visibility === "both-once" || visibility === "none-once") &&
+      this.moveCollectionReadRound === 1;
+    const forceBoth = visibility === "both-always" || (visibility === "both-once" && transient);
+    const forceNone = visibility === "none-always" || (visibility === "none-once" && transient);
+    const project = this.forceProjectDataListMode
         ? { ...await this.getProject(projectId), viewMode: "list" }
-        : await this.getProject(projectId),
-      tasks: [
+        : await this.getProject(projectId);
+    const tasks = [
         ...[...this.tasks.values()].filter(
           (task) => task.projectId === projectId && task.status !== 2,
         ),
         ...[...this.moveSourceCollectionGhosts.values()].filter(
           (task) => task.projectId === projectId && task.status !== 2,
         ),
-      ],
+      ];
+    if (isMoveCollection && forceBoth && projectId === "test-project-1") {
+      const moved = this.tasks.get("test-task-1");
+      if (moved) tasks.push({ ...moved, projectId });
+    }
+    const visibleTasks = isMoveCollection && forceNone
+      ? tasks.filter((task) => task.id !== "test-task-1")
+      : tasks;
+    return {
+      project: this.moveProjectIdentityMismatch === "source" && isMoveCollection &&
+          projectId === "test-project-1"
+        ? { ...project, id: "wrong-source-project" }
+        : this.moveProjectIdentityMismatch === "target" && isMoveCollection &&
+            projectId === "test-project-2"
+          ? { ...project, id: "wrong-target-project" }
+          : project,
+      tasks: visibleTasks,
       columns: await this.getColumns(projectId),
     };
   }
@@ -237,6 +310,9 @@ class ContractApiFake {
   async createTask(
     value: Partial<DidaTask> & Pick<DidaTask, "title" | "projectId">,
   ): Promise<DidaTask> {
+    if (this.rejectParentCreate && value.parentId) {
+      throw new DidaHttpError("permanent", this.rejectParentCreate, 400);
+    }
     const task: DidaTask = {
       ...value,
       id: `test-task-${++this.taskSequence}`,
@@ -256,9 +332,17 @@ class ContractApiFake {
       throw new Error("update reread unavailable");
     }
     const task = this.tasks.get(taskId);
+    if (this.failTargetReadAfterMove && projectId === "test-project-2" && task?.projectId === projectId) {
+      throw new Error("target reread unavailable");
+    }
     if (task && this.wrongUpdateIdPending) {
       this.wrongUpdateIdPending = false;
       return { ...task, id: "wrong-task-id" };
+    }
+    if (task && this.staleReminderClearRead?.id === taskId) {
+      const stale = this.staleReminderClearRead;
+      this.staleReminderClearRead = undefined;
+      return { ...stale };
     }
     if (!task || task.projectId !== projectId) {
       const moveTombstone = this.moveSourceTombstones.get(`${projectId}:${taskId}`);
@@ -274,24 +358,77 @@ class ContractApiFake {
     return { ...task };
   }
 
-  async updateTask(taskId: string, value: Partial<DidaTask>): Promise<DidaTask> {
+  async updateTask(taskId: string, value: DidaTaskUpdateWirePayload): Promise<DidaTask> {
     this.updateCalls += 1;
     this.updatePayloads.push({ ...value });
     const current = this.tasks.get(taskId);
     if (!current) throw notFound();
+    if (this.rejectReminderWrites && Object.hasOwn(value, "reminders")) {
+      throw new DidaHttpError("permanent", this.rejectReminderWrites, 400);
+    }
+    if (this.rejectRepeatWrites && Object.hasOwn(value, "repeatFlag")) {
+      throw new DidaHttpError("permanent", this.rejectRepeatWrites, 400);
+    }
     const placement = Object.prototype.hasOwnProperty.call(value, "columnId") &&
       !Object.prototype.hasOwnProperty.call(value, "title");
-    const outcome = placement ? this.placementOutcome : this.updateOutcome;
+    if (placement && this.rejectPlacementWrites) {
+      throw new DidaHttpError("permanent", this.rejectPlacementWrites, 400);
+    }
+    const outcome = placement
+      ? this.placementOutcome
+      : Object.hasOwn(value, "reminders")
+        ? (this.reminderUpdateOutcome ?? this.updateOutcome)
+        : Object.hasOwn(value, "parentId")
+          ? (this.parentUpdateOutcome ?? this.updateOutcome)
+          : this.updateOutcome;
     if (outcome === "not-applied-unknown") {
       if (this.failUpdateRereadOnce) this.updateRereadPending = true;
       throw new DidaHttpError("unknown-outcome", "update unknown", 503, undefined, true);
     }
-    const updated = { ...current, ...value };
+    const updated = {
+      ...current,
+      ...value,
+      reminders: value.reminders === null
+        ? (this.ignoreReminderClear ? current.reminders : [])
+        : (value.reminders ?? current.reminders),
+      ...(this.advanceEtimestampOnUpdate
+        ? { etimestamp: Number(current.etimestamp ?? 0) + 1 }
+        : {}),
+    };
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
     if (this.corruptSchedule) updated.dueDate = "2030-01-01T00:00:00.000Z";
     if (this.corruptUpdatedAllDay) updated.isAllDay = true;
-    if (placement && this.corruptPlacementContent) updated.content = "被归栏意外改写";
+    if (
+      this.addEmptyChildIdsWhenClearingReminder &&
+      (value.reminders === null ||
+        (Array.isArray(value.reminders) && value.reminders.length === 0))
+    ) {
+      updated.childIds = [];
+    }
+    if (
+      this.replaceChildIdsWhenClearingReminder &&
+      (value.reminders === null ||
+        (Array.isArray(value.reminders) && value.reminders.length === 0))
+    ) {
+      updated.childIds = ["unexpected-child-id"];
+    }
+    if (
+      this.returnStaleReminderOnClearRead &&
+      (value.reminders === null ||
+        (Array.isArray(value.reminders) && value.reminders.length === 0))
+    ) {
+      this.staleReminderClearRead = { ...current };
+    }
+    if (placement && this.corruptPlacementContent) {
+      updated.content = this.placementContentAfterMutation ?? "被归栏意外改写";
+    }
+    if (placement && this.placementColumnNameAfterMutation !== undefined) {
+      updated.columnName = this.placementColumnNameAfterMutation;
+    }
     this.tasks.set(taskId, updated);
+    if (placement && this.placementErrorAfterMutation) {
+      throw new DidaHttpError("permanent", this.placementErrorAfterMutation, 400);
+    }
     if (outcome === "applied-unknown") {
       if (this.failUpdateRereadOnce) this.updateRereadPending = true;
       if (this.returnWrongIdOnUpdateReread) this.wrongUpdateIdPending = true;
@@ -304,13 +441,21 @@ class ContractApiFake {
     fromProjectId: string;
     toProjectId: string;
     taskId: string;
-  }): Promise<{ id: string }> {
+  }): Promise<unknown> {
+    this.moveCalls += 1;
+    if (this.moveNotAppliedUnknown) {
+      throw new DidaHttpError("unknown-outcome", "move not applied unknown", 503, undefined, true);
+    }
     const task = await this.getTask(input.fromProjectId, input.taskId);
     this.moveSourceTombstones.set(`${input.fromProjectId}:${task.id}`, { ...task });
     if (this.duplicateSourceCollectionAfterMove) {
       this.moveSourceCollectionGhosts.set(`${input.fromProjectId}:${task.id}`, { ...task });
     }
-    this.tasks.set(task.id, { ...task, projectId: input.toProjectId });
+    this.tasks.set(task.id, {
+      ...task,
+      projectId: input.toProjectId,
+      ...(this.corruptMovedContent ? { content: "move corrupted content" } : {}),
+    });
     if (this.injectForeignTaskOnMove) {
       this.tasks.set("foreign-task", {
         id: "foreign-task",
@@ -331,7 +476,7 @@ class ContractApiFake {
     if (this.throwAfterMove) {
       throw new DidaHttpError("unknown-outcome", "move unknown", 503, undefined, true);
     }
-    return { id: task.id };
+    return this.moveResponse ?? { id: task.id };
   }
 
   async completeTask(projectId: string, taskId: string): Promise<void> {
@@ -350,13 +495,13 @@ class ContractApiFake {
     const task = await this.getTask(projectId, taskId);
     this.deletedTasks.push(taskId);
     if (!this.keepTaskOnDelete) this.tasks.delete(taskId);
-    if (this.injectForeignColumnOnTaskDelete) {
+    if (this.injectForeignColumnOnTaskDelete && taskId === "test-task-1") {
       this.columns.set(projectId, [
         ...await this.getColumns(projectId),
         { id: "foreign-column", projectId, name: "用户新增分栏" },
       ]);
     }
-    if (this.renameKnownColumnOnTaskDelete) {
+    if (this.renameKnownColumnOnTaskDelete && taskId === "test-task-1") {
       const columns = await this.getColumns(projectId);
       this.columns.set(projectId, columns.map((column, index) =>
         index === 0 ? { ...column, name: "用户并发改名" } : column));
@@ -477,18 +622,60 @@ describe("DidaWriteContractRunner", () => {
     const api = new ContractApiFake();
     const report = await new DidaWriteContractRunner(api, () => "run-safe", fixedNow).run();
 
+    expect(report.failure).toBeUndefined();
     expect(report).toMatchObject({
       status: "passed",
       cleanupErrors: [],
       remoteArtifactsRemaining: false,
+      taskCrudVerified: true,
+      reminderWriteVerified: true,
+      repeatWriteVerified: true,
+      parentTaskVerified: true,
     });
+    expect(api.updatePayloads).toContainEqual(expect.objectContaining({
+      reminders: ["TRIGGER:-PT10M"],
+    }));
+    expect(api.updatePayloads).toContainEqual(expect.objectContaining({
+      repeatFlag: "RRULE:FREQ=DAILY;INTERVAL=1",
+    }));
+    expect(api.updatePayloads).toContainEqual(expect.objectContaining({
+      reminders: null,
+    }));
+    expect(api.updatePayloads).toContainEqual(expect.objectContaining({ repeatFlag: null }));
+    expect(api.updatePayloads).toContainEqual(expect.objectContaining({ parentId: null }));
+    expect(api.updatePayloads).toContainEqual(expect.objectContaining({ parentId: "test-task-4" }));
     expect(report.steps.join(" ")).toMatch(/列表→看板→列表.*3 个看板列/);
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");
     expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
+  });
+
+  it("keeps the successful contract at the recorded 95-call local-fake upper bound", async () => {
+    const api = new ContractApiFake();
+    let calls = 0;
+    const counted = new Proxy(api, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function"
+          ? (...args: unknown[]) => {
+              calls += 1;
+              return value.apply(target, args);
+            }
+          : value;
+      },
+    });
+    const report = await new DidaWriteContractRunner(
+      counted,
+      () => "run-request-count",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    // 此数只记录无传输重试的本地合同假体调用；不推断真实服务的分钟配额。
+    expect(calls).toBeLessThanOrEqual(95);
   });
 
   it("creates and renames uniquely marked columns when a new board has none", async () => {
@@ -503,6 +690,196 @@ describe("DidaWriteContractRunner", () => {
     expect(report.boardPlacementVerified).toBe(true);
     expect(report.steps.join(" ")).toMatch(/复读 2 个看板列/);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
+  });
+
+  it("keeps reminder and repeat capabilities independent after a safe rejection", async () => {
+    const api = new ContractApiFake();
+    api.rejectReminderWrites = "reminders unsupported";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-independent-capabilities",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.taskCrudVerified).toBe(true);
+    expect(report.reminderWriteVerified).toBe(false);
+    expect(report.repeatWriteVerified).toBe(true);
+    expect(report.parentTaskVerified).toBe(true);
+    expect(report.boardPlacementVerified).toBe(true);
+    expect(report.capabilityFailures).toEqual(["提醒：未通过写入合同，保持只读"]);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+  });
+
+  it("keeps the core contract passed when a reminder clear is silently ignored on its isolated task", async () => {
+    const api = new ContractApiFake();
+    api.ignoreReminderClear = true;
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-reminder-clear-ignored",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "passed",
+      taskCrudVerified: true,
+      reminderWriteVerified: false,
+      repeatWriteVerified: true,
+      parentTaskVerified: true,
+      boardPlacementVerified: true,
+      remoteArtifactsRemaining: false,
+      cleanupErrors: [],
+    });
+    expect(report.capabilityFailures).toEqual(["提醒：未通过写入合同，保持只读"]);
+    expect(api.tasks.has("original-task")).toBe(true);
+    expect([...api.tasks]).toHaveLength(1);
+  });
+
+  it("globally fails without publishing later capabilities when a reminder update outcome is unknown and unproven", async () => {
+    const api = new ContractApiFake();
+    api.reminderUpdateOutcome = "not-applied-unknown";
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-reminder-unknown-unproven",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "failed",
+      reminderWriteVerified: false,
+      repeatWriteVerified: false,
+      parentTaskVerified: false,
+      boardPlacementVerified: false,
+      remoteArtifactsRemaining: false,
+      cleanupErrors: [],
+    });
+    expect(report.failure).toMatch(/属性写入响应未知.*未重发/);
+    expect(api.updatePayloads).toHaveLength(2);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-1"]);
+    expect([...api.tasks]).toHaveLength(1);
+  });
+
+  it("does not mistake a server-added empty childIds field for a reminder-clear mutation", async () => {
+    const api = new ContractApiFake();
+    api.addEmptyChildIdsWhenClearingReminder = true;
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-reminder-child-ids",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.reminderWriteVerified).toBe(true);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+  });
+
+  it("rejects a real childIds mutation while clearing a reminder", async () => {
+    const api = new ContractApiFake();
+    api.replaceChildIdsWhenClearingReminder = true;
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-reminder-child-ids-mutated",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "failed",
+      reminderWriteVerified: false,
+      remoteArtifactsRemaining: false,
+      cleanupErrors: [],
+    });
+    expect(report.failure).toMatch(/未恢复到安全基线.*childIds/);
+    expect(report.failure).not.toContain("unexpected-child-id");
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-1"]);
+    expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
+    expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
+  });
+
+  it("labels an otherwise-empty field difference without leaking reminder values", async () => {
+    const api = new ContractApiFake();
+    api.returnStaleReminderOnClearRead = true;
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-reminder-empty-difference",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.reminderWriteVerified).toBe(false);
+    expect(report.capabilityFailures).toEqual(["提醒：未通过写入合同，保持只读"]);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+  });
+
+  it("keeps task CRUD verified when parent creation is safely rejected", async () => {
+    const api = new ContractApiFake();
+    api.rejectParentCreate = "parent unsupported";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-parent-independent",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.parentTaskVerified).toBe(false);
+    expect(report.taskCrudVerified).toBe(true);
+    expect(report.capabilityFailures).toEqual(["父子任务：未通过写入合同，保持只读"]);
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1"]);
+    expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
+  });
+
+  it.each([
+    ["提醒", "提醒远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectReminderWrites = secret; }],
+    ["重复规则", "重复规则远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectRepeatWrites = secret; }],
+    ["父子任务", "父子任务远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectParentCreate = secret; }],
+    ["看板归栏", "看板归栏远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectPlacementWrites = secret; }],
+  ])("uses only a fixed settings-visible summary for a safely rejected %s capability", async (
+    capability,
+    secret,
+    arrange,
+  ) => {
+    const api = new ContractApiFake();
+    arrange(api, secret);
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => `run-${capability}-secret`,
+      fixedNow,
+    ).run();
+
+    const expected = `${capability}：未通过写入合同，保持只读`;
+    const settingsVisibleSummary = `以下能力保持只读：${report.capabilityFailures.join("；")}`;
+    expect(report.status).toBe("passed");
+    expect(report.capabilityFailures).toEqual([expected]);
+    expect(settingsVisibleSummary).toContain(expected);
+    expect(settingsVisibleSummary).not.toContain(secret);
+  });
+
+  it("globally fails and stops before board placement when a parent update outcome is unknown and unproven", async () => {
+    const api = new ContractApiFake();
+    api.parentUpdateOutcome = "not-applied-unknown";
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-parent-unknown-unproven",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "failed",
+      parentTaskVerified: false,
+      boardPlacementVerified: false,
+      remoteArtifactsRemaining: false,
+      cleanupErrors: [],
+    });
+    expect(report.failure).toMatch(/属性写入响应未知.*未重发/);
+    expect(api.updatePayloads.some((payload) => "columnId" in payload)).toBe(false);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-1"]);
+    expect([...api.tasks]).toHaveLength(1);
   });
 
   it("does not let a progress observer interrupt cleanup", async () => {
@@ -523,7 +900,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
   });
 
   it("classifies a server-collapsed schedule as point mode and completes the core contract", async () => {
@@ -543,7 +920,27 @@ describe("DidaWriteContractRunner", () => {
     });
     expect(report.steps.join(" ")).toMatch(/单点任务时间/);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
+  });
+
+  it("treats server-managed etimestamp changes as metadata across all field probes", async () => {
+    const api = new ContractApiFake();
+    api.advanceEtimestampOnUpdate = true;
+
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-etimestamp-metadata",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "passed",
+      taskCrudVerified: true,
+      reminderWriteVerified: true,
+      repeatWriteVerified: true,
+      parentTaskVerified: true,
+      remoteArtifactsRemaining: false,
+    });
   });
 
   it("continues after one unknown update response when an exact reread proves the write", async () => {
@@ -561,7 +958,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(report.steps.join(" ")).toMatch(/未重发.*精确复读已证明字段生效/);
-    expect(api.updateCalls).toBe(2);
+    expect(api.updateCalls).toBe(8);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 
@@ -574,12 +971,28 @@ describe("DidaWriteContractRunner", () => {
     ).run();
 
     expect(report.status).toBe("passed");
-    expect(api.updatePayloads[1]).toEqual({
-      id: "test-task-1",
+    expect(api.updatePayloads.find((payload) => "columnId" in payload)).toEqual({
+      id: "test-task-6",
       projectId: "test-project-1",
       columnId: "test-project-1-doing",
     });
     expect(report.steps.join(" ")).toMatch(/最小白名单归栏.*其他任务字段未变化/);
+  });
+
+  it("accepts the server-derived columnName change caused by a verified board placement", async () => {
+    const api = new ContractApiFake();
+    api.placementColumnNameAfterMutation = "进行中";
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-placement-column-name",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "passed",
+      boardPlacementVerified: true,
+      remoteArtifactsRemaining: false,
+    });
   });
 
   it("fails and cleans up when a minimal board placement changes another task field", async () => {
@@ -594,8 +1007,33 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.boardPlacementVerified).toBe(false);
     expect(report.failureStage).toBe("以最小载荷验证测试任务看板归栏");
-    expect(report.failure).toMatch(/分栏以外的任务字段/);
+    expect(report.failure).toMatch(/归栏修改出现非目标字段；差异字段 content/);
+    expect(report.failure).not.toContain("被归栏意外改写");
     expect(report.remoteArtifactsRemaining).toBe(false);
+  });
+
+  it("never exposes remote error or task content in the settings-displayable board failure", async () => {
+    const api = new ContractApiFake();
+    const secretTaskContent = "绝不可展示的秘密任务正文";
+    const secretRemoteError = "远端内部错误包含秘密任务正文";
+    api.corruptPlacementContent = true;
+    api.placementContentAfterMutation = secretTaskContent;
+    api.placementErrorAfterMutation = secretRemoteError;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-placement-secret-error",
+      fixedNow,
+    ).run();
+
+    expect(report).toMatchObject({
+      status: "failed",
+      failureStage: "以最小载荷验证测试任务看板归栏",
+      remoteArtifactsRemaining: false,
+    });
+    expect(report.failure).toBe("以最小载荷验证测试任务看板归栏：看板归栏合同失败：归栏修改出现非目标字段；差异字段 content");
+    // 设置页直接展示 report.failure；该摘要必须同样无远端或任务正文。
+    expect(report.failure).not.toContain(secretTaskContent);
+    expect(report.failure).not.toContain(secretRemoteError);
   });
 
   it("does not resend an unknown minimal placement when an exact reread proves it", async () => {
@@ -729,10 +1167,32 @@ describe("DidaWriteContractRunner", () => {
     expect(api.tasks.has("original-task")).toBe(true);
   });
 
+  it("recovers a rate-limited project-cleanup read without leaving test artifacts", async () => {
+    const api = new ContractApiFake();
+    api.rateLimitProjectCollectionAfterDeleteOnce = true;
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-cleanup-rate-limit",
+      fixedNow,
+      sleep,
+      undefined,
+      () => 0,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(report.cleanupErrors).toEqual([]);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep.mock.calls[0]?.[0]).toBe(15_000);
+    expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
   it("waits through bounded eventual-consistency reads after deletion", async () => {
     const api = new ContractApiFake();
     api.staleReadsAfterDelete = 2;
-    const sleep = vi.fn(async () => undefined);
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
     const report = await new DidaWriteContractRunner(
       api,
       () => "run-eventual-delete",
@@ -859,21 +1319,24 @@ describe("DidaWriteContractRunner", () => {
       .filter((value) => value.stage === "等待任务集合确认删除")
       .map((value) => value.attempt ?? 0);
     expect(report.status).toBe("failed");
-    expect(Math.max(...deletionAttempts)).toBeLessThan(20);
+    expect(deletionAttempts.some((attempt) => attempt < 20)).toBe(true);
     expect(api.deletedProjects).toEqual([]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 
-  it("finds and safely removes a moved test task after an unknown move result", async () => {
+  it("reconciles an applied unknown move without resending and completes the contract", async () => {
     const api = new ContractApiFake();
     api.throwAfterMove = true;
     api.returnMoveTombstoneAtSource = true;
     const report = await new DidaWriteContractRunner(api, () => "run-unknown", fixedNow).run();
 
-    expect(report.status).toBe("failed");
-    expect(report.failure).toMatch(/move unknown/);
+    expect(report.status).toBe("passed");
+    expect(report.failure).toBeUndefined();
+    expect(report.steps).toContain(
+      "移动响应未知；未重发，目标清单精确复读且来源清单确认移出",
+    );
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
     expect(api.sourceTombstoneReads).toBe(0);
@@ -893,10 +1356,203 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(true);
-    expect(report.cleanupErrors.join(" ")).toMatch(/多个候选清单集合/);
-    expect(api.deletedTasks).toEqual([]);
+    expect(report.cleanupErrors.join(" ")).toMatch(/停止自动清理/);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6"]);
+    expect(api.deletedProjects).toEqual([]);
+    expect(report.manualCleanupRequired).toMatchObject({
+      taskId: "test-task-1",
+      candidateProjectIds: ["test-project-1", "test-project-2"],
+    });
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it("cleans all test artifacts after a confirmed not-applied unknown move without resending", async () => {
+    const api = new ContractApiFake();
+    api.moveNotAppliedUnknown = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-move-not-applied-unknown",
+      fixedNow,
+      async () => undefined,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(report.manualCleanupRequired).toBeUndefined();
+    expect(api.moveCalls).toBe(1);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
+    expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
+    expect(api.tasks.has("test-task-1")).toBe(false);
+  });
+
+  it("holds artifacts when a successful move changes a non-placement task field", async () => {
+    const api = new ContractApiFake();
+    api.corruptMovedContent = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-move-corruption",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.failure).toMatch(/清单归属以外的任务字段/);
+    expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(api.moveCalls).toBe(1);
+    expect(api.deletedProjects).toEqual([]);
+  });
+
+  it("ignores a non-object 2xx move response and proves the move from candidate task lists", async () => {
+    const api = new ContractApiFake();
+    api.moveResponse = "OK";
+    const report = await new DidaWriteContractRunner(api, () => "run-move-text-response", fixedNow).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(api.moveCalls).toBe(1);
+  });
+
+  it("holds artifacts when the target task cannot be reread after one move", async () => {
+    const api = new ContractApiFake();
+    api.failTargetCollectionReadAfterMove = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-move-target-read-failure",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.manualCleanupRequired?.reason).toMatch(/target collection reread unavailable/);
+    expect(api.moveCalls).toBe(1);
+    expect(api.deletedProjects).toEqual([]);
+  });
+
+  it("holds artifacts when the source collection cannot be reread after one move", async () => {
+    const api = new ContractApiFake();
+    api.failSourceCollectionReadAfterMove = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-move-source-read-failure",
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.manualCleanupRequired?.reason).toMatch(/source collection reread unavailable/);
+    expect(api.moveCalls).toBe(1);
+    expect(api.deletedProjects).toEqual([]);
+  });
+
+  it("holds artifacts after a successful move while the source collection still has the same ID", async () => {
+    const api = new ContractApiFake();
+    api.duplicateSourceCollectionAfterMove = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-move-success-dual-location",
+      fixedNow,
+      async () => undefined,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.manualCleanupRequired?.reason).toMatch(/持续同时存在于两个候选清单/);
+    expect(api.moveCalls).toBe(1);
+    expect(api.deletedProjects).toEqual([]);
+  });
+
+  it.each([
+    ["both", "both-once" as const],
+    ["none", "none-once" as const],
+  ])("retries a transient %s location until target-only proof without resending", async (_name, visibility) => {
+    const api = new ContractApiFake();
+    api.moveCollectionVisibility = visibility;
+    const progress: Array<{ stage: string; attempt?: number }> = [];
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => `run-transient-${visibility}`,
+      fixedNow,
+      async () => undefined,
+      (value) => progress.push(value),
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(api.moveCalls).toBe(1);
+    expect(progress.filter((value) => value.stage === "复读移动任务位置").length).toBe(2);
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it.each([
+    ["both", "both-always" as const, /持续同时存在/],
+    ["none", "none-always" as const, /持续不在任一候选/],
+  ])("requires manual review after bounded permanent %s location ambiguity", async (
+    _name,
+    visibility,
+    reason,
+  ) => {
+    const api = new ContractApiFake();
+    api.moveCollectionVisibility = visibility;
+    const progress: Array<{ stage: string; attempt?: number }> = [];
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => `run-permanent-${visibility}`,
+      fixedNow,
+      async () => undefined,
+      (value) => progress.push(value),
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.manualCleanupRequired?.reason).toMatch(reason);
+    expect(api.moveCalls).toBe(1);
+    expect(progress.filter((value) => value.stage === "复读移动任务位置")).toHaveLength(20);
     expect(api.deletedProjects).toEqual([]);
     expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it.each(["source", "target"] as const)("requires manual review when the %s project identity mismatches", async (side) => {
+    const api = new ContractApiFake();
+    api.moveProjectIdentityMismatch = side;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => `run-project-id-${side}`,
+      fixedNow,
+    ).run();
+
+    expect(report.status).toBe("failed");
+    expect(report.manualCleanupRequired?.reason).toMatch(/候选清单项目身份不匹配/);
+    expect(api.moveCalls).toBe(1);
+    expect(api.deletedProjects).toEqual([]);
+    expect(api.tasks.has("original-task")).toBe(true);
+  });
+
+  it.each([
+    ["source-only", "normal" as const, true, false],
+    ["both", "both-always" as const, false, true],
+  ])("never sleeps a negative duration when the monotonic clock jumps during %s reconciliation", async (
+    _name,
+    visibility,
+    notApplied,
+    requiresManual,
+  ) => {
+    const api = new ContractApiFake();
+    api.moveCollectionVisibility = visibility;
+    api.moveNotAppliedUnknown = notApplied;
+    const clockValues = [1, 20_000];
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
+    let reconcilingMove = false;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => `run-clock-jump-${visibility}`,
+      fixedNow,
+      sleep,
+      (progress) => { if (progress.stage === "复读移动任务位置") reconcilingMove = true; },
+      () => reconcilingMove ? (clockValues.shift() ?? 20_000) : 0,
+    ).run();
+
+    expect(sleep.mock.calls.flatMap(([milliseconds]) => [milliseconds])).toEqual([750]);
+    expect(sleep.mock.calls.flatMap(([milliseconds]) => [milliseconds]).every(
+      (milliseconds) => typeof milliseconds === "number" && milliseconds >= 0 && milliseconds <= 750,
+    )).toBe(true);
+    expect(api.moveCalls).toBe(1);
+    expect(api.tasks.has("original-task")).toBe(true);
+    expect(report.manualCleanupRequired !== undefined).toBe(requiresManual);
+    expect(report.remoteArtifactsRemaining).toBe(requiresManual);
   });
 
   it("finds a remotely completed task when the complete response outcome is unknown", async () => {
@@ -907,7 +1563,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.failure).toMatch(/complete unknown/);
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
@@ -961,7 +1617,7 @@ describe("DidaWriteContractRunner", () => {
     expect(api.projects.has("test-project-2")).toBe(true);
     expect(api.tasks.get("foreign-task")?.title).toBe("用户意外放入的任务");
     expect(api.deletedProjects).toEqual(["test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 

@@ -80,6 +80,13 @@ export function normalizeTask(task: DidaTask): DidaTask {
   ) {
     throw new Error("Dida 任务 columnId 缺失或类型错误");
   }
+  if (
+    task.columnName !== undefined &&
+    task.columnName !== null &&
+    (typeof task.columnName !== "string" || !task.columnName.trim())
+  ) {
+    throw new Error("Dida 任务 columnName 缺失或类型错误");
+  }
   const sortOrderUnsafe = task.sortOrder !== undefined && !Number.isSafeInteger(task.sortOrder);
   return {
     ...task,
@@ -98,7 +105,11 @@ export function normalizeTask(task: DidaTask): DidaTask {
     tags: normalizedStrings(task.tags),
     items: normalizeChecklist(task.items),
     parentId: task.parentId || null,
+    // 有些任务详情响应会把“无子任务”从缺失字段规范化为 []；两者不能被
+    // 后续的逐字段合同误判成业务改动。
+    childIds: preservedStrings(task.childIds, "任务 childIds"),
     columnId: task.columnId === undefined ? undefined : task.columnId?.trim() || null,
+    columnName: task.columnName === undefined ? undefined : task.columnName?.trim() || null,
     sortOrder: sortOrderUnsafe ? undefined : task.sortOrder,
     sortOrderUnsafe: sortOrderUnsafe || undefined,
   };

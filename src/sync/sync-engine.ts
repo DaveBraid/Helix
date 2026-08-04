@@ -1,4 +1,5 @@
 import type { EntityKind, EntitySnapshot, RemoteEntity } from "../domain/entities";
+import { DIDA_TASK_REMOTE_METADATA_FIELDS } from "../domain/dida-task-metadata";
 import { cloneValue, deepEqual, stableHash } from "../domain/stable";
 import { createSnapshot, snapshotChanged } from "./snapshots";
 import {
@@ -90,6 +91,7 @@ export class SyncEngine<T extends RemoteEntity> {
       }
       await this.dependencies.adapter.delete(operation.entityId, {
         projectId: operation.projectId,
+        writeFields: operation.writeFields,
       });
       const verified = await this.dependencies.adapter.get(operation.entityId, {
         projectId: operation.projectId,
@@ -326,6 +328,7 @@ export class SyncEngine<T extends RemoteEntity> {
     this.dependencies.validateWrite?.(desired.value, preflight);
     await this.dependencies.adapter.update(operation.entityId, desired.value, {
       projectId: operation.projectId,
+      writeFields: operation.writeFields,
     });
     const verificationProjectId = projectIdOf(desired.value) ?? operation.projectId;
     const verified = await this.dependencies.adapter.get(operation.entityId, {
@@ -391,7 +394,12 @@ export class SyncEngine<T extends RemoteEntity> {
 
     if (!equivalentForVerification(merged, freshRemote)) {
       this.dependencies.validateWrite?.(merged, freshRemote);
-      await this.dependencies.adapter.update(conflict.entityId, merged, context);
+      await this.dependencies.adapter.update(conflict.entityId, merged, {
+        ...context,
+        writeFields: [...new Set(conflict.fields
+          .filter((field) => field.choice === "local" || field.choice === "custom")
+          .map((field) => adapterWriteField(field.path)))],
+      });
     }
     const verified = await this.dependencies.adapter.get(conflict.entityId, {
       projectId: projectIdOf(merged) ?? context?.projectId,
@@ -504,6 +512,11 @@ export class SyncEngine<T extends RemoteEntity> {
   }
 }
 
+/** 适配器只接受根字段；嵌套检查项等路径的写意图归并为其原子根集合。 */
+function adapterWriteField(path: string): string {
+  return path.split(/[.[\]]/, 1)[0] || path;
+}
+
 function unknownRemoteOutcome(message: string): {
   category: "unknown-outcome";
   message: string;
@@ -531,7 +544,14 @@ function equivalentForVerification(
   if (!expected || !actual || typeof expected !== "object" || typeof actual !== "object") {
     return false;
   }
-  const ignored = new Set(["etag", "modifiedTime", "createdTime", "completedTime"]);
+  const ignored = new Set([
+    ...DIDA_TASK_REMOTE_METADATA_FIELDS,
+    "createdTime",
+    // 本阶段 status/completedTime 由滴答 App 管理；普通冲突只写用户选择的
+    // 业务字段，写后快照必须采纳远端状态，不能因旧 merged 值反复开冲突。
+    "status",
+    "completedTime",
+  ]);
   if (ignoreGeneratedId) ignored.add("id");
   if (ignoreGeneratedId) {
     return Object.entries(expected as Record<string, unknown>)

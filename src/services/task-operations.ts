@@ -8,6 +8,7 @@ export function buildTaskUpdateOperation(
   operationType: "update" | "complete",
   now: string,
   operationId: string,
+  writeFields: string[] = [],
 ): SyncQueueOperation<DidaTask> {
   if (!base.value.projectId) throw new Error("同步基线缺少任务原清单");
   return {
@@ -22,6 +23,7 @@ export function buildTaskUpdateOperation(
     status: "pending",
     base,
     local: createSnapshot("task", task.id, task, { capturedAt: now }),
+    writeFields: [...new Set(writeFields)].sort(),
   };
 }
 

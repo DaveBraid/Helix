@@ -55,8 +55,13 @@ export interface HelixPersistedData {
   recoveryIssues: string[];
   didaContractCapabilities?: {
     probeVersion: number;
+    authorizationBinding?: string;
     taskScheduleMode: Exclude<TaskScheduleMode, "unknown">;
-    boardPlacementVerified: boolean;
+    boardPlacementVerified?: boolean;
+    taskCrudVerified?: boolean;
+    reminderWriteVerified?: boolean;
+    repeatWriteVerified?: boolean;
+    parentTaskVerified?: boolean;
     verifiedAt: string;
   };
   lineageConflict?: {
@@ -204,16 +209,28 @@ function validateDidaContractCapabilities(
     (record.taskScheduleMode !== "point" && record.taskScheduleMode !== "duration") ||
     typeof record.verifiedAt !== "string" ||
     !Number.isFinite(Date.parse(record.verifiedAt)) ||
-    (record.boardPlacementVerified !== undefined &&
-      typeof record.boardPlacementVerified !== "boolean")
+    typeof record.authorizationBinding !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(record.authorizationBinding) ||
+    [
+      "boardPlacementVerified",
+      "taskCrudVerified",
+      "reminderWriteVerified",
+      "repeatWriteVerified",
+      "parentTaskVerified",
+    ].some((key) => record[key] !== undefined && typeof record[key] !== "boolean")
   ) {
     issues.push("滴答合同能力缓存字段无效，已忽略并进入只读恢复模式");
     return undefined;
   }
   return {
     probeVersion: DIDA_CONTRACT_PROBE_VERSION,
+    authorizationBinding: record.authorizationBinding,
     taskScheduleMode: record.taskScheduleMode,
-    boardPlacementVerified: record.boardPlacementVerified ?? false,
+    boardPlacementVerified: record.boardPlacementVerified === true,
+    taskCrudVerified: record.taskCrudVerified === true,
+    reminderWriteVerified: record.reminderWriteVerified === true,
+    repeatWriteVerified: record.repeatWriteVerified === true,
+    parentTaskVerified: record.parentTaskVerified === true,
     verifiedAt: record.verifiedAt,
   };
 }
@@ -406,6 +423,11 @@ function isQueueOperation(value: unknown): value is SyncQueueOperation {
     !optionalString(value.projectId) || !optionalString(value.conflictId) ||
     !optionalString(value.lastError) || !optionalString(value.idempotencyFingerprint) ||
     !optionalDate(value.nextAttemptAt) ||
+    (value.writeFields !== undefined && (
+      !Array.isArray(value.writeFields) ||
+      value.writeFields.some((field) => typeof field !== "string" || !field.trim()) ||
+      new Set(value.writeFields).size !== value.writeFields.length
+    )) ||
     (value.remoteOutcomeUnknown !== undefined && typeof value.remoteOutcomeUnknown !== "boolean")) {
     return false;
   }

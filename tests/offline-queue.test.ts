@@ -45,6 +45,42 @@ describe("OfflineQueue", () => {
     ]);
   });
 
+  it("unions explicit write intent when pending or failed updates coalesce", () => {
+    const first = operation("op-first", "update");
+    first.writeFields = ["reminders"];
+    const second = operation("op-second", "update");
+    second.writeFields = ["repeatFlag"];
+    const queue = new OfflineQueue([first]);
+
+    queue.enqueue(second);
+    expect(queue.list()[0]?.writeFields).toEqual(["reminders", "repeatFlag"]);
+
+    const failed = queue.list()[0]!;
+    failed.status = "failed";
+    const recovered = new OfflineQueue([failed]);
+    const third = operation("op-third", "update");
+    third.writeFields = ["parentId"];
+    recovered.enqueue(third);
+    expect(recovered.list()[0]?.writeFields).toEqual([
+      "parentId",
+      "reminders",
+      "repeatFlag",
+    ]);
+  });
+
+  it("round-trips valid write intent and rejects duplicate persisted fields", () => {
+    const queued = operation("op-5", "update");
+    queued.writeFields = ["reminders", "repeatFlag"];
+    const valid = hydrateData({ schemaVersion: 2, queue: [queued] });
+    expect(valid.queue[0]?.writeFields).toEqual(["reminders", "repeatFlag"]);
+
+    const invalid = structuredClone(queued);
+    invalid.writeFields = ["reminders", "reminders"];
+    const recovered = hydrateData({ schemaVersion: 2, queue: [invalid] });
+    expect(recovered.queue).toEqual([]);
+    expect(recovered.recoveryIssues.join(" ")).toMatch(/队列/);
+  });
+
   it("cancels a never-attempted local create followed by delete", () => {
     const queue = new OfflineQueue();
     queue.enqueue(operation("op-1", "create"));
@@ -52,7 +88,7 @@ describe("OfflineQueue", () => {
     expect(queue.list()).toHaveLength(0);
   });
 
-  it("moves an unknown create outcome to reconciliation and never retries it", () => {
+  it("moves an unknown create outcome to reconciliation and refuses any unverified retry", () => {
     const queue = new OfflineQueue([operation("op-1", "create")]);
     queue.markRunning("op-1");
     queue.markFailed("op-1", {
@@ -65,8 +101,28 @@ describe("OfflineQueue", () => {
       remoteOutcomeUnknown: true,
     });
     expect(queue.nextRunnable()).toBeNull();
-    queue.resolveReconciliation("op-1", "not-created");
-    expect(queue.nextRunnable()?.id).toBe("op-1");
+    // 结果未知必须先由服务层复读并采纳远端快照；队列层没有“未创建后重发”出口。
+    expect(() => (queue.resolveReconciliation as (id: string, outcome: string) => void)(
+      "op-1",
+      "not-created",
+    )).toThrow();
+    expect(queue.nextRunnable()).toBeNull();
+  });
+
+  it("moves a rate-limited non-idempotent write outcome into reconciliation instead of retrying", () => {
+    const queue = new OfflineQueue([operation("op-rate-write", "update")]);
+    queue.markRunning("op-rate-write");
+    queue.markFailed("op-rate-write", {
+      category: "unknown-outcome",
+      message: "查询限流发生在写入请求之后，无法确认远端结果；已转入待核对状态",
+      remoteOutcomeUnknown: true,
+    });
+
+    expect(queue.list()[0]).toMatchObject({
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+    });
+    expect(queue.nextRunnable()).toBeNull();
   });
 
   it("blocks later operations for the same entity but not other entities", () => {

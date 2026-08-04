@@ -47,6 +47,8 @@ import { HelixSecretStore } from "./storage/secrets";
 import { HelixVaultRepository } from "./storage/vault-repository";
 import { HELIX_VIEW_TYPE, HelixView } from "./ui/helix-view";
 import { HelixSettingTab } from "./ui/settings-tab";
+import { DidaWriteContractConfirmationGate } from "./ui/dida-write-contract-confirmation";
+import { DidaWriteContractCommandController } from "./ui/dida-write-contract-command";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = {
@@ -59,6 +61,10 @@ export default class HelixPlugin extends Plugin {
   vaultRepository!: HelixVaultRepository;
   projectWorkspace!: ProjectWorkspaceService;
   taskReferences!: TaskReferenceService;
+  /** 设置页和命令面板使用同一确认规则，但绝不允许跨入口确认。 */
+  readonly didaWriteContractSettingsConfirmation = new DidaWriteContractConfirmationGate();
+  private readonly didaWriteContractCommandConfirmation = new DidaWriteContractConfirmationGate();
+  private didaWriteContractCommands!: DidaWriteContractCommandController;
   private syncIntervalId: number | null = null;
   private immediateSyncTimerId: number | null = null;
   private unloaded = false;
@@ -126,6 +132,14 @@ export default class HelixPlugin extends Plugin {
     }
     this.service = new HelixService(this.store, this.secrets);
     await this.service.initialize();
+    this.didaWriteContractCommands = new DidaWriteContractCommandController(
+      this.didaWriteContractCommandConfirmation,
+      {
+        runtimeSummary: () => this.service.didaWriteContractRuntimeSummary(),
+        run: () => this.service.runDidaWriteContractTest(),
+        notice: (message, timeout) => new Notice(message, timeout),
+      },
+    );
     if (!this.recoveryMode) await this.recoverClosedReviewEvents();
 
     this.registerView(
@@ -157,6 +171,16 @@ export default class HelixPlugin extends Plugin {
       id: "sync-now",
       name: "立即同步滴答数据",
       callback: () => void this.service.sync().catch((error) => this.service.notifySyncError(error)),
+    });
+    this.addCommand({
+      id: "show-dida-write-contract-status",
+      name: "显示滴答写入合同状态",
+      callback: () => this.didaWriteContractCommands.showStatus(),
+    });
+    this.addCommand({
+      id: "run-dida-write-contract-test",
+      name: "运行滴答写入合同测试",
+      callback: () => this.didaWriteContractCommands.requestRun(),
     });
     this.addCommand({
       id: "create-project",
@@ -298,6 +322,8 @@ export default class HelixPlugin extends Plugin {
 
   onunload(): void {
     this.unloaded = true;
+    this.didaWriteContractSettingsConfirmation.disarm();
+    this.didaWriteContractCommands?.dispose();
     if (this.projectRefreshTimer !== null) {
       window.clearTimeout(this.projectRefreshTimer);
       this.projectRefreshTimer = null;

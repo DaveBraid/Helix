@@ -47,6 +47,7 @@ export class OfflineQueue {
       operation.operation === "update"
     ) {
       previous.local = cloneValue(operation.local);
+      previous.writeFields = mergeWriteFields(previous.writeFields, operation.writeFields);
       previous.updatedAt = operation.updatedAt;
       return previous.id;
     }
@@ -56,6 +57,7 @@ export class OfflineQueue {
       operation.operation === "update"
     ) {
       previous.local = cloneValue(operation.local);
+      previous.writeFields = mergeWriteFields(previous.writeFields, operation.writeFields);
       previous.updatedAt = operation.updatedAt;
       return previous.id;
     }
@@ -65,6 +67,7 @@ export class OfflineQueue {
       operation.operation === "update"
     ) {
       previous.local = cloneValue(operation.local);
+      previous.writeFields = mergeWriteFields(previous.writeFields, operation.writeFields);
       previous.status = "pending";
       previous.attempts = 0;
       previous.nextAttemptAt = undefined;
@@ -151,19 +154,17 @@ export class OfflineQueue {
     }
   }
 
-  resolveReconciliation(operationId: string, outcome: "confirmed" | "not-created"): void {
+  /** 结果未知只能采纳已验证远端事实，永远不能重置为 pending 后重发。 */
+  resolveReconciliation(operationId: string, outcome: "confirmed"): void {
     const operation = this.require(operationId);
     if (operation.status !== "reconciliation") {
       throw new Error("Operation is not waiting for reconciliation");
     }
-    if (outcome === "confirmed") {
-      this.complete(operationId);
-      return;
+    if (outcome !== "confirmed") {
+      throw new Error("远端结果未知只能由已验证快照采纳，禁止重新排队发送");
     }
-    operation.status = "pending";
-    operation.remoteOutcomeUnknown = false;
-    operation.nextAttemptAt = undefined;
-    operation.updatedAt = new Date().toISOString();
+    void operation;
+    this.complete(operationId);
   }
 
   retryFailed(operationId: string): void {
@@ -249,6 +250,10 @@ export class OfflineQueue {
         candidate.entityId === operation.entityId,
     );
   }
+}
+
+function mergeWriteFields(left: string[] | undefined, right: string[] | undefined): string[] {
+  return [...new Set([...(left ?? []), ...(right ?? [])])].sort();
 }
 
 function rebaseQueuedValue(

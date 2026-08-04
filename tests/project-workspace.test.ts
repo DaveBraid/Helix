@@ -436,6 +436,383 @@ describe("ProjectWorkspaceService", () => {
     expect((await repo.read(CANVAS))!.content).toBe(afterCanvas);
   });
 
+  it("applies, undoes and redoes existing Markdown updates in one journaled Canvas change", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!;
+    const stageAfter = `${stageBefore.content}\n受管聚焦块`;
+    const canvasBefore = (await repo.read(CANVAS))!;
+    const canvasDocument = JSON.parse(canvasBefore.content);
+    canvasDocument.transactionProbe = true;
+    const canvasAfter = JSON.stringify(canvasDocument);
+
+    await service.applyAtomicWorkspaceChange({
+      label: "更新阶段聚焦关系",
+      canvasBeforeHash: canvasBefore.hash,
+      canvasAfterContent: canvasAfter,
+      markdownUpdates: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "cycle-1",
+        projectId: "project-1",
+        beforeHash: stageBefore.hash,
+        afterContent: stageAfter,
+      }],
+    });
+    expect((await repo.read(stagePath))?.content).toBe(stageAfter);
+    expect((await repo.read(CANVAS))?.content).toBe(canvasAfter);
+    expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
+
+    await service.undoLastWorkspaceChange();
+    expect((await repo.read(stagePath))?.content).toBe(stageBefore.content);
+    expect((await repo.read(CANVAS))?.content).toBe(canvasBefore.content);
+    await service.redoLastWorkspaceChange();
+    expect((await repo.read(stagePath))?.content).toBe(stageAfter);
+    expect((await repo.read(CANVAS))?.content).toBe(canvasAfter);
+  });
+
+  it.each([
+    ["rolls Markdown back when Canvas is still before", false, true, "aborted"],
+    ["completes Markdown when Canvas is already after", true, false, "completed"],
+  ] as const)("%s", async (_name, canvasIsAfter, stageIsAfter, expected) => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!.content;
+    const stageAfter = `${stageBefore}\n恢复态聚焦块`;
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const canvasDocument = JSON.parse(canvasBefore);
+    canvasDocument.recoveryProbe = true;
+    const canvasAfter = JSON.stringify(canvasDocument);
+    if (canvasIsAfter) repo.set(CANVAS, canvasAfter);
+    if (stageIsAfter) repo.set(stagePath, stageAfter);
+    repo.set(HISTORY_JOURNAL, JSON.stringify({
+      version: 2,
+      operation: "apply-workspace-history",
+      phase: canvasIsAfter ? "canvas-applied" : "markdown-applied",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      entryId: "focus-recovery",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvasBefore,
+      canvasToContent: canvasAfter,
+      markdownTransitions: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "cycle-1",
+        projectId: "project-1",
+        fromContent: stageBefore,
+        toContent: stageAfter,
+      }],
+    }, null, 2));
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).resolves.toBe(expected);
+    expect((await repo.read(stagePath))?.content).toBe(
+      canvasIsAfter ? stageAfter : stageBefore,
+    );
+    expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
+  });
+
+  it("retains the journal and freezes when Canvas competes after Markdown updates", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!;
+    const stageAfter = `${stageBefore.content}\n待恢复聚焦块`;
+    const canvasBefore = (await repo.read(CANVAS))!;
+    const canvasAfterDocument = JSON.parse(canvasBefore.content);
+    canvasAfterDocument.planned = true;
+    const armCanvasCompetition = (path: string): void => {
+      if (path !== CANVAS) {
+        repo.beforeCompare = armCanvasCompetition;
+        return;
+      }
+      const external = repo.json(CANVAS);
+      external.userEdit = "保留";
+      repo.set(CANVAS, JSON.stringify(external));
+    };
+    repo.beforeCompare = armCanvasCompetition;
+
+    await expect(service.applyAtomicWorkspaceChange({
+      label: "竞争事务",
+      canvasBeforeHash: canvasBefore.hash,
+      canvasAfterContent: JSON.stringify(canvasAfterDocument),
+      markdownUpdates: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "cycle-1",
+        projectId: "project-1",
+        beforeHash: stageBefore.hash,
+        afterContent: stageAfter,
+      }],
+    })).rejects.toThrow(/事务日志已保留/);
+    expect(repo.json(CANVAS).userEdit).toBe("保留");
+    expect((await repo.read(stagePath))?.content).toBe(stageAfter);
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+    await expect(service.snapshot()).rejects.toThrow(/人工检查|未完整结束/);
+  });
+
+  it("does not write the first Markdown when a newly created journal is changed", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!;
+    const canvasBefore = (await repo.read(CANVAS))!;
+    let journalReads = 0;
+    repo.beforeRead = (path) => {
+      if (path !== HISTORY_JOURNAL || ++journalReads !== 2) return;
+      const current = repo.json(HISTORY_JOURNAL);
+      current.createdAt = "2099-01-01T00:00:00.000Z";
+      repo.set(HISTORY_JOURNAL, JSON.stringify(current, null, 2));
+    };
+
+    await expect(service.applyAtomicWorkspaceChange({
+      label: "日志竞争零写",
+      canvasBeforeHash: canvasBefore.hash,
+      canvasAfterContent: JSON.stringify({ ...JSON.parse(canvasBefore.content), planned: true }),
+      markdownUpdates: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "cycle-1",
+        projectId: "project-1",
+        beforeHash: stageBefore.hash,
+        afterContent: `${stageBefore.content}\n不得写入`,
+      }],
+    })).rejects.toThrow(/日志|清理未完成/);
+    expect((await repo.read(stagePath))?.content).toBe(stageBefore.content);
+    expect((await repo.read(CANVAS))?.content).toBe(canvasBefore.content);
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+  });
+
+  it("freezes a recovery journal with duplicate Markdown paths before any write", async () => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!.content;
+    const stageAfter = `${stageBefore}\n第一转换`;
+    const otherAfter = `${stageBefore}\n第二转换`;
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const transition = {
+      path: stagePath,
+      kind: "stage",
+      entityId: "cycle-1",
+      projectId: "project-1",
+      fromContent: stageBefore,
+      toContent: stageAfter,
+    };
+    repo.set(HISTORY_JOURNAL, JSON.stringify({
+      version: 2,
+      operation: "apply-workspace-history",
+      phase: "prepared",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      entryId: "duplicate-path",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvasBefore,
+      canvasToContent: JSON.stringify({ ...JSON.parse(canvasBefore), changed: true }),
+      markdownTransitions: [transition, { ...transition, toContent: otherAfter }],
+    }, null, 2));
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).rejects.toThrow(/重复路径/);
+    expect((await repo.read(stagePath))?.content).toBe(stageBefore);
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+  });
+
+  it("recovers a Markdown-only transaction from its persisted phase", async () => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!;
+    const stageAfter = `${stageBefore.content}\n纯 Markdown 目标态`;
+    const canvas = (await repo.read(CANVAS))!;
+    repo.set(stagePath, stageAfter);
+    repo.set(HISTORY_JOURNAL, JSON.stringify({
+      version: 2,
+      operation: "apply-workspace-history",
+      phase: "canvas-applied",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      entryId: "markdown-only",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvas.content,
+      canvasToContent: canvas.content,
+      markdownTransitions: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "cycle-1",
+        projectId: "project-1",
+        fromContent: stageBefore.content,
+        toContent: stageAfter,
+      }],
+    }, null, 2));
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).resolves.toBe("completed");
+    expect((await repo.read(stagePath))?.content).toBe(stageAfter);
+    expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
+  });
+
+  it("freezes a phased Markdown-only journal with mixed file states", async () => {
+    const repo = baseRepository();
+    const firstPath = "Helix/Projects/Alpha/Cycle-01.md";
+    const secondPath = "Helix/Projects/Alpha/Cycle-02.md";
+    repo.set(secondPath, cycle("cycle-2", "project-1", 2));
+    const firstBefore = (await repo.read(firstPath))!.content;
+    const secondBefore = (await repo.read(secondPath))!.content;
+    const firstAfter = `${firstBefore}\n第一目标态`;
+    const secondAfter = `${secondBefore}\n第二目标态`;
+    const canvas = (await repo.read(CANVAS))!.content;
+    repo.set(firstPath, firstAfter);
+    repo.set(HISTORY_JOURNAL, JSON.stringify({
+      version: 2,
+      operation: "apply-workspace-history",
+      phase: "markdown-applied",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      entryId: "markdown-mixed",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvas,
+      canvasToContent: canvas,
+      markdownTransitions: [
+        { path: firstPath, kind: "stage", entityId: "cycle-1", projectId: "project-1", fromContent: firstBefore, toContent: firstAfter },
+        { path: secondPath, kind: "stage", entityId: "cycle-2", projectId: "project-1", fromContent: secondBefore, toContent: secondAfter },
+      ],
+    }, null, 2));
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).rejects.toThrow(/相位与文件状态不一致/);
+    expect((await repo.read(firstPath))?.content).toBe(firstAfter);
+    expect((await repo.read(secondPath))?.content).toBe(secondBefore);
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+  });
+
+  it("keeps a committed Markdown-only target when journal cleanup fails", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const stageBefore = (await repo.read(stagePath))!;
+    const stageAfter = `${stageBefore.content}\n清理失败目标态`;
+    const canvas = (await repo.read(CANVAS))!;
+    repo.failTrashPath = HISTORY_JOURNAL;
+
+    await expect(service.applyAtomicWorkspaceChange({
+      label: "纯 Markdown 清理失败",
+      canvasBeforeHash: canvas.hash,
+      canvasAfterContent: canvas.content,
+      markdownUpdates: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "cycle-1",
+        projectId: "project-1",
+        beforeHash: stageBefore.hash,
+        afterContent: stageAfter,
+      }],
+    })).rejects.toThrow(/已提交但日志尚未清理/);
+    expect((await repo.read(stagePath))?.content).toBe(stageAfter);
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+  });
+
+  it("keeps version 1 history recovery compatible when Canvas is at the target", async () => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Legacy-Recovered.md";
+    const stageContent = cycle("legacy-recovered", "project-1", 9);
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const canvasAfterDocument = JSON.parse(canvasBefore);
+    canvasAfterDocument.legacyRecovery = true;
+    const canvasAfter = JSON.stringify(canvasAfterDocument);
+    repo.set(CANVAS, canvasAfter);
+    repo.set(HISTORY_JOURNAL, JSON.stringify({
+      version: 1,
+      operation: "apply-workspace-history",
+      createdAt: "2026-08-03T00:00:00.000Z",
+      entryId: "legacy-v1",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvasBefore,
+      canvasToContent: canvasAfter,
+      markdownTransitions: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "legacy-recovered",
+        projectId: "project-1",
+        fromContent: null,
+        toContent: stageContent,
+      }],
+    }, null, 2));
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).resolves.toBe("completed");
+    expect((await repo.read(stagePath))?.content).toBe(stageContent);
+    expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
+  });
+
+  it("does not create recovery Markdown when the journal changes immediately before write", async () => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Guarded-Recovery.md";
+    const stageContent = cycle("guarded-recovery", "project-1", 10);
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const canvasAfter = JSON.stringify({ ...JSON.parse(canvasBefore), guarded: true });
+    repo.set(CANVAS, canvasAfter);
+    const journal = {
+      version: 2,
+      operation: "apply-workspace-history",
+      phase: "canvas-applied",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      entryId: "guarded-recovery",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvasBefore,
+      canvasToContent: canvasAfter,
+      markdownTransitions: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "guarded-recovery",
+        projectId: "project-1",
+        fromContent: null,
+        toContent: stageContent,
+      }],
+    };
+    repo.set(HISTORY_JOURNAL, JSON.stringify(journal, null, 2));
+    let journalReads = 0;
+    repo.beforeRead = (path) => {
+      if (path !== HISTORY_JOURNAL || ++journalReads !== 2) return;
+      repo.set(HISTORY_JOURNAL, JSON.stringify({
+        ...journal,
+        createdAt: "2099-01-01T00:00:00.000Z",
+      }, null, 2));
+    };
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).rejects.toThrow(/日志在写入前发生变化/);
+    expect(await repo.read(stagePath)).toBeNull();
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+  });
+
+  it("freezes a history journal without a canonical createdAt before any write", async () => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Invalid-Time.md";
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const canvasAfter = JSON.stringify({ ...JSON.parse(canvasBefore), invalidTime: true });
+    repo.set(CANVAS, canvasAfter);
+    repo.set(HISTORY_JOURNAL, JSON.stringify({
+      version: 2,
+      operation: "apply-workspace-history",
+      phase: "canvas-applied",
+      entryId: "invalid-time",
+      direction: "redo",
+      canvasPath: CANVAS,
+      canvasFromContent: canvasBefore,
+      canvasToContent: canvasAfter,
+      markdownTransitions: [{
+        path: stagePath,
+        kind: "stage",
+        entityId: "invalid-time",
+        projectId: "project-1",
+        fromContent: null,
+        toContent: cycle("invalid-time", "project-1", 11),
+      }],
+    }, null, 2));
+
+    await expect(workspace(repo).recoverPendingWorkspaceHistory()).rejects.toThrow(/字段无效/);
+    expect(await repo.read(stagePath)).toBeNull();
+    expect((await repo.read(CANVAS))?.content).toBe(canvasAfter);
+    expect(await repo.read(HISTORY_JOURNAL)).not.toBeNull();
+  });
+
   it("undoes and redoes a bridged stage deletion without losing the note", async () => {
     const repo = linearRepository();
     const service = workspace(repo);
@@ -2623,7 +3000,7 @@ class MemoryRepository {
   failCreatePath?: string;
   failTrashPath?: string;
   beforeCreate?: (path: string) => void;
-  beforeCompare?: () => void;
+  beforeCompare?: (path: string) => void;
   beforeRead?: (path: string) => void;
   beforeTrash?: (revision: VaultRevision) => void;
 
@@ -2672,8 +3049,9 @@ class MemoryRepository {
     content: string,
     beforeWrite?: () => void,
   ): Promise<VaultRevision> {
-    this.beforeCompare?.();
+    const beforeCompare = this.beforeCompare;
     this.beforeCompare = undefined;
+    beforeCompare?.(revision.path);
     const current = await this.read(revision.path);
     if (!current || current.hash !== revision.hash) throw new Error("write conflict");
     beforeWrite?.();

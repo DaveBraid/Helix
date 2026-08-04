@@ -283,6 +283,22 @@ interface ProjectWorkspaceHistoryFileTransition {
   toContent: string | null;
 }
 
+export interface ProjectWorkspaceMarkdownUpdate {
+  path: string;
+  kind: "project" | "stage";
+  entityId: string;
+  projectId: string;
+  beforeHash: string;
+  afterContent: string;
+}
+
+export interface ProjectWorkspaceAtomicChange {
+  label: string;
+  canvasBeforeHash: string;
+  canvasAfterContent: string;
+  markdownUpdates: readonly ProjectWorkspaceMarkdownUpdate[];
+}
+
 interface ProjectWorkspaceHistoryEntry {
   id: string;
   label: string;
@@ -293,8 +309,9 @@ interface ProjectWorkspaceHistoryEntry {
 }
 
 interface ProjectWorkspaceHistoryJournal {
-  version: 1;
+  version: 1 | 2;
   operation: "apply-workspace-history";
+  phase?: "prepared" | "markdown-applied" | "canvas-applied";
   createdAt: string;
   entryId: string;
   direction: "undo" | "redo";
@@ -373,6 +390,73 @@ export class ProjectWorkspaceService {
     if (this.applyingHistory) return;
     this.undoStack.length = 0;
     this.redoStack.length = 0;
+  }
+
+  async applyAtomicWorkspaceChange(
+    change: ProjectWorkspaceAtomicChange,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    if (!change.label.trim()) throw new Error("项目图谱事务缺少操作名称");
+    const canvas = await this.repository.read(normalizePath(this.canvasPath()));
+    if (!canvas || canvas.hash !== change.canvasBeforeHash) {
+      throw new Error("Canvas 在跨文件事务开始前已变化");
+    }
+    let canvasDocument: unknown;
+    try {
+      canvasDocument = JSON.parse(change.canvasAfterContent);
+    } catch {
+      throw new Error("跨文件事务的目标 Canvas 不是有效 JSON");
+    }
+    if (
+      !canvasDocument ||
+      typeof canvasDocument !== "object" ||
+      !Array.isArray((canvasDocument as Partial<CanvasDocument>).nodes) ||
+      !Array.isArray((canvasDocument as Partial<CanvasDocument>).edges)
+    ) {
+      throw new Error("跨文件事务的目标 Canvas 缺少 nodes 或 edges");
+    }
+    const seen = new Set<string>();
+    const projectRoot = `${normalizePath(this.rootFolder())}/Projects/`;
+    const transitions: ProjectWorkspaceHistoryFileTransition[] = [];
+    for (const update of change.markdownUpdates) {
+      const path = normalizePath(update.path);
+      if (
+        path !== update.path ||
+        seen.has(path) ||
+        !path.startsWith(projectRoot) ||
+        !path.endsWith(".md") ||
+        !update.entityId ||
+        !update.projectId
+      ) {
+        throw new Error(`跨文件事务包含重复或未规范化路径：${update.path}`);
+      }
+      seen.add(path);
+      const current = await this.repository.read(path);
+      if (!current || current.hash !== update.beforeHash) {
+        throw new Error(`阶段 Markdown 在跨文件事务开始前已变化：${path}`);
+      }
+      const transition: ProjectWorkspaceHistoryFileTransition = {
+        path,
+        kind: update.kind,
+        entityId: update.entityId,
+        projectId: update.projectId,
+        fromContent: current.content,
+        toContent: update.afterContent,
+      };
+      this.assertHistoryStageIdentity(current.content, transition);
+      this.assertHistoryStageIdentity(update.afterContent, transition);
+      if (current.content !== update.afterContent) transitions.push(transition);
+    }
+    const entry: ProjectWorkspaceHistoryEntry = {
+      id: crypto.randomUUID(),
+      label: change.label.trim(),
+      canvasPath: canvas.path,
+      canvasBeforeContent: canvas.content,
+      canvasAfterContent: change.canvasAfterContent,
+      markdownTransitions: transitions,
+    };
+    await this.applyHistoryEntry(entry, "redo");
+    this.recordHistoryEntry(entry);
+    return this.snapshot();
   }
 
   async observeCanvasChange(): Promise<void> {
@@ -467,15 +551,40 @@ export class ProjectWorkspaceService {
       if (!canvas) throw new Error("撤销事务引用的 Canvas 已不存在");
       const fromHash = stableHash(journal.canvasFromContent);
       const toHash = stableHash(journal.canvasToContent);
+      if (fromHash === toHash) {
+        if (canvas.hash !== fromHash) {
+          throw new Error("Canvas 已偏离纯 Markdown 事务的稳定版本");
+        }
+        if (journal.version !== 2 || !journal.phase) {
+          throw new Error("旧版事务日志无法判定 Canvas 起终点相同的恢复方向");
+        }
+        const states = await this.historyTransitionStates(journal.markdownTransitions);
+        if (states.some((state) => state === "unknown")) {
+          throw new Error("纯 Markdown 事务文件同时偏离起点和终点");
+        }
+        const allAfter = states.every((state) => state === "after");
+        if (journal.phase !== "prepared" && !allAfter) {
+          throw new Error("纯 Markdown 事务相位与文件状态不一致，禁止猜测补写");
+        }
+        const shouldComplete = journal.phase !== "prepared" || allAfter;
+        if (shouldComplete) {
+          await this.finishHistoryRemovals(journal.markdownTransitions, generation, journalRevision);
+          await this.finishMachineJournal(journalRevision, generation);
+          return "completed";
+        }
+        await this.rollbackHistoryAdditions(journal.markdownTransitions, generation, journalRevision);
+        await this.finishMachineJournal(journalRevision, generation);
+        return "aborted";
+      }
       if (canvas.hash === fromHash) {
-        await this.rollbackHistoryAdditions(journal.markdownTransitions, generation);
+        await this.rollbackHistoryAdditions(journal.markdownTransitions, generation, journalRevision);
         await this.finishMachineJournal(journalRevision, generation);
         return "aborted";
       }
       if (canvas.hash !== toHash) {
         throw new Error("Canvas 同时偏离撤销事务的起点和终点");
       }
-      await this.finishHistoryRemovals(journal.markdownTransitions, generation);
+      await this.finishHistoryRemovals(journal.markdownTransitions, generation, journalRevision);
       await this.finishMachineJournal(journalRevision, generation);
       return "completed";
     } catch (error) {
@@ -2014,9 +2123,10 @@ export class ProjectWorkspaceService {
       throw new Error("Canvas 在操作完成后已被修改，不能撤销或重做");
     }
     await this.assertHistoryFromState(transitions);
-    const journal: ProjectWorkspaceHistoryJournal = {
-      version: 1,
+    let journal: ProjectWorkspaceHistoryJournal = {
+      version: 2,
       operation: "apply-workspace-history",
+      phase: "prepared",
       createdAt: new Date().toISOString(),
       entryId: entry.id,
       direction,
@@ -2033,7 +2143,7 @@ export class ProjectWorkspaceService {
       this.freezePendingStageDeletion(message);
       throw new Error(message);
     }
-    const journalRevision = await this.repository.create(
+    let journalRevision = await this.repository.create(
       this.historyJournalPath(),
       JSON.stringify(journal, null, 2),
       () => this.assertActive(generation),
@@ -2042,19 +2152,47 @@ export class ProjectWorkspaceService {
     try {
       for (const transition of transitions) {
         if (transition.fromContent === null && transition.toContent !== null) {
+          await this.assertHistoryJournalCurrent(journalRevision);
           await this.repository.create(
             transition.path,
             transition.toContent,
             () => this.assertActive(generation),
           );
+        } else if (
+          transition.fromContent !== null &&
+          transition.toContent !== null
+        ) {
+          const current = await this.repository.read(transition.path);
+          if (!current || current.hash !== stableHash(transition.fromContent)) {
+            throw new Error(`阶段 Markdown 已变化，不能应用历史：${transition.path}`);
+          }
+          await this.assertHistoryJournalCurrent(journalRevision);
+          await this.repository.compareAndWrite(
+            current,
+            transition.toContent,
+            () => this.assertActive(generation),
+          );
         }
       }
+      ({ journal, revision: journalRevision } = await this.updateHistoryJournalPhase(
+        journalRevision,
+        journal,
+        "markdown-applied",
+        generation,
+      ));
+      await this.assertHistoryJournalCurrent(journalRevision);
       await this.repository.compareAndWrite(
         canvas,
         toCanvasContent,
         () => this.assertActive(generation),
       );
-      await this.finishHistoryRemovals(transitions, generation);
+      ({ journal, revision: journalRevision } = await this.updateHistoryJournalPhase(
+        journalRevision,
+        journal,
+        "canvas-applied",
+        generation,
+      ));
+      await this.finishHistoryRemovals(transitions, generation, journalRevision);
       await this.finishMachineJournal(journalRevision, generation);
     } catch (error) {
       let currentCanvas: VaultRevision | null;
@@ -2068,9 +2206,23 @@ export class ProjectWorkspaceService {
         this.freezePendingStageDeletion(message);
         throw new Error(message);
       }
-      if (currentCanvas?.hash === stableHash(fromCanvasContent)) {
+      const canvasFromHash = stableHash(fromCanvasContent);
+      const canvasToHash = stableHash(toCanvasContent);
+      if (
+        currentCanvas?.hash === canvasFromHash &&
+        canvasFromHash === canvasToHash &&
+        journal.phase === "canvas-applied"
+      ) {
+        const message =
+          `纯 Markdown 项目事务已提交但日志尚未清理，已保留目标态等待重启恢复：${
+            error instanceof Error ? error.message : String(error)
+          }`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
+      if (currentCanvas?.hash === canvasFromHash) {
         try {
-          await this.rollbackHistoryAdditions(transitions, generation);
+          await this.rollbackHistoryAdditions(transitions, generation, journalRevision);
           await this.finishMachineJournal(journalRevision, generation);
         } catch (cleanupError) {
           const message =
@@ -2112,9 +2264,32 @@ export class ProjectWorkspaceService {
     }
   }
 
+  private async historyTransitionStates(
+    transitions: ProjectWorkspaceHistoryFileTransition[],
+  ): Promise<Array<"before" | "after" | "unknown">> {
+    const states: Array<"before" | "after" | "unknown"> = [];
+    for (const transition of transitions) {
+      const current = await this.repository.read(transition.path);
+      const beforeMatches = transition.fromContent === null
+        ? current === null
+        : current?.hash === stableHash(transition.fromContent);
+      const afterMatches = transition.toContent === null
+        ? current === null
+        : current?.hash === stableHash(transition.toContent);
+      if (beforeMatches === afterMatches) {
+        states.push("unknown");
+        continue;
+      }
+      if (current) this.assertHistoryStageIdentity(current.content, transition);
+      states.push(beforeMatches ? "before" : "after");
+    }
+    return states;
+  }
+
   private async rollbackHistoryAdditions(
     transitions: ProjectWorkspaceHistoryFileTransition[],
     generation: number,
+    journalRevision: VaultRevision,
   ): Promise<void> {
     for (const transition of transitions) {
       if (transition.fromContent === null && transition.toContent !== null) {
@@ -2124,6 +2299,7 @@ export class ProjectWorkspaceService {
           throw new Error(`撤销事务新增的 Markdown 已被修改：${transition.path}`);
         }
         this.assertHistoryStageIdentity(current.content, transition);
+        await this.assertHistoryJournalCurrent(journalRevision);
         await this.repository.trashIfUnchanged(
           current,
           () => this.assertActive(generation),
@@ -2131,8 +2307,24 @@ export class ProjectWorkspaceService {
         );
       } else if (transition.fromContent !== null) {
         const current = await this.repository.read(transition.path);
-        if (!current || current.hash !== stableHash(transition.fromContent)) {
-          throw new Error(`撤销事务起点 Markdown 已变化：${transition.path}`);
+        if (!current) {
+          throw new Error(`撤销事务起点 Markdown 已缺失：${transition.path}`);
+        }
+        if (
+          transition.toContent !== null &&
+          current.hash === stableHash(transition.toContent)
+        ) {
+          this.assertHistoryStageIdentity(current.content, transition);
+          await this.assertHistoryJournalCurrent(journalRevision);
+          await this.repository.compareAndWrite(
+            current,
+            transition.fromContent,
+            () => this.assertActive(generation),
+          );
+          continue;
+        }
+        if (current.hash !== stableHash(transition.fromContent)) {
+          throw new Error(`撤销事务 Markdown 同时偏离起点和终点：${transition.path}`);
         }
         this.assertHistoryStageIdentity(current.content, transition);
       }
@@ -2142,6 +2334,7 @@ export class ProjectWorkspaceService {
   private async finishHistoryRemovals(
     transitions: ProjectWorkspaceHistoryFileTransition[],
     generation: number,
+    journalRevision: VaultRevision,
   ): Promise<void> {
     for (const transition of transitions) {
       const current = await this.repository.read(transition.path);
@@ -2154,6 +2347,7 @@ export class ProjectWorkspaceService {
           throw new Error(`待移除的阶段 Markdown 已变化：${transition.path}`);
         }
         this.assertHistoryStageIdentity(current.content, transition);
+        await this.assertHistoryJournalCurrent(journalRevision);
         await this.repository.trashIfUnchanged(
           current,
           () => this.assertActive(generation),
@@ -2161,8 +2355,33 @@ export class ProjectWorkspaceService {
         );
         continue;
       }
-      if (!current || current.hash !== stableHash(transition.toContent)) {
-        throw new Error(`历史目标 Markdown 缺失或已变化：${transition.path}`);
+      if (!current && transition.fromContent === null) {
+        await this.assertHistoryJournalCurrent(journalRevision);
+        await this.repository.create(
+          transition.path,
+          transition.toContent,
+          () => this.assertActive(generation),
+        );
+        continue;
+      }
+      if (!current) {
+        throw new Error(`历史目标 Markdown 缺失：${transition.path}`);
+      }
+      if (
+        transition.fromContent !== null &&
+        current.hash === stableHash(transition.fromContent)
+      ) {
+        this.assertHistoryStageIdentity(current.content, transition);
+        await this.assertHistoryJournalCurrent(journalRevision);
+        await this.repository.compareAndWrite(
+          current,
+          transition.toContent,
+          () => this.assertActive(generation),
+        );
+        continue;
+      }
+      if (current.hash !== stableHash(transition.toContent)) {
+        throw new Error(`历史目标 Markdown 同时偏离起点和终点：${transition.path}`);
       }
       this.assertHistoryStageIdentity(current.content, transition);
     }
@@ -2203,9 +2422,16 @@ export class ProjectWorkspaceService {
     }
     const journal = value as Partial<ProjectWorkspaceHistoryJournal>;
     if (
-      journal.version !== 1 ||
+      (journal.version !== 1 && journal.version !== 2) ||
       journal.operation !== "apply-workspace-history" ||
+      (journal.version === 2 &&
+        journal.phase !== "prepared" &&
+        journal.phase !== "markdown-applied" &&
+        journal.phase !== "canvas-applied") ||
       (journal.direction !== "undo" && journal.direction !== "redo") ||
+      typeof journal.createdAt !== "string" ||
+      !journal.createdAt ||
+      !isCanonicalIsoTimestamp(journal.createdAt) ||
       typeof journal.entryId !== "string" ||
       !journal.entryId ||
       typeof journal.canvasPath !== "string" ||
@@ -2217,6 +2443,7 @@ export class ProjectWorkspaceService {
       throw new Error("项目图谱撤销事务日志字段无效");
     }
     const root = `${normalizePath(this.rootFolder())}/Projects/`;
+    const transitionPaths = new Set<string>();
     for (const transition of journal.markdownTransitions) {
       if (
         !transition ||
@@ -2241,6 +2468,10 @@ export class ProjectWorkspaceService {
       ) {
         throw new Error("项目图谱撤销事务日志的 Markdown 转换无效");
       }
+      if (transitionPaths.has(transition.path)) {
+        throw new Error(`项目图谱撤销事务日志包含重复路径：${transition.path}`);
+      }
+      transitionPaths.add(transition.path);
       if (transition.fromContent !== null) {
         this.assertHistoryStageIdentity(transition.fromContent, transition);
       }
@@ -2249,6 +2480,38 @@ export class ProjectWorkspaceService {
       }
     }
     return journal as ProjectWorkspaceHistoryJournal;
+  }
+
+  private async updateHistoryJournalPhase(
+    revision: VaultRevision,
+    journal: ProjectWorkspaceHistoryJournal,
+    phase: "markdown-applied" | "canvas-applied",
+    generation: number,
+  ): Promise<{ journal: ProjectWorkspaceHistoryJournal; revision: VaultRevision }> {
+    const current = await this.repository.read(revision.path);
+    if (!current || current.hash !== revision.hash) {
+      throw new Error("项目图谱事务日志在阶段推进前发生变化");
+    }
+    const next: ProjectWorkspaceHistoryJournal = { ...journal, version: 2, phase };
+    const written = await this.repository.compareAndWrite(
+      current,
+      JSON.stringify(next, null, 2),
+      () => this.assertActive(generation),
+    );
+    return { journal: next, revision: written };
+  }
+
+  private async assertHistoryJournalCurrent(revision: VaultRevision): Promise<void> {
+    const current = await this.repository.read(revision.path);
+    if (!current) throw new Error("项目图谱事务日志在写入前已不存在");
+    const expected = this.parseHistoryJournal(revision.content);
+    const actual = this.parseHistoryJournal(current.content);
+    if (
+      current.hash !== revision.hash ||
+      stableHash(actual) !== stableHash(expected)
+    ) {
+      throw new Error("项目图谱事务日志在写入前发生变化");
+    }
   }
 
   private async finishMachineJournal(
@@ -3327,6 +3590,11 @@ export class ProjectWorkspaceService {
     }
     return written;
   }
+}
+
+function isCanonicalIsoTimestamp(value: string): boolean {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
 function cardNode(

@@ -1,14 +1,14 @@
 # 当前开发状态
 
 最后更新：2026-08-04
-当前基线提交：`98d06f6 feat: add draggable stage status board`
-工作树状态：仅本状态快照待提交；Vault 模板、项目文件、Canvas 和运行态 `data.json` 均不纳入 Git。
-当前阶段：阶段 2 已提交；准备实施关系驱动的聚焦问题引用块（阶段 3）。
+当前基线提交：`0d68c76 docs: checkpoint stage board phase`
+工作树状态：阶段 3A/3B 的计划、领域协议、可恢复事务、测试及文档尚未提交；Vault 文件与运行态 `data.json` 不纳入 Git。
+当前阶段：阶段 3A/3B 已完成；准备接入 3C 关系命令。
 
 ## 本轮目标
 
-- 落实五列阶段看板、同一 Markdown 状态写入入口及键鼠等价交互。
-- 非目标：不改 Canvas 关系或布局、不联动滴答、不做聚焦问题引用块、远端发布或用户数据迁移。
+- 完成聚焦问题纯领域协议，以及 Canvas 与多份既有 Markdown 共用的可恢复 CAS 事务。
+- 非目标：本轮不接入关系命令、监听、冲突 UI、滴答同步、远端发布或迁移。
 
 ## 当前事实
 
@@ -24,10 +24,11 @@
 
 ## 本轮改动
 
-- 新增阶段看板领域合同：固定五态顺序、统一图标／颜色／文案、Markdown 阶段成员投影、预期状态校验和异步防重闸门。
-- 项目页阶段看板固定五列单行；列内纵滚、看板自身横滚，不带动工作台侧栏；完成折叠或 Canvas 缺节点不会漏卡。
-- 指针拖拽支持阈值、跟手阴影、目标提示和计数预览；取消、同列、Escape、丢失 capture 均零写且不误开笔记。
-- 拖拽与键盘状态候选共用 Markdown CAS 和恢复模式写闸门；成功后从新快照重渲染，失败刷新真实状态并上浮错误。
+- `src/domain/stage-focus-bridge.ts`：新增明确 H1/H2、fence 感知的小节解析，受管包络／来源子块渲染与解析，以及仅接受 Canvas 派生来源 ID 的零写入计划函数。
+- `tests/stage-focus-bridge.test.ts`：覆盖空内容、多来源顺序、嵌套引用／列表、代码围栏、CRLF、损坏标记、重复来源、受管内容被编辑和冲突冻结。
+- `docs/plans/03-stage-focus-bridge/PLAN.md`：将阶段 3 拆为纯领域协议、跨文件事务、关系接入、监听冲突和 CLI 实机验收五段。
+- `src/services/project-workspace.ts`：workspace-history v2 增加 phase、既有 Markdown 转换、纯 Markdown 事务、逐写日志守卫、启动补全／回滚与 v1 兼容。
+- `tests/project-workspace.test.ts`：覆盖正常应用、撤销重做、崩溃相位、日志竞争、未知状态冻结、纯 Markdown 与 v1 恢复。
 
 ## 相关约束
 
@@ -39,12 +40,11 @@
 
 ## 当前验证
 
-- 已通过：最终全量 57 个测试文件、580 项；`typecheck`、`build`、`release:check`、`git diff --check` 全绿。
-- 已通过：成员完整性、状态竞争、恢复拒绝、同列／取消零写、重复防重、销毁后清理、五列布局与命中穿透专项。
-- 实机：Obsidian 1.13.4 深色模式下五列同一横排、宽 244 px、颜色互异；看板 `scrollWidth 1296 > clientWidth 839`，横滚为 `auto`、纵滚为 `hidden`。
-- 实机：隔离 Stage 从 active 拖至 completed 后 Markdown 属性和列计数 `0→1` 一致；同列拖拽零写且未打开笔记；状态按钮可聚焦、ARIA 正确，`dev:errors` 为 0。
+- 已通过：全量 58 个测试文件、619 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿；3A 专项 27/27、3B 项目工作区专项 98/98。
+- 审查：3A P0/P1/P2=0，3B P0/P1=0；两段均未接入 UI。
+- 实机（提交基线）：Obsidian 1.13.4 深色模式五列横排／独立横滚正常；隔离 Stage 跨列写入与计数一致，同列拖拽零写，键盘和 ARIA 正常，`dev:errors` 为 0。
 - 实机：临时 Project/Stage 已移入 Obsidian 废纸篓并移除空目录；当时既有 Project/Stage、模板和 Canvas 前后哈希一致。
-- 审查：看门狗确认 P0/P1 为 0；阶段 2 已提交为 `98d06f6`。目标列入场动画已验证存在，跨列 FLIP 作为后续视觉优化。
+- 实机：3A/3B 尚未接入 UI，不适用；阶段 3C 接入后统一用 Obsidian CLI 验收。
 
 ## 未关闭问题
 
@@ -52,5 +52,6 @@
 
 ## 下一步
 
-1. 实施阶段 3：关系驱动的聚焦问题引用块与双向 CAS。
-2. 阶段 3 稳定后，以隔离合同开始 Helix→滴答单向投影。
+1. 实施 3C：只从 Canvas 托管入边生成聚焦引用，覆盖新建、连边、换边、断边、删除、撤销重做。
+2. 实施监听与逐字段冲突 UI，再用 Obsidian CLI 完成阶段 3 实机验收。
+3. 阶段 3 稳定后开始 Helix→滴答隔离投影。

@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-04
-当前基线提交：`a5b36cf docs: checkpoint canvas and review work`
-工作树状态：非干净；本轮首页、专注派生、测试及文档已终审待提交。用户正修改的 `Template/Helix/` 与运行态 `data.json` 均不纳入 Git。
-当前阶段：首页今日投影与专注统计纠正已通过终审；下一阶段继续项目 Canvas 和复盘交互打磨。
+当前基线提交：`eba9f8a fix: refine today dashboard metrics`
+工作树状态：工作树干净；用户正修改的 `Template/Helix/` 与运行态 `data.json` 均不纳入 Git。
+当前阶段：首页今日投影与专注统计纠正已提交；下一阶段继续项目 Canvas 和复盘交互打磨。
 
 ## 本轮目标
 

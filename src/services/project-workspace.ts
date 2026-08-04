@@ -9,6 +9,21 @@ import {
   type CycleRelationKind,
 } from "../domain/cycle-graph";
 import { cycleTemplate, projectTemplate } from "../domain/projects";
+import {
+  isProjectStatus,
+  isStageStatus,
+  isTerminalStageStatus,
+  projectStatusFromFrontmatter,
+  stageStatusFromFrontmatter,
+  type HelixProjectStatus,
+  type HelixStageStatus,
+} from "../domain/project-status";
+import {
+  nextBranchStageCodes,
+  nextMajorStageCode,
+  nextUnusedMajorStageCode,
+  parseStageCode,
+} from "../domain/stage-numbering";
 import type {
   HelixTemplateRenderRequest,
 } from "./template-manager";
@@ -56,6 +71,8 @@ interface CanvasDocument {
   nodes: CanvasNode[];
   edges: CanvasEdge[];
   helixStageSequences?: Record<string, number>;
+  /** 已发放展示编号的防复用账本；不承载阶段关系、状态或正文真值。 */
+  helixStageCodes?: Record<string, string[]>;
   helixCompletedCollapse?: {
     version: 1;
     projectIds: string[];
@@ -82,12 +99,12 @@ export interface ProjectWorkspaceCycle {
   title: string;
   notePath: string;
   sequence: number;
+  stageCode: string;
   status: ProjectWorkspaceCycleStatus;
 }
 
-export type ProjectWorkspaceCycleStatus = "planned" | "active" | "closed";
-export type ProjectWorkspaceProjectStatus =
-  "planned" | "active" | "paused" | "completed" | "archived";
+export type ProjectWorkspaceCycleStatus = HelixStageStatus;
+export type ProjectWorkspaceProjectStatus = HelixProjectStatus;
 
 export interface ProjectWorkspaceProjectStatusUpdatePlan {
   kind: "project";
@@ -95,6 +112,7 @@ export interface ProjectWorkspaceProjectStatusUpdatePlan {
   notePath: string;
   revisionHash: string;
   currentStatus: ProjectWorkspaceProjectStatus;
+  currentStoredStatus: string;
 }
 
 export interface ProjectWorkspaceDidaMappingUpdatePlan {
@@ -112,6 +130,7 @@ export interface ProjectWorkspaceCycleStatusUpdatePlan {
   notePath: string;
   revisionHash: string;
   currentStatus: ProjectWorkspaceCycleStatus;
+  currentStoredStatus: string;
 }
 
 export interface ProjectWorkspaceProject {
@@ -146,12 +165,16 @@ export interface ProjectWorkspaceNodeMove {
 export interface ProjectWorkspaceSnapshot {
   canvasPath: string;
   canvasRevisionHash: string | null;
+  /** 仅用于写前竞争检测；不向 UI 暴露正文。 */
+  managedMarkdownRevisionHashes: Record<string, string>;
   projects: ProjectWorkspaceProject[];
   nextStageSequenceByProject: Record<string, number>;
   relations: CycleRelation[];
   migrationWarnings: string[];
   migrationItems: ProjectWorkspaceMigrationItem[];
   migrationRequired: boolean;
+  canvasRepairRequired?: boolean;
+  canvasRepairReasons?: string[];
   canvasNodes: ProjectWorkspaceCanvasNode[];
   collapsedCompletedProjectIds: string[];
   nativeRelationCandidates: ProjectWorkspaceNativeRelationCandidate[];
@@ -383,6 +406,12 @@ export class ProjectWorkspaceService {
   }
 
   async loadStableWorkspace(): Promise<ProjectWorkspaceSnapshot> {
+    const snapshot = await this.readStableSnapshot();
+    if (snapshot.migrationRequired) return snapshot;
+    return this.ensureCanvasFromSnapshot(snapshot, { allowWrite: false });
+  }
+
+  private async readStableSnapshot(): Promise<ProjectWorkspaceSnapshot> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
@@ -392,8 +421,7 @@ export class ProjectWorkspaceService {
         if (workspaceStabilitySignature(first) !== workspaceStabilitySignature(second)) {
           throw new Error("项目 Markdown 或 Canvas 仍在变化");
         }
-        if (second.migrationRequired) return second;
-        return await this.ensureCanvasFromSnapshot(second);
+        return second;
       } catch (error) {
         lastError = error;
         if (attempt < 2) {
@@ -549,11 +577,12 @@ export class ProjectWorkspaceService {
         : undefined;
       if (frontmatter?.["helix-kind"] !== "helix-project") return [];
       const id = frontmatter["helix-id"];
-      const status = frontmatter["helix-status"];
+      const rawStatus = frontmatter["helix-status"];
+      const status = projectStatusFromFrontmatter(rawStatus);
       if (
         typeof id !== "string" ||
         !id.trim() ||
-        !["planned", "active", "paused", "completed", "archived"].includes(String(status))
+        !status
       ) {
         throw new Error(`项目元数据不完整：${file.path}`);
       }
@@ -563,8 +592,9 @@ export class ProjectWorkspaceService {
       return [{
         id,
         title: heading || file.parent?.name || file.basename,
-        status: status as ProjectWorkspaceProject["status"],
+        status,
         notePath: file.path,
+        revisionHash: revision?.hash ?? "",
         color: parseProjectColor(frontmatter["helix-color"], file.path),
         didaProjectId:
           typeof frontmatter["helix-dida-project-id"] === "string" &&
@@ -583,6 +613,9 @@ export class ProjectWorkspaceService {
       path: project.notePath,
       didaProjectId: project.didaProjectId,
     })));
+    const managedMarkdownRevisionHashes = new Map(
+      projectFiles.map((project) => [normalizePath(project.notePath), project.revisionHash]),
+    );
     const seenEntityIds = new Set(projectFiles.map((project) => project.id));
     const projectByFolder = new Map<string, typeof projectFiles[number]>();
     for (const project of projectFiles) {
@@ -631,16 +664,24 @@ export class ProjectWorkspaceService {
       ) continue;
       const id = frontmatter["helix-id"];
       const sequence = Number(frontmatter["helix-sequence"]);
-      const status = frontmatter["helix-status"];
+      const rawStatus = frontmatter["helix-status"];
+      const status = stageStatusFromFrontmatter(rawStatus);
+      const stageCodeField = managedFrontmatterString(revision?.content ?? "", "helix-stage-code");
       if (
         typeof id !== "string" ||
         !id.trim() ||
         !Number.isSafeInteger(sequence) ||
         sequence < 1 ||
-        !["planned", "active", "closed"].includes(String(status))
+        !status
       ) {
         throw new Error(`阶段元数据不完整：${file.path}`);
       }
+      if (stageCodeField.present &&
+          (!stageCodeField.value || !parseStageCode(stageCodeField.value))) {
+        throw new Error(`阶段展示编号无效：${file.path}`);
+      }
+      const stageCode = stageCodeField.value ?? String(sequence);
+      managedMarkdownRevisionHashes.set(normalizePath(file.path), revision?.hash ?? "");
       if (seenEntityIds.has(id)) {
         throw new Error(`项目或阶段 ID 重复：${id}`);
       }
@@ -682,15 +723,19 @@ export class ProjectWorkspaceService {
       if (cycles.some((cycle) => cycle.sequence === sequence)) {
         throw new Error(`同一项目的阶段编号重复：${project.title} / 阶段 ${sequence}`);
       }
+      if (cycles.some((cycle) => cycle.stageCode === stageCode)) {
+        throw new Error(`同一项目的阶段展示编号重复：${project.title} / 阶段 ${stageCode}`);
+      }
       const heading = revision
         ? /^#\s+(.+?)\s*$/m.exec(revision.content)?.[1]?.trim()
         : undefined;
       cycles.push({
         id,
-        title: stageTitleFromHeading(heading, sequence),
+        title: stageTitleFromHeading(heading, stageCode),
         notePath: file.path,
         sequence,
-        status: status as ProjectWorkspaceCycle["status"],
+        stageCode,
+        status,
       });
       cyclesByProject.set(project.id, cycles);
     }
@@ -708,6 +753,7 @@ export class ProjectWorkspaceService {
       .sort((left, right) => left.title.localeCompare(right.title, "zh-CN"));
     const canvas = await this.readCanvas();
     validatedStageSequenceLedger(canvas.document);
+    validatedStageCodeLedger(canvas.document);
     assertUniqueCanvasIds(canvas.document);
     const cycles = projects.flatMap((project) => project.cycles);
     const projectById = new Map(projects.map((project) => [project.id, project]));
@@ -871,12 +917,18 @@ export class ProjectWorkspaceService {
     const result: ProjectWorkspaceSnapshot = {
       canvasPath: normalizePath(this.canvasPath()),
       canvasRevisionHash: canvas.revision?.hash ?? null,
+      managedMarkdownRevisionHashes: Object.fromEntries(
+        [...managedMarkdownRevisionHashes.entries()].sort(([left], [right]) =>
+          left.localeCompare(right)),
+      ),
       projects,
       nextStageSequenceByProject,
       relations,
       migrationWarnings: [...new Set(migrationWarnings)],
       migrationItems: pendingMigrationItems,
       migrationRequired: pendingMigrationItems.length > 0,
+      canvasRepairRequired: false,
+      canvasRepairReasons: [],
       canvasNodes,
       collapsedCompletedProjectIds: validatedCompletedCollapse(
         canvas.document,
@@ -893,11 +945,12 @@ export class ProjectWorkspaceService {
   }
 
   async ensureCanvas(): Promise<ProjectWorkspaceSnapshot> {
-    return this.ensureCanvasFromSnapshot(await this.snapshot());
+    return this.ensureCanvasFromSnapshot(await this.readStableSnapshot(), { allowWrite: true });
   }
 
   private async ensureCanvasFromSnapshot(
     snapshot: ProjectWorkspaceSnapshot,
+    options: { allowWrite: boolean },
   ): Promise<ProjectWorkspaceSnapshot> {
     const generation = this.beginOperation();
     if (snapshot.migrationRequired) {
@@ -907,17 +960,14 @@ export class ProjectWorkspaceService {
     if ((canvas.revision?.hash ?? null) !== snapshot.canvasRevisionHash) {
       throw new Error("Canvas 在稳定读取后再次变化，未执行摘要修复");
     }
-    if (!canvas.revision) {
-      const document: CanvasDocument = { nodes: [], edges: [] };
-      const content = JSON.stringify(document, null, 2);
-      const revision = await this.repository.create(
-        normalizePath(this.canvasPath()),
-        content,
-        () => this.assertActive(generation),
-      );
-      canvas = { revision, document };
-    }
-    let changed = false;
+    const canvasMissing = !canvas.revision;
+    canvas = {
+      revision: canvas.revision,
+      document: JSON.parse(JSON.stringify(canvas.document)) as CanvasDocument,
+    };
+    let changed = canvasMissing;
+    const reasons = new Set<string>();
+    if (canvasMissing) reasons.add("项目 Canvas 不存在");
     const entityById = new Map<string, { path: string; title: string; status: string }>([
       ...snapshot.projects.map((project) => [
         `project:${project.id}`,
@@ -933,11 +983,7 @@ export class ProjectWorkspaceService {
           {
             path: cycle.notePath,
             title: cycle.title,
-            status: cycle.status === "active"
-              ? "进行中"
-              : cycle.status === "closed"
-                ? "已关闭"
-                : "计划中",
+            status: stageStatusText(cycle.status),
           },
         ] as const)),
     ]);
@@ -962,6 +1008,7 @@ export class ProjectWorkspaceService {
         node.text = nextText;
         delete node.file;
         changed = true;
+        reasons.add("托管节点摘要需要更新");
       }
     }
     const existingProjects = new Set(
@@ -996,6 +1043,7 @@ export class ProjectWorkspaceService {
         ));
         existingProjects.add(project.id);
         changed = true;
+        reasons.add("缺少项目 Canvas 节点");
       }
       project.cycles.forEach((cycle, cycleIndex) => {
         if (existingCycles.has(cycle.id)) return;
@@ -1003,11 +1051,7 @@ export class ProjectWorkspaceService {
           `helix-stage-${cycle.id}`,
           cycle.notePath,
           cycle.title,
-          cycle.status === "active"
-            ? "进行中"
-            : cycle.status === "closed"
-              ? "已关闭"
-              : "计划中",
+          stageStatusText(cycle.status),
           projectIndex * 520,
           300 + cycleIndex * 260,
           360,
@@ -1020,10 +1064,12 @@ export class ProjectWorkspaceService {
         ));
         existingCycles.add(cycle.id);
         changed = true;
+        reasons.add("缺少阶段 Canvas 节点");
       });
     });
     if (ensureStageSequenceLedger(canvas.document, snapshot)) {
       changed = true;
+      reasons.add("阶段编号高水位需要补齐");
     }
     const edgeBefore = JSON.stringify(canvas.document.edges);
     const normalized = normalizeProjectGraph(
@@ -1034,12 +1080,31 @@ export class ProjectWorkspaceService {
     applyNormalizedManagedEdges(canvas.document, normalized.edges);
     if (JSON.stringify(canvas.document.edges) !== edgeBefore) {
       changed = true;
+      reasons.add("托管阶段关系需要正规化");
     }
     if (changed) {
+      if (!options.allowWrite) return {
+        ...snapshot,
+        canvasRepairRequired: true,
+        canvasRepairReasons: [...reasons],
+      };
+      await this.assertManagedMarkdownRevisions(snapshot);
       this.assertActive(generation);
       await this.writeCanvas(canvas, generation);
     }
     return this.snapshot();
+  }
+
+  private async assertManagedMarkdownRevisions(
+    snapshot: ProjectWorkspaceSnapshot,
+  ): Promise<void> {
+    for (const [path, expectedHash] of Object.entries(snapshot.managedMarkdownRevisionHashes)
+      .sort(([left], [right]) => left.localeCompare(right))) {
+      const current = await this.repository.read(path);
+      if (!current || !expectedHash || current.hash !== expectedHash) {
+        throw new Error("项目 Markdown 已变化，请重试");
+      }
+    }
   }
 
   async moveCanvasNode(
@@ -1169,7 +1234,7 @@ export class ProjectWorkspaceService {
     if (
       frontmatter?.["helix-kind"] !== "helix-project" ||
       frontmatter["helix-id"] !== project.id ||
-      frontmatter["helix-status"] !== project.status
+      projectStatusFromFrontmatter(frontmatter["helix-status"]) !== project.status
     ) {
       throw new Error("项目 Markdown 身份或状态已变化，请重新打开状态编辑");
     }
@@ -1179,6 +1244,7 @@ export class ProjectWorkspaceService {
       notePath: project.notePath,
       revisionHash: revision.hash,
       currentStatus: project.status,
+      currentStoredStatus: String(frontmatter["helix-status"]),
     };
   }
 
@@ -1186,7 +1252,7 @@ export class ProjectWorkspaceService {
     plan: ProjectWorkspaceProjectStatusUpdatePlan,
     status: ProjectWorkspaceProjectStatus,
   ): Promise<ProjectWorkspaceSnapshot> {
-    if (!["planned", "active", "paused", "completed", "archived"].includes(status)) {
+    if (!isProjectStatus(status)) {
       throw new Error("项目状态无效");
     }
     const generation = this.beginOperation();
@@ -1198,7 +1264,7 @@ export class ProjectWorkspaceService {
       revision.hash !== plan.revisionHash ||
       frontmatter?.["helix-kind"] !== "helix-project" ||
       frontmatter["helix-id"] !== plan.entityId ||
-      frontmatter["helix-status"] !== plan.currentStatus
+      frontmatter["helix-status"] !== plan.currentStoredStatus
     ) {
       throw new Error("项目 Markdown 在状态确认期间已经变化，请重新打开状态编辑");
     }
@@ -1234,7 +1300,7 @@ export class ProjectWorkspaceService {
       ) ||
       frontmatter["helix-id"] !== cycle.id ||
       frontmatter["helix-project-id"] !== owner.id ||
-      frontmatter["helix-status"] !== cycle.status
+      stageStatusFromFrontmatter(frontmatter["helix-status"]) !== cycle.status
     ) {
       throw new Error("阶段 Markdown 身份、所属项目或状态已变化，请重新打开状态编辑");
     }
@@ -1245,6 +1311,7 @@ export class ProjectWorkspaceService {
       notePath: cycle.notePath,
       revisionHash: revision.hash,
       currentStatus: cycle.status,
+      currentStoredStatus: String(frontmatter["helix-status"]),
     };
   }
 
@@ -1252,7 +1319,7 @@ export class ProjectWorkspaceService {
     plan: ProjectWorkspaceCycleStatusUpdatePlan,
     status: ProjectWorkspaceCycleStatus,
   ): Promise<ProjectWorkspaceSnapshot> {
-    if (!["planned", "active", "closed"].includes(status)) {
+    if (!isStageStatus(status)) {
       throw new Error("阶段状态无效");
     }
     const generation = this.beginOperation();
@@ -1268,7 +1335,7 @@ export class ProjectWorkspaceService {
       ) ||
       frontmatter["helix-id"] !== plan.entityId ||
       frontmatter["helix-project-id"] !== plan.projectId ||
-      frontmatter["helix-status"] !== plan.currentStatus
+      frontmatter["helix-status"] !== plan.currentStoredStatus
     ) {
       throw new Error("阶段 Markdown 在状态确认期间已经变化，请重新打开状态编辑");
     }
@@ -1277,6 +1344,7 @@ export class ProjectWorkspaceService {
       revision,
       patchManagedFrontmatter(revision.content, {
         "helix-status": status,
+        "helix-closed": isTerminalStageStatus(status) ? new Date().toISOString() : undefined,
         "helix-updated": new Date().toISOString(),
       }),
       () => this.assertActive(generation),
@@ -2577,7 +2645,9 @@ export class ProjectWorkspaceService {
           projectId,
           projectLink: "[[Project]]",
           sequence: 1,
+          stageCode: "1",
           startedAt: now,
+          status: "idea",
           stageTitle: "项目启动",
         }, stageBody),
         () => this.assertActive(generation),
@@ -2585,7 +2655,7 @@ export class ProjectWorkspaceService {
       const plannedProject: ProjectWorkspaceProject = {
         id: projectId,
         title: normalizedTitle,
-        status: "active",
+        status: "planned",
         notePath: projectPath,
         didaProjectId: normalizedDidaProjectId,
         color: normalizedColor,
@@ -2594,7 +2664,8 @@ export class ProjectWorkspaceService {
           title: "项目启动",
           notePath: cyclePath,
           sequence: 1,
-          status: "active",
+          stageCode: "1",
+          status: "idea",
         }],
       };
       addMissingManagedNodes(canvas.document, {
@@ -2617,6 +2688,11 @@ export class ProjectWorkspaceService {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: 1,
       };
+      canvas.document.helixStageCodes = recordIssuedStageCodes(
+        canvas.document,
+        projectId,
+        ["1"],
+      );
       this.assertActive(generation);
       await this.writeCanvas(canvas, generation, {
         label: "创建项目",
@@ -2745,12 +2821,66 @@ export class ProjectWorkspaceService {
       throw new Error("阶段编号已达到安全上限，无法继续创建阶段");
     }
     const folder = parentPath(project.notePath);
+    const predecessorCycles = predecessors.map((id) => {
+      const cycle = allCycles.find((candidate) => candidate.id === id);
+      if (!cycle) throw new Error("找不到前置阶段");
+      return cycle;
+    });
+    const codeCandidates = [
+      ...project.cycles.map((cycle) => ({ code: cycle.stageCode, sequence: cycle.sequence })),
+      ...issuedStageCodes(canvas.document, projectId).map((code) => ({ code, sequence: 1 })),
+    ];
+    let stageCodes: string[];
+    const stageCodeConversions: Array<{ cycle: ProjectWorkspaceCycle; stageCode: string }> = [];
+    if (relationKind === "branch") {
+      const source = predecessorCycles[0]!;
+      if (convertedInheritances.length > 0) {
+        const existingTarget = allCycles.find((cycle) =>
+          cycle.id === convertedInheritances[0]!.toCycleId);
+        if (!existingTarget) throw new Error("找不到需要转换为分支的既有阶段");
+        if (parseStageCode(existingTarget.stageCode)?.branch !== undefined) {
+          stageCodes = nextBranchStageCodes(
+            { code: source.stageCode, sequence: source.sequence },
+            [...codeCandidates, { code: existingTarget.stageCode, sequence: existingTarget.sequence }],
+            1,
+            1,
+          );
+        } else {
+          const pair = nextBranchStageCodes(
+            { code: source.stageCode, sequence: source.sequence }, codeCandidates, 2);
+          stageCodeConversions.push({ cycle: existingTarget, stageCode: pair[0]! });
+          stageCodes = [pair[1]!];
+        }
+      } else {
+      const siblings = snapshot.relations
+        .filter((relation) => relation.fromCycleIds.includes(source.id))
+        .map((relation) => allCycles.find((cycle) => cycle.id === relation.toCycleId))
+        .filter((cycle): cycle is ProjectWorkspaceCycle => Boolean(cycle));
+      const sourceMajor = parseStageCode(source.stageCode)?.major ?? source.sequence;
+      const branchBase = sourceMajor + 1;
+      stageCodes = nextBranchStageCodes(
+        { ...source, code: String(branchBase - 1) },
+        [...siblings.map((cycle) => ({ code: cycle.stageCode, sequence: cycle.sequence })), ...codeCandidates],
+        createCount,
+        1,
+      );
+      }
+    } else {
+      if (relationKind === "merge") {
+        const minimumMajor = Math.max(...predecessorCycles.map((cycle) =>
+          parseStageCode(cycle.stageCode)?.major ?? cycle.sequence)) + 1;
+        stageCodes = [nextUnusedMajorStageCode(codeCandidates, minimumMajor)];
+      } else {
+        stageCodes = Array.from({ length: createCount }, () => nextMajorStageCode(codeCandidates));
+      }
+    }
     const specs = Array.from({ length: createCount }, (_, index) => {
       const sequence = firstSequence + index;
       const name = `Stage-${String(sequence).padStart(2, "0")}`;
       return {
         id: crypto.randomUUID(),
         sequence,
+        stageCode: stageCodes[index]!,
         name,
         path: normalizePath(`${folder}/${name}.md`),
         stageTitle: index === 1 ? secondaryStageTitle! : stageTitle,
@@ -2780,7 +2910,9 @@ export class ProjectWorkspaceService {
             projectId,
             projectLink: "[[Project]]",
             sequence: spec.sequence,
+            stageCode: spec.stageCode,
             startedAt: new Date().toISOString(),
+            status: "idea",
             stageTitle: spec.stageTitle,
           }, body),
           () => this.assertActive(generation),
@@ -2791,13 +2923,41 @@ export class ProjectWorkspaceService {
       await this.rollbackCreatedFiles(createdRevisions, error);
     }
     let canvasWritten = false;
+    const convertedCodeRevisions: Array<{ before: VaultRevision; after: VaultRevision }> = [];
     try {
+      for (const conversion of stageCodeConversions) {
+        const before = await this.repository.read(conversion.cycle.notePath);
+        if (!before) throw new Error("既有分支阶段 Markdown 已不存在");
+        const frontmatter = frontmatterFromContent(before.content);
+        const currentCode = managedFrontmatterString(before.content, "helix-stage-code");
+        if (
+          frontmatter?.["helix-id"] !== conversion.cycle.id ||
+          stageStatusFromFrontmatter(frontmatter["helix-status"]) !== conversion.cycle.status ||
+          (currentCode.present
+            ? currentCode.value !== conversion.cycle.stageCode
+            : conversion.cycle.stageCode !== String(conversion.cycle.sequence))
+        ) {
+          throw new Error("既有继承阶段在分支确认期间已经变化，请重新操作");
+        }
+        const nextContent = rewriteManagedStageHeading(
+          patchManagedFrontmatter(before.content, { "helix-stage-code": conversion.stageCode }),
+          conversion.cycle.stageCode,
+          conversion.stageCode,
+        );
+        const after = await this.repository.compareAndWrite(
+          before,
+          nextContent,
+          () => this.assertActive(generation),
+        );
+        convertedCodeRevisions.push({ before, after });
+      }
       const plannedCycles = specs.map((spec) => ({
       id: spec.id,
       title: spec.stageTitle,
       notePath: spec.path,
       sequence: spec.sequence,
-      status: "active" as const,
+      stageCode: spec.stageCode,
+      status: "idea" as const,
     }));
       const plannedSnapshot: ProjectWorkspaceSnapshot = {
       ...snapshot,
@@ -2935,6 +3095,12 @@ export class ProjectWorkspaceService {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: specs.at(-1)!.sequence,
       };
+      canvas.document.helixStageCodes = recordIssuedStageCodes(
+        canvas.document,
+        projectId,
+        [...stageCodeConversions.map((conversion) => conversion.stageCode),
+          ...specs.map((spec) => spec.stageCode)],
+      );
       const physical = physicalManagedEdges(canvas.document);
       const normalized = normalizeProjectGraph(
         [...allCycles.map((cycle) => cycle.id), ...specs.map((spec) => spec.id)],
@@ -2953,7 +3119,8 @@ export class ProjectWorkspaceService {
                   title: spec.stageTitle,
                   notePath: spec.path,
                   sequence: spec.sequence,
-                  status: "active" as const,
+                  stageCode: spec.stageCode,
+                  status: "idea" as const,
                 })),
               ],
             });
@@ -2985,9 +3152,8 @@ export class ProjectWorkspaceService {
         affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
       );
       this.assertActive(generation);
-      await this.writeCanvas(canvas, generation, {
-        label: specs.length > 1 ? `创建 ${specs.length} 个阶段` : "创建阶段",
-        markdownTransitions: createdRevisions.map((revision, index) => ({
+      const markdownTransitions: ProjectWorkspaceHistoryFileTransition[] = [
+        ...createdRevisions.map((revision, index): ProjectWorkspaceHistoryFileTransition => ({
           path: revision.path,
           kind: "stage",
           entityId: specs[index]!.id,
@@ -2995,11 +3161,24 @@ export class ProjectWorkspaceService {
           fromContent: null,
           toContent: revision.content,
         })),
+        ...convertedCodeRevisions.map((revision): ProjectWorkspaceHistoryFileTransition => ({
+          path: revision.before.path,
+          kind: "stage",
+          entityId: stageCodeConversions.find((conversion) =>
+            conversion.cycle.notePath === revision.before.path)!.cycle.id,
+          projectId,
+          fromContent: revision.before.content,
+          toContent: revision.after.content,
+        })),
+      ];
+      await this.writeCanvas(canvas, generation, {
+        label: specs.length > 1 ? `创建 ${specs.length} 个阶段` : "创建阶段",
+        markdownTransitions,
       });
       canvasWritten = true;
     } catch (error) {
       if (!canvasWritten) {
-        await this.rollbackCreatedFiles(createdRevisions, error);
+        await this.rollbackCycleCreation(createdRevisions, convertedCodeRevisions, error, generation);
       }
       throw error;
     }
@@ -3041,6 +3220,40 @@ export class ProjectWorkspaceService {
       throw new Error(failure);
     }
     throw new Error(`阶段操作失败，已将新建文件移入废纸篓：${message}`);
+  }
+
+  /** 先恢复既有阶段的受控改码，再清理新文件；任一竞争立即冻结工作区。 */
+  private async rollbackCycleCreation(
+    created: VaultRevision[],
+    converted: Array<{ before: VaultRevision; after: VaultRevision }>,
+    cause: unknown,
+    generation: number,
+  ): Promise<void> {
+    const failures: string[] = [];
+    for (const revision of [...converted].reverse()) {
+      try {
+        await this.repository.compareAndWrite(
+          revision.after,
+          revision.before.content,
+          () => this.assertActive(generation),
+        );
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    for (const revision of [...created].reverse()) {
+      try {
+        await this.repository.trashIfUnchanged(revision, () => this.assertActive(generation));
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (failures.length > 0) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      const failure = `阶段创建失败且回滚遇到竞争，工作区已冻结：${message}；${failures.join("；")}`;
+      this.freezePendingStageDeletion(failure);
+      throw new Error(failure);
+    }
   }
 
   private async readCanvas(
@@ -3381,6 +3594,8 @@ function workspaceStabilitySignature(
 ): string {
   return stableHash({
     canvasRevisionHash: snapshot.canvasRevisionHash,
+    managedMarkdownRevisionHashes: Object.entries(snapshot.managedMarkdownRevisionHashes)
+      .sort(([left], [right]) => left.localeCompare(right)),
     migrationRequired: snapshot.migrationRequired,
     migrationItems: snapshot.migrationItems.map((item) => ({
       id: item.id,
@@ -3462,7 +3677,17 @@ function projectStatusText(status: ProjectWorkspaceProject["status"]): string {
     active: "进行中",
     paused: "已暂停",
     completed: "已完成",
-    archived: "已归档",
+    terminated: "已终止",
+  }[status];
+}
+
+function stageStatusText(status: ProjectWorkspaceCycle["status"]): string {
+  return {
+    idea: "想法",
+    active: "进行中",
+    completed: "已完成",
+    paused: "已暂停",
+    terminated: "已终止",
   }[status];
 }
 
@@ -3535,11 +3760,7 @@ function addMissingManagedNodes(
         `helix-stage-${cycle.id}`,
         cycle.notePath,
         cycle.title,
-        cycle.status === "active"
-          ? "进行中"
-          : cycle.status === "closed"
-            ? "已关闭"
-            : "计划中",
+        stageStatusText(cycle.status),
         projectIndex * 520,
         300 + cycleIndex * 260,
         360,
@@ -3620,6 +3841,48 @@ function validatedStageSequenceLedger(
   return ledger as Record<string, number>;
 }
 
+function issuedStageCodes(document: CanvasDocument, projectId: string): string[] {
+  return validatedStageCodeLedger(document)[projectId] ?? [];
+}
+
+function validatedStageCodeLedger(document: CanvasDocument): Record<string, string[]> {
+  const raw = document.helixStageCodes;
+  if (raw === undefined) return {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Canvas 阶段展示编号账本无效");
+  }
+  const ledger: Record<string, string[]> = {};
+  for (const [projectId, codes] of Object.entries(raw)) {
+    if (!projectId.trim() || !Array.isArray(codes) || codes.some((code) =>
+      typeof code !== "string" || !parseStageCode(code))) {
+      throw new Error(`Canvas 阶段展示编号账本无效：${projectId}`);
+    }
+    if (new Set(codes).size !== codes.length) {
+      throw new Error(`Canvas 阶段展示编号账本存在重复：${projectId}`);
+    }
+    ledger[projectId] = [...codes];
+  }
+  return ledger;
+}
+
+function recordIssuedStageCodes(
+  document: CanvasDocument,
+  projectId: string,
+  added: readonly string[],
+): Record<string, string[]> {
+  const ledger = validatedStageCodeLedger(document);
+  if (added.some((code) => !parseStageCode(code))) {
+    throw new Error("新增阶段展示编号无效");
+  }
+  return {
+    ...ledger,
+    [projectId]: [...new Set([
+      ...(ledger[projectId] ?? []),
+      ...added,
+    ])],
+  };
+}
+
 function managedNodePath(node: CanvasNode): string | undefined {
   if (node.type === "file" && typeof node.file === "string") return node.file;
   if (node.type === "text" && typeof node.helixFilePath === "string") {
@@ -3635,11 +3898,25 @@ function canvasCardText(path: string, title: string, status: string): string {
 
 function stageTitleFromHeading(
   heading: string | undefined,
-  sequence: number,
+  stageCode: string,
 ): string {
-  if (!heading || /^Cycle\s+\d+$/i.test(heading)) return `阶段 ${sequence}`;
-  const modern = /^阶段\s+\d+\s*[·:：-]\s*(.+)$/.exec(heading);
+  if (!heading || /^Cycle\s+\d+$/i.test(heading)) return `阶段 ${stageCode}`;
+  const modern = /^阶段\s+\d+(?:\.\d+)?\s*[·:：-]\s*(.+)$/.exec(heading);
   return modern?.[1]?.trim() || heading;
+}
+
+/** 只改 Helix 创建的一级阶段标题编号，不触碰标题文字或后续正文。 */
+function rewriteManagedStageHeading(
+  content: string,
+  oldCode: string,
+  nextCode: string,
+): string {
+  const escaped = oldCode.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^(#\\s+阶段\\s+)${escaped}(\\s*[·:：-]\\s*.+)$`, "m");
+  if (!pattern.test(content)) {
+    throw new Error("既有阶段标题在分支确认期间已经变化，请重新操作");
+  }
+  return content.replace(pattern, `$1${nextCode}$2`);
 }
 
 function managedStageId(node: CanvasNode): string | undefined {
@@ -3679,6 +3956,22 @@ function frontmatterFromContent(
   return parsed && typeof parsed === "object"
     ? parsed as Record<string, unknown>
     : undefined;
+}
+
+/** 只接受显式引用的字符串，避免 YAML 将展示编号折叠为数值。 */
+function managedFrontmatterString(
+  content: string,
+  key: string,
+): { present: boolean; value?: string } {
+  const frontmatter = /^(?:\uFEFF)?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(content)?.[1];
+  if (frontmatter === undefined) return { present: false };
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matches = [...frontmatter.matchAll(new RegExp(`^${escaped}:\\s*(.*?)\\s*$`, "gm"))];
+  if (matches.length > 1) throw new Error(`重复的受管属性：${key}`);
+  if (matches.length === 0) return { present: false };
+  const raw = matches[0]![1]!.trim();
+  const quoted = /^(?:"([\s\S]*)"|'([\s\S]*)')$/.exec(raw);
+  return { present: true, value: quoted?.[1] ?? quoted?.[2] };
 }
 
 function assertUniqueCanvasIds(document: CanvasDocument): void {

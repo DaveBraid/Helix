@@ -88,10 +88,12 @@ import type {
 import { HelixService } from "../services/helix-service";
 import type {
   ProjectConnectionPlan,
+  ProjectWorkspaceCycleStatusUpdatePlan,
   ProjectWorkspaceCycleStatus,
   ProjectWorkspaceNativeRelationAdoptionPlan,
   ProjectWorkspaceNativeRelationCandidate,
   ProjectWorkspaceProject,
+  ProjectWorkspaceProjectStatusUpdatePlan,
   ProjectWorkspaceProjectStatus,
   ProjectWorkspaceService,
   ProjectWorkspaceSnapshot,
@@ -138,7 +140,7 @@ const NAV_ICONS: Record<Section, IconName> = {
 const NAV: Array<{ id: Section; label: string; icon: IconName }> = WORKBENCH_NAVIGATION
   .map((item) => ({ ...item, icon: NAV_ICONS[item.id] }));
 
-const PROJECT_STATUS_OPTIONS: Array<{
+export const PROJECT_STATUS_OPTIONS: Array<{
   value: ProjectWorkspaceProjectStatus;
   label: string;
 }> = [
@@ -146,16 +148,18 @@ const PROJECT_STATUS_OPTIONS: Array<{
   { value: "active", label: "进行中" },
   { value: "paused", label: "已暂停" },
   { value: "completed", label: "已完成" },
-  { value: "archived", label: "已归档" },
+  { value: "terminated", label: "已终止" },
 ];
 
-const CYCLE_STATUS_OPTIONS: Array<{
+export const CYCLE_STATUS_OPTIONS: Array<{
   value: ProjectWorkspaceCycleStatus;
   label: string;
 }> = [
-  { value: "planned", label: "计划中" },
+  { value: "idea", label: "想法" },
   { value: "active", label: "进行中" },
-  { value: "closed", label: "已完成" },
+  { value: "completed", label: "已完成" },
+  { value: "paused", label: "已暂停" },
+  { value: "terminated", label: "已终止" },
 ];
 
 const SAMPLE_PROJECTS: DidaProject[] = [
@@ -229,7 +233,17 @@ export class HelixView extends ItemView {
       openProjectFile: (path: string) => Promise<void>;
       projectWorkspace: ProjectWorkspaceService;
       taskReferences: TaskReferenceService;
+      readProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       mutateProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
+      repairProjectCanvas: () => Promise<void>;
+      updateProjectStatus: (
+        plan: ProjectWorkspaceProjectStatusUpdatePlan,
+        status: ProjectWorkspaceProjectStatus,
+      ) => Promise<void>;
+      updateCycleStatus: (
+        plan: ProjectWorkspaceCycleStatusUpdatePlan,
+        status: ProjectWorkspaceCycleStatus,
+      ) => Promise<void>;
       reviewLegacyMigration: () => void;
       getTaskMatrixRules: () => TaskMatrixRules;
       updateTaskMatrixRules: (rules: TaskMatrixRules) => Promise<void>;
@@ -2073,7 +2087,7 @@ export class HelixView extends ItemView {
   private async renderProjects(content: HTMLElement, token: number): Promise<void> {
     let workspace: ProjectWorkspaceSnapshot;
     try {
-      workspace = await this.actions.mutateProjectWorkspace(() =>
+      workspace = await this.actions.readProjectWorkspace(() =>
         this.actions.projectWorkspace.loadStableWorkspace());
     } catch (error) {
       if (token !== this.renderToken) return;
@@ -2107,6 +2121,28 @@ export class HelixView extends ItemView {
       return;
     }
 
+    if (workspace.canvasRepairRequired) {
+      const repair = content.createDiv({ cls: "helix-card helix-migration-card" });
+      repair.createEl("strong", { text: "Canvas 需要修复" });
+      const reasons = repair.createEl("ul");
+      for (const reason of workspace.canvasRepairReasons ?? []) {
+        reasons.createEl("li", { text: reason });
+      }
+      const apply = repair.createEl("button", {
+        cls: "helix-primary-button",
+        text: "修复 Canvas",
+      });
+      apply.addEventListener("click", () => {
+        apply.disabled = true;
+        void this.actions.repairProjectCanvas()
+          .then(() => this.render())
+          .catch((error) => {
+            apply.disabled = false;
+            new Notice(error instanceof Error ? error.message : String(error), 8_000);
+          });
+      });
+    }
+
     if (workspace.projects.length === 0) {
       const empty = content.createDiv({ cls: "helix-card helix-project-empty" });
       const emptyIcon = empty.createDiv();
@@ -2136,6 +2172,7 @@ export class HelixView extends ItemView {
       workspace,
       lifecycleGeneration,
     );
+    const workbenchHost = content.createDiv({ cls: "helix-project-workbench-host" });
     const focusEntityId = this.currentLineageFocusId();
     this.projectWorkbench = new ProjectLineageWorkbench({
       snapshot: workspace,
@@ -2224,8 +2261,7 @@ export class HelixView extends ItemView {
               plan.currentStatus,
               PROJECT_STATUS_OPTIONS,
               async (status) => {
-                await this.actions.mutateProjectWorkspace(() =>
-                  this.actions.projectWorkspace.updateProjectStatus(plan, status));
+                await this.actions.updateProjectStatus(plan, status);
                 await this.render();
               },
             ).open();
@@ -2243,12 +2279,11 @@ export class HelixView extends ItemView {
             new WorkspaceStatusModal(
               this.app,
               "修改阶段状态",
-              `阶段 ${cycle.sequence} · ${cycle.title}`,
+              `阶段 ${cycle.stageCode} · ${cycle.title}`,
               plan.currentStatus,
               CYCLE_STATUS_OPTIONS,
               async (status) => {
-                await this.actions.mutateProjectWorkspace(() =>
-                  this.actions.projectWorkspace.updateCycleStatus(plan, status));
+                await this.actions.updateCycleStatus(plan, status);
                 await this.render();
               },
             ).open();
@@ -2295,7 +2330,7 @@ export class HelixView extends ItemView {
       onError: (error) =>
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
-    this.projectWorkbench.render(content);
+    this.projectWorkbench.render(workbenchHost);
   }
 
   private renderProjectDidaMappingBar(
@@ -2345,7 +2380,7 @@ export class HelixView extends ItemView {
     save.addEventListener("click", () => {
       save.disabled = true;
       const nextId = select.value || undefined;
-      void this.actions.mutateProjectWorkspace(() =>
+      void this.actions.readProjectWorkspace(() =>
         this.actions.projectWorkspace.prepareProjectDidaMappingUpdate(project.id))
         .then((plan) => {
           new ProjectDidaMappingConfirmModal(
@@ -2398,7 +2433,7 @@ export class HelixView extends ItemView {
       });
       adopt.addEventListener("click", () => {
         adopt.disabled = true;
-        void this.actions.mutateProjectWorkspace(() =>
+        void this.actions.readProjectWorkspace(() =>
           this.actions.projectWorkspace.planNativeRelationAdoption(candidate))
           .then((plan) => {
             new NativeRelationAdoptionModal(
@@ -2474,7 +2509,7 @@ export class HelixView extends ItemView {
         const item = stages.createEl("li");
         const openStage = item.createEl("button", {
           cls: "helix-link-button",
-          text: `阶段 ${stage.sequence} · ${stage.title}`,
+          text: `阶段 ${stage.stageCode} · ${stage.title}`,
         });
         openStage.addEventListener("click", () => {
           void this.actions.openProjectFile(stage.notePath)
@@ -2496,7 +2531,7 @@ export class HelixView extends ItemView {
     lifecycleGeneration = this.viewGeneration,
   ): Promise<void> {
     try {
-      const plan = await this.actions.mutateProjectWorkspace(() =>
+      const plan = await this.actions.readProjectWorkspace(() =>
         this.actions.projectWorkspace.planConnection(
           sourceCycleId,
           targetCycleId,
@@ -3090,7 +3125,7 @@ export class HelixView extends ItemView {
   }
 }
 
-class WorkspaceStatusModal<T extends string> extends Modal {
+export class WorkspaceStatusModal<T extends string> extends Modal {
   private selected: T;
 
   constructor(
@@ -3176,7 +3211,7 @@ class ConnectionTargetModal extends Modal {
             if (cycle.id === this.sourceId || !allowed.has(cycle.id)) continue;
             dropdown.addOption(
               cycle.id,
-              `${project.title} / 阶段 ${cycle.sequence} · ${cycle.title}`,
+              `${project.title} / 阶段 ${cycle.stageCode} · ${cycle.title}`,
             );
           }
         }
@@ -3205,7 +3240,7 @@ class ConnectionTargetModal extends Modal {
   private stageLabel(id: string): string {
     for (const project of this.snapshot.projects) {
       const cycle = project.cycles.find((candidate) => candidate.id === id);
-      if (cycle) return `${project.title} / 阶段 ${cycle.sequence} · ${cycle.title}`;
+      if (cycle) return `${project.title} / 阶段 ${cycle.stageCode} · ${cycle.title}`;
     }
     return id;
   }

@@ -12,6 +12,7 @@ import type {
   ProjectWorkspaceCanvasNode,
   ProjectWorkspaceHistoryState,
   ProjectWorkspaceNodeMove,
+  ProjectWorkspaceCycle,
   ProjectWorkspaceProject,
   ProjectWorkspaceSnapshot,
 } from "../services/project-workspace";
@@ -516,7 +517,7 @@ export function completedLineageProjection(
     const components = collapsedClosedComponents(
       project.cycles.map((cycle) => cycle.id),
       new Set(project.cycles
-        .filter((cycle) => cycle.status === "closed")
+        .filter((cycle) => cycle.status === "completed")
         .map((cycle) => cycle.id)),
       physical,
     );
@@ -1134,7 +1135,7 @@ export class ProjectLineageWorkbench {
         cls: "helix-lineage-project-container-count",
         text: `${project.cycles.length} 阶段`,
       });
-      const completedCount = project.cycles.filter((cycle) => cycle.status === "closed").length;
+      const completedCount = project.cycles.filter((cycle) => cycle.status === "completed").length;
       if (completedCount > 0) {
         header.createSpan({
           cls: "helix-lineage-project-container-completed",
@@ -1207,7 +1208,8 @@ export class ProjectLineageWorkbench {
     top.createSpan({
       cls: "helix-lineage-card-kind",
       text: node.kind === "project" ? "PROJECT" : `阶段 ${
-        owner.cycles.find((cycle) => cycle.id === node.entityId)?.sequence ?? ""
+        owner.cycles.find((cycle) => cycle.id === node.entityId)?.stageCode ??
+          owner.cycles.find((cycle) => cycle.id === node.entityId)?.sequence ?? ""
       }`,
     });
     const open = top.createEl("button", {
@@ -1240,18 +1242,10 @@ export class ProjectLineageWorkbench {
       const cycle = owner.cycles.find((item) => item.id === node.entityId)!;
       const status = meta.createEl("button", {
         cls: `helix-lineage-status-button is-${cycle.status}`,
-        text: cycle.status === "active"
-          ? "进行中"
-          : cycle.status === "closed"
-            ? "已完成"
-            : "计划中",
+        text: stageStatusLabel(cycle.status),
         attr: {
           "aria-label": `修改 ${cycle.title} 的阶段状态，当前${
-            cycle.status === "active"
-              ? "进行中"
-              : cycle.status === "closed"
-                ? "已完成"
-                : "计划中"
+            stageStatusLabel(cycle.status)
           }`,
           title: "修改阶段状态",
         },
@@ -1260,7 +1254,7 @@ export class ProjectLineageWorkbench {
         event.stopPropagation();
         this.options.onEditCycleStatus(cycle.id);
       });
-      if (cycle.status === "closed") {
+      if (cycle.status === "completed") {
         const check = status.createSpan({ cls: "helix-lineage-complete-check" });
         setIcon(check, "circle-check-big");
       }
@@ -1623,9 +1617,11 @@ export class ProjectLineageWorkbench {
   private renderKanban(parent: HTMLElement): void {
     const board = parent.createDiv({ cls: "helix-lineage-kanban" });
     for (const status of [
-      { id: "planned" as const, label: "计划中" },
+      { id: "idea" as const, label: "想法" },
       { id: "active" as const, label: "进行中" },
-      { id: "closed" as const, label: "已关闭" },
+      { id: "completed" as const, label: "已完成" },
+      { id: "paused" as const, label: "已暂停" },
+      { id: "terminated" as const, label: "已终止" },
     ]) {
       const column = board.createDiv({ cls: `helix-lineage-column is-${status.id}` });
       const heading = column.createDiv({ cls: "helix-lineage-column-heading" });
@@ -2502,6 +2498,16 @@ function projectStatusLabel(status: ProjectWorkspaceProject["status"]): string {
     active: "进行中",
     paused: "已暂停",
     completed: "已完成",
-    archived: "已归档",
+    terminated: "已终止",
+  }[status];
+}
+
+function stageStatusLabel(status: ProjectWorkspaceCycle["status"]): string {
+  return {
+    idea: "想法",
+    active: "进行中",
+    completed: "已完成",
+    paused: "已暂停",
+    terminated: "已终止",
   }[status];
 }

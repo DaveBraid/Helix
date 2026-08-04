@@ -417,15 +417,16 @@ describe("Project Lineage card-plus intent", () => {
     const snapshot: ProjectWorkspaceSnapshot = {
       canvasPath: "Project Lineage.canvas",
       canvasRevisionHash: "hash",
+      managedMarkdownRevisionHashes: {},
       projects: [{
         id: "project",
         title: "Project",
         status: "active",
         notePath: "Project.md",
         cycles: [
-          { id: "a", title: "a", notePath: "a.md", sequence: 1, status: "closed" },
-          { id: "x", title: "x", notePath: "x.md", sequence: 2, status: "active" },
-          { id: "b", title: "b", notePath: "b.md", sequence: 3, status: "closed" },
+          { id: "a", title: "a", notePath: "a.md", sequence: 1, stageCode: "1", status: "completed" },
+          { id: "x", title: "x", notePath: "x.md", sequence: 2, stageCode: "2", status: "active" },
+          { id: "b", title: "b", notePath: "b.md", sequence: 3, stageCode: "3", status: "completed" },
         ],
       }],
       nextStageSequenceByProject: {},
@@ -522,7 +523,8 @@ function foldedSnapshot(): ProjectWorkspaceSnapshot {
       title: cycleId,
       notePath: `${cycleId}.md`,
       sequence: index + 1,
-      status: cycleId.startsWith("visible") ? "active" : "closed",
+      stageCode: String(index + 1),
+      status: cycleId.startsWith("visible") ? "active" : "completed",
     })),
   });
   const canvasNodes = ["a1", "a2", "b1", "b2", "visible", "visible-2"].map(
@@ -538,6 +540,7 @@ function foldedSnapshot(): ProjectWorkspaceSnapshot {
   return {
     canvasPath: "Project Lineage.canvas",
     canvasRevisionHash: "hash",
+    managedMarkdownRevisionHashes: {},
     projects: [
       project("project-a", ["a1", "a2"]),
       project("project-b", ["b1", "b2"]),

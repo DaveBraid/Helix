@@ -9,8 +9,8 @@
 | 任务、远端清单 | 滴答清单 | 缓存、编辑、离线排队、显式冲突合并 |
 | 习惯定义与打卡 | 滴答清单 | 可在 Helix 新建、编辑和打卡，远端记录为最终事实 |
 | 专注记录 | 滴答清单 | 导入各设备记录，Helix 计时完成后回写 |
-| 项目身份、名称、状态、颜色与正文 | 项目 Markdown | Helix 发现、创建、打开和安全写入 |
-| 阶段身份、所属项目、状态与正文 | 阶段 Markdown | 自动编号“阶段 X”，标题由用户自拟；支持多个 `active` 阶段 |
+| 项目身份、名称、状态、颜色与正文 | 项目 Markdown | `planned/active/completed/paused/terminated`；Helix 安全写入 |
+| 阶段身份、所属项目、状态与正文 | 阶段 Markdown | `idea/active/completed/paused/terminated`、稳定展示编号；支持多个 `active` 阶段 |
 | 滴答任务与 Helix 项目/阶段的关联 | Task Reference Markdown | 每个已确认远端任务至多一份关联；项目 0..1、阶段 0..n |
 | 日周月年复盘 | Helix Markdown | 模板生成、数据辅助、用户回答 |
 | 阶段关系与布局 | 唯一主 Canvas | 只解释明确托管的继承、分支、合并边并强制 DAG |
@@ -95,8 +95,10 @@
 - 任务字段与 Helix 关联属于两个权威域，任务弹窗提供独立保存动作。只改关联不得创建滴答同步队列；只改滴答字段不得重写关联 Markdown，也不得把其中一个动作的成功显示成两侧整体成功。
 - 只有已取得远端 ID 的任务可以建立关联；`local-*` 临时任务禁止成为关联真值。任务移动清单、完成或暂时不在同步覆盖范围内时保留关联；远端删除不级联删除关联。任务被人工重建成新 ID 时，只允许用户明确核验后重绑，禁止按标题或时间猜测；提交前还必须按新任务 ID 与滴答清单实时复读，并核对远端返回身份一致。
 - 关联保存必须用弹窗打开时的关联 UUID 与 Markdown revision 做比较；文件在提交前变化、同一任务出现多份关联、关联 UUID 重复或结构损坏时停止写入。项目/阶段删除或阶段改属其他项目时保留原 ID 并显示断链，用户可以明确重新绑定或解除，不静默清理。
-- 项目与阶段状态编辑只允许在对应 Markdown revision 未变化时更新 `helix-status` 与 `helix-updated`；不得重写用户正文、未知 frontmatter 或用 Canvas 摘要反向覆盖 Markdown。Canvas 中的标题和状态摘要只是派生缓存，由下一次 `ensureCanvas` 校验按 Markdown 真值修复。
-- 新阶段文件使用 `Stage-XX.md`；一级标题为 `阶段 X · 自拟标题`，新元数据使用 `helix-kind: helix-stage`。
+- 项目与阶段状态编辑只允许在对应 Markdown revision 未变化时更新 `helix-status` 与 `helix-updated`；阶段进入 `completed/terminated` 才写 `helix-closed`。旧项目 `archived`、旧阶段 `planned/closed` 仅兼容读取为 `terminated/idea/completed`，绝不批量回写；未知值明确诊断。不得重写用户正文、未知 frontmatter 或用 Canvas 摘要反向覆盖 Markdown。
+- 新阶段文件使用 `Stage-XX.md`；一级标题为 `阶段 X · 自拟标题`，并写入 `helix-stage-code` 字符串和整数 `helix-sequence`。前者赋值后稳定（继承转分支时在同一受控事务改为 `.1` 是唯一例外），后者只作路径和高水位兼容键；缺少 code 回退 sequence，存在但非法则拒绝操作。
+- 为保证删除后的展示编号不复用，Canvas 可保存经严格校验的 `helixStageCodes` 已发放编号账本；它只记录已发放 code，绝不反推或承载阶段关系、状态、身份或正文真值。当前活动的项目／阶段笔记以公开状态栏入口显示中文状态；未知手工值仅诊断、零写入，编辑仍复用同一 Markdown CAS 与状态候选控件。
+- 项目页纯读取只报告 `canvasRepairRequired` 与中文原因，绝不为缺失节点、摘要、编号账本或关系正规化写入 Canvas。只有用户明确点击“修复 Canvas”时，才在恢复模式写入闸门后使用连续稳定快照、受管 Markdown 最终修订复核与 Canvas CAS 应用同一修复计划；任一竞争均保持 Canvas 零写入。
 - 专用 Canvas 是项目/阶段节点布局和阶段关系的唯一事实；`data.json` 不保存项目、阶段、关系或布局副本。
 - 托管项目节点必须包含 `helixManaged=true`、`helixNodeKind=project`、`helixProjectId`；新托管阶段节点使用 `helixNodeKind=stage`、`helixStageId` 和所属 `helixProjectId`。旧 `helix-kind: helix-cycle`、`helixNodeKind=cycle`、`helixCycleId` 与 `Cycle-XX.md` 仅兼容读取，不静默改名。身份必须与对应 Markdown 唯一匹配。
 - 托管物理边只允许阶段指向阶段，并且是唯一结构事实。`helixRelation` 是全图正规化后的显示分类：若目标入度不少于 2，则目标的全部入边为合并；否则若来源出度不少于 2，则来源的全部非合并出边为分支；其余为继承。合并组必须覆盖同一目标的全部入边，`helixMergeGroupId` 由目标阶段 ID 稳定生成。拒绝自环、重复边、悬空节点和有向环。

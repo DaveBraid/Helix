@@ -154,7 +154,7 @@ export type RemoteEntity =
 export interface HelixProject {
   id: string;
   title: string;
-  status: "planned" | "active" | "paused" | "completed" | "archived";
+  status: "planned" | "active" | "paused" | "completed" | "terminated";
   area?: string;
   didaProjectId?: string;
   parentProjectIds: string[];
@@ -168,7 +168,8 @@ export interface HelixCycle {
   id: string;
   projectId: string;
   sequence: number;
-  status: "planned" | "active" | "closed";
+  stageCode?: string;
+  status: "idea" | "active" | "completed" | "paused" | "terminated";
   predecessorCycleId?: string;
   startedAt?: string;
   closedAt?: string;

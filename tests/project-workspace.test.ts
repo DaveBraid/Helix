@@ -30,9 +30,13 @@ describe("ProjectWorkspaceService", () => {
 
     expect(calls).toEqual(["project:模板项目", "stage:项目启动"]);
     expect(project?.content).toContain("helix-kind: helix-project");
+    expect(project?.content).toContain("helix-status: planned");
+    expect(project?.content).not.toContain("helix-updated:");
     expect(project?.content).toContain("# 模板项目");
     expect(project?.content).toContain("自定义项目正文 {{unknown}}");
     expect(stage?.content).toContain("helix-kind: helix-stage");
+    expect(stage?.content).toContain('helix-stage-code: "1"');
+    expect(stage?.content).toContain("helix-status: idea");
     expect(stage?.content).toContain("# 阶段 1 · 项目启动");
     expect(stage?.content).toContain("自定义阶段正文");
   });
@@ -173,6 +177,102 @@ describe("ProjectWorkspaceService", () => {
     const snapshot = await workspace(repo).loadStableWorkspace();
     expect(snapshot.migrationRequired).toBe(false);
     expect(projectReads).toBeGreaterThanOrEqual(8);
+  });
+
+  it("opens an existing Canvas with legacy status text without writing a cosmetic repair", async () => {
+    const repo = baseRepository();
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(stagePath, (repo.take(stagePath) ?? "").replace(
+      "helix-status: active",
+      "helix-status: closed",
+    ));
+    const canvasBefore = repo.json(CANVAS);
+    canvasBefore.nodes[1]!.text = "[[Helix/Projects/Alpha/Cycle-01|阶段标题 1]]\n\n已关闭";
+    repo.set(CANVAS, JSON.stringify(canvasBefore));
+    repo.beforeCompare = () => { throw new Error("纯打开不得写 Canvas"); };
+
+    const service = workspace(repo);
+    await expect(service.loadStableWorkspace()).resolves.toMatchObject({
+      projects: [expect.objectContaining({
+        cycles: [expect.objectContaining({ status: "completed" })],
+      })],
+      canvasRepairRequired: true,
+      canvasRepairReasons: expect.arrayContaining(["托管节点摘要需要更新"]),
+    });
+    expect(repo.json(CANVAS).nodes[1]!.text).toContain("已关闭");
+    repo.beforeCompare = undefined;
+    await service.ensureCanvas();
+    expect(repo.json(CANVAS).nodes[1]!.text).toContain("已完成");
+  });
+
+  it("reports missing nodes, stale high-water and derived edges without writing on load", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Alpha/Cycle-02.md", cycle("cycle-2", "project-1", 2));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes = canvas.nodes.filter((node: { id: string }) => node.id !== "project-node");
+    canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 0, 560));
+    canvas.helixStageSequences = { "project-1": 0 };
+    canvas.edges = [{
+      id: "stale-derived-edge",
+      fromNode: "cycle-node",
+      toNode: "cycle-2-node",
+      helixManaged: true,
+      helixRelation: "branch",
+      label: "分支",
+    }];
+    repo.set(CANVAS, JSON.stringify(canvas));
+    repo.beforeCompare = () => { throw new Error("纯打开不得写 Canvas"); };
+    const loaded = await workspace(repo).loadStableWorkspace();
+    expect(loaded).toMatchObject({ canvasRepairRequired: true });
+    expect(loaded.canvasRepairReasons).toEqual(expect.arrayContaining([
+      "缺少项目 Canvas 节点",
+      "阶段编号高水位需要补齐",
+      "托管阶段关系需要正规化",
+    ]));
+  });
+
+  it("reports a missing Canvas on open and creates it only when explicitly repaired", async () => {
+    const repo = baseRepository();
+    repo.take(CANVAS);
+    repo.beforeCreate = () => { throw new Error("纯打开不得创建 Canvas"); };
+    const service = workspace(repo);
+
+    await expect(service.loadStableWorkspace()).resolves.toMatchObject({
+      canvasRepairRequired: true,
+      canvasRepairReasons: expect.arrayContaining(["项目 Canvas 不存在"]),
+    });
+    expect(await repo.read(CANVAS)).toBeNull();
+
+    repo.beforeCreate = undefined;
+    await service.ensureCanvas();
+    expect(repo.json(CANVAS)).toMatchObject({ nodes: expect.any(Array), edges: expect.any(Array) });
+  });
+
+  it("creates a fully planned missing Canvas once and leaves no residue when creation fails", async () => {
+    const repo = baseRepository();
+    repo.take(CANVAS);
+    repo.failCreatePath = CANVAS;
+
+    await expect(workspace(repo).ensureCanvas()).rejects.toThrow(/injected create failure/);
+
+    expect(await repo.read(CANVAS)).toBeNull();
+    expect(repo.createCalls).toBe(1);
+  });
+
+  it("does not repair Canvas when a managed Markdown note changes after planning", async () => {
+    const repo = baseRepository();
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    let canvasReads = 0;
+    repo.beforeRead = (path) => {
+      if (path !== CANVAS || ++canvasReads !== 2) return;
+      repo.set(stagePath, `${repo.take(stagePath)!}\n用户在修复前修改了正文\n`);
+    };
+    repo.beforeCompare = () => { throw new Error("Markdown 竞争后不得写 Canvas"); };
+
+    await expect(workspace(repo).ensureCanvas()).rejects.toThrow(/Markdown 已变化，请重试/);
+
+    expect((await repo.read(CANVAS))!.content).toBe(canvasBefore);
   });
 
   it("does not repair a Canvas created after a missing-file snapshot", async () => {
@@ -594,15 +694,15 @@ describe("ProjectWorkspaceService", () => {
     const projectPlan = await service.prepareProjectStatusUpdate("project-1");
     const cyclePlan = await service.prepareCycleStatusUpdate("cycle-1");
     await service.updateProjectStatus(projectPlan, "paused");
-    await service.updateCycleStatus(cyclePlan, "closed");
+    await service.updateCycleStatus(cyclePlan, "completed");
 
     expect((await repo.read(projectPath))?.content).toContain("helix-status: \"paused\"");
     expect((await repo.read(projectPath))?.content).toContain("custom-owner: user");
-    expect((await repo.read(cyclePath))?.content).toContain("helix-status: \"closed\"");
+    expect((await repo.read(cyclePath))?.content).toContain("helix-status: \"completed\"");
     expect((await repo.read(cyclePath))?.content).toContain("用户正文保留");
     expect((await service.snapshot()).projects[0]).toMatchObject({
       status: "paused",
-      cycles: [expect.objectContaining({ status: "closed" })],
+      cycles: [expect.objectContaining({ status: "completed" })],
     });
 
     await service.ensureCanvas();
@@ -613,7 +713,7 @@ describe("ProjectWorkspaceService", () => {
       }),
       expect.objectContaining({
         id: "cycle-node",
-        text: expect.stringContaining("已关闭"),
+        text: expect.stringContaining("已完成"),
       }),
     ]));
     await expect(service.updateProjectStatus(projectPlan, "invalid" as never))
@@ -653,9 +753,9 @@ describe("ProjectWorkspaceService", () => {
     await expect(service.updateCycleStatus({
       ...cyclePlan,
       revisionHash: replacement!.hash,
-    }, "closed")).rejects.toThrow(/确认期间已经变化/);
+    }, "completed")).rejects.toThrow(/确认期间已经变化/);
     expect((await repo.read(cyclePath))?.content).toContain("helix-id: unrelated-stage");
-    expect((await repo.read(cyclePath))?.content).not.toContain("helix-status: \"closed\"");
+    expect((await repo.read(cyclePath))?.content).not.toContain("helix-status: \"completed\"");
   });
 
   it("adds a physical edge, normalizes the complete graph and rejects stale plans", async () => {
@@ -1207,6 +1307,12 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({ kind: "branch", toCycleId: second.id }),
     ]));
     expect(outgoing).toHaveLength(2);
+    const firstContent = (await repo.read(first.notePath))!.content;
+    expect(firstContent).toContain('helix-stage-code: "2.1"');
+    expect(firstContent).toContain("# 阶段 2.1 · 第一条路线");
+    expect(repo.json(CANVAS).helixStageCodes).toMatchObject({
+      "project-1": ["2", "2.1", "2.2"],
+    });
     expect(repo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
       expect.objectContaining({ helixStageId: first.id, x: 816, y: 0 }),
       expect.objectContaining({ helixStageId: second.id, x: 816, y: 200 }),
@@ -1238,7 +1344,7 @@ describe("ProjectWorkspaceService", () => {
     await service.ensureCanvas();
     let canvasReads = 0;
     repo.beforeRead = (path) => {
-      if (path !== CANVAS || ++canvasReads !== 4) return;
+      if (path !== CANVAS || ++canvasReads !== 5) return;
       const competing = repo.json(CANVAS);
       competing.userEdit = "keep";
       repo.set(CANVAS, JSON.stringify(competing));
@@ -1320,6 +1426,25 @@ describe("ProjectWorkspaceService", () => {
       x: 816,
       y: 200,
     }));
+    expect((await repo.read(merged.notePath))?.content)
+      .toContain('helix-stage-code: "4"');
+  });
+
+  it("assigns a merge the next major after its branch predecessors", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    await service.createCycle("project-1", "branch", ["cycle-1"], {
+      confirmBranchConversion: true,
+      stageTitle: "路线甲",
+      secondaryStageTitle: "路线乙",
+    });
+    const branches = (await service.snapshot()).projects[0]!.cycles
+      .filter((cycle) => cycle.stageCode === "2.1" || cycle.stageCode === "2.2");
+    const merged = await service.createCycle("project-1", "merge", branches.map((cycle) => cycle.id), {
+      stageTitle: "合并结论",
+    });
+    expect((await repo.read(merged.notePath))?.content)
+      .toContain('helix-stage-code: "3"');
   });
 
   it("keeps an explicit confirmation for cross-project card-plus merges", async () => {
@@ -1380,6 +1505,8 @@ describe("ProjectWorkspaceService", () => {
         toCycleId: merged.id,
       }),
     );
+    expect((await repo.read(merged.notePath))?.content)
+      .toContain('helix-stage-code: "2"');
   });
 
   it("uses user-defined branch titles and places children to the right in rows", async () => {
@@ -1412,9 +1539,13 @@ describe("ProjectWorkspaceService", () => {
       },
     );
     expect((await repo.read("Helix/Projects/Alpha/Stage-02.md"))?.content)
-      .toContain("# 阶段 2 · 实验路线");
+      .toContain("# 阶段 2.1 · 实验路线");
+    expect((await repo.read("Helix/Projects/Alpha/Stage-02.md"))?.content)
+      .toContain('helix-stage-code: "2.1"');
     expect((await repo.read("Helix/Projects/Alpha/Stage-03.md"))?.content)
-      .toContain("# 阶段 3 · 理论路线");
+      .toContain("# 阶段 2.2 · 理论路线");
+    expect((await repo.read("Helix/Projects/Alpha/Stage-03.md"))?.content)
+      .toContain('helix-stage-code: "2.2"');
     const stages = repo.json(CANVAS).nodes.filter(
       (node: Record<string, unknown>) => node.helixNodeKind === "stage",
     );
@@ -2147,10 +2278,8 @@ describe("ProjectWorkspaceService", () => {
     const stageThree = (await service.snapshot()).projects[0]!.cycles.find(
       (cycle) => cycle.sequence === 3,
     )!;
-    const deletedContent = (await repo.read(stageThree.notePath))!.content;
     await service.deleteCycle(stageThree.id);
     expect((await service.snapshot()).nextStageSequenceByProject["project-1"]).toBe(4);
-    repo.set(stageThree.notePath, deletedContent);
 
     await service.createCycle(
       "project-1",
@@ -2163,9 +2292,54 @@ describe("ProjectWorkspaceService", () => {
     );
 
     expect(await repo.read("Helix/Projects/Alpha/Stage-04.md")).not.toBeNull();
+    expect((await repo.read("Helix/Projects/Alpha/Stage-04.md"))?.content)
+      .toContain('helix-stage-code: "2.3"');
     expect(repo.json(CANVAS).helixStageSequences).toMatchObject({
       "project-1": 4,
     });
+  });
+
+  it("rejects a competing inherited code before conversion without overwriting it", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const inherited = await service.createCycle("project-1", "inherit", ["cycle-1"], {
+      stageTitle: "原继承",
+    });
+    repo.beforeCompare = () => repo.set(
+      inherited.notePath,
+      (repo.take(inherited.notePath) ?? "").replace('helix-stage-code: "2"', 'helix-stage-code: "7"'),
+    );
+    await expect(service.createCycle("project-1", "branch", ["cycle-1"], {
+      confirmBranchConversion: true,
+      stageTitle: "竞争分支",
+    })).rejects.toThrow(/变化|conflict/);
+    expect((await repo.read(inherited.notePath))?.content).toContain('helix-stage-code: "7"');
+    expect(await repo.read("Helix/Projects/Alpha/Stage-03.md")).toBeNull();
+  });
+
+  it("upgrades a legacy inherited stage without a code during an explicit branch conversion", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const inherited = await service.createCycle("project-1", "inherit", ["cycle-1"], {
+      stageTitle: "旧阶段",
+    });
+    repo.set(inherited.notePath, (repo.take(inherited.notePath) ?? "")
+      .replace('helix-stage-code: "2"\n', ""));
+    await service.createCycle("project-1", "branch", ["cycle-1"], {
+      confirmBranchConversion: true,
+      stageTitle: "新增分支",
+    });
+    const upgraded = (await repo.read(inherited.notePath))!.content;
+    expect(upgraded).toContain('helix-stage-code: "2.1"');
+    expect(upgraded).toContain("# 阶段 2.1 · 旧阶段");
+  });
+
+  it("rejects invalid codes anywhere in the issued-code ledger", async () => {
+    const repo = baseRepository();
+    const canvas = repo.json(CANVAS);
+    canvas.helixStageCodes = { "other-project": ["02.1"] };
+    repo.set(CANVAS, JSON.stringify(canvas));
+    await expect(workspace(repo).snapshot()).rejects.toThrow(/展示编号账本无效/);
   });
 
   it.each([
@@ -2412,7 +2586,7 @@ function project(id: string, title: string, didaProjectId?: string): string {
     title,
     createdAt: "2026-07-30T00:00:00.000Z",
     didaProjectId,
-  });
+  }).replace("helix-status: planned", "helix-status: active");
 }
 
 function cycle(id: string, projectId: string, sequence: number): string {
@@ -2423,7 +2597,7 @@ function cycle(id: string, projectId: string, sequence: number): string {
     sequence,
     startedAt: "2026-07-30T00:00:00.000Z",
     stageTitle: `阶段标题 ${sequence}`,
-  });
+  }).replace("helix-status: idea", "helix-status: active");
 }
 
 function fileFromPath(path: string): {
@@ -2445,6 +2619,7 @@ function fileFromPath(path: string): {
 
 class MemoryRepository {
   private readonly files = new Map<string, string>();
+  createCalls = 0;
   failCreatePath?: string;
   failTrashPath?: string;
   beforeCreate?: (path: string) => void;
@@ -2483,6 +2658,7 @@ class MemoryRepository {
   }
 
   async create(path: string, content: string): Promise<VaultRevision> {
+    this.createCalls += 1;
     this.beforeCreate?.(path);
     this.beforeCreate = undefined;
     if (path === this.failCreatePath) throw new Error("injected create failure");

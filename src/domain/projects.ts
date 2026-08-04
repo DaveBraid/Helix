@@ -14,7 +14,8 @@ export interface ProjectFrontmatter {
   "helix-parents"?: string[];
   "helix-active-cycle"?: string;
   "helix-created": string;
-  "helix-updated": string;
+  /** 初建不写；首次 Helix 受管修改后才写入。 */
+  "helix-updated"?: string;
 }
 
 export interface CycleFrontmatter {
@@ -23,6 +24,7 @@ export interface CycleFrontmatter {
   "helix-project-id": string;
   "helix-project": string;
   "helix-sequence": number;
+  "helix-stage-code": string;
   "helix-status": HelixCycle["status"];
   "helix-started"?: string;
   "helix-closed"?: string;
@@ -38,11 +40,10 @@ export function projectTemplate(input: {
   return `---
 helix-kind: ${PROJECT_KIND}
 helix-id: ${input.id}
-helix-status: active
+helix-status: planned
 ${input.didaProjectId ? `helix-dida-project-id: ${input.didaProjectId}\n` : ""}
 ${input.color ? `helix-color: "${input.color}"\n` : ""}
 helix-created: ${input.createdAt}
-helix-updated: ${input.createdAt}
 ---
 
 # ${input.title}
@@ -66,6 +67,7 @@ export function cycleTemplate(input: {
   projectId?: string;
   projectLink: string;
   sequence: number;
+  stageCode?: string;
   startedAt: string;
   status?: HelixCycle["status"];
   stageTitle?: string;
@@ -77,11 +79,12 @@ helix-id: ${input.id}
 ${input.projectId ? `helix-project-id: ${input.projectId}\n` : ""}
 helix-project: "${input.projectLink}"
 helix-sequence: ${input.sequence}
-helix-status: ${input.status ?? "active"}
+helix-stage-code: "${input.stageCode ?? String(input.sequence)}"
+helix-status: ${input.status ?? "idea"}
 helix-started: ${input.startedAt}
 ---
 
-# 阶段 ${input.sequence} · ${stageTitle}
+# 阶段 ${input.stageCode ?? input.sequence} · ${stageTitle}
 
 ${body ?? `> [!question] 本轮起因
 > 哪个观察、问题或上一轮结论触发了本轮？
@@ -102,18 +105,4 @@ ${body ?? `> [!question] 本轮起因
 > 下一轮保留、调整或停止什么？
 
 `}`;
-}
-
-export function assertCycleTransition(
-  cycle: HelixCycle,
-  nextStatus: HelixCycle["status"],
-): void {
-  const allowed: Record<HelixCycle["status"], HelixCycle["status"][]> = {
-    planned: ["active"],
-    active: ["closed"],
-    closed: [],
-  };
-  if (!allowed[cycle.status].includes(nextStatus)) {
-    throw new Error(`Invalid cycle transition: ${cycle.status} -> ${nextStatus}`);
-  }
 }

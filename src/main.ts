@@ -32,8 +32,12 @@ import { SerializedRunner } from "./services/serialized-runner";
 import { TaskMatrixRuleUpdater } from "./services/task-view-settings";
 import { autoSyncPlan } from "./services/auto-sync";
 import type {
+  ProjectWorkspaceCycleStatus,
+  ProjectWorkspaceCycleStatusUpdatePlan,
   ProjectWorkspaceMigrationItem,
   ProjectWorkspaceProject,
+  ProjectWorkspaceProjectStatus,
+  ProjectWorkspaceProjectStatusUpdatePlan,
   StageDeletionPlan,
 } from "./services/project-workspace";
 import { HelixDataStore } from "./storage/data-store";
@@ -52,6 +56,16 @@ import { runTemplateStartup, templateStartupAction } from "./services/template-s
 import { createJournalDocument } from "./services/journal-creation";
 import { configureTemplateSettings } from "./services/template-settings-coordinator";
 import { HELIX_VIEW_TYPE, HelixView } from "./ui/helix-view";
+import {
+  CYCLE_STATUS_OPTIONS,
+  PROJECT_STATUS_OPTIONS,
+  WorkspaceStatusModal,
+} from "./ui/helix-view";
+import {
+  PROJECT_STATUS_LABELS,
+  STAGE_STATUS_LABELS,
+} from "./domain/project-status";
+import { activeHelixStatusTarget, type ActiveHelixStatusTarget } from "./domain/active-project-status";
 import { HelixSettingTab } from "./ui/settings-tab";
 import { DidaWriteContractConfirmationGate } from "./ui/dida-write-contract-confirmation";
 import { DidaWriteContractCommandController } from "./ui/dida-write-contract-command";
@@ -85,6 +99,7 @@ export default class HelixPlugin extends Plugin {
   private readonly projectMutationRunner = new SerializedRunner();
   private readonly settingsMutationRunner = new SerializedRunner();
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
+  private projectStatusItem: HTMLElement | null = null;
 
   async onload(): Promise<void> {
     this.unloaded = false;
@@ -178,7 +193,11 @@ export default class HelixPlugin extends Plugin {
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
         taskReferences: this.taskReferences,
-        mutateProjectWorkspace: (operation) => this.withProjectMutation(operation),
+        readProjectWorkspace: (operation) => this.withProjectWorkspaceRead(operation),
+        mutateProjectWorkspace: (operation) => this.withWritableProjectMutation(operation),
+        repairProjectCanvas: () => this.repairProjectCanvas(),
+        updateProjectStatus: (plan, status) => this.updateProjectStatus(plan, status),
+        updateCycleStatus: (plan, status) => this.updateCycleStatus(plan, status),
         reviewLegacyMigration: () => this.showLegacyMigrationModal(),
         getTaskMatrixRules: () => ({ ...this.settings.taskMatrixRules }),
         updateTaskMatrixRules: (rules) => this.updateTaskMatrixRules(rules),
@@ -211,12 +230,21 @@ export default class HelixPlugin extends Plugin {
       callback: () => this.openProjectModal(),
     });
     this.addCommand({
+      id: "edit-active-project-or-stage-status",
+      name: "修改当前 Helix 项目或阶段状态",
+      checkCallback: (checking) => {
+        const available = this.activeHelixStatusTarget() !== null;
+        if (!checking && available) void this.openActiveHelixStatusModal();
+        return available;
+      },
+    });
+    this.addCommand({
       id: "undo-project-workspace",
       name: "撤销上一次项目图谱操作",
       checkCallback: (checking) => {
         const available = this.projectWorkspace.historyState().undoCount > 0;
         if (!checking && available) {
-          void this.withProjectMutation(() =>
+          void this.withWritableProjectMutation(() =>
             this.projectWorkspace.undoLastWorkspaceChange())
             .then(() => this.service.refreshPersistedEvents())
             .catch((error) =>
@@ -231,7 +259,7 @@ export default class HelixPlugin extends Plugin {
       checkCallback: (checking) => {
         const available = this.projectWorkspace.historyState().redoCount > 0;
         if (!checking && available) {
-          void this.withProjectMutation(() =>
+          void this.withWritableProjectMutation(() =>
             this.projectWorkspace.redoLastWorkspaceChange())
             .then(() => this.service.refreshPersistedEvents())
             .catch((error) =>
@@ -284,6 +312,7 @@ export default class HelixPlugin extends Plugin {
     this.addSettingTab(new HelixSettingTab(this.app, this));
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        this.refreshActiveStatusForPaths(file.path);
         if (this.isProjectWorkspaceFile(file.path)) {
           this.scheduleProjectRefresh(file.path);
           return;
@@ -297,6 +326,7 @@ export default class HelixPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
+        this.refreshActiveStatusForPaths(file.path);
         if (this.isProjectWorkspaceFile(file.path)) {
           this.scheduleProjectRefresh(file.path);
           return;
@@ -310,6 +340,7 @@ export default class HelixPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        this.refreshActiveStatusForPaths(file.path);
         if (
           this.isProjectWorkspaceFile(file.path) ||
           this.taskReferences.isKnownTaskReferencePath(file.path)
@@ -320,6 +351,7 @@ export default class HelixPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        this.refreshActiveStatusForPaths(file.path, oldPath);
         if (
           this.isProjectWorkspaceFile(file.path) ||
           this.isProjectWorkspaceFile(oldPath)
@@ -339,8 +371,93 @@ export default class HelixPlugin extends Plugin {
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
+    this.projectStatusItem = this.addStatusBarItem();
+    this.projectStatusItem.addClass("helix-active-status-control");
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
+      void this.refreshActiveHelixStatusControl();
+    }));
+    this.registerEvent(this.app.workspace.on("file-open", () => {
+      void this.refreshActiveHelixStatusControl();
+    }));
+    void this.refreshActiveHelixStatusControl();
 
     this.refreshAutoSync(this.settings.autoSync);
+  }
+
+  private activeHelixStatusTarget(): ActiveHelixStatusTarget | null {
+    const file = this.app.workspace.getActiveFile();
+    const frontmatter = file ? this.app.metadataCache.getFileCache(file)?.frontmatter : undefined;
+    return activeHelixStatusTarget(frontmatter, file?.basename);
+  }
+
+  private refreshActiveStatusForPaths(...paths: string[]): void {
+    const activePath = this.app.workspace.getActiveFile()?.path;
+    if (activePath && paths.includes(activePath)) {
+      void this.refreshActiveHelixStatusControl();
+    }
+  }
+
+  private async refreshActiveHelixStatusControl(): Promise<void> {
+    const item = this.projectStatusItem;
+    if (!item) return;
+    item.empty();
+    item.onclick = null;
+    item.onkeydown = null;
+    item.removeAttribute("role");
+    item.removeAttribute("tabindex");
+    item.removeAttribute("title");
+    const file = this.app.workspace.getActiveFile();
+    const frontmatter = file ? this.app.metadataCache.getFileCache(file)?.frontmatter : undefined;
+    const target = this.activeHelixStatusTarget();
+    if (!target) {
+      if (file && (frontmatter?.["helix-kind"] === "helix-project" ||
+        frontmatter?.["helix-kind"] === "helix-stage" || frontmatter?.["helix-kind"] === "helix-cycle")) {
+        item.setText("Helix · 状态异常");
+        item.setAttribute("aria-label", "Helix 状态异常，请在属性中修正；不会自动写入");
+        item.setAttribute("title", "状态异常，请在属性中修正；Helix 不会自动写入");
+        item.show();
+      } else item.hide();
+      return;
+    }
+    item.show();
+    const label = target.kind === "project"
+      ? PROJECT_STATUS_LABELS[target.status as keyof typeof PROJECT_STATUS_LABELS]
+      : STAGE_STATUS_LABELS[target.status as keyof typeof STAGE_STATUS_LABELS];
+    item.setText(`Helix · ${target.kind === "project" ? "项目" : "阶段"}：${label}`);
+    item.setAttribute("aria-label", `修改当前 ${target.kind === "project" ? "项目" : "阶段"}状态`);
+    item.setAttribute("title", "点击或按 Enter/Space 修改状态");
+    item.setAttribute("role", "button");
+    item.setAttribute("tabindex", "0");
+    item.onclick = () => void this.openActiveHelixStatusModal();
+    item.onkeydown = (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      void this.openActiveHelixStatusModal();
+    };
+  }
+
+  private async openActiveHelixStatusModal(): Promise<void> {
+    const target = this.activeHelixStatusTarget();
+    if (!target) return;
+    try {
+      if (target.kind === "project") {
+        const plan = await this.projectWorkspace.prepareProjectStatusUpdate(target.id);
+        new WorkspaceStatusModal(this.app, "修改项目状态", target.title, plan.currentStatus,
+          PROJECT_STATUS_OPTIONS, async (status) => {
+            await this.updateProjectStatus(plan, status);
+            await this.refreshActiveHelixStatusControl();
+          }).open();
+      } else {
+        const plan = await this.projectWorkspace.prepareCycleStatusUpdate(target.id);
+        new WorkspaceStatusModal(this.app, "修改阶段状态", target.title, plan.currentStatus,
+          CYCLE_STATUS_OPTIONS, async (status) => {
+            await this.updateCycleStatus(plan, status);
+            await this.refreshActiveHelixStatusControl();
+          }).open();
+      }
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error), 8_000);
+    }
   }
 
   onunload(): void {
@@ -495,7 +612,7 @@ export default class HelixPlugin extends Plugin {
       async (title, didaProjectId, color) => {
         this.assertWritable();
         if (didaProjectId) await this.service.verifyRemoteProject(didaProjectId);
-        const created = await this.withProjectMutation(() =>
+        const created = await this.withWritableProjectMutation(() =>
           this.projectWorkspace.createProject(title, didaProjectId, color));
         onCreated?.(created.id);
         await this.service.refreshPersistedEvents();
@@ -540,7 +657,7 @@ export default class HelixPlugin extends Plugin {
           snapshot.nextStageSequenceByProject[project.id]!,
           async (stageTitle, crossProjectConfirmed) => {
             this.assertWritable();
-            const created = await this.withProjectMutation(() =>
+            const created = await this.withWritableProjectMutation(() =>
               this.projectWorkspace.createCycle(
                 projectId,
                 "auto",
@@ -574,7 +691,7 @@ export default class HelixPlugin extends Plugin {
       new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能删除阶段", 8_000);
       return;
     }
-    void this.withProjectMutation(async () => {
+    void this.withProjectWorkspaceRead(async () => {
       const snapshot = await this.projectWorkspace.snapshot();
       const plan = await this.projectWorkspace.planCycleDeletion(cycleId);
       return [snapshot, plan] as const;
@@ -593,7 +710,7 @@ export default class HelixPlugin extends Plugin {
           plan,
           async (bridge, confirmCrossProject) => {
             this.assertWritable();
-            await this.withProjectMutation(() =>
+            await this.withWritableProjectMutation(() =>
               this.projectWorkspace.deleteCycle(plan, {
                 bridge,
                 confirmCrossProject,
@@ -642,7 +759,7 @@ export default class HelixPlugin extends Plugin {
           snapshot.projects,
           async (kind, predecessorIds, crossProjectConfirmed) => {
             this.assertWritable();
-            await this.withProjectMutation(() =>
+            await this.withWritableProjectMutation(() =>
               this.projectWorkspace.replaceRelation(
                 relation.id,
                 kind,
@@ -654,7 +771,7 @@ export default class HelixPlugin extends Plugin {
           },
           async () => {
             this.assertWritable();
-            await this.withProjectMutation(() =>
+            await this.withWritableProjectMutation(() =>
               this.projectWorkspace.deleteRelation(relation.id));
             onChanged?.(relation.toCycleId);
             new Notice("阶段关系已删除");
@@ -682,7 +799,7 @@ export default class HelixPlugin extends Plugin {
           Boolean(persisted.lineageConflict),
           async (ids, archiveLegacyConflict) => {
             this.assertWritable();
-            await this.withProjectMutation(() =>
+            await this.withWritableProjectMutation(() =>
               this.projectWorkspace.acknowledgeLegacyMigration(ids));
             if (archiveLegacyConflict) {
               await this.store.mutate((data) => {
@@ -869,6 +986,33 @@ export default class HelixPlugin extends Plugin {
         }
       }
     });
+  }
+
+  private async withProjectWorkspaceRead<T>(operation: () => Promise<T>): Promise<T> {
+    return this.projectMutationRunner.run(operation);
+  }
+
+  private async withWritableProjectMutation<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertWritable();
+    return this.withProjectMutation(operation);
+  }
+
+  private async repairProjectCanvas(): Promise<void> {
+    await this.withWritableProjectMutation(() => this.projectWorkspace.ensureCanvas());
+  }
+
+  private async updateProjectStatus(
+    plan: ProjectWorkspaceProjectStatusUpdatePlan,
+    status: ProjectWorkspaceProjectStatus,
+  ): Promise<void> {
+    await this.withWritableProjectMutation(() => this.projectWorkspace.updateProjectStatus(plan, status));
+  }
+
+  private async updateCycleStatus(
+    plan: ProjectWorkspaceCycleStatusUpdatePlan,
+    status: ProjectWorkspaceCycleStatus,
+  ): Promise<void> {
+    await this.withWritableProjectMutation(() => this.projectWorkspace.updateCycleStatus(plan, status));
   }
 
   private isProjectWorkspaceFile(path: string): boolean {

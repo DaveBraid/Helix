@@ -81,6 +81,7 @@ import {
   type TaskViewMode,
 } from "../domain/task-views";
 import { homeGreeting } from "../domain/home-dashboard";
+import { requestStageBoardStatusChange } from "../domain/stage-board";
 import type {
   DidaProjectViewModeSyncStatus,
   HelixRuntimeState,
@@ -199,6 +200,7 @@ export class HelixView extends ItemView {
   private taskReferenceSnapshot: TaskReferenceSnapshot | null = null;
   private lineageCamera: LineageCamera | undefined;
   private lineageFocusRequest: { entityId: string; generation: number } | null = null;
+  private pendingKanbanArrivalCycleId: string | null = null;
   private viewGeneration = 0;
   private closed = true;
   private renderToken = 0;
@@ -284,6 +286,7 @@ export class HelixView extends ItemView {
       this.taskSearchTimer = null;
     }
     this.lineageFocusRequest = null;
+    this.pendingKanbanArrivalCycleId = null;
     this.lineageCamera = undefined;
     this.projectWorkbench?.destroy();
     this.projectWorkbench = null;
@@ -2174,10 +2177,13 @@ export class HelixView extends ItemView {
     );
     const workbenchHost = content.createDiv({ cls: "helix-project-workbench-host" });
     const focusEntityId = this.currentLineageFocusId();
+    const arrivalCycleId = this.pendingKanbanArrivalCycleId ?? undefined;
+    this.pendingKanbanArrivalCycleId = null;
     this.projectWorkbench = new ProjectLineageWorkbench({
       snapshot: workspace,
       selectedProjectId: this.selectedProjectId,
       mode: this.projectLineageMode,
+      arrivalCycleId,
       initialCamera: this.lineageCamera,
       onFocusApplied: (entityId) =>
         this.acknowledgeLineageFocus(entityId, lifecycleGeneration),
@@ -2252,7 +2258,8 @@ export class HelixView extends ItemView {
       onEditProjectStatus: (projectId) => {
         const project = workspace.projects.find((candidate) => candidate.id === projectId);
         if (!project) return;
-        void this.actions.projectWorkspace.prepareProjectStatusUpdate(projectId)
+        void this.actions.readProjectWorkspace(() =>
+          this.actions.projectWorkspace.prepareProjectStatusUpdate(projectId))
           .then((plan) => {
             new WorkspaceStatusModal(
               this.app,
@@ -2274,7 +2281,8 @@ export class HelixView extends ItemView {
           .flatMap((project) => project.cycles)
           .find((candidate) => candidate.id === cycleId);
         if (!cycle) return;
-        void this.actions.projectWorkspace.prepareCycleStatusUpdate(cycleId)
+        void this.actions.readProjectWorkspace(() =>
+          this.actions.projectWorkspace.prepareCycleStatusUpdate(cycleId))
           .then((plan) => {
             new WorkspaceStatusModal(
               this.app,
@@ -2283,13 +2291,15 @@ export class HelixView extends ItemView {
               plan.currentStatus,
               CYCLE_STATUS_OPTIONS,
               async (status) => {
-                await this.actions.updateCycleStatus(plan, status);
-                await this.render();
+                await this.requestCycleStatusChange(cycleId, plan.currentStatus, status);
               },
             ).open();
           })
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      requestCycleStatusChange: async (cycleId, expectedStatus, status) => {
+        await this.requestCycleStatusChange(cycleId, expectedStatus, status);
       },
       onToggleCompletedCollapse: (projectId, collapsed) => {
         void this.actions.mutateProjectWorkspace(() =>
@@ -2331,6 +2341,29 @@ export class HelixView extends ItemView {
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
     this.projectWorkbench.render(workbenchHost);
+  }
+
+  private async requestCycleStatusChange(
+    cycleId: string,
+    expectedStatus: ProjectWorkspaceCycleStatus,
+    status: ProjectWorkspaceCycleStatus,
+  ): Promise<void> {
+    try {
+      await requestStageBoardStatusChange(
+        cycleId,
+        expectedStatus,
+        status,
+        () => this.actions.readProjectWorkspace(() =>
+          this.actions.projectWorkspace.prepareCycleStatusUpdate(cycleId)),
+        (plan, nextStatus) => this.actions.updateCycleStatus(plan, nextStatus),
+      );
+    } catch (error) {
+      await this.render();
+      throw error;
+    }
+    if (this.closed) return;
+    this.pendingKanbanArrivalCycleId = cycleId;
+    await this.render();
   }
 
   private renderProjectDidaMappingBar(

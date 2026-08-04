@@ -2234,20 +2234,11 @@
   font-weight: 750;
 }
 
-.helix-cycle-status.is-active {
-  background: var(--helix-success-soft);
-  color: var(--helix-success-ink);
-}
-
-.helix-cycle-status.is-planned {
-  background: var(--helix-accent-soft);
-  color: var(--helix-accent-ink);
-}
-
-.helix-cycle-status.is-closed {
-  background: var(--helix-surface-hover);
-  color: var(--helix-muted);
-}
+.helix-cycle-status.is-idea { background: var(--helix-surface-hover); color: var(--helix-muted); }
+.helix-cycle-status.is-active { background: var(--helix-accent-soft); color: var(--helix-accent-ink); }
+.helix-cycle-status.is-completed { background: var(--helix-success-soft); color: var(--helix-success-ink); }
+.helix-cycle-status.is-paused { background: color-mix(in srgb, var(--helix-warning-ink) 14%, transparent); color: var(--helix-warning-ink); }
+.helix-cycle-status.is-terminated { background: color-mix(in srgb, var(--text-error) 14%, transparent); color: var(--text-error); }
 
 .helix-cycle-relation {
   margin-top: 16px;
@@ -3740,6 +3731,20 @@
   font-size: inherit;
   line-height: 1.25;
 }
+.helix-lineage-status-icon,
+.helix-lineage-column-icon { display: inline-flex; align-items: center; }
+.helix-lineage-status-icon svg { width: 12px; height: 12px; }
+.helix-lineage-column-icon svg { width: 14px; height: 14px; }
+.helix-lineage-status-button.is-idea,
+.helix-lineage-column.is-idea .helix-lineage-column-heading h3 { color: var(--text-muted); }
+.helix-lineage-status-button.is-active,
+.helix-lineage-column.is-active .helix-lineage-column-heading h3 { color: var(--interactive-accent); }
+.helix-lineage-status-button.is-completed,
+.helix-lineage-column.is-completed .helix-lineage-column-heading h3 { color: var(--helix-success-ink); }
+.helix-lineage-status-button.is-paused,
+.helix-lineage-column.is-paused .helix-lineage-column-heading h3 { color: var(--helix-warning-ink); }
+.helix-lineage-status-button.is-terminated,
+.helix-lineage-column.is-terminated .helix-lineage-column-heading h3 { color: var(--text-error); }
 .helix-lineage-status-button:hover,
 .helix-lineage-status-button:focus-visible {
   color: var(--text-normal);
@@ -3748,17 +3753,7 @@
 .helix-lineage-status-button.is-project { color: var(--helix-relation-inherit); background: color-mix(in srgb, var(--helix-relation-inherit) 12%, transparent); }
 .helix-lineage-status-button.is-project.is-paused { color: var(--helix-warning-ink); background: color-mix(in srgb, var(--helix-warning-ink) 14%, transparent); }
 .helix-lineage-status-button.is-project.is-completed { color: var(--helix-success-ink); background: color-mix(in srgb, var(--helix-success-ink) 14%, transparent); }
-.helix-lineage-status-button.is-project.is-archived { color: var(--text-muted); background: var(--background-secondary); }
-.helix-lineage-status-button.is-closed {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--helix-success-ink);
-  background: color-mix(in srgb, var(--helix-success-ink) 17%, transparent);
-  font-weight: 720;
-}
-.helix-lineage-complete-check { display: inline-flex; order: -1; }
-.helix-lineage-complete-check svg { width: 15px; height: 15px; stroke-width: 3; }
+.helix-lineage-status-button.is-project.is-terminated { color: var(--text-muted); background: var(--background-secondary); }
 .helix-lineage-card-relations { margin-top: auto; }
 
 .helix-lineage-add-child,
@@ -3968,12 +3963,24 @@
 .helix-lineage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); gap: 14px; height: 100%; padding: 18px; overflow: auto; align-content: start; }
 .helix-lineage-card.is-grid,
 .helix-lineage-card.is-kanban { position: relative; width: 100%; height: 128px; cursor: pointer; }
-.helix-lineage-kanban { display: grid; grid-template-columns: repeat(3, minmax(230px, 1fr)); gap: 12px; height: 100%; padding: 14px; overflow: auto; }
-.helix-lineage-column { min-width: 0; padding: 10px; border: 1px solid var(--background-modifier-border); border-radius: 10px; background: var(--background-secondary); }
+.helix-lineage-kanban { display: grid; box-sizing: border-box; grid-template-columns: repeat(5, minmax(244px, 1fr)); gap: 12px; height: 100%; padding: 14px; overflow-x: auto; overflow-y: hidden; align-items: stretch; }
+.helix-lineage-column { display: flex; box-sizing: border-box; min-width: 244px; height: 100%; min-height: 0; padding: 10px; flex-direction: column; border: 1px solid var(--background-modifier-border); border-radius: 10px; background: var(--background-secondary); transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
+.helix-lineage-column.is-drop-target { border-color: var(--interactive-accent); background: color-mix(in srgb, var(--interactive-accent) 8%, var(--background-secondary)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 45%, transparent); }
 .helix-lineage-column-heading { display: flex; align-items: center; justify-content: space-between; padding: 3px 3px 12px; }
-.helix-lineage-column-heading h3 { margin: 0; font-size: 12px; }
+.helix-lineage-column-heading h3 { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
 .helix-lineage-column-heading span { color: var(--text-muted); font-size: 10px; }
-.helix-lineage-column-list { display: grid; gap: 10px; }
+.helix-lineage-column-list { display: grid; min-height: 0; flex: 1 1 auto; gap: 10px; overflow-y: auto; }
+.helix-lineage-card.is-kanban { transition: transform .18s ease, opacity .18s ease, box-shadow .18s ease; }
+.helix-lineage-card.is-kanban.is-dragging { z-index: 2; pointer-events: none; opacity: .5; box-shadow: 0 14px 28px rgba(0, 0, 0, .2); transform: translate(var(--helix-drag-x, 0), var(--helix-drag-y, 0)) rotate(1deg) scale(.985); }
+.helix-lineage-card.is-kanban.is-dragging::after { content: ""; position: absolute; inset: 6px -4px -6px 4px; z-index: -1; border-radius: inherit; background: color-mix(in srgb, var(--interactive-accent) 16%, transparent); filter: blur(8px); }
+.helix-lineage-column.is-drop-target .helix-lineage-column-list::before { content: "放到此处"; display: block; padding: 6px 8px; border: 1px dashed color-mix(in srgb, var(--interactive-accent) 62%, transparent); border-radius: 7px; color: var(--interactive-accent); font-size: 10px; text-align: center; }
+.helix-lineage-card.is-kanban.is-status-pending { pointer-events: none; opacity: .6; }
+.helix-lineage-card.is-kanban.is-status-arrived { animation: helix-kanban-arrive .24s ease-out; }
+@keyframes helix-kanban-arrive { from { transform: translateY(-8px); } to { transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .helix-lineage-column,
+  .helix-lineage-card.is-kanban { transition: none; animation: none; }
+}
 
 @media (max-width: 900px) {
   .helix-task-filter-bar { align-items: stretch; flex-wrap: wrap; overflow-x: visible; }
@@ -3992,5 +3999,5 @@
   .helix-task-matrix { grid-template-columns: 1fr; }
   .helix-lineage-toolbar { grid-template-columns: 1fr auto; }
   .helix-lineage-view-switcher { order: 3; grid-column: 1 / -1; justify-self: start; }
-  .helix-lineage-kanban { grid-template-columns: repeat(3, 260px); }
+  .helix-lineage-kanban { grid-template-columns: repeat(5, 260px); }
 }

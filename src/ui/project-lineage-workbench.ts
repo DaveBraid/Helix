@@ -8,6 +8,15 @@ import {
   projectedGraphIsAcyclic,
   type ProjectGraphEdge,
 } from "../domain/project-graph";
+import {
+  STAGE_BOARD_COLUMNS,
+  STAGE_STATUS_PRESENTATION,
+  stageBoardCycleIds,
+  stageBoardMoveDecision,
+  stageBoardPointerDecision,
+  StageBoardMoveRegistry,
+} from "../domain/stage-board";
+import { PROJECT_STATUS_LABELS } from "../domain/project-status";
 import type {
   ProjectWorkspaceCanvasNode,
   ProjectWorkspaceHistoryState,
@@ -54,6 +63,7 @@ interface WorkbenchOptions {
   initialCamera?: LineageCamera;
   onFocusApplied?: (entityId: string) => void;
   mode: ProjectLineageViewMode;
+  arrivalCycleId?: string;
   onModeChange: (mode: ProjectLineageViewMode) => void;
   onSelectProject: (projectId: string | null) => void;
   onCreateProject: () => void;
@@ -70,6 +80,11 @@ interface WorkbenchOptions {
   onEditProjectColor: (projectId: string, color: string) => void;
   onEditProjectStatus: (projectId: string) => void;
   onEditCycleStatus: (cycleId: string) => void;
+  requestCycleStatusChange: (
+    cycleId: string,
+    expectedStatus: ProjectWorkspaceCycle["status"],
+    status: ProjectWorkspaceCycle["status"],
+  ) => Promise<void>;
   onToggleCompletedCollapse: (projectId: string, collapsed: boolean) => void;
   onExpandCompletedProjects: (projectIds: string[]) => void;
   onAutoLayout: () => void;
@@ -667,6 +682,14 @@ export class ProjectLineageWorkbench {
   private programmaticScrollTimer: number | null = null;
   private programmaticScrollFrame: number | null = null;
   private pendingCamera: LineageCamera | null = null;
+  private readonly boardMoves = new StageBoardMoveRegistry();
+  private boardDrag: {
+    card: HTMLElement;
+    cycleId: string;
+    pointerId: number;
+    sourceStatus: ProjectWorkspaceCycle["status"];
+  } | null = null;
+  private boardEscapeListener: ((event: KeyboardEvent) => void) | null = null;
 
   constructor(private readonly options: WorkbenchOptions) {
     const minimumX = Math.min(0, ...options.snapshot.canvasNodes.map((node) => node.x));
@@ -693,6 +716,8 @@ export class ProjectLineageWorkbench {
 
   destroy(): void {
     this.destroyed = true;
+    this.boardDrag = null;
+    this.clearBoardEscapeListener();
     this.moveVersion += 1;
     this.selected.clear();
     this.lasso?.overlay.remove();
@@ -870,14 +895,14 @@ export class ProjectLineageWorkbench {
       const button = item.createEl("button", {
         attr: {
           "aria-pressed": String(project.id === this.options.selectedProjectId),
-          "aria-label": `${project.title}，${projectStatusLabel(project.status)}，${
+          "aria-label": `${project.title}，${PROJECT_STATUS_LABELS[project.status]}，${
             project.cycles.filter((cycle) => cycle.status === "active").length
           } 个进行中阶段`,
         },
       });
       button.createSpan({ cls: "helix-lineage-project-name", text: project.title });
       button.createEl("small", {
-        text: `${projectStatusLabel(project.status)} · ${
+        text: `${PROJECT_STATUS_LABELS[project.status]} · ${
           project.cycles.filter((cycle) => cycle.status === "active").length
         } 个进行中阶段`,
       });
@@ -1122,10 +1147,10 @@ export class ProjectLineageWorkbench {
       open.addEventListener("click", () => this.options.onOpenNote(project.notePath));
       const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
-        text: projectStatusLabel(project.status),
+        text: PROJECT_STATUS_LABELS[project.status],
         attr: {
           "aria-label": `修改 ${project.title} 的项目状态，当前${
-            projectStatusLabel(project.status)
+            PROJECT_STATUS_LABELS[project.status]
           }`,
           title: "修改项目状态",
         },
@@ -1225,10 +1250,10 @@ export class ProjectLineageWorkbench {
     if (node.kind === "project") {
       const status = meta.createEl("button", {
         cls: `helix-lineage-status-button is-project is-${owner.status}`,
-        text: projectStatusLabel(owner.status),
+        text: PROJECT_STATUS_LABELS[owner.status],
         attr: {
           "aria-label": `修改 ${owner.title} 的项目状态，当前${
-            projectStatusLabel(owner.status)
+            PROJECT_STATUS_LABELS[owner.status]
           }`,
           title: "修改项目状态",
         },
@@ -1240,24 +1265,23 @@ export class ProjectLineageWorkbench {
       meta.createSpan({ text: `${owner.cycles.length} 个阶段` });
     } else {
       const cycle = owner.cycles.find((item) => item.id === node.entityId)!;
+      const presentation = STAGE_STATUS_PRESENTATION[cycle.status];
       const status = meta.createEl("button", {
         cls: `helix-lineage-status-button is-${cycle.status}`,
-        text: stageStatusLabel(cycle.status),
         attr: {
           "aria-label": `修改 ${cycle.title} 的阶段状态，当前${
-            stageStatusLabel(cycle.status)
+            presentation.label
           }`,
           title: "修改阶段状态",
         },
       });
+      const statusIcon = status.createSpan({ cls: "helix-lineage-status-icon" });
+      setIcon(statusIcon, presentation.icon);
+      status.createSpan({ text: presentation.label });
       status.addEventListener("click", (event) => {
         event.stopPropagation();
         this.options.onEditCycleStatus(cycle.id);
       });
-      if (cycle.status === "completed") {
-        const check = status.createSpan({ cls: "helix-lineage-complete-check" });
-        setIcon(check, "circle-check-big");
-      }
       meta.createSpan({ text: owner.title });
     }
     const relation = this.options.snapshot.relations.find(
@@ -1616,24 +1640,21 @@ export class ProjectLineageWorkbench {
 
   private renderKanban(parent: HTMLElement): void {
     const board = parent.createDiv({ cls: "helix-lineage-kanban" });
-    for (const status of [
-      { id: "idea" as const, label: "想法" },
-      { id: "active" as const, label: "进行中" },
-      { id: "completed" as const, label: "已完成" },
-      { id: "paused" as const, label: "已暂停" },
-      { id: "terminated" as const, label: "已终止" },
-    ]) {
-      const column = board.createDiv({ cls: `helix-lineage-column is-${status.id}` });
+    const boardNodes = this.boardStageNodes();
+    for (const status of STAGE_BOARD_COLUMNS) {
+      const presentation = STAGE_STATUS_PRESENTATION[status];
+      const column = board.createDiv({
+        cls: `helix-lineage-column is-${status}`,
+        attr: { "data-stage-status": status },
+      });
       const heading = column.createDiv({ cls: "helix-lineage-column-heading" });
-      heading.createEl("h3", { text: status.label });
-      const nodes = this.visibleNodes().filter((node) => {
-        if (node.kind !== "cycle") return false;
-        if (
-          this.options.selectedProjectId &&
-          node.projectId !== this.options.selectedProjectId
-        ) return false;
+      const title = heading.createEl("h3");
+      const icon = title.createSpan({ cls: "helix-lineage-column-icon" });
+      setIcon(icon, presentation.icon);
+      title.createSpan({ text: presentation.label });
+      const nodes = boardNodes.filter((node) => {
         const owner = this.projectFor(node.projectId);
-        return owner.cycles.find((cycle) => cycle.id === node.entityId)?.status === status.id;
+        return owner.cycles.find((cycle) => cycle.id === node.entityId)?.status === status;
       });
       heading.createSpan({ text: String(nodes.length) });
       const list = column.createDiv({ cls: "helix-lineage-column-list" });
@@ -1646,8 +1667,186 @@ export class ProjectLineageWorkbench {
         if (!this.collapseCountByHead.has(node.entityId)) {
           this.renderCycleActions(card, node);
         }
-        card.addEventListener("click", () => this.options.onOpenNote(node.notePath));
+        this.bindKanbanCard(card, node, status);
+        if (node.entityId === this.options.arrivalCycleId) {
+          card.addClass("is-status-arrived");
+          window.setTimeout(() => {
+            if (!this.destroyed) card.removeClass("is-status-arrived");
+          }, 260);
+        }
       }
+    }
+  }
+
+  private bindKanbanCard(
+    card: HTMLElement,
+    node: ProjectWorkspaceCanvasNode,
+    status: ProjectWorkspaceCycle["status"],
+  ): void {
+    card.dataset.helixStageStatus = status;
+    card.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || (event.target as Element).closest("button") ||
+          this.boardMoves.isPending(node.entityId)) return;
+      this.boardDrag = {
+        card,
+        cycleId: node.entityId,
+        pointerId: event.pointerId,
+        sourceStatus: card.dataset.helixStageStatus as ProjectWorkspaceCycle["status"],
+      };
+      card.dataset.helixPointerX = String(event.clientX);
+      card.dataset.helixPointerY = String(event.clientY);
+      card.setPointerCapture(event.pointerId);
+      this.boardEscapeListener = (keyEvent) => {
+        if (keyEvent.key !== "Escape") return;
+        keyEvent.preventDefault();
+        this.cancelBoardDrag();
+      };
+      document.addEventListener("keydown", this.boardEscapeListener, true);
+    });
+    card.addEventListener("pointermove", (event) => {
+      const drag = this.boardDrag;
+      if (!drag || drag.card !== card) return;
+      const startX = Number(card.dataset.helixPointerX);
+      const startY = Number(card.dataset.helixPointerY);
+      if (!card.hasClass("is-dragging") && Math.hypot(event.clientX - startX, event.clientY - startY) < 7) return;
+      event.preventDefault();
+      card.addClass("is-dragging");
+      card.style.setProperty("--helix-drag-x", `${event.clientX - startX}px`);
+      card.style.setProperty("--helix-drag-y", `${event.clientY - startY}px`);
+      const target = document.elementFromPoint(event.clientX, event.clientY)
+        ?.closest<HTMLElement>(".helix-lineage-column[data-stage-status]");
+      this.clearKanbanDropState(card.closest(".helix-lineage-kanban"));
+      target?.addClass("is-drop-target");
+      this.previewKanbanCounts(card.closest(".helix-lineage-kanban"), target?.dataset.stageStatus as ProjectWorkspaceCycle["status"] | undefined);
+    });
+    const finishPointer = (event: PointerEvent, canceled = false) => {
+      const drag = this.boardDrag;
+      if (!drag || drag.card !== card) return;
+      const moved = card.hasClass("is-dragging");
+      card.removeClass("is-dragging");
+      card.style.removeProperty("--helix-drag-x");
+      card.style.removeProperty("--helix-drag-y");
+      this.clearKanbanDropState(card.closest(".helix-lineage-kanban"));
+      this.boardDrag = null;
+      this.clearBoardEscapeListener();
+      const column = document.elementFromPoint(event.clientX, event.clientY)
+        ?.closest<HTMLElement>(".helix-lineage-column[data-stage-status]");
+      const targetStatus = column?.dataset.stageStatus as ProjectWorkspaceCycle["status"] | undefined;
+      const pointerDecision = stageBoardPointerDecision(
+        moved ? 7 : 0,
+        drag.sourceStatus,
+        targetStatus,
+        canceled,
+      );
+      if (pointerDecision.suppressOpen) {
+        card.dataset.helixSuppressOpen = "true";
+        window.setTimeout(() => delete card.dataset.helixSuppressOpen, 0);
+      }
+      if (pointerDecision.move !== "commit" || !targetStatus || !column) return;
+      const targetList = column.querySelector<HTMLElement>(".helix-lineage-column-list");
+      if (!targetList) return;
+      this.commitKanbanMove(drag, targetStatus, targetList);
+    };
+    card.addEventListener("pointerup", (event) => finishPointer(event));
+    card.addEventListener("pointercancel", (event) => finishPointer(event, true));
+    card.addEventListener("lostpointercapture", (event) => finishPointer(event, true));
+    card.addEventListener("click", () => {
+      if (card.dataset.helixSuppressOpen === "true") return;
+      this.options.onOpenNote(node.notePath);
+    });
+  }
+
+  private commitKanbanMove(
+    drag: NonNullable<ProjectLineageWorkbench["boardDrag"]>,
+    targetStatus: ProjectWorkspaceCycle["status"],
+    list: HTMLElement,
+  ): void {
+      if (drag.sourceStatus === targetStatus) return;
+      if (!this.boardMoves.tryBegin(drag.cycleId)) return;
+      const decision = stageBoardMoveDecision(drag.sourceStatus, targetStatus, false);
+      if (decision !== "commit") {
+        this.boardMoves.finish(drag.cycleId, !this.destroyed);
+        return;
+      }
+      drag.card.addClass("is-status-pending");
+      void this.options.requestCycleStatusChange(drag.cycleId, drag.sourceStatus, targetStatus)
+        .then(() => {
+          // 提交器已经基于 Markdown 新快照重渲染；旧实例不得保留局部伪状态。
+        })
+        .catch((error) => {
+          this.options.onError(error);
+        })
+        .finally(() => {
+          const alive = this.boardMoves.finish(drag.cycleId, !this.destroyed);
+          if (alive) drag.card.removeClass("is-status-pending");
+        });
+  }
+
+  private cancelBoardDrag(): void {
+    const drag = this.boardDrag;
+    if (!drag) return;
+    if (drag.card.hasClass("is-dragging")) {
+      drag.card.dataset.helixSuppressOpen = "true";
+      window.setTimeout(() => delete drag.card.dataset.helixSuppressOpen, 0);
+    }
+    drag.card.removeClass("is-dragging");
+    if (drag.card.hasPointerCapture(drag.pointerId)) drag.card.releasePointerCapture(drag.pointerId);
+    drag.card.style.removeProperty("--helix-drag-x");
+    drag.card.style.removeProperty("--helix-drag-y");
+    this.clearKanbanDropState(drag.card.closest(".helix-lineage-kanban"));
+    this.boardDrag = null;
+    this.clearBoardEscapeListener();
+  }
+
+  private clearBoardEscapeListener(): void {
+    if (!this.boardEscapeListener) return;
+    document.removeEventListener("keydown", this.boardEscapeListener, true);
+    this.boardEscapeListener = null;
+  }
+
+  private boardStageNodes(): ProjectWorkspaceCanvasNode[] {
+    const visibleIds = new Set(stageBoardCycleIds(
+      this.options.snapshot.projects,
+      this.options.selectedProjectId,
+    ));
+    return this.options.snapshot.projects.flatMap((project) =>
+      project.cycles.flatMap((cycle) => !visibleIds.has(cycle.id) ? [] : [
+        this.nodeByEntity.get(cycle.id) ?? ({
+          nodeId: `helix-board-${cycle.id}`,
+          entityId: cycle.id,
+          projectId: project.id,
+          kind: "cycle" as const,
+          notePath: cycle.notePath,
+          title: cycle.title,
+          x: 0,
+          y: 0,
+          width: GRAPH_CARD_WIDTH,
+          height: GRAPH_CARD_HEIGHT,
+        }),
+      ]),
+    );
+  }
+
+  private clearKanbanDropState(board: Element | null): void {
+    board?.querySelectorAll(".helix-lineage-column.is-drop-target")
+      .forEach((column) => column.removeClass("is-drop-target"));
+    this.previewKanbanCounts(board, undefined);
+  }
+
+  private previewKanbanCounts(
+    board: Element | null,
+    targetStatus: ProjectWorkspaceCycle["status"] | undefined,
+  ): void {
+    if (!board) return;
+    for (const column of board.querySelectorAll<HTMLElement>(".helix-lineage-column[data-stage-status]")) {
+      const status = column.dataset.stageStatus as ProjectWorkspaceCycle["status"];
+      let count = column.querySelectorAll(".helix-lineage-card.is-kanban").length;
+      if (this.boardDrag && targetStatus && targetStatus !== this.boardDrag.sourceStatus) {
+        if (status === this.boardDrag.sourceStatus) count -= 1;
+        if (status === targetStatus) count += 1;
+      }
+      column.querySelector<HTMLElement>(".helix-lineage-column-heading > span:last-child")
+        ?.setText(String(Math.max(0, count)));
     }
   }
 
@@ -2490,24 +2689,4 @@ function physicalEdgesFromSnapshot(
       fromCycleId,
       toCycleId: relation.toCycleId,
     })));
-}
-
-function projectStatusLabel(status: ProjectWorkspaceProject["status"]): string {
-  return {
-    planned: "计划中",
-    active: "进行中",
-    paused: "已暂停",
-    completed: "已完成",
-    terminated: "已终止",
-  }[status];
-}
-
-function stageStatusLabel(status: ProjectWorkspaceCycle["status"]): string {
-  return {
-    idea: "想法",
-    active: "进行中",
-    completed: "已完成",
-    paused: "已暂停",
-    terminated: "已终止",
-  }[status];
 }

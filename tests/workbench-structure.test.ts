@@ -40,9 +40,9 @@ describe("workbench layout and navigation structure", () => {
   it("routes all new status saves through a recovery-mode write gate", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(view).toMatch(/this\.actions\.updateProjectStatus\(plan, status\)/);
-    expect(view).toMatch(/this\.actions\.updateCycleStatus\(plan, status\)/);
+    expect(view).toMatch(/this\.requestCycleStatusChange\(cycleId, plan\.currentStatus, status\)/);
     expect(view).not.toMatch(/projectWorkspace\.updateProjectStatus\(plan, status\)/);
-    expect(view).not.toMatch(/projectWorkspace\.updateCycleStatus\(plan, status\)/);
+    expect(view).toMatch(/requestStageBoardStatusChange\(/);
     expect(main).toMatch(/updateProjectStatus: \(plan, status\) => this\.updateProjectStatus\(plan, status\)/);
     expect(main).toMatch(/updateCycleStatus: \(plan, status\) => this\.updateCycleStatus\(plan, status\)/);
     expect(main).toMatch(
@@ -67,5 +67,23 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/Canvas 需要修复[\s\S]*const workbenchHost = content\.createDiv\(\{ cls: "helix-project-workbench-host" \}\)/);
     expect(view).toMatch(/this\.projectWorkbench\.render\(workbenchHost\)/);
     expect(view).not.toMatch(/this\.projectWorkbench\.render\(content\)/);
+  });
+
+  it("keeps the five-column stage board isolated, horizontally scrollable and write-gated", () => {
+    const lineage = readFileSync(resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"), "utf8");
+    expect(lineage).toMatch(/STAGE_BOARD_COLUMNS/);
+    expect(lineage).toMatch(/boardStageNodes\(\)[\s\S]*snapshot\.projects/);
+    expect(lineage).toMatch(/requestCycleStatusChange\(drag\.cycleId, drag\.sourceStatus, targetStatus\)/);
+    expect(lineage).toMatch(/pointercancel[\s\S]*lostpointercapture[\s\S]*is-dragging/);
+    expect(css).toMatch(/\.helix-lineage-kanban \{[\s\S]*grid-template-columns: repeat\(5, minmax\(244px, 1fr\)\);[\s\S]*overflow-x: auto;/);
+    expect(css).toMatch(/\.helix-lineage-kanban \{[\s\S]*overflow-y: hidden;/);
+    expect(css).toMatch(/\.helix-lineage-column-list \{[\s\S]*min-height: 0;[\s\S]*overflow-y: auto;/);
+    expect(css).toMatch(/\.helix-lineage-card\.is-kanban\.is-dragging \{[\s\S]*pointer-events: none;/);
+    expect(css).toMatch(/prefers-reduced-motion: reduce[\s\S]*\.helix-lineage-card\.is-kanban/);
+  });
+
+  it("clears deferred kanban arrival when the view closes", () => {
+    expect(view).toMatch(/this\.pendingKanbanArrivalCycleId = null;/);
+    expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
 });

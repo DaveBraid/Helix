@@ -2213,6 +2213,66 @@ describe("ProjectWorkspaceService", () => {
     ]);
   });
 
+  it("re-derives bridged focus in the same deletion transaction and undo/redo", async () => {
+    const repo = linearRepository();
+    const firstPath = "Helix/Projects/Alpha/Cycle-01.md";
+    const middlePath = "Helix/Projects/Alpha/Cycle-02.md";
+    const targetPath = "Helix/Projects/Alpha/Cycle-03.md";
+    repo.set(firstPath, repo.take(firstPath)!.replace(
+      "## 下一阶段聚焦问题\n",
+      "## 下一阶段聚焦问题\n来自阶段一\n",
+    ));
+    repo.set(middlePath, repo.take(middlePath)!.replace(
+      "## 下一阶段聚焦问题\n",
+      "## 下一阶段聚焦问题\n来自阶段二\n",
+    ));
+    const service = workspace(repo);
+    await service.replaceRelation("edge-23", "inherit", ["cycle-2"]);
+    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+
+    await service.deleteCycle("cycle-2", { bridge: true });
+    const deleted = (await repo.read(targetPath))!.content;
+    expect(await repo.read(middlePath)).toBeNull();
+    expect(deleted).toContain("sourceId=cycle-1");
+    expect(deleted).toContain("> 来自阶段一");
+    expect(deleted).not.toContain("sourceId=cycle-2");
+    expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
+
+    await service.undoLastWorkspaceChange();
+    expect(await repo.read(middlePath)).not.toBeNull();
+    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+    await service.redoLastWorkspaceChange();
+    expect(await repo.read(middlePath)).toBeNull();
+    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-1");
+  });
+
+  it("does not delete a stage when a successor derived block was edited", async () => {
+    const repo = linearRepository();
+    const targetPath = "Helix/Projects/Alpha/Cycle-03.md";
+    const service = workspace(repo);
+    await service.replaceRelation("edge-23", "inherit", ["cycle-2"]);
+    repo.set(targetPath, repo.take(targetPath)!.replace("|阶段标题 2]]", "|用户修改来源]]"));
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+
+    await expect(service.deleteCycle("cycle-2", { bridge: true }))
+      .rejects.toThrow(/已被编辑/);
+    expect((await repo.read(CANVAS))!.content).toBe(canvasBefore);
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
+  });
+
+  it("removes and restores a successor envelope in a no-bridge deletion", async () => {
+    const repo = linearRepository();
+    const targetPath = "Helix/Projects/Alpha/Cycle-03.md";
+    const service = workspace(repo);
+    await service.replaceRelation("edge-23", "inherit", ["cycle-2"]);
+    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+
+    await service.deleteCycle("cycle-2", { bridge: false });
+    expect((await repo.read(targetPath))!.content).not.toContain("helix-focus-bridge");
+    await service.undoLastWorkspaceChange();
+    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+  });
+
   it("previews and applies no-bridge branch degradation with exact edge identity", async () => {
     const repo = baseRepository();
     for (const sequence of [2, 3, 4]) {

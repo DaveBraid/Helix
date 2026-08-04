@@ -304,11 +304,20 @@ export interface ProjectWorkspaceMarkdownCreation {
   content: string;
 }
 
+export interface ProjectWorkspaceMarkdownDeletion {
+  path: string;
+  kind: "project" | "stage";
+  entityId: string;
+  projectId: string;
+  beforeHash: string;
+}
+
 export interface ProjectWorkspaceAtomicChange {
   label: string;
   canvasBeforeHash: string;
   canvasAfterContent: string;
   markdownCreations?: readonly ProjectWorkspaceMarkdownCreation[];
+  markdownDeletions?: readonly ProjectWorkspaceMarkdownDeletion[];
   markdownUpdates: readonly ProjectWorkspaceMarkdownUpdate[];
 }
 
@@ -483,6 +492,34 @@ export class ProjectWorkspaceService {
       this.assertHistoryStageIdentity(current.content, transition);
       this.assertHistoryStageIdentity(update.afterContent, transition);
       if (current.content !== update.afterContent) transitions.push(transition);
+    }
+    for (const deletion of change.markdownDeletions ?? []) {
+      const path = normalizePath(deletion.path);
+      if (
+        path !== deletion.path ||
+        seen.has(path) ||
+        !path.startsWith(projectRoot) ||
+        !path.endsWith(".md") ||
+        !deletion.entityId ||
+        !deletion.projectId
+      ) {
+        throw new Error(`跨文件事务包含重复或无效的删除路径：${deletion.path}`);
+      }
+      seen.add(path);
+      const current = await this.repository.read(path);
+      if (!current || current.hash !== deletion.beforeHash) {
+        throw new Error(`待删除 Markdown 在跨文件事务开始前已变化：${path}`);
+      }
+      const transition: ProjectWorkspaceHistoryFileTransition = {
+        path,
+        kind: deletion.kind,
+        entityId: deletion.entityId,
+        projectId: deletion.projectId,
+        fromContent: current.content,
+        toContent: null,
+      };
+      this.assertHistoryStageIdentity(current.content, transition);
+      transitions.push(transition);
     }
     const entry: ProjectWorkspaceHistoryEntry = {
       id: crypto.randomUUID(),
@@ -2098,6 +2135,30 @@ export class ProjectWorkspaceService {
     applyManagedLayout(canvas.document, layoutSnapshot, physical, affected);
 
     const nextCanvasContent = JSON.stringify(canvas.document, null, 2);
+    const changedFocusTargets = remainingCycleIds.filter((targetId) =>
+      relationSourceSignature(snapshot.relations, targetId) !==
+        relationSourceSignature(normalized.relations, targetId));
+    const focusUpdates = await this.focusMarkdownUpdates(
+      layoutSnapshot,
+      normalized.relations,
+      changedFocusTargets,
+    );
+    if (focusUpdates.length > 0) {
+      this.assertActive(generation);
+      return this.applyAtomicWorkspaceChange({
+        label: bridge ? "删除并桥接阶段" : "删除阶段",
+        canvasBeforeHash: canvas.revision.hash,
+        canvasAfterContent: nextCanvasContent,
+        markdownUpdates: focusUpdates,
+        markdownDeletions: [{
+          path: cycleRevision.path,
+          kind: "stage",
+          entityId: cycleId,
+          projectId: owner.id,
+          beforeHash: cycleRevision.hash,
+        }],
+      });
+    }
     const journal: StageDeletionJournal = {
       version: 1,
       operation: "delete-stage",
@@ -3673,6 +3734,17 @@ export class ProjectWorkspaceService {
 function isCanonicalIsoTimestamp(value: string): boolean {
   const parsed = new Date(value);
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function relationSourceSignature(
+  relations: readonly CycleRelation[],
+  targetId: string,
+): string {
+  return [...new Set(relations
+    .filter((relation) => relation.toCycleId === targetId)
+    .flatMap((relation) => relation.fromCycleIds))]
+    .sort()
+    .join("\u0000");
 }
 
 function cardNode(

@@ -1,14 +1,14 @@
 # 当前开发状态
 
 最后更新：2026-08-04
-当前基线提交：`90fa0ec feat: add recoverable stage focus bridge foundation`
-工作树状态：3C 的默认 Stage 正文、关系桥接服务、专项测试及本快照尚未提交；Vault 文件与运行态 `data.json` 不纳入 Git。
-当前阶段：阶段 3C 关系命令接入进行中；删除阶段尚未接入。
+当前基线提交：`a21fddd feat: derive stage focus from project relations`
+工作树状态：3C 删除事务服务、专项测试及本快照尚未提交；Vault 文件与运行态 `data.json` 不纳入 Git。
+当前阶段：阶段 3C 已完成；准备实施 3D 双向监听与冲突 UI。
 
 ## 本轮目标
 
 - 让新建、连接、纳管、替换和断开关系只按 Canvas 托管入边派生 Stage 聚焦引用，并与 Canvas 同事务。
-- 非目标：本批不接删除阶段、监听、冲突 UI、滴答同步、发布或迁移。
+- 本批已接删除／桥接阶段；非目标为监听、冲突 UI、滴答同步、发布或迁移。
 
 ## 当前事实
 
@@ -24,9 +24,8 @@
 
 ## 本轮改动
 
-- `src/services/project-workspace.ts`：关系入口生成聚焦更新；新 Stage 与受控改码改用 v2 日志原子创建，不再提前落盘。
-- `src/domain/projects.ts`：内置 Stage 兜底正文与当前默认模板结构一致。
-- `tests/project-workspace.test.ts`：覆盖继承／合并、连线／断线／撤销、缺标题、损坏标记、受管编辑、创建回滚和 Canvas 零写。
+- `src/services/project-workspace.ts`：共享 v2 事务增加受管删除；删除导致存活目标入链变化时，同步重派生引用、提交 Canvas 并删除 Stage。
+- `tests/project-workspace.test.ts`：覆盖桥接删除、引用换源、受管编辑拒绝及删除撤销／重做。
 
 ## 相关约束
 
@@ -38,9 +37,10 @@
 
 ## 当前验证
 
-- 已通过：全量 58 个测试文件、626 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿。
+- 已通过：全量 58 个测试文件、629 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿。
 - 审查：3A P0/P1/P2=0，3B P0/P1=0；两段均未接入 UI。
-- 3C 第一批：专项 145/145、看门狗 P0/P1/P2=0；新建／连线／纳管／替换／断开已通过，删除阶段尚未接入，故完整 3C 仍未完成。
+- 3C 第一批：专项 145/145、看门狗 P0/P1/P2=0；新建／连线／纳管／替换／断开已通过并提交。
+- 3C 第二批：项目工作区专项 108/108、看门狗 P0/P1/P2=0；桥接／无桥接删除、撤销重做和受管编辑拒绝均通过。
 - 实机（提交基线）：Obsidian 1.13.4 深色模式五列横排／独立横滚正常；隔离 Stage 跨列写入与计数一致，同列拖拽零写，键盘和 ARIA 正常，`dev:errors` 为 0。
 - 实机：临时 Project/Stage 已移入 Obsidian 废纸篓并移除空目录；当时既有 Project/Stage、模板和 Canvas 前后哈希一致。
 - 实机：3A/3B 尚未接入 UI，不适用；阶段 3C 接入后统一用 Obsidian CLI 验收。
@@ -51,6 +51,6 @@
 
 ## 下一步
 
-1. 实施 3C：只从 Canvas 托管入边生成聚焦引用，覆盖新建、连边、换边、断边、删除、撤销重做。
-2. 实施监听与逐字段冲突 UI，再用 Obsidian CLI 完成阶段 3 实机验收。
+1. 实施 3D：监听源／派生编辑，单边变化自动 CAS，双边变化冻结并进入手动冲突解决。
+2. 用 Obsidian CLI 完成 Live Preview、隐藏标记、关系与反向编辑实机验收。
 3. 阶段 3 稳定后开始 Helix→滴答隔离投影。

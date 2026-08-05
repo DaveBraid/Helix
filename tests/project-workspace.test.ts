@@ -1245,6 +1245,319 @@ describe("ProjectWorkspaceService", () => {
     expect(markdown).toContain("> 直接进入新阶段");
   });
 
+  it("observes a source-only focus edit through one recoverable Markdown transaction", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const historyBefore = service.historyState();
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+
+    await service.observeFocusBridgeChanges([sourcePath]);
+
+    expect((await repo.read(targetPath))!.content).toContain("> Source focus");
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+    expect(repo.paths()).toContain("Helix/.transactions/stage-focus-bridge.json");
+    expect(service.historyState()).toEqual(historyBefore);
+    const targetAfter = (await repo.read(targetPath))!.content;
+    const stateAfter = repo.take("Helix/.transactions/stage-focus-bridge.json")!;
+    repo.set("Helix/.transactions/stage-focus-bridge.json", stateAfter);
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    expect((await repo.read(targetPath))!.content).toBe(targetAfter);
+    expect((await repo.read("Helix/.transactions/stage-focus-bridge.json"))!.content).toBe(stateAfter);
+    expect(service.historyState()).toEqual(historyBefore);
+  });
+
+  it("reverse-applies a derived-only edit to source and origin target in the same transaction", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+
+    await service.observeFocusBridgeChanges([targetPath]);
+
+    expect((await repo.read(sourcePath))!.content).toContain("## 下一阶段聚焦问题\nDerived focus");
+    const targetMarkdown = (await repo.read(targetPath))!.content;
+    expect(targetMarkdown).toContain("> Derived focus");
+    expect(targetMarkdown).toContain("baseHash=" + stableHash("Derived focus"));
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+  });
+
+  it("persists simultaneous focus edits across restart without blocking another pair", async () => {
+    const first = await focusBridgeWorkspace();
+    first.repo.set(first.sourcePath, first.repo.take(first.sourcePath)!.replace("Base focus", "Source focus"));
+    first.repo.set(first.targetPath, first.repo.take(first.targetPath)!.replace("> Base focus", "> Derived focus"));
+
+    await first.service.observeFocusBridgeChanges([first.sourcePath, first.targetPath]);
+
+    const conflicts = await first.service.listFocusBridgeConflicts();
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({
+      baseContent: "Base focus",
+      sourceContent: "Source focus",
+      derivedContent: "Derived focus",
+    });
+    const restarted = workspace(first.repo);
+    expect(await restarted.listFocusBridgeConflicts()).toEqual(conflicts);
+  });
+
+  it("rechecks exact revisions before resolving a persisted focus conflict", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    const conflict = (await service.listFocusBridgeConflicts())[0]!;
+    await service.resolveFocusBridgeConflict(conflict.id, "derived");
+
+    expect((await repo.read(sourcePath))!.content).toContain("## 下一阶段聚焦问题\nDerived focus");
+    expect((await repo.read(targetPath))!.content).toContain("> Derived focus");
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+  });
+
+  it("does not overwrite a concurrently advanced focus state while resolving", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    const conflict = (await service.listFocusBridgeConflicts())[0]!;
+    const sourceBeforeResolution = (await repo.read(sourcePath))!.content;
+    const targetBeforeResolution = (await repo.read(targetPath))!.content;
+    let competed = false;
+    repo.beforeCompareEvery = (path) => {
+      if (path !== statePath || competed) return;
+      competed = true;
+      const concurrent = repo.json(statePath);
+      const checkpoint = structuredClone(
+        Object.values(concurrent.checkpoints)[0],
+      ) as Record<string, unknown>;
+      concurrent.checkpoints.concurrent = { ...checkpoint, key: "concurrent" };
+      repo.set(statePath, JSON.stringify(concurrent));
+    };
+
+    await expect(service.resolveFocusBridgeConflict(conflict.id, "source"))
+      .rejects.toThrow(/write conflict/);
+
+    expect(repo.json(statePath).checkpoints.concurrent).toBeDefined();
+    expect((await repo.read(sourcePath))!.content).toBe(sourceBeforeResolution);
+    expect((await repo.read(targetPath))!.content).toBe(targetBeforeResolution);
+  });
+
+  it("recovers a committed focus resolution when state finalization is interrupted", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    const conflict = (await service.listFocusBridgeConflicts())[0]!;
+    let stateWrites = 0;
+    repo.beforeCompareEvery = (path) => {
+      if (path !== statePath) return;
+      stateWrites += 1;
+      if (stateWrites === 2 || stateWrites === 3) throw new Error("finalize interrupted");
+    };
+
+    await expect(service.resolveFocusBridgeConflict(conflict.id, "derived"))
+      .rejects.toThrow(/finalize interrupted/);
+    expect(repo.json(statePath).pendingResolution).toBeDefined();
+    repo.beforeCompareEvery = undefined;
+
+    const restarted = workspace(repo);
+    await restarted.initializeFocusBridgeState();
+
+    expect((await repo.read(sourcePath))!.content).toContain("Derived focus");
+    expect((await repo.read(targetPath))!.content).toContain("> Derived focus");
+    expect(await restarted.listFocusBridgeConflicts()).toEqual([]);
+    expect(repo.json(statePath).pendingResolution).toBeUndefined();
+  });
+
+  it("freezes every project write and preserves pending state on mixed resolution files", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    const conflict = (await service.listFocusBridgeConflicts())[0]!;
+    const sourceBeforeResolution = (await repo.read(sourcePath))!.content;
+    let stateWrites = 0;
+    repo.beforeCompareEvery = (path) => {
+      if (path !== statePath) return;
+      stateWrites += 1;
+      if (stateWrites === 2 || stateWrites === 3) throw new Error("finalize interrupted");
+    };
+    await expect(service.resolveFocusBridgeConflict(conflict.id, "derived"))
+      .rejects.toThrow(/finalize interrupted/);
+    repo.beforeCompareEvery = undefined;
+    repo.set(sourcePath, sourceBeforeResolution);
+    const projectPath = "Helix/Projects/Alpha/Project.md";
+    const projectBefore = (await repo.read(projectPath))!.content;
+    const restarted = workspace(repo);
+
+    await expect(restarted.observeFocusBridgeChanges([sourcePath, targetPath]))
+      .rejects.toThrow(/混合或未知版本|已冻结/);
+    expect(repo.json(statePath).pendingResolution).toBeDefined();
+    await expect(restarted.updateProjectColor("project-1", "#5870A8"))
+      .rejects.toThrow(/已冻结/);
+    expect((await repo.read(projectPath))!.content).toBe(projectBefore);
+    expect(repo.json(statePath).pendingResolution).toBeDefined();
+  });
+
+  it("uses dedicated rebuild for a recoverable structural conflict", async () => {
+    const { repo, service, targetPath } = await focusBridgeWorkspace();
+    repo.set(targetPath, repo.take(targetPath)!.replace("|阶段标题 1]]", "|用户改坏链接]]"));
+    await service.observeFocusBridgeChanges([targetPath]);
+    const conflict = (await service.listFocusBridgeConflicts())[0]!;
+    expect(conflict.reason).toBe("derived-structure-changed");
+    await expect(service.resolveFocusBridgeConflict(conflict.id, "source"))
+      .rejects.toThrow(/不能使用内容三选一/);
+
+    await service.rebuildFocusBridgeConflict(conflict.id);
+
+    expect((await repo.read(targetPath))!.content).toContain("|阶段标题 1]]");
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+  });
+
+  it("prunes orphan focus checkpoints and conflicts when no active relation remains", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    expect(await service.listFocusBridgeConflicts()).toHaveLength(1);
+    const canvas = repo.json(CANVAS);
+    canvas.edges = [];
+    repo.set(CANVAS, JSON.stringify(canvas));
+
+    await service.observeFocusBridgeChanges([sourcePath]);
+
+    expect(repo.json(statePath)).toMatchObject({ checkpoints: {}, conflicts: [] });
+  });
+
+  it("freezes only the structurally conflicted focus pair while updating another target", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const thirdPath = "Helix/Projects/Alpha/Cycle-03.md";
+    repo.set(thirdPath, cycle("cycle-3", "project-1", 3));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(card("cycle-3-node", "cycle", "project-1", "cycle-3", 920, 300));
+    repo.set(CANVAS, JSON.stringify(canvas));
+    await service.connectCycles(await service.planConnection("cycle-1", "cycle-3"));
+    await service.initializeFocusBridgeState();
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Shared source"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("|阶段标题 1]]", "|Tampered]]"));
+
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+
+    expect(await service.listFocusBridgeConflicts()).toHaveLength(1);
+    expect((await repo.read(targetPath))!.content).toContain("|Tampered]]");
+    expect((await repo.read(thirdPath))!.content).toContain("> Shared source");
+  });
+
+  it("keeps a focus conflict frozen when either exact file revision changes before apply", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    const conflict = (await service.listFocusBridgeConflicts())[0]!;
+    repo.set(targetPath, `${repo.take(targetPath)!}\n外部竞争`);
+
+    await expect(service.resolveFocusBridgeConflict(conflict.id, "source"))
+      .rejects.toThrow(/已经变化/);
+    expect(await service.listFocusBridgeConflicts()).toHaveLength(1);
+    await service.observeFocusBridgeChanges([targetPath]);
+    const refreshed = (await service.listFocusBridgeConflicts())[0]!;
+    await service.resolveFocusBridgeConflict(refreshed.id, "source");
+    expect((await repo.read(targetPath))!.content).toContain("外部竞争");
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+  });
+
+  it("uses a persisted non-authoritative Base checkpoint after service restart", async () => {
+    const { repo, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const restarted = workspace(repo);
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "After restart"));
+
+    await restarted.observeFocusBridgeChanges([sourcePath]);
+
+    expect((await repo.read(targetPath))!.content).toContain("> After restart");
+    expect(await restarted.listFocusBridgeConflicts()).toEqual([]);
+  });
+
+  it("fails closed when the persisted Base checkpoint structure is damaged", async () => {
+    const { repo, service, sourcePath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    const state = repo.json(statePath);
+    const checkpoint = Object.values(state.checkpoints)[0] as { baseHash: string };
+    checkpoint.baseHash = "0".repeat(64);
+    repo.set(statePath, JSON.stringify(state));
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Must not write"));
+
+    await expect(service.observeFocusBridgeChanges([sourcePath]))
+      .rejects.toThrow(/检查点结构无效/);
+  });
+
+  it.each([
+    ["forward", ["cycle-2", "cycle-3"]],
+    ["reverse", ["cycle-3", "cycle-2"]],
+  ])("freezes different reverse candidates for one source independent of order: %s", async (_name, order) => {
+    const setup = await focusBridgeWorkspaceWithTwoTargets();
+    setup.repo.set(setup.targetPaths[0], setup.repo.take(setup.targetPaths[0])!
+      .replace("> Base focus", "> Candidate A"));
+    setup.repo.set(setup.targetPaths[1], setup.repo.take(setup.targetPaths[1])!
+      .replace("> Base focus", "> Candidate B"));
+    const paths = order.map((id) => id === "cycle-2" ? setup.targetPaths[0] : setup.targetPaths[1]);
+
+    await setup.service.observeFocusBridgeChanges(paths);
+
+    expect((await setup.repo.read(setup.sourcePath))!.content).toContain("Base focus");
+    expect(await setup.service.listFocusBridgeConflicts()).toHaveLength(2);
+    expect((await setup.repo.read(setup.targetPaths[0]))!.content).toContain("> Candidate A");
+    expect((await setup.repo.read(setup.targetPaths[1]))!.content).toContain("> Candidate B");
+  });
+
+  it("accepts identical reverse candidates only after validating both pairs", async () => {
+    const setup = await focusBridgeWorkspaceWithTwoTargets();
+    for (const path of setup.targetPaths) {
+      setup.repo.set(path, setup.repo.take(path)!.replace("> Base focus", "> Same candidate"));
+    }
+
+    await setup.service.observeFocusBridgeChanges([...setup.targetPaths].reverse());
+
+    expect((await setup.repo.read(setup.sourcePath))!.content).toContain("Same candidate");
+    expect(await setup.service.listFocusBridgeConflicts()).toEqual([]);
+    for (const path of setup.targetPaths) {
+      expect((await setup.repo.read(path))!.content).toContain("> Same candidate");
+    }
+  });
+
+  it.each([
+    ["body", (markdown: string) => markdown.replace("> Base focus", "> Hidden edit")],
+    ["structure", (markdown: string) => markdown.replace("|阶段标题 1]]", "|Hidden link edit]]")],
+  ])("does not overwrite an unobserved target with an existing %s edit", async (_name, edit) => {
+    const setup = await focusBridgeWorkspaceWithTwoTargets();
+    setup.repo.set(setup.targetPaths[0], setup.repo.take(setup.targetPaths[0])!
+      .replace("> Base focus", "> Accepted reverse"));
+    setup.repo.set(setup.targetPaths[1], edit(setup.repo.take(setup.targetPaths[1])!));
+
+    await setup.service.observeFocusBridgeChanges([setup.targetPaths[0]]);
+
+    expect((await setup.repo.read(setup.sourcePath))!.content).toContain("Accepted reverse");
+    expect((await setup.repo.read(setup.targetPaths[0]))!.content).toContain("> Accepted reverse");
+    expect((await setup.repo.read(setup.targetPaths[1]))!.content)
+      .toContain(_name === "body" ? "> Hidden edit" : "|Hidden link edit]]");
+    expect(await setup.service.listFocusBridgeConflicts()).toHaveLength(1);
+  });
+
+  it("does not advance a checkpoint when the corresponding Markdown transaction loses CAS", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    const beforeState = repo.json(statePath);
+    const beforeCheckpoint = structuredClone(Object.values(beforeState.checkpoints)[0]);
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "CAS candidate"));
+    repo.beforeCompare = (path) => {
+      if (path === targetPath) repo.set(targetPath, `${repo.take(targetPath)!}\n竞争内容`);
+    };
+
+    await expect(service.observeFocusBridgeChanges([sourcePath])).rejects.toThrow(/变化|conflict/);
+
+    const afterState = repo.json(statePath);
+    expect(Object.values(afterState.checkpoints)[0]).toEqual(beforeCheckpoint);
+    expect((await repo.read(targetPath))!.content).not.toContain("> CAS candidate");
+  });
+
   it("keeps Canvas byte-identical when connection focus headings or markers are invalid", async () => {
     for (const damage of ["target-heading", "source-heading", "target-marker"] as const) {
       const repo = baseRepository();
@@ -3042,6 +3355,51 @@ describe("ProjectWorkspaceService", () => {
   });
 });
 
+async function focusBridgeWorkspace(): Promise<{
+  repo: MemoryRepository;
+  service: ProjectWorkspaceService;
+  sourcePath: string;
+  targetPath: string;
+}> {
+  const repo = baseRepository();
+  const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+  const targetPath = "Helix/Projects/Alpha/Cycle-02.md";
+  repo.set(sourcePath, repo.take(sourcePath)!.replace(
+    "## 下一阶段聚焦问题\n",
+    "## 下一阶段聚焦问题\nBase focus\n",
+  ));
+  repo.set(targetPath, cycle("cycle-2", "project-1", 2));
+  const canvas = repo.json(CANVAS);
+  canvas.nodes.push(card("cycle-2-node", "cycle", "project-1", "cycle-2", 520, 300));
+  repo.set(CANVAS, JSON.stringify(canvas));
+  const service = workspace(repo);
+  await service.connectCycles(await service.planConnection("cycle-1", "cycle-2"));
+  await service.initializeFocusBridgeState();
+  return { repo, service, sourcePath, targetPath };
+}
+
+async function focusBridgeWorkspaceWithTwoTargets(): Promise<{
+  repo: MemoryRepository;
+  service: ProjectWorkspaceService;
+  sourcePath: string;
+  targetPaths: [string, string];
+}> {
+  const setup = await focusBridgeWorkspace();
+  const thirdPath = "Helix/Projects/Alpha/Cycle-03.md";
+  setup.repo.set(thirdPath, cycle("cycle-3", "project-1", 3));
+  const canvas = setup.repo.json(CANVAS);
+  canvas.nodes.push(card("cycle-3-node", "cycle", "project-1", "cycle-3", 920, 300));
+  setup.repo.set(CANVAS, JSON.stringify(canvas));
+  await setup.service.connectCycles(await setup.service.planConnection("cycle-1", "cycle-3"));
+  await setup.service.initializeFocusBridgeState();
+  return {
+    repo: setup.repo,
+    service: setup.service,
+    sourcePath: setup.sourcePath,
+    targetPaths: [setup.targetPath, thirdPath],
+  };
+}
+
 function workspace(repo: MemoryRepository): ProjectWorkspaceService {
   return new ProjectWorkspaceService(
     {
@@ -3221,6 +3579,7 @@ class MemoryRepository {
   failTrashPath?: string;
   beforeCreate?: (path: string) => void;
   beforeCompare?: (path: string) => void;
+  beforeCompareEvery?: (path: string) => void;
   beforeRead?: (path: string) => void;
   beforeTrash?: (revision: VaultRevision) => void;
 
@@ -3269,6 +3628,7 @@ class MemoryRepository {
     content: string,
     beforeWrite?: () => void,
   ): Promise<VaultRevision> {
+    this.beforeCompareEvery?.(revision.path);
     const beforeCompare = this.beforeCompare;
     this.beforeCompare = undefined;
     beforeCompare?.(revision.path);

@@ -95,6 +95,7 @@ export default class HelixPlugin extends Plugin {
   private projectMutationDepth = 0;
   private projectRefreshPending = false;
   private projectCanvasRefreshPending = false;
+  private readonly projectMarkdownRefreshPaths = new Set<string>();
   private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
   private readonly settingsMutationRunner = new SerializedRunner();
@@ -130,7 +131,7 @@ export default class HelixPlugin extends Plugin {
     this.recoveryMode = data.recoveryIssues.length > 0;
     if (this.recoveryMode) {
       this.projectWorkspace.freezePendingStageDeletion(
-        "Helix data.json 处于只读恢复模式，阶段删除事务不会自动执行，项目写入已冻结",
+        "Helix 处于只读恢复模式，阶段删除事务不会自动执行，项目写入已冻结；请处理冲突中心列出的恢复问题",
       );
     } else {
       try {
@@ -163,6 +164,16 @@ export default class HelixPlugin extends Plugin {
         } catch (error) {
           new Notice(`Helix 默认模板未完全补齐：${error instanceof Error ? error.message : String(error)}`, 10_000);
         }
+      }
+    }
+    if (!this.recoveryMode) {
+      try {
+        await this.projectWorkspace.initializeFocusBridgeState();
+      } catch (error) {
+        const message = `Helix 阶段聚焦桥接需要人工检查：${
+          error instanceof Error ? error.message : String(error)}`;
+        await this.enterProjectRecoveryMode(message);
+        new Notice(message, 0);
       }
     }
     this.service = new HelixService(this.store, this.secrets);
@@ -602,7 +613,7 @@ export default class HelixPlugin extends Plugin {
 
   private openProjectModal(onCreated?: (projectId: string) => void): void {
     if (this.recoveryMode) {
-      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能创建项目", 8_000);
+      new Notice("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能创建项目", 8_000);
       return;
     }
     new ProjectPromptModal(
@@ -631,7 +642,7 @@ export default class HelixPlugin extends Plugin {
     onCreated?: (cycleId: string) => void,
   ): void {
     if (this.recoveryMode) {
-      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能创建阶段", 8_000);
+      new Notice("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能创建阶段", 8_000);
       return;
     }
     void this.projectWorkspace.snapshot()
@@ -688,7 +699,7 @@ export default class HelixPlugin extends Plugin {
     onDeleted?: (focusEntityId: string) => void,
   ): void {
     if (this.recoveryMode) {
-      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能删除阶段", 8_000);
+      new Notice("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能删除阶段", 8_000);
       return;
     }
     void this.withProjectWorkspaceRead(async () => {
@@ -745,7 +756,7 @@ export default class HelixPlugin extends Plugin {
     onChanged?: (focusEntityId: string) => void,
   ): void {
     if (this.recoveryMode) {
-      new Notice("Helix 当前处于只读恢复模式，修复 data.json 前不能修改关系", 8_000);
+      new Notice("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能修改关系", 8_000);
       return;
     }
     void this.projectWorkspace.snapshot()
@@ -917,6 +928,9 @@ export default class HelixPlugin extends Plugin {
 
   private scheduleProjectRefresh(changedPath?: string): void {
     if (this.unloaded) return;
+    if (changedPath && changedPath.endsWith(".md")) {
+      this.projectMarkdownRefreshPaths.add(normalizePath(changedPath));
+    }
     if (
       changedPath &&
       normalizePath(changedPath) === normalizePath(this.settings.lineageCanvasPath)
@@ -935,12 +949,22 @@ export default class HelixPlugin extends Plugin {
       if (this.unloaded) return;
       const observeCanvas = this.projectCanvasRefreshPending;
       this.projectCanvasRefreshPending = false;
-      void (observeCanvas
-        ? this.projectWorkspace.observeCanvasChange()
-        : Promise.resolve())
-        .then(() => this.service.refreshPersistedEvents())
-        .catch((error) =>
-          new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      const markdownPaths = [...this.projectMarkdownRefreshPaths];
+      this.projectMarkdownRefreshPaths.clear();
+      void this.projectMutationRunner.run(async () => {
+        if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
+        if (!this.recoveryMode && markdownPaths.length > 0) {
+          await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
+        }
+        await this.service.refreshPersistedEvents();
+      }).catch(async (error) => {
+        const recoveryIssue = this.projectWorkspace.recoveryIssueMessage();
+        const message = error instanceof Error ? error.message : String(error);
+        if (recoveryIssue) {
+          await this.enterProjectRecoveryMode(`Helix 项目工作区需要人工检查：${recoveryIssue}`);
+        }
+        new Notice(message, recoveryIssue ? 0 : 8_000);
+      });
     }, 200);
   }
 
@@ -1030,9 +1054,23 @@ export default class HelixPlugin extends Plugin {
 
   private assertWritable(): void {
     if (this.recoveryMode) {
-      throw new Error("Helix 当前处于只读恢复模式，修复 data.json 前不能写入");
+      throw new Error("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能写入");
     }
     if (this.unloaded) throw new Error("Helix 已卸载，写入已取消");
+  }
+
+  private async enterProjectRecoveryMode(message: string): Promise<void> {
+    this.projectWorkspace.freezePendingStageDeletion(message);
+    this.recoveryMode = true;
+    try {
+      await this.store.mutate((draft) => {
+        if (!draft.recoveryIssues.includes(message)) draft.recoveryIssues.push(message);
+      });
+      this.service?.reportRecoveryIssue(message);
+    } catch (persistError) {
+      new Notice(`Helix 无法持久化恢复问题：${
+        persistError instanceof Error ? persistError.message : String(persistError)}`, 0);
+    }
   }
 
   private async openFile(path: string): Promise<void> {

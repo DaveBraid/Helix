@@ -63,10 +63,31 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/workspace = await this\.actions\.readProjectWorkspace\([\s\S]*loadStableWorkspace\(\)/);
   });
 
+  it("persists focus startup failures into the generic recovery center", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(main).toMatch(
+      /initializeFocusBridgeState\(\)[\s\S]*recoveryIssues\.includes\(message\)[\s\S]*recoveryIssues\.push\(message\)/,
+    );
+    expect(main).toContain("处理冲突中心列出的恢复问题前不能写入");
+    expect(view).toContain("Helix 数据或事务状态需要人工修复");
+    expect(main).toMatch(
+      /recoveryIssueMessage\(\)[\s\S]*enterProjectRecoveryMode\(`Helix 项目工作区需要人工检查/,
+    );
+    expect(main).toMatch(
+      /enterProjectRecoveryMode\(message: string\)[\s\S]*this\.recoveryMode = true[\s\S]*recoveryIssues\.push\(message\)/,
+    );
+  });
+
   it("keeps Canvas repair diagnostics beside the lineage workbench", () => {
     expect(view).toMatch(/Canvas 需要修复[\s\S]*const workbenchHost = content\.createDiv\(\{ cls: "helix-project-workbench-host" \}\)/);
     expect(view).toMatch(/this\.projectWorkbench\.render\(workbenchHost\)/);
     expect(view).not.toMatch(/this\.projectWorkbench\.render\(content\)/);
+  });
+
+  it("offers structural focus repair without invalid content choices", () => {
+    expect(view).toMatch(/conflict\.reason !== "simultaneous-edit"[\s\S]*按来源重建受管块/);
+    expect(view).toMatch(/打开 Markdown 手工修复/);
+    expect(view).toMatch(/return;[\s\S]*addChoice\("来源"/);
   });
 
   it("keeps the five-column stage board isolated, horizontally scrollable and write-gated", () => {

@@ -49,7 +49,7 @@ export class HelixDataStore implements SnapshotRepository, ConflictRepository {
       this.assertActive();
       if (!this.data) this.data = hydrateData(await this.plugin.loadData());
       if (this.data.recoveryIssues.length > 0) {
-        throw new Error("Helix data.json 含损坏结构，当前为只读恢复模式；请先复制诊断摘要并修复数据");
+        throw new Error("Helix 当前为只读恢复模式；请先处理冲突中心列出的恢复问题");
       }
       const next = cloneValue(this.data);
       mutator(next);

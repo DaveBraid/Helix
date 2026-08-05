@@ -8,6 +8,7 @@ import {
   planStageFocusBridge,
   renderFocusBridgeEnvelope,
   replaceFocusBridgeEnvelope,
+  resolveStageFocusBridge,
   scanFocusSection,
   type FocusSource,
 } from "../src/domain/stage-focus-bridge";
@@ -409,6 +410,27 @@ describe("阶段聚焦桥接纯领域协议", () => {
       if (emptyDerived.action !== "update-source") throw new Error("unexpected action");
       expect(scanFocusSection(emptyDerived.sourceMarkdown, FOCUS_SOURCE_HEADING, 2).normalizedContent)
         .toBe("");
+    });
+
+    it("canonicalizes one chosen conflict value into both source and target plans", () => {
+      const pair = syncedPair();
+      const targetEdited = pair.targetMarkdown.replace("> Base", "> Derived");
+      const resolved = resolveStageFocusBridge({
+        source: source("a", "Source"),
+        targetMarkdown: targetEdited,
+        acceptedContent: "Custom\n\n- item",
+      });
+      expect(scanFocusSection(resolved.sourceMarkdown, FOCUS_SOURCE_HEADING, 2).normalizedContent)
+        .toBe("Custom\n\n- item");
+      const parsed = parseFocusBridgeEnvelope(resolved.targetMarkdown);
+      if (parsed.kind !== "present") throw new Error("missing resolved envelope");
+      expect(parsed.blocks[0]).toMatchObject({
+        content: "Custom\n\n- item",
+        baseHash: resolved.acceptedHash,
+        sourceHash: resolved.acceptedHash,
+        state: "synced",
+      });
+      expect(parsed.blocks[0]!.currentDerivedHash).toBe(parsed.blocks[0]!.derivedHash);
     });
   });
 });

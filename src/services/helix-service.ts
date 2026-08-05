@@ -252,13 +252,23 @@ export class HelixService {
       new Notice("Helix 检测到中断的远端写入，已停止自动重试；请在“冲突”中人工核对。", 10_000);
     }
     if (data.recoveryIssues.length > 0) {
-      new Notice("Helix 检测到 data.json 结构损坏，已进入只读恢复模式；请在“冲突”中复制诊断摘要。", 12_000);
+      new Notice("Helix 检测到需要人工处理的恢复问题，已进入只读恢复模式；请在“冲突”中查看详情。", 12_000);
     }
     this.emit();
   }
 
   snapshot(): HelixRuntimeState {
     return structuredClone(this.state);
+  }
+
+  reportRecoveryIssue(issue: string): void {
+    if (this.state.recoveryIssues.includes(issue)) return;
+    this.state = {
+      ...this.state,
+      recoveryIssues: [...this.state.recoveryIssues, issue],
+      attentionCount: this.state.attentionCount + 1,
+    };
+    this.emit();
   }
 
   subscribe(listener: StateListener): () => void {
@@ -1801,7 +1811,7 @@ export class HelixService {
       throw new Error("滴答写入合同测试正在运行，其他写入已暂时冻结");
     }
     if (this.state.recoveryIssues.length > 0) {
-      throw new Error("Helix 当前处于只读恢复模式，修复 data.json 前不能写入");
+      throw new Error("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能写入");
     }
   }
 

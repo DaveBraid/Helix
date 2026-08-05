@@ -91,6 +91,7 @@ import type {
   ProjectConnectionPlan,
   ProjectWorkspaceCycleStatusUpdatePlan,
   ProjectWorkspaceCycleStatus,
+  ProjectWorkspaceFocusConflict,
   ProjectWorkspaceNativeRelationAdoptionPlan,
   ProjectWorkspaceNativeRelationCandidate,
   ProjectWorkspaceProject,
@@ -214,6 +215,7 @@ export class HelixView extends ItemView {
   private charts: echarts.ECharts[] = [];
   private chartObservers: ResizeObserver[] = [];
   private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
+  private focusBridgeConflictCount = 0;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -296,6 +298,13 @@ export class HelixView extends ItemView {
   private async render(): Promise<void> {
     if (!this.state || this.closed) return;
     const token = ++this.renderToken;
+    try {
+      this.focusBridgeConflictCount = (await this.actions.readProjectWorkspace(() =>
+        this.actions.projectWorkspace.listFocusBridgeConflicts())).length;
+    } catch {
+      this.focusBridgeConflictCount = 0;
+    }
+    if (token !== this.renderToken || this.closed) return;
     if (this.section === "projects") {
       this.lineageCamera = this.projectWorkbench?.camera() ?? this.lineageCamera;
     }
@@ -332,7 +341,7 @@ export class HelixView extends ItemView {
       setIcon(icon, item.icon);
       button.createSpan({ text: item.label });
       if (item.id === "conflicts") {
-        const count = this.state?.attentionCount ?? 0;
+        const count = (this.state?.attentionCount ?? 0) + this.focusBridgeConflictCount;
         if (count > 0) button.createSpan({ cls: "helix-nav-badge", text: String(count) });
       }
       button.addEventListener("click", () => {
@@ -518,12 +527,13 @@ export class HelixView extends ItemView {
     this.renderWeeklyChallengeCard(lower);
     const conflicts = await this.store.list();
     if (token !== this.renderToken) return;
-    if (conflicts.length > 0) {
+    const totalConflicts = conflicts.length + this.focusBridgeConflictCount;
+    if (totalConflicts > 0) {
       const warning = content.createDiv({ cls: "helix-card helix-conflict-warning" });
       const icon = warning.createSpan();
       setIcon(icon, "git-compare-arrows");
       const body = warning.createDiv();
-      body.createEl("strong", { text: `${conflicts.length} 项等待手动合并` });
+      body.createEl("strong", { text: `${totalConflicts} 项等待手动合并` });
       body.createEl("p", { text: "Helix 不会静默覆盖竞争修改。" });
       warning.addEventListener("click", () => {
         this.section = "conflicts";
@@ -2844,10 +2854,12 @@ export class HelixView extends ItemView {
       cls: "helix-safety-note",
       text: "竞争字段必须逐项选择；应用前会再次读取远端。",
     });
-    const [conflicts, persisted, queue] = await Promise.all([
+    const [conflicts, persisted, queue, focusConflicts] = await Promise.all([
       this.store.list(),
       this.store.snapshot(),
       this.service.listQueue(),
+      this.actions.readProjectWorkspace(() =>
+        this.actions.projectWorkspace.listFocusBridgeConflicts()),
     ]);
     if (token !== this.renderToken) return;
     if (persisted.lineageConflict) {
@@ -2868,7 +2880,7 @@ export class HelixView extends ItemView {
     for (const issue of this.state?.recoveryIssues ?? []) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "只读恢复模式" });
-      card.createEl("h3", { text: "data.json 结构需要人工修复" });
+      card.createEl("h3", { text: "Helix 数据或事务状态需要人工修复" });
       card.createEl("p", { text: issue });
       const copy = card.createEl("button", { text: "复制脱敏诊断摘要" });
       copy.addEventListener("click", () => {
@@ -2960,8 +2972,10 @@ export class HelixView extends ItemView {
           .catch((error) => new Notice(error instanceof Error ? error.message : String(error)));
       });
     }
+    for (const conflict of focusConflicts) this.renderFocusBridgeConflict(content, conflict);
     if (
       conflicts.length === 0 &&
+      focusConflicts.length === 0 &&
       (this.state?.recoveryIssues.length ?? 0) === 0 &&
       reconciliation.length === 0 &&
       failed.length === 0 &&
@@ -2976,6 +2990,102 @@ export class HelixView extends ItemView {
       return;
     }
     for (const conflict of conflicts) this.renderConflict(content, conflict);
+  }
+
+  private renderFocusBridgeConflict(
+    content: HTMLElement,
+    conflict: ProjectWorkspaceFocusConflict,
+  ): void {
+    const card = content.createDiv({ cls: "helix-card helix-conflict-card" });
+    card.createEl("span", { cls: "helix-chip is-danger", text: "阶段聚焦冲突" });
+    card.createEl("h3", { text: `${conflict.sourceId} → ${conflict.targetId}` });
+    card.createEl("p", {
+      text: conflict.reason === "derived-structure-changed"
+        ? "派生引用的链接或结构发生变化，已冻结该引用。"
+        : conflict.reason === "checkpoint-missing"
+          ? "缺少可验证的同步基线，已停止自动写入。"
+          : "来源和派生正文均已变化，请选择保留内容。",
+    });
+    const columns = card.createDiv({ cls: "helix-conflict-options" });
+    const base = columns.createDiv({ cls: "helix-conflict-option is-base" });
+    base.createEl("strong", { text: "Base" });
+    base.createEl("pre", { text: conflict.baseContent ?? "（检查点不可恢复）" });
+    if (conflict.reason !== "simultaneous-edit") {
+      const actions = card.createDiv({ cls: "helix-reconciliation-actions" });
+      if (conflict.reason === "derived-structure-changed" &&
+        conflict.derivedContent !== "<派生受管块结构损坏>") {
+        const rebuild = actions.createEl("button", {
+          cls: "helix-primary-button",
+          text: "按来源重建受管块",
+        });
+        rebuild.addEventListener("click", () => {
+          rebuild.disabled = true;
+          void this.actions.mutateProjectWorkspace(() =>
+            this.actions.projectWorkspace.rebuildFocusBridgeConflict(conflict.id))
+            .then(() => this.render())
+            .catch((error) => {
+              rebuild.disabled = false;
+              new Notice(error instanceof Error ? error.message : String(error), 8_000);
+            });
+        });
+      }
+      const open = actions.createEl("button", {
+        cls: "helix-secondary-button",
+        text: "打开 Markdown 手工修复",
+      });
+      open.addEventListener("click", () => {
+        void this.actions.openProjectFile(conflict.targetPath);
+      });
+      return;
+    }
+    const addChoice = (
+      title: string,
+      value: string | null,
+      choice: "source" | "derived",
+    ) => {
+      const option = columns.createDiv({ cls: "helix-conflict-option" });
+      option.createEl("strong", { text: title });
+      option.createEl("pre", { text: value ?? "（检查点不可恢复）" });
+      const button = option.createEl("button", {
+        cls: "helix-secondary-button",
+        text: `采用${title}`,
+      });
+      button.addEventListener("click", () => {
+        button.disabled = true;
+        void this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.resolveFocusBridgeConflict(conflict.id, choice))
+          .then(() => this.render())
+          .catch((error) => {
+            button.disabled = false;
+            new Notice(error instanceof Error ? error.message : String(error), 8_000);
+          });
+      });
+    };
+    addChoice("来源", conflict.sourceContent, "source");
+    addChoice("派生", conflict.derivedContent, "derived");
+    const custom = columns.createDiv({ cls: "helix-conflict-option" });
+    custom.createEl("strong", { text: "自定义" });
+    const editor = custom.createEl("textarea", {
+      attr: { "aria-label": "自定义阶段聚焦内容" },
+    });
+    const apply = custom.createEl("button", {
+      cls: "helix-primary-button",
+      text: "采用自定义内容",
+    });
+    apply.addEventListener("click", () => {
+      apply.disabled = true;
+      void this.actions.mutateProjectWorkspace(() =>
+        this.actions.projectWorkspace.resolveFocusBridgeConflict(
+          conflict.id,
+          "custom",
+          editor.value,
+        ))
+        .then(() => this.render())
+        .catch((error) => {
+          apply.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
   }
 
   private renderConflict(content: HTMLElement, conflict: SyncConflict): void {

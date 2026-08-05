@@ -268,6 +268,39 @@ export function replaceFocusSectionContent(
   return document.lines.join(document.eol);
 }
 
+/** 将人工选择的正文同时规范化到来源小节与原始派生块；调用方负责 CAS 复核。 */
+export function resolveStageFocusBridge(input: {
+  source: FocusSource;
+  targetMarkdown: string;
+  acceptedContent: string;
+}): { sourceMarkdown: string; targetMarkdown: string; acceptedHash: string } {
+  const parsed = parseFocusBridgeEnvelope(input.targetMarkdown);
+  if (parsed.kind !== "present") {
+    throw new FocusBridgeError("source-missing", `目标阶段缺少来源 ${input.source.id} 的受管引用`);
+  }
+  const blocks = parsed.blocks.filter((block) => block.sourceId === input.source.id);
+  if (blocks.length !== 1) {
+    throw new FocusBridgeError("source-missing", `目标阶段无法唯一定位来源 ${input.source.id} 的受管引用`);
+  }
+  const sourceSection = scanFocusSection(input.source.markdown, FOCUS_SOURCE_HEADING, 2);
+  const content = normalizeFocusHashContent(input.acceptedContent);
+  const acceptedHash = focusContentHash(content);
+  const replacement = renderBlock({
+    sourceId: input.source.id,
+    notePath: input.source.notePath,
+    title: input.source.title,
+    content,
+    baseHash: acceptedHash,
+    sourceHash: acceptedHash,
+    state: "synced",
+  });
+  return {
+    sourceMarkdown: replaceFocusSectionContent(input.source.markdown, sourceSection, content),
+    targetMarkdown: replaceFocusBridgeBlock(input.targetMarkdown, blocks[0]!, replacement),
+    acceptedHash,
+  };
+}
+
 export function normalizeFocusHashContent(content: string): string {
   const lines = content.replace(/\r\n?/g, "\n").split("\n");
   while (lines.length > 0 && lines[0]!.trim() === "") lines.shift();

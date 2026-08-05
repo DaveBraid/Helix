@@ -37,10 +37,17 @@ import {
 import { assertProjectMappingsUnique } from "../domain/project-mapping";
 import { stableHash } from "../domain/stable";
 import {
+  coordinateStageFocusBridge,
+  focusContentHash,
   parseFocusBridgeEnvelope,
   planStageFocusBridge,
+  resolveStageFocusBridge,
+  scanFocusSection,
+  FOCUS_SOURCE_HEADING,
+  FocusBridgeError,
   type FocusSource,
 } from "../domain/stage-focus-bridge";
+import { SerializedRunner } from "./serialized-runner";
 import { patchManagedFrontmatter } from "../storage/frontmatter";
 import {
   VaultDeletionClaimError,
@@ -320,6 +327,8 @@ export interface ProjectWorkspaceAtomicChange {
   markdownCreations?: readonly ProjectWorkspaceMarkdownCreation[];
   markdownDeletions?: readonly ProjectWorkspaceMarkdownDeletion[];
   markdownUpdates: readonly ProjectWorkspaceMarkdownUpdate[];
+  /** 自动派生事务需要崩溃恢复，但不进入用户可见撤销栈。 */
+  recordHistory?: boolean;
 }
 
 interface ProjectWorkspaceHistoryEntry {
@@ -351,6 +360,69 @@ export interface ProjectWorkspaceHistoryState {
   redoLabel?: string;
 }
 
+export type ProjectWorkspaceFocusConflictChoice = "source" | "derived" | "custom";
+
+export interface ProjectWorkspaceFocusConflict {
+  id: string;
+  key: string;
+  sourceId: string;
+  targetId: string;
+  sourcePath: string;
+  targetPath: string;
+  createdAt: string;
+  reason: "simultaneous-edit" | "derived-structure-changed" | "checkpoint-missing";
+  baseContent: string | null;
+  sourceContent: string;
+  derivedContent: string;
+  sourceRevisionHash: string;
+  targetRevisionHash: string;
+}
+
+interface ProjectWorkspaceFocusCheckpoint {
+  key: string;
+  sourceId: string;
+  targetId: string;
+  sourcePath: string;
+  targetPath: string;
+  baseContent: string;
+  baseHash: string;
+}
+
+interface ProjectWorkspaceFocusState {
+  version: 1;
+  checkpoints: Record<string, ProjectWorkspaceFocusCheckpoint>;
+  conflicts: ProjectWorkspaceFocusConflict[];
+  pendingResolution?: ProjectWorkspacePendingFocusResolution;
+}
+
+interface ProjectWorkspacePendingFocusResolution {
+  id: string;
+  conflictId: string;
+  createdAt: string;
+  transitions: Array<{
+    path: string;
+    beforeHash: string;
+    afterHash: string;
+  }>;
+  finalCheckpoints: Record<string, ProjectWorkspaceFocusCheckpoint>;
+  finalConflicts: ProjectWorkspaceFocusConflict[];
+}
+
+interface ProjectWorkspaceFocusPair {
+  key: string;
+  source: FocusSource;
+  sourcePath: string;
+  targetId: string;
+  targetPath: string;
+  sourceProjectId: string;
+  projectId: string;
+}
+
+interface LoadedProjectWorkspaceFocusState {
+  state: ProjectWorkspaceFocusState;
+  revision: VaultRevision | null;
+}
+
 export type StageDeletionRecoveryResult =
   | "none"
   | "aborted"
@@ -367,6 +439,7 @@ export class ProjectWorkspaceService {
   private readonly redoStack: ProjectWorkspaceHistoryEntry[] = [];
   private applyingHistory = false;
   private knownMarkdownPaths = new Set<string>();
+  private readonly focusBridgeRunner = new SerializedRunner();
 
   constructor(
     private readonly app: App,
@@ -392,6 +465,10 @@ export class ProjectWorkspaceService {
   freezePendingStageDeletion(message: string): void {
     this.recoveryIssue = message;
     this.generation += 1;
+  }
+
+  recoveryIssueMessage(): string | null {
+    return this.recoveryIssue;
   }
 
   private assertActive(generation: number): void {
@@ -531,7 +608,7 @@ export class ProjectWorkspaceService {
       markdownTransitions: transitions,
     };
     await this.applyHistoryEntry(entry, "redo");
-    this.recordHistoryEntry(entry);
+    if (change.recordHistory !== false) this.recordHistoryEntry(entry);
     return this.snapshot();
   }
 
@@ -614,6 +691,806 @@ export class ProjectWorkspaceService {
       });
     }
     return planStageFocusBridge(sourceIds, sources, markdown).markdown;
+  }
+
+  async initializeFocusBridgeState(): Promise<void> {
+    await this.focusBridgeRunner.run(async () => {
+      const snapshot = await this.snapshot();
+      const loaded = await this.readFocusBridgeState();
+      await this.recoverPendingFocusResolution(loaded);
+      let changed = false;
+      const pendingSourcePaths = new Set<string>();
+      const pairs = this.focusBridgePairs(snapshot);
+      changed = this.pruneFocusBridgeState(loaded.state, pairs);
+      for (const pair of pairs) {
+        const existingConflict = loaded.state.conflicts.find((conflict) => conflict.key === pair.key);
+        if (existingConflict) {
+          const [sourceRevision, targetRevision] = await Promise.all([
+            this.repository.read(pair.sourcePath),
+            this.repository.read(pair.targetPath),
+          ]);
+          const recovered = sourceRevision && targetRevision
+            ? this.recoverFocusCheckpoint(pair, sourceRevision.content, targetRevision.content)
+            : null;
+          if (!recovered) continue;
+          loaded.state.conflicts = loaded.state.conflicts.filter((conflict) =>
+            conflict.key !== pair.key);
+          loaded.state.checkpoints[pair.key] = recovered;
+          changed = true;
+          continue;
+        }
+        if (loaded.state.checkpoints[pair.key]) {
+          pendingSourcePaths.add(pair.sourcePath);
+          pendingSourcePaths.add(pair.targetPath);
+          continue;
+        }
+        const [sourceRevision, targetRevision] = await Promise.all([
+          this.repository.read(pair.sourcePath),
+          this.repository.read(pair.targetPath),
+        ]);
+        if (!sourceRevision || !targetRevision) continue;
+        let baseContent: string | null = null;
+        try {
+          const parsed = parseFocusBridgeEnvelope(targetRevision.content);
+          if (parsed.kind !== "present") throw new Error("目标缺少聚焦桥接受管块");
+          const block = parsed.blocks.find((candidate) => candidate.sourceId === pair.source.id);
+          if (!block || focusContentHash(block.content) !== block.baseHash) {
+            throw new Error("聚焦桥接正文无法证明同步基线");
+          }
+          baseContent = block.content;
+          const coordination = coordinateStageFocusBridge({
+            source: { ...pair.source, markdown: sourceRevision.content },
+            targetMarkdown: targetRevision.content,
+            baseContent,
+          });
+          if (coordination.action === "conflict" || coordination.action === "update-source") {
+            this.upsertFocusConflict(loaded.state, this.focusConflict(
+              pair,
+              sourceRevision,
+              targetRevision,
+              baseContent,
+              coordination.action === "conflict"
+                ? coordination.conflict.reason
+                : "simultaneous-edit",
+            ));
+            changed = true;
+            continue;
+          }
+          loaded.state.checkpoints[pair.key] = this.focusCheckpoint(pair, block.content);
+          if (coordination.action === "update-derived") pendingSourcePaths.add(pair.sourcePath);
+          changed = true;
+        } catch {
+          this.upsertFocusConflict(loaded.state, this.focusConflict(
+            pair,
+            sourceRevision,
+            targetRevision,
+            baseContent,
+            baseContent === null ? "checkpoint-missing" : "derived-structure-changed",
+          ));
+          changed = true;
+        }
+      }
+      if (changed) await this.writeFocusBridgeState(loaded);
+      if (pendingSourcePaths.size > 0) {
+        await this.observeFocusBridgeChangesOnce(pendingSourcePaths);
+      }
+    });
+  }
+
+  async observeFocusBridgeChanges(paths: readonly string[]): Promise<void> {
+    const changedPaths = new Set(paths.map((path) => normalizePath(path)));
+    if (changedPaths.size === 0) return;
+    await this.focusBridgeRunner.run(() => this.observeFocusBridgeChangesOnce(changedPaths));
+  }
+
+  async listFocusBridgeConflicts(): Promise<ProjectWorkspaceFocusConflict[]> {
+    const { state } = await this.readFocusBridgeState();
+    return structuredClone(state.conflicts);
+  }
+
+  async resolveFocusBridgeConflict(
+    conflictId: string,
+    choice: ProjectWorkspaceFocusConflictChoice,
+    customContent?: string,
+  ): Promise<void> {
+    await this.focusBridgeRunner.run(async () => {
+      const loaded = await this.readFocusBridgeState();
+      await this.recoverPendingFocusResolution(loaded);
+      const stateBefore = structuredClone(loaded.state);
+      const conflict = loaded.state.conflicts.find((candidate) => candidate.id === conflictId);
+      if (!conflict) throw new Error("聚焦桥接冲突不存在或已经解决");
+      if (conflict.reason !== "simultaneous-edit") {
+        throw new Error("结构或检查点冲突不能使用内容三选一；请重建受管块或打开 Markdown 手工修复");
+      }
+      const accepted = choice === "source"
+        ? conflict.sourceContent
+        : choice === "derived"
+          ? conflict.derivedContent
+          : customContent;
+      if (accepted === undefined) throw new Error("自定义聚焦内容不能为空");
+      const snapshot = await this.snapshot();
+      const pair = this.focusBridgePairs(snapshot).find((candidate) => candidate.key === conflict.key);
+      if (!pair) throw new Error("聚焦桥接关系已经变化，不能应用旧冲突");
+      const [sourceRevision, targetRevision, canvas] = await Promise.all([
+        this.repository.read(conflict.sourcePath),
+        this.repository.read(conflict.targetPath),
+        this.repository.read(normalizePath(this.canvasPath())),
+      ]);
+      if (!sourceRevision || !targetRevision || !canvas ||
+        sourceRevision.hash !== conflict.sourceRevisionHash ||
+        targetRevision.hash !== conflict.targetRevisionHash) {
+        throw new Error("聚焦桥接文件在冲突建立后已经变化，请重新观察后再处理");
+      }
+      const resolved = resolveStageFocusBridge({
+        source: { ...pair.source, markdown: sourceRevision.content },
+        targetMarkdown: targetRevision.content,
+        acceptedContent: accepted,
+      });
+      const updates: ProjectWorkspaceMarkdownUpdate[] = [
+        {
+          path: sourceRevision.path,
+          kind: "stage",
+          entityId: conflict.sourceId,
+          projectId: pair.sourceProjectId,
+          beforeHash: sourceRevision.hash,
+          afterContent: resolved.sourceMarkdown,
+        },
+        {
+          path: targetRevision.path,
+          kind: "stage",
+          entityId: conflict.targetId,
+          projectId: pair.projectId,
+          beforeHash: targetRevision.hash,
+          afterContent: resolved.targetMarkdown,
+        },
+      ];
+      for (const other of this.focusBridgePairs(snapshot).filter((candidate) =>
+        candidate.source.id === conflict.sourceId && candidate.key !== conflict.key)) {
+        if (loaded.state.conflicts.some((candidate) => candidate.key === other.key)) continue;
+        const otherCheckpoint = loaded.state.checkpoints[other.key];
+        const otherTarget = await this.repository.read(other.targetPath);
+        if (!otherCheckpoint || !otherTarget) continue;
+        try {
+          const current = coordinateStageFocusBridge({
+            source: { ...other.source, markdown: sourceRevision.content },
+            targetMarkdown: otherTarget.content,
+            baseContent: otherCheckpoint.baseContent,
+          });
+          if (current.action === "update-source" || current.action === "conflict") {
+            this.upsertFocusConflict(loaded.state, this.focusConflict(
+              other,
+              sourceRevision,
+              otherTarget,
+              otherCheckpoint.baseContent,
+              current.action === "conflict"
+                ? current.conflict.reason
+                : "simultaneous-edit",
+            ));
+            continue;
+          }
+          const propagated = resolveStageFocusBridge({
+            source: { ...other.source, markdown: sourceRevision.content },
+            targetMarkdown: otherTarget.content,
+            acceptedContent: accepted,
+          });
+          updates.push({
+            path: otherTarget.path,
+            kind: "stage",
+            entityId: other.targetId,
+            projectId: other.projectId,
+            beforeHash: otherTarget.hash,
+            afterContent: propagated.targetMarkdown,
+          });
+          loaded.state.checkpoints[other.key] = this.focusCheckpoint(other, accepted);
+        } catch {
+          this.upsertFocusConflict(loaded.state, this.focusConflict(
+            other,
+            sourceRevision,
+            otherTarget,
+            otherCheckpoint.baseContent,
+            "derived-structure-changed",
+          ));
+        }
+      }
+      loaded.state.conflicts = loaded.state.conflicts.filter((candidate) => candidate.id !== conflictId);
+      loaded.state.checkpoints[pair.key] = this.focusCheckpoint(pair, accepted);
+      const finalState = structuredClone(loaded.state);
+      await this.applyFocusResolution(loaded, stateBefore, finalState, conflict.id, {
+        label: "解决阶段聚焦冲突",
+        canvasBeforeHash: canvas.hash,
+        canvasAfterContent: canvas.content,
+        markdownUpdates: updates,
+        recordHistory: false,
+      });
+    });
+  }
+
+  async rebuildFocusBridgeConflict(conflictId: string): Promise<void> {
+    await this.focusBridgeRunner.run(async () => {
+      const loaded = await this.readFocusBridgeState();
+      await this.recoverPendingFocusResolution(loaded);
+      const stateBefore = structuredClone(loaded.state);
+      const conflict = loaded.state.conflicts.find((candidate) => candidate.id === conflictId);
+      if (!conflict) throw new Error("聚焦桥接冲突不存在或已经解决");
+      if (conflict.reason !== "derived-structure-changed" ||
+        conflict.derivedContent === "<派生受管块结构损坏>") {
+        throw new Error("该冲突不能安全重建，请打开 Markdown 手工修复受管块");
+      }
+      const snapshot = await this.snapshot();
+      const pair = this.focusBridgePairs(snapshot).find((candidate) => candidate.key === conflict.key);
+      if (!pair) throw new Error("聚焦桥接关系已经变化，不能重建旧冲突");
+      const [sourceRevision, targetRevision, canvas] = await Promise.all([
+        this.repository.read(conflict.sourcePath),
+        this.repository.read(conflict.targetPath),
+        this.repository.read(normalizePath(this.canvasPath())),
+      ]);
+      if (!sourceRevision || !targetRevision || !canvas ||
+        sourceRevision.hash !== conflict.sourceRevisionHash ||
+        targetRevision.hash !== conflict.targetRevisionHash) {
+        throw new Error("聚焦桥接文件在冲突建立后已经变化，请重新观察后再处理");
+      }
+      const accepted = scanFocusSection(sourceRevision.content, FOCUS_SOURCE_HEADING, 2)
+        .normalizedContent;
+      let resolved: ReturnType<typeof resolveStageFocusBridge>;
+      try {
+        resolved = resolveStageFocusBridge({
+          source: { ...pair.source, markdown: sourceRevision.content },
+          targetMarkdown: targetRevision.content,
+          acceptedContent: accepted,
+        });
+      } catch {
+        throw new Error("受管块结构无法安全定位，请打开 Markdown 手工修复");
+      }
+      loaded.state.conflicts = loaded.state.conflicts.filter((candidate) => candidate.id !== conflictId);
+      loaded.state.checkpoints[pair.key] = this.focusCheckpoint(pair, accepted);
+      const finalState = structuredClone(loaded.state);
+      await this.applyFocusResolution(loaded, stateBefore, finalState, conflict.id, {
+        label: "重建阶段聚焦受管块",
+        canvasBeforeHash: canvas.hash,
+        canvasAfterContent: canvas.content,
+        markdownUpdates: [{
+          path: targetRevision.path,
+          kind: "stage",
+          entityId: pair.targetId,
+          projectId: pair.projectId,
+          beforeHash: targetRevision.hash,
+          afterContent: resolved.targetMarkdown,
+        }],
+        recordHistory: false,
+      });
+    });
+  }
+
+  private async observeFocusBridgeChangesOnce(changedPaths: Set<string>): Promise<void> {
+    const snapshot = await this.snapshot();
+    const allPairs = this.focusBridgePairs(snapshot);
+    let loaded = await this.readFocusBridgeState();
+    await this.recoverPendingFocusResolution(loaded);
+    const pruned = this.pruneFocusBridgeState(loaded.state, allPairs);
+    const pairs = allPairs.filter((pair) =>
+      changedPaths.has(normalizePath(pair.sourcePath)) ||
+      changedPaths.has(normalizePath(pair.targetPath)));
+    if (pairs.length === 0) {
+      if (pruned) await this.writeFocusBridgeState(loaded);
+      return;
+    }
+    const safeCheckpoints = structuredClone(loaded.state.checkpoints);
+    const canvas = await this.repository.read(normalizePath(this.canvasPath()));
+    if (!canvas) throw new Error("聚焦桥接监听找不到项目 Canvas");
+    const updates = new Map<string, ProjectWorkspaceMarkdownUpdate>();
+    const checkpointAdvances = new Map<string, ProjectWorkspaceFocusCheckpoint>();
+    type ReverseCandidate = {
+      pair: ProjectWorkspaceFocusPair;
+      sourceRevision: VaultRevision;
+      targetRevision: VaultRevision;
+      checkpoint: ProjectWorkspaceFocusCheckpoint;
+      result: Extract<ReturnType<typeof coordinateStageFocusBridge>, { action: "update-source" }>;
+      accepted: string;
+    };
+    const reverseBySource = new Map<string, ReverseCandidate[]>();
+    for (const pair of pairs) {
+      const frozen = loaded.state.conflicts.find((conflict) => conflict.key === pair.key);
+      if (frozen) {
+        const [sourceRevision, targetRevision] = await Promise.all([
+          this.repository.read(pair.sourcePath),
+          this.repository.read(pair.targetPath),
+        ]);
+        if (!sourceRevision || !targetRevision ||
+          (sourceRevision.hash === frozen.sourceRevisionHash &&
+            targetRevision.hash === frozen.targetRevisionHash)) continue;
+        const refreshed = this.focusConflict(
+          pair,
+          sourceRevision,
+          targetRevision,
+          frozen.baseContent,
+          frozen.reason,
+        );
+        refreshed.id = frozen.id;
+        refreshed.createdAt = frozen.createdAt;
+        this.upsertFocusConflict(loaded.state, refreshed);
+        continue;
+      }
+      const [sourceRevision, targetRevision] = await Promise.all([
+        this.repository.read(pair.sourcePath),
+        this.repository.read(pair.targetPath),
+      ]);
+      if (!sourceRevision || !targetRevision) continue;
+      let checkpoint: ProjectWorkspaceFocusCheckpoint | null | undefined =
+        loaded.state.checkpoints[pair.key];
+      const recoveredCheckpoint = this.recoverFocusCheckpoint(
+        pair,
+        sourceRevision.content,
+        targetRevision.content,
+      );
+      if (!checkpoint ||
+        focusContentHash(checkpoint.baseContent) !== checkpoint.baseHash ||
+        (recoveredCheckpoint && recoveredCheckpoint.baseHash !== checkpoint.baseHash)) {
+        checkpoint = recoveredCheckpoint;
+        if (checkpoint) {
+          loaded.state.checkpoints[pair.key] = checkpoint;
+          safeCheckpoints[pair.key] = checkpoint;
+        }
+      }
+      if (!checkpoint || focusContentHash(checkpoint.baseContent) !== checkpoint.baseHash) {
+        this.upsertFocusConflict(loaded.state, this.focusConflict(
+          pair,
+          sourceRevision,
+          targetRevision,
+          checkpoint?.baseContent ?? null,
+          "checkpoint-missing",
+        ));
+        continue;
+      }
+      try {
+        const result = coordinateStageFocusBridge({
+          source: { ...pair.source, markdown: sourceRevision.content },
+          targetMarkdown: updates.get(targetRevision.path)?.afterContent ?? targetRevision.content,
+          baseContent: checkpoint.baseContent,
+        });
+        if (result.action === "noop") continue;
+        if (result.action === "conflict") {
+          this.upsertFocusConflict(loaded.state, {
+            id: `focus-${stableHash([pair.key, sourceRevision.hash, targetRevision.hash])}`,
+            key: pair.key,
+            sourceId: pair.source.id,
+            targetId: pair.targetId,
+            sourcePath: sourceRevision.path,
+            targetPath: targetRevision.path,
+            createdAt: new Date().toISOString(),
+            reason: result.conflict.reason,
+            baseContent: result.conflict.base.content,
+            sourceContent: result.conflict.source.content,
+            derivedContent: result.conflict.derived.content,
+            sourceRevisionHash: sourceRevision.hash,
+            targetRevisionHash: targetRevision.hash,
+          });
+          continue;
+        }
+        if (result.action === "update-derived") {
+          updates.set(targetRevision.path, {
+            path: targetRevision.path,
+            kind: "stage",
+            entityId: pair.targetId,
+            projectId: pair.projectId,
+            beforeHash: targetRevision.hash,
+            afterContent: result.targetMarkdown,
+          });
+          const content = scanFocusSection(sourceRevision.content, FOCUS_SOURCE_HEADING, 2)
+            .normalizedContent;
+          checkpointAdvances.set(pair.key, this.focusCheckpoint(pair, content));
+          continue;
+        }
+        const accepted = scanFocusSection(
+          result.sourceMarkdown,
+          FOCUS_SOURCE_HEADING,
+          2,
+        ).normalizedContent;
+        const candidates = reverseBySource.get(pair.source.id) ?? [];
+        candidates.push({ pair, sourceRevision, targetRevision, checkpoint, result, accepted });
+        reverseBySource.set(pair.source.id, candidates);
+      } catch (error) {
+        this.upsertFocusConflict(loaded.state, this.focusConflict(
+          pair,
+          sourceRevision,
+          targetRevision,
+          checkpoint.baseContent,
+          error instanceof FocusBridgeError && error.code === "bridge-conflict"
+            ? "simultaneous-edit"
+            : "derived-structure-changed",
+        ));
+      }
+    }
+    for (const [sourceId, candidates] of [...reverseBySource].sort(([left], [right]) =>
+      left.localeCompare(right))) {
+      const distinct = new Set(candidates.map((candidate) => candidate.accepted));
+      if (distinct.size > 1) {
+        for (const candidate of candidates) {
+          this.upsertFocusConflict(loaded.state, this.focusConflict(
+            candidate.pair,
+            candidate.sourceRevision,
+            candidate.targetRevision,
+            candidate.checkpoint.baseContent,
+            "simultaneous-edit",
+          ));
+        }
+        continue;
+      }
+      const accepted = candidates[0]!.accepted;
+      const sourceRevision = candidates[0]!.sourceRevision;
+      if (candidates.some((candidate) => candidate.sourceRevision.hash !== sourceRevision.hash)) {
+        for (const candidate of candidates) {
+          this.upsertFocusConflict(loaded.state, this.focusConflict(
+            candidate.pair,
+            candidate.sourceRevision,
+            candidate.targetRevision,
+            candidate.checkpoint.baseContent,
+            "simultaneous-edit",
+          ));
+        }
+        continue;
+      }
+      const candidateByKey = new Map(candidates.map((candidate) => [candidate.pair.key, candidate]));
+      const sourcePairs = allPairs.filter((pair) => pair.source.id === sourceId);
+      for (const pair of sourcePairs) {
+        if (loaded.state.conflicts.some((conflict) => conflict.key === pair.key)) continue;
+        const candidate = candidateByKey.get(pair.key);
+        const targetRevision = candidate?.targetRevision ?? await this.repository.read(pair.targetPath);
+        const checkpoint = candidate?.checkpoint ?? loaded.state.checkpoints[pair.key];
+        if (!targetRevision || !checkpoint ||
+          focusContentHash(checkpoint.baseContent) !== checkpoint.baseHash) {
+          if (targetRevision) this.upsertFocusConflict(loaded.state, this.focusConflict(
+            pair,
+            sourceRevision,
+            targetRevision,
+            checkpoint?.baseContent ?? null,
+            "checkpoint-missing",
+          ));
+          continue;
+        }
+        if (!candidate) {
+          try {
+            const current = coordinateStageFocusBridge({
+              source: { ...pair.source, markdown: sourceRevision.content },
+              targetMarkdown: updates.get(targetRevision.path)?.afterContent ?? targetRevision.content,
+              baseContent: checkpoint.baseContent,
+            });
+            if (current.action === "update-source" || current.action === "conflict") {
+              this.upsertFocusConflict(loaded.state, this.focusConflict(
+                pair,
+                sourceRevision,
+                targetRevision,
+                checkpoint.baseContent,
+                current.action === "conflict"
+                  ? current.conflict.reason
+                  : "simultaneous-edit",
+              ));
+              continue;
+            }
+          } catch {
+            this.upsertFocusConflict(loaded.state, this.focusConflict(
+              pair,
+              sourceRevision,
+              targetRevision,
+              checkpoint.baseContent,
+              "derived-structure-changed",
+            ));
+            continue;
+          }
+        }
+        const resolved = resolveStageFocusBridge({
+          source: { ...pair.source, markdown: sourceRevision.content },
+          targetMarkdown: updates.get(targetRevision.path)?.afterContent ?? targetRevision.content,
+          acceptedContent: accepted,
+        });
+        updates.set(targetRevision.path, {
+          path: targetRevision.path,
+          kind: "stage",
+          entityId: pair.targetId,
+          projectId: pair.projectId,
+          beforeHash: targetRevision.hash,
+          afterContent: resolved.targetMarkdown,
+        });
+        checkpointAdvances.set(pair.key, this.focusCheckpoint(pair, accepted));
+      }
+      const sourceAfter = candidates[0]!.result.sourceMarkdown;
+      updates.set(sourceRevision.path, {
+        path: sourceRevision.path,
+        kind: "stage",
+        entityId: sourceId,
+        projectId: candidates[0]!.pair.sourceProjectId,
+        beforeHash: sourceRevision.hash,
+        afterContent: sourceAfter,
+      });
+    }
+    if (updates.size > 0) {
+      // 先只持久化冲突；检查点必须等 Markdown 事务成功后才能前移。
+      const pendingState: LoadedProjectWorkspaceFocusState = {
+        state: { ...loaded.state, checkpoints: safeCheckpoints },
+        revision: loaded.revision,
+      };
+      await this.writeFocusBridgeState(pendingState);
+      loaded.revision = pendingState.revision;
+      await this.applyAtomicWorkspaceChange({
+        label: "同步阶段聚焦问题",
+        canvasBeforeHash: canvas.hash,
+        canvasAfterContent: canvas.content,
+        markdownUpdates: [...updates.values()],
+        recordHistory: false,
+      });
+      for (const [key, checkpoint] of checkpointAdvances) {
+        loaded.state.checkpoints[key] = checkpoint;
+      }
+      for (const conflict of loaded.state.conflicts) {
+        const sourceUpdate = updates.get(conflict.sourcePath);
+        if (sourceUpdate) {
+          conflict.sourceRevisionHash = stableHash(sourceUpdate.afterContent);
+          conflict.sourceContent = scanFocusSection(
+            sourceUpdate.afterContent,
+            FOCUS_SOURCE_HEADING,
+            2,
+          ).normalizedContent;
+        }
+        const targetUpdate = updates.get(conflict.targetPath);
+        if (targetUpdate) conflict.targetRevisionHash = stableHash(targetUpdate.afterContent);
+      }
+      await this.writeFocusBridgeState(loaded);
+      return;
+    }
+    await this.writeFocusBridgeState(loaded);
+  }
+
+  private focusBridgePairs(snapshot: ProjectWorkspaceSnapshot): ProjectWorkspaceFocusPair[] {
+    const stages = snapshot.projects.flatMap((project) => project.cycles.map((cycle) => ({
+      ...cycle,
+      projectId: project.id,
+    })));
+    const byId = new Map(stages.map((stage) => [stage.id, stage]));
+    const pairs = new Map<string, ProjectWorkspaceFocusPair>();
+    for (const relation of snapshot.relations) {
+      const target = byId.get(relation.toCycleId);
+      if (!target) continue;
+      for (const sourceId of relation.fromCycleIds) {
+        const source = byId.get(sourceId);
+        if (!source) continue;
+        const key = `${target.id}\u0000${source.id}`;
+        pairs.set(key, {
+          key,
+          source: {
+            id: source.id,
+            notePath: source.notePath.replace(/\.md$/i, ""),
+            title: source.title,
+            stageCode: source.stageCode,
+            markdown: "",
+          },
+          sourcePath: source.notePath,
+          targetId: target.id,
+          targetPath: target.notePath,
+          sourceProjectId: source.projectId,
+          projectId: target.projectId,
+        });
+      }
+    }
+    return [...pairs.values()].sort((left, right) => left.key.localeCompare(right.key));
+  }
+
+  private pruneFocusBridgeState(
+    state: ProjectWorkspaceFocusState,
+    pairs: readonly ProjectWorkspaceFocusPair[],
+  ): boolean {
+    const activeKeys = new Set(pairs.map((pair) => pair.key));
+    let changed = false;
+    for (const key of Object.keys(state.checkpoints)) {
+      if (activeKeys.has(key)) continue;
+      delete state.checkpoints[key];
+      changed = true;
+    }
+    const retainedConflicts = state.conflicts.filter((conflict) => activeKeys.has(conflict.key));
+    if (retainedConflicts.length !== state.conflicts.length) {
+      state.conflicts = retainedConflicts;
+      changed = true;
+    }
+    return changed;
+  }
+
+  private focusCheckpoint(
+    pair: ProjectWorkspaceFocusPair,
+    baseContent: string,
+  ): ProjectWorkspaceFocusCheckpoint {
+    const normalized = baseContent.replace(/\r\n?/g, "\n").replace(/^\n+|\n+$/g, "");
+    return {
+      key: pair.key,
+      sourceId: pair.source.id,
+      targetId: pair.targetId,
+      sourcePath: normalizePath(pair.sourcePath),
+      targetPath: normalizePath(pair.targetPath),
+      baseContent: normalized,
+      baseHash: focusContentHash(normalized),
+    };
+  }
+
+  private recoverFocusCheckpoint(
+    pair: ProjectWorkspaceFocusPair,
+    sourceMarkdown: string,
+    targetMarkdown: string,
+  ): ProjectWorkspaceFocusCheckpoint | null {
+    try {
+      const parsed = parseFocusBridgeEnvelope(targetMarkdown);
+      if (parsed.kind !== "present") return null;
+      const block = parsed.blocks.find((candidate) => candidate.sourceId === pair.source.id);
+      if (!block || focusContentHash(block.content) !== block.baseHash) return null;
+      const result = coordinateStageFocusBridge({
+        source: { ...pair.source, markdown: sourceMarkdown },
+        targetMarkdown,
+        baseContent: block.content,
+      });
+      return result.action === "noop" || result.action === "update-derived"
+        ? this.focusCheckpoint(pair, block.content)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private focusConflict(
+    pair: ProjectWorkspaceFocusPair,
+    sourceRevision: VaultRevision,
+    targetRevision: VaultRevision,
+    baseContent: string | null,
+    reason: ProjectWorkspaceFocusConflict["reason"],
+  ): ProjectWorkspaceFocusConflict {
+    let sourceContent = "";
+    let derivedContent = "";
+    try {
+      sourceContent = scanFocusSection(sourceRevision.content, FOCUS_SOURCE_HEADING, 2)
+        .normalizedContent;
+    } catch {
+      sourceContent = "<来源小节结构损坏>";
+    }
+    try {
+      const parsed = parseFocusBridgeEnvelope(targetRevision.content);
+      if (parsed.kind === "present") {
+        derivedContent = parsed.blocks.find((block) => block.sourceId === pair.source.id)?.content ?? "";
+      }
+    } catch {
+      derivedContent = "<派生受管块结构损坏>";
+    }
+    return {
+      id: `focus-${stableHash([pair.key, sourceRevision.hash, targetRevision.hash])}`,
+      key: pair.key,
+      sourceId: pair.source.id,
+      targetId: pair.targetId,
+      sourcePath: sourceRevision.path,
+      targetPath: targetRevision.path,
+      createdAt: new Date().toISOString(),
+      reason,
+      baseContent,
+      sourceContent,
+      derivedContent,
+      sourceRevisionHash: sourceRevision.hash,
+      targetRevisionHash: targetRevision.hash,
+    };
+  }
+
+  private upsertFocusConflict(
+    state: ProjectWorkspaceFocusState,
+    conflict: ProjectWorkspaceFocusConflict,
+  ): void {
+    state.conflicts = [
+      ...state.conflicts.filter((candidate) => candidate.key !== conflict.key),
+      conflict,
+    ];
+  }
+
+  private async readFocusBridgeState(): Promise<LoadedProjectWorkspaceFocusState> {
+    const revision = await this.repository.read(this.focusBridgeStatePath());
+    if (!revision) {
+      return { state: { version: 1, checkpoints: {}, conflicts: [] }, revision: null };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(revision.content);
+    } catch {
+      throw new Error("阶段聚焦桥接检查点文件损坏，已停止自动写入");
+    }
+    if (!isProjectWorkspaceFocusState(parsed)) {
+      throw new Error("阶段聚焦桥接检查点结构无效，已停止自动写入");
+    }
+    return {
+      state: structuredClone(parsed as ProjectWorkspaceFocusState),
+      revision,
+    };
+  }
+
+  private async writeFocusBridgeState(loaded: LoadedProjectWorkspaceFocusState): Promise<void> {
+    const content = JSON.stringify(loaded.state, null, 2);
+    if (loaded.revision?.content === content) return;
+    loaded.revision = loaded.revision
+      ? await this.repository.compareAndWrite(loaded.revision, content)
+      : await this.repository.create(this.focusBridgeStatePath(), content);
+  }
+
+  private async applyFocusResolution(
+    loaded: LoadedProjectWorkspaceFocusState,
+    stateBefore: ProjectWorkspaceFocusState,
+    finalState: ProjectWorkspaceFocusState,
+    conflictId: string,
+    change: ProjectWorkspaceAtomicChange,
+  ): Promise<void> {
+    const pending: ProjectWorkspacePendingFocusResolution = {
+      id: crypto.randomUUID(),
+      conflictId,
+      createdAt: new Date().toISOString(),
+      transitions: change.markdownUpdates
+        .filter((update) => update.beforeHash !== stableHash(update.afterContent))
+        .map((update) => ({
+          path: update.path,
+          beforeHash: update.beforeHash,
+          afterHash: stableHash(update.afterContent),
+        })),
+      finalCheckpoints: structuredClone(finalState.checkpoints),
+      finalConflicts: structuredClone(finalState.conflicts),
+    };
+    loaded.state = { ...stateBefore, pendingResolution: pending };
+    // 先认领状态 revision；竞争发生在此处时 Markdown 保持零变化。
+    await this.writeFocusBridgeState(loaded);
+    try {
+      await this.applyAtomicWorkspaceChange(change);
+    } catch (error) {
+      try {
+        await this.recoverPendingFocusResolution(loaded);
+      } catch (recoveryError) {
+        const message = `聚焦冲突事务失败且无法判定落盘状态：${
+          recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
+      throw error;
+    }
+    loaded.state = {
+      version: 1,
+      checkpoints: structuredClone(finalState.checkpoints),
+      conflicts: structuredClone(finalState.conflicts),
+    };
+    try {
+      await this.writeFocusBridgeState(loaded);
+    } catch {
+      const current = await this.readFocusBridgeState();
+      const result = await this.recoverPendingFocusResolution(current);
+      if (result !== "completed") {
+        throw new Error("聚焦冲突正文已提交，但状态收口受到竞争；已保留可恢复事务，请重新加载插件");
+      }
+    }
+  }
+
+  private async recoverPendingFocusResolution(
+    loaded: LoadedProjectWorkspaceFocusState,
+  ): Promise<"none" | "aborted" | "completed"> {
+    const pending = loaded.state.pendingResolution;
+    if (!pending) return "none";
+    const revisions = await Promise.all(pending.transitions.map((transition) =>
+      this.repository.read(transition.path)));
+    const atBefore = pending.transitions.every((transition, index) =>
+      revisions[index]?.hash === transition.beforeHash);
+    const atAfter = pending.transitions.every((transition, index) =>
+      revisions[index]?.hash === transition.afterHash);
+    if (!atBefore && !atAfter) {
+      const message = "聚焦冲突待决事务的 Markdown 处于混合或未知版本，项目工作区已冻结";
+      this.freezePendingStageDeletion(message);
+      throw new Error(message);
+    }
+    loaded.state = atAfter
+      ? {
+          version: 1,
+          checkpoints: structuredClone(pending.finalCheckpoints),
+          conflicts: structuredClone(pending.finalConflicts),
+        }
+      : {
+          version: 1,
+          checkpoints: loaded.state.checkpoints,
+          conflicts: loaded.state.conflicts,
+        };
+    await this.writeFocusBridgeState(loaded);
+    return atAfter ? "completed" : "aborted";
   }
 
   async observeCanvasChange(): Promise<void> {
@@ -2265,6 +3142,10 @@ export class ProjectWorkspaceService {
     return normalizePath(`${this.rootFolder()}/.transactions/workspace-history.json`);
   }
 
+  private focusBridgeStatePath(): string {
+    return normalizePath(`${this.rootFolder()}/.transactions/stage-focus-bridge.json`);
+  }
+
   private recordHistoryEntry(entry: ProjectWorkspaceHistoryEntry): void {
     if (this.applyingHistory) return;
     if (entry.canvasBeforeContent === entry.canvasAfterContent &&
@@ -3741,6 +4622,49 @@ export class ProjectWorkspaceService {
 function isCanonicalIsoTimestamp(value: string): boolean {
   const parsed = new Date(value);
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function isProjectWorkspaceFocusState(value: unknown): value is ProjectWorkspaceFocusState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<ProjectWorkspaceFocusState>;
+  if (state.version !== 1 || !state.checkpoints || typeof state.checkpoints !== "object" ||
+    !Array.isArray(state.conflicts)) return false;
+  const text = (candidate: unknown): candidate is string => typeof candidate === "string";
+  for (const [key, checkpoint] of Object.entries(state.checkpoints)) {
+    if (!checkpoint || typeof checkpoint !== "object") return false;
+    const item = checkpoint as Partial<ProjectWorkspaceFocusCheckpoint>;
+    if (item.key !== key || !text(item.sourceId) || !text(item.targetId) ||
+      !text(item.sourcePath) || !text(item.targetPath) || !text(item.baseContent) ||
+      !text(item.baseHash) || focusContentHash(item.baseContent) !== item.baseHash) return false;
+  }
+  const validConflict = (candidate: unknown): candidate is ProjectWorkspaceFocusConflict => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const item = candidate as Partial<ProjectWorkspaceFocusConflict>;
+    return text(item.id) && text(item.key) && text(item.sourceId) && text(item.targetId) &&
+      text(item.sourcePath) && text(item.targetPath) && text(item.createdAt) &&
+      ["simultaneous-edit", "derived-structure-changed", "checkpoint-missing"].includes(String(item.reason)) &&
+      (item.baseContent === null || text(item.baseContent)) && text(item.sourceContent) &&
+      text(item.derivedContent) && text(item.sourceRevisionHash) && text(item.targetRevisionHash);
+  };
+  if (!state.conflicts.every(validConflict)) return false;
+  if (state.pendingResolution === undefined) return true;
+  const pending = state.pendingResolution as Partial<ProjectWorkspacePendingFocusResolution>;
+  if (!pending || typeof pending !== "object" || !text(pending.id) ||
+    !text(pending.conflictId) || !text(pending.createdAt) ||
+    !Array.isArray(pending.transitions) || !pending.transitions.every((candidate) => {
+      if (!candidate || typeof candidate !== "object") return false;
+      const transition = candidate as { path?: unknown; beforeHash?: unknown; afterHash?: unknown };
+      return text(transition.path) && text(transition.beforeHash) && text(transition.afterHash);
+    }) || !pending.finalCheckpoints || typeof pending.finalCheckpoints !== "object" ||
+    !Array.isArray(pending.finalConflicts) || !pending.finalConflicts.every(validConflict)) return false;
+  for (const [key, checkpoint] of Object.entries(pending.finalCheckpoints)) {
+    if (!checkpoint || typeof checkpoint !== "object") return false;
+    const item = checkpoint as Partial<ProjectWorkspaceFocusCheckpoint>;
+    if (item.key !== key || !text(item.sourceId) || !text(item.targetId) ||
+      !text(item.sourcePath) || !text(item.targetPath) || !text(item.baseContent) ||
+      !text(item.baseHash) || focusContentHash(item.baseContent) !== item.baseHash) return false;
+  }
+  return true;
 }
 
 function relationSourceSignature(

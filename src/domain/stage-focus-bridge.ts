@@ -74,6 +74,200 @@ export interface FocusPlan {
   markdown: string;
 }
 
+export interface FocusBridgeConflictSnapshot {
+  sourceId: string;
+  reason: "simultaneous-edit" | "derived-structure-changed";
+  base: { content: string; hash: string };
+  source: { content: string; hash: string };
+  derived: { content: string; hash: string };
+}
+
+export type FocusBridgeCoordination =
+  | {
+      action: "noop";
+      sourceId: string;
+    }
+  | {
+      action: "update-derived";
+      sourceId: string;
+      targetMarkdown: string;
+    }
+  | {
+      action: "update-source";
+      sourceId: string;
+      sourceMarkdown: string;
+      originTargetMarkdown: string;
+      rederiveSourceIds: string[];
+    }
+  | {
+      action: "conflict";
+      sourceId: string;
+      conflict: FocusBridgeConflictSnapshot;
+    };
+
+/**
+ * 协调一对既有的来源小节与派生子块。此函数只生成写入计划，不执行 I/O。
+ * baseContent 来自上次成功同步的持久快照，用于校验受管块的 baseHash，
+ * 也是双边冲突中不可从当前文件反推的 Base 内容。
+ */
+export function coordinateStageFocusBridge(input: {
+  source: FocusSource;
+  targetMarkdown: string;
+  baseContent: string;
+}): FocusBridgeCoordination {
+  const parsed = parseFocusBridgeEnvelope(input.targetMarkdown);
+  if (parsed.kind !== "present") {
+    throw new FocusBridgeError("source-missing", `目标阶段缺少来源 ${input.source.id} 的受管引用`);
+  }
+  const matches = parsed.blocks.filter((block) => block.sourceId === input.source.id);
+  if (matches.length !== 1) {
+    throw new FocusBridgeError("source-missing", `目标阶段无法唯一定位来源 ${input.source.id} 的受管引用`);
+  }
+  const block = matches[0]!;
+  if (block.state === "conflict") {
+    throw new FocusBridgeError("bridge-conflict", `来源 ${block.sourceId} 的引用仍处于冲突状态`);
+  }
+
+  const baseContent = normalizeFocusHashContent(input.baseContent);
+  const baseHash = focusContentHash(baseContent);
+  if (baseHash !== block.baseHash) {
+    throw corrupt(`来源 ${block.sourceId} 的 Base 快照与受管标记不一致`);
+  }
+  // synced 状态的 sourceHash 必须指向同一个同步基线；否则标记本身已损坏。
+  if (block.sourceHash !== block.baseHash) {
+    throw corrupt(`来源 ${block.sourceId} 的 sourceHash 与 baseHash 不一致`);
+  }
+
+  const sourceSection = scanFocusSection(input.source.markdown, FOCUS_SOURCE_HEADING, 2);
+  const sourceChanged = sourceSection.hash !== block.sourceHash;
+  const derivedBodyHash = focusContentHash(block.content);
+  const derivedBodyChanged = derivedBodyHash !== block.baseHash;
+  const derivedVisibleChanged = block.currentDerivedHash !== block.derivedHash;
+  const canonicalCurrentBlock = renderBlock({
+    sourceId: input.source.id,
+    notePath: input.source.notePath,
+    title: input.source.title,
+    content: block.content,
+    baseHash: block.baseHash,
+    sourceHash: block.sourceHash,
+    state: "synced",
+  });
+  const derivedStructureChanged =
+    renderedBlockDerivedHash(canonicalCurrentBlock) !== block.currentDerivedHash;
+
+  if (derivedStructureChanged || (derivedBodyChanged && !derivedVisibleChanged)) {
+    return focusBridgeConflict(
+      block,
+      baseContent,
+      baseHash,
+      sourceSection,
+      "derived-structure-changed",
+    );
+  }
+  if (!derivedBodyChanged && derivedVisibleChanged) {
+    throw corrupt(`来源 ${block.sourceId} 的 derivedHash 与 canonical 展示不一致`);
+  }
+
+  if (!sourceChanged && !derivedBodyChanged) {
+    return { action: "noop", sourceId: block.sourceId };
+  }
+  if (sourceChanged && !derivedBodyChanged) {
+    const replacement = renderBlock({
+      sourceId: input.source.id,
+      notePath: input.source.notePath,
+      title: input.source.title,
+      content: sourceSection.normalizedContent,
+      baseHash: sourceSection.hash,
+      sourceHash: sourceSection.hash,
+      state: "synced",
+    });
+    return {
+      action: "update-derived",
+      sourceId: block.sourceId,
+      targetMarkdown: replaceFocusBridgeBlock(input.targetMarkdown, block, replacement),
+    };
+  }
+  if (!sourceChanged && derivedBodyChanged) {
+    const acceptedHash = derivedBodyHash;
+    const acceptedBlock = renderBlock({
+      sourceId: input.source.id,
+      notePath: input.source.notePath,
+      title: input.source.title,
+      content: block.content,
+      baseHash: acceptedHash,
+      sourceHash: acceptedHash,
+      state: "synced",
+    });
+    return {
+      action: "update-source",
+      sourceId: block.sourceId,
+      sourceMarkdown: replaceFocusSectionContent(
+        input.source.markdown,
+        sourceSection,
+        block.content,
+      ),
+      originTargetMarkdown: replaceFocusBridgeBlock(
+        input.targetMarkdown,
+        block,
+        acceptedBlock,
+      ),
+      rederiveSourceIds: [block.sourceId],
+    };
+  }
+  return focusBridgeConflict(
+    block,
+    baseContent,
+    baseHash,
+    sourceSection,
+    "simultaneous-edit",
+  );
+}
+
+function focusBridgeConflict(
+  block: FocusBridgeBlock,
+  baseContent: string,
+  baseHash: string,
+  sourceSection: FocusSection,
+  reason: FocusBridgeConflictSnapshot["reason"],
+): Extract<FocusBridgeCoordination, { action: "conflict" }> {
+  return {
+    action: "conflict",
+    sourceId: block.sourceId,
+    conflict: {
+      sourceId: block.sourceId,
+      reason,
+      base: { content: baseContent, hash: baseHash },
+      source: { content: sourceSection.normalizedContent, hash: sourceSection.hash },
+      derived: { content: block.content, hash: focusContentHash(block.content) },
+    },
+  };
+}
+
+function renderedBlockDerivedHash(block: string): string {
+  const firstLine = block.replace(/\r\n?/g, "\n").split("\n")[0]!;
+  const match = CHILD_START.exec(firstLine);
+  if (!match) throw corrupt("内部渲染未生成有效来源标记");
+  return match[4]!;
+}
+
+/** 仅替换已精确定位的来源 H2 正文，保留标题、后续小节、EOL 与其他用户内容。 */
+export function replaceFocusSectionContent(
+  markdown: string,
+  section: FocusSection,
+  content: string,
+): string {
+  const document = markdownDocument(markdown);
+  const replacement = normalizeFocusHashContent(content) === ""
+    ? []
+    : normalizeFocusHashContent(content).split("\n");
+  document.lines.splice(
+    section.bodyStartLine,
+    section.bodyEndLine - section.bodyStartLine,
+    ...replacement,
+  );
+  return document.lines.join(document.eol);
+}
+
 export function normalizeFocusHashContent(content: string): string {
   const lines = content.replace(/\r\n?/g, "\n").split("\n");
   while (lines.length > 0 && lines[0]!.trim() === "") lines.shift();
@@ -248,6 +442,20 @@ export function replaceFocusBridgeEnvelope(markdown: string, envelope: string | 
   return document.lines.join(document.eol);
 }
 
+function replaceFocusBridgeBlock(
+  markdown: string,
+  block: FocusBridgeBlock,
+  replacement: string,
+): string {
+  const document = markdownDocument(markdown);
+  document.lines.splice(
+    block.startLine,
+    block.endLine - block.startLine + 1,
+    ...replacement.replace(/\r\n?/g, "\n").split("\n"),
+  );
+  return document.lines.join(document.eol);
+}
+
 export function planStageFocusBridge(
   sourceIds: readonly string[],
   sources: ReadonlyMap<string, FocusSource>,
@@ -265,7 +473,7 @@ export function planStageFocusBridge(
     if (parsed.kind === "absent") {
       return { action: "noop", sourceIds: [], content: "", markdown: targetMarkdown };
     }
-    assertEnvelopeSafeToReplace(parsed);
+    assertEnvelopeSafeToReplace(parsed, sources);
     return {
       action: "remove",
       sourceIds: [],
@@ -273,7 +481,7 @@ export function planStageFocusBridge(
       markdown: replaceFocusBridgeEnvelope(targetMarkdown, null),
     };
   }
-  if (parsed.kind === "present") assertEnvelopeSafeToReplace(parsed);
+  if (parsed.kind === "present") assertEnvelopeSafeToReplace(parsed, sources);
   const content = renderFocusBridgeEnvelope(selected);
   const markdown = replaceFocusBridgeEnvelope(targetMarkdown, content);
   return {
@@ -284,7 +492,10 @@ export function planStageFocusBridge(
   };
 }
 
-function assertEnvelopeSafeToReplace(parsed: Extract<ParsedFocusEnvelope, { kind: "present" }>): void {
+function assertEnvelopeSafeToReplace(
+  parsed: Extract<ParsedFocusEnvelope, { kind: "present" }>,
+  sources: ReadonlyMap<string, FocusSource>,
+): void {
   for (const block of parsed.blocks) {
     if (block.state === "conflict") {
       throw new FocusBridgeError("bridge-conflict", `来源 ${block.sourceId} 的引用仍处于冲突状态`);
@@ -293,6 +504,31 @@ function assertEnvelopeSafeToReplace(parsed: Extract<ParsedFocusEnvelope, { kind
       throw new FocusBridgeError(
         "managed-edit-would-be-lost",
         `来源 ${block.sourceId} 的引用已被编辑，拒绝覆盖或移除`,
+      );
+    }
+    if (focusContentHash(block.content) !== block.baseHash) {
+      throw new FocusBridgeError(
+        "managed-edit-would-be-lost",
+        `来源 ${block.sourceId} 的引用正文与同步基线不一致，拒绝覆盖或移除`,
+      );
+    }
+    const source = sources.get(block.sourceId);
+    if (!source) {
+      throw corrupt(`缺少来源 ${block.sourceId}，无法校验受管引用的 canonical 结构`);
+    }
+    const canonical = renderBlock({
+      sourceId: source.id,
+      notePath: source.notePath,
+      title: source.title,
+      content: block.content,
+      baseHash: block.baseHash,
+      sourceHash: block.sourceHash,
+      state: block.state,
+    });
+    if (renderedBlockDerivedHash(canonical) !== block.currentDerivedHash) {
+      throw new FocusBridgeError(
+        "managed-edit-would-be-lost",
+        `来源 ${block.sourceId} 的引用结构或链接已变化，拒绝覆盖或移除`,
       );
     }
   }
@@ -327,9 +563,9 @@ function renderBlock(input: {
 }
 
 function parseVisibleQuote(lines: readonly string[]): string {
-  if (lines.length < 2 || !/^> \[!quote\] 来源：\[\[.+\]\]$/.test(lines[0]!) || lines[1] !== ">") {
-    throw corrupt("来源子块的 callout 标题或分隔行损坏");
-  }
+  // 标题、链接或分隔行由协调器与 canonical 渲染结果比较后转为冲突；
+  // 此处只需保证仍能安全提取正文，避免把结构编辑误当作正文反写。
+  if (lines.length < 2) throw corrupt("来源子块缺少 callout 标题或分隔行");
   return lines.slice(2).map((line) => {
     if (line === ">") return "";
     if (line.startsWith("> ")) return line.slice(2);

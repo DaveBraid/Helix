@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   FOCUS_SOURCE_HEADING,
   FocusBridgeError,
+  coordinateStageFocusBridge,
   focusContentHash,
   parseFocusBridgeEnvelope,
   planStageFocusBridge,
@@ -155,7 +156,7 @@ describe("阶段聚焦桥接纯领域协议", () => {
     const inserted = planStageFocusBridge(["a"], sources, original);
     expect(inserted.action).toBe("insert");
     expect(parseFocusBridgeEnvelope(inserted.markdown).kind).toBe("present");
-    const removed = planStageFocusBridge([], new Map(), inserted.markdown);
+    const removed = planStageFocusBridge([], sources, inserted.markdown);
     expect(removed.action).toBe("remove");
     expect(removed.markdown).toBe(original);
   });
@@ -192,5 +193,222 @@ describe("阶段聚焦桥接纯领域协议", () => {
     const plan = planStageFocusBridge(["a"], sources, target("> [[B]] 只是用户文字"));
     expect(plan.sourceIds).toEqual(["a"]);
     expect(plan.content).not.toContain("sourceId=b");
+  });
+
+  describe("3D 双向协调", () => {
+    function syncedPair(base = "Base"): { sourceNote: FocusSource; targetMarkdown: string } {
+      const sourceNote = source("a", base);
+      return {
+        sourceNote,
+        targetMarkdown: planStageFocusBridge(
+          [sourceNote.id],
+          new Map([[sourceNote.id, sourceNote]]),
+          target(),
+        ).markdown,
+      };
+    }
+
+    it("returns noop when source and derived remain at their managed hashes", () => {
+      const pair = syncedPair();
+      expect(coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: pair.targetMarkdown,
+        baseContent: "Base",
+      })).toEqual({ action: "noop", sourceId: "a" });
+    });
+
+    it("turns a source-only edit into one derived block update", () => {
+      const pair = syncedPair();
+      const changedSource = source("a", "Source changed");
+      const result = coordinateStageFocusBridge({
+        source: changedSource,
+        targetMarkdown: pair.targetMarkdown,
+        baseContent: "Base",
+      });
+      expect(result.action).toBe("update-derived");
+      if (result.action !== "update-derived") throw new Error("unexpected action");
+      const parsed = parseFocusBridgeEnvelope(result.targetMarkdown);
+      if (parsed.kind !== "present") throw new Error("missing envelope");
+      expect(parsed.blocks[0]).toMatchObject({
+        sourceId: "a",
+        content: "Source changed",
+        state: "synced",
+      });
+      expect(parsed.blocks[0]!.baseHash).toBe(focusContentHash("Source changed"));
+      expect(parsed.blocks[0]!.sourceHash).toBe(focusContentHash("Source changed"));
+      expect(result.targetMarkdown).toContain("# 计划行动\n- [ ] x");
+    });
+
+    it("turns a derived-only edit into an exact source-section update and rederive id", () => {
+      const pair = syncedPair();
+      const editedTarget = pair.targetMarkdown.replace("> Base", "> Derived changed");
+      const result = coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: editedTarget,
+        baseContent: "Base",
+      });
+      expect(result.action).toBe("update-source");
+      if (result.action !== "update-source") throw new Error("unexpected action");
+      expect(result.rederiveSourceIds).toEqual(["a"]);
+      expect(scanFocusSection(result.sourceMarkdown, FOCUS_SOURCE_HEADING, 2).normalizedContent)
+        .toBe("Derived changed");
+      expect(result.sourceMarkdown).toContain("## 其他\n保留");
+      expect(result.sourceMarkdown).toContain("# 阶段");
+      const accepted = parseFocusBridgeEnvelope(result.originTargetMarkdown);
+      if (accepted.kind !== "present") throw new Error("missing accepted envelope");
+      expect(accepted.blocks[0]).toMatchObject({
+        content: "Derived changed",
+        baseHash: focusContentHash("Derived changed"),
+        sourceHash: focusContentHash("Derived changed"),
+        state: "synced",
+      });
+      expect(accepted.blocks[0]!.currentDerivedHash).toBe(accepted.blocks[0]!.derivedHash);
+    });
+
+    it("returns Base Source Derived snapshots for simultaneous edits", () => {
+      const pair = syncedPair();
+      const editedTarget = pair.targetMarkdown.replace("> Base", "> Derived changed");
+      const result = coordinateStageFocusBridge({
+        source: source("a", "Source changed"),
+        targetMarkdown: editedTarget,
+        baseContent: "Base",
+      });
+      expect(result).toMatchObject({
+        action: "conflict",
+        sourceId: "a",
+        conflict: {
+          sourceId: "a",
+          reason: "simultaneous-edit",
+          base: { content: "Base", hash: focusContentHash("Base") },
+          source: { content: "Source changed", hash: focusContentHash("Source changed") },
+          derived: { content: "Derived changed", hash: focusContentHash("Derived changed") },
+        },
+      });
+    });
+
+    it("fails descriptively for damaged markers or a mismatched Base snapshot", () => {
+      const pair = syncedPair();
+      expect(() => coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: pair.targetMarkdown.replace("sourceHash=", "sourceHash=broken"),
+        baseContent: "Base",
+      })).toThrowError(expect.objectContaining({ code: "marker-corrupt" }));
+      expect(() => coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: pair.targetMarkdown,
+        baseContent: "Wrong base",
+      })).toThrowError(expect.objectContaining({
+        code: "marker-corrupt",
+        message: expect.stringContaining("Base 快照"),
+      }));
+    });
+
+    it.each([
+      ["link", (markdown: string) => markdown.replace("|A]]", "|Renamed]]")],
+      ["callout title", (markdown: string) => markdown.replace("[!quote]", "[!info]")],
+      ["separator", (markdown: string) => markdown.replace("\n>\n> Base", "\n> changed\n> Base")],
+    ])("freezes a derived %s edit instead of treating it as source body", (_name, edit) => {
+      const pair = syncedPair();
+      const result = coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: edit(pair.targetMarkdown),
+        baseContent: "Base",
+      });
+      expect(result).toMatchObject({
+        action: "conflict",
+        conflict: { reason: "derived-structure-changed" },
+      });
+    });
+
+    it("detects a structure edit even when derivedHash is also forged to match it", () => {
+      const pair = syncedPair();
+      const linkEdited = pair.targetMarkdown.replace("|A]]", "|Forged]]");
+      const parsedEdited = parseFocusBridgeEnvelope(linkEdited);
+      if (parsedEdited.kind !== "present") throw new Error("missing edited envelope");
+      const forged = linkEdited.replace(
+        `derivedHash=${parsedEdited.blocks[0]!.derivedHash}`,
+        `derivedHash=${parsedEdited.blocks[0]!.currentDerivedHash}`,
+      );
+      const result = coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: forged,
+        baseContent: "Base",
+      });
+      expect(result).toMatchObject({
+        action: "conflict",
+        conflict: { reason: "derived-structure-changed" },
+      });
+    });
+
+    it("makes the general planner reject a forged canonical link and derivedHash", () => {
+      const pair = syncedPair();
+      const sources = new Map([["a", pair.sourceNote]]);
+      const linkEdited = pair.targetMarkdown.replace("|A]]", "|Forged]]");
+      const parsedEdited = parseFocusBridgeEnvelope(linkEdited);
+      if (parsedEdited.kind !== "present") throw new Error("missing edited envelope");
+      const forged = linkEdited.replace(
+        `derivedHash=${parsedEdited.blocks[0]!.derivedHash}`,
+        `derivedHash=${parsedEdited.blocks[0]!.currentDerivedHash}`,
+      );
+      expect(() => planStageFocusBridge(["a"], sources, forged))
+        .toThrowError(expect.objectContaining({ code: "managed-edit-would-be-lost" }));
+    });
+
+    it("preserves CRLF, target exterior text and source H2 siblings during reverse update", () => {
+      const sourceNote = source("a", "Base", {
+        markdown: source("a", "Base").markdown.replace(/\n/g, "\r\n"),
+      });
+      const targetMarkdown = planStageFocusBridge(
+        ["a"],
+        new Map([["a", sourceNote]]),
+        target("外部前言\n\n外部结尾").replace(/\n/g, "\r\n"),
+      ).markdown;
+      const result = coordinateStageFocusBridge({
+        source: sourceNote,
+        targetMarkdown: targetMarkdown.replace("> Base", "> Reverse"),
+        baseContent: "Base",
+      });
+      expect(result.action).toBe("update-source");
+      if (result.action !== "update-source") throw new Error("unexpected action");
+      expect(result.sourceMarkdown).not.toMatch(/(^|[^\r])\n/);
+      expect(result.originTargetMarkdown).not.toMatch(/(^|[^\r])\n/);
+      expect(result.sourceMarkdown).toContain("## 其他\r\n保留");
+      expect(result.originTargetMarkdown).toContain("外部前言\r\n\r\n外部结尾");
+      expect(result.originTargetMarkdown).toContain("# 计划行动\r\n- [ ] x");
+    });
+
+    it("handles empty Base, Source and Derived bodies without synthetic text", () => {
+      const empty = syncedPair("");
+      const sourceOnly = coordinateStageFocusBridge({
+        source: source("a", "Source"),
+        targetMarkdown: empty.targetMarkdown,
+        baseContent: "",
+      });
+      expect(sourceOnly.action).toBe("update-derived");
+
+      const derivedOnlyTarget = empty.targetMarkdown.replace(
+        "\n<!-- helix-focus-source:end -->",
+        "\n> Derived\n<!-- helix-focus-source:end -->",
+      );
+      const derivedOnly = coordinateStageFocusBridge({
+        source: empty.sourceNote,
+        targetMarkdown: derivedOnlyTarget,
+        baseContent: "",
+      });
+      expect(derivedOnly.action).toBe("update-source");
+      if (derivedOnly.action !== "update-source") throw new Error("unexpected action");
+      expect(scanFocusSection(derivedOnly.sourceMarkdown, FOCUS_SOURCE_HEADING, 2).normalizedContent)
+        .toBe("Derived");
+
+      const emptyDerived = coordinateStageFocusBridge({
+        source: source("a", "Base"),
+        targetMarkdown: syncedPair("Base").targetMarkdown.replace("\n> Base", ""),
+        baseContent: "Base",
+      });
+      expect(emptyDerived.action).toBe("update-source");
+      if (emptyDerived.action !== "update-source") throw new Error("unexpected action");
+      expect(scanFocusSection(emptyDerived.sourceMarkdown, FOCUS_SOURCE_HEADING, 2).normalizedContent)
+        .toBe("");
+    });
   });
 });

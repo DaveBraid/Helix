@@ -37,6 +37,7 @@ import {
 import { assertProjectMappingsUnique } from "../domain/project-mapping";
 import { stableHash } from "../domain/stable";
 import {
+  parseFocusBridgeEnvelope,
   planStageFocusBridge,
   type FocusSource,
 } from "../domain/stage-focus-bridge";
@@ -564,7 +565,11 @@ export class ProjectWorkspaceService {
         .filter((relation) => relation.toCycleId === targetId)
         .flatMap((relation) => relation.fromCycleIds))];
       const sources = new Map<string, FocusSource>();
-      for (const sourceId of sourceIds) {
+      const existingEnvelope = parseFocusBridgeEnvelope(targetRevision.content);
+      const validationSourceIds = existingEnvelope.kind === "present"
+        ? existingEnvelope.blocks.map((block) => block.sourceId)
+        : [];
+      for (const sourceId of [...new Set([...sourceIds, ...validationSourceIds])]) {
         const { cycle, revision } = await readCycle(sourceId);
         sources.set(sourceId, {
           id: cycle.id,
@@ -2139,7 +2144,9 @@ export class ProjectWorkspaceService {
       relationSourceSignature(snapshot.relations, targetId) !==
         relationSourceSignature(normalized.relations, targetId));
     const focusUpdates = await this.focusMarkdownUpdates(
-      layoutSnapshot,
+      // 旧来源仍需参与受管块 canonical 校验；它只用于校验，最终派生关系
+      // 仍完全取自 normalized.relations，且其 Markdown 会在同一事务删除。
+      snapshot,
       normalized.relations,
       changedFocusTargets,
     );

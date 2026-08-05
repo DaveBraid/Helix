@@ -77,6 +77,17 @@ export interface ProjectionLedgerEntry {
   conflictId?: string;
 }
 
+export type ProjectionReceiptCleanupProof = {
+  operationId: string;
+  conflictId?: string;
+  targetProjectId: string;
+  marker: string;
+  remoteTaskId: string;
+} & (
+  | { kind: "action"; projectId: string; stageId: string; uuid: string }
+  | { kind: "parent"; projectId: string }
+);
+
 export type ProjectionIntent =
   | { kind: "create-action"; entry: ProjectionLedgerEntry }
   | { kind: "recover-action"; entry: ProjectionLedgerEntry }
@@ -224,6 +235,14 @@ export function readProjectProjectionIdentity(markdown: string): {
     legacyListId: readUniqueFrontmatterScalar(markdown, LEGACY_PROJECT_LIST_FIELD),
     parentTaskId: readUniqueFrontmatterScalar(markdown, PROJECT_PARENT_TASK_FIELD),
   };
+}
+
+export function assertProjectionStageIdentity(markdown: string, expectedStageId: string): void {
+  const kind = readUniqueFrontmatterScalar(markdown, "helix-kind");
+  const stageId = readUniqueFrontmatterScalar(markdown, "helix-id");
+  if (kind !== "helix-stage" || stageId !== expectedStageId) {
+    throw new Error("计划行动所属阶段 Markdown 身份与稳定工作区不一致");
+  }
 }
 
 export function patchProjectParentTaskId(markdown: string, remoteId: string): string {

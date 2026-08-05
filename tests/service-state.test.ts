@@ -1167,6 +1167,55 @@ describe("HelixService runtime recovery", () => {
       .rejects.toThrow(/清单身份/);
   });
 
+  it("builds projection catalog readiness from exact project and dual-source column reads", async () => {
+    const data = createDefaultData("device-projection-catalog");
+    grantTaskCrud(data);
+    data.didaContractCapabilities!.taskReopenVerified = true;
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(data); },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    const project: DidaProject = {
+      id: "projection-list", name: "科研", viewMode: "kanban", permission: "write",
+    };
+    const columns = [{
+      id: "projection-column", projectId: project.id, name: "Helix项目", sortOrder: 10,
+    }];
+    let mismatch = false;
+    Object.defineProperty(service, "api", {
+      value: {
+        async getProject() { return project; },
+        async getProjectData() {
+          return { project, tasks: [], columns };
+        },
+        async getColumns() {
+          return mismatch ? [{ ...columns[0], name: "竞争改名" }] : columns;
+        },
+      },
+    });
+
+    await expect(service.readProjectionCatalog(project.id)).resolves.toMatchObject({
+      projects: [project],
+      columns,
+      readiness: {
+        writable: true,
+        queueEmpty: true,
+        authorizationCurrent: true,
+        parentTaskVerified: true,
+        boardPlacementVerified: true,
+        boardFresh: true,
+        taskReopenVerified: true,
+        unknownOutcomes: 0,
+      },
+    });
+    mismatch = true;
+    await expect(service.readProjectionCatalog(project.id)).rejects.toThrow(/双源复读不一致/);
+  });
+
   it("migrates an in-progress marker after an ordinary queued create succeeds", async () => {
     const data = createDefaultData("device-a");
     grantTaskCrud(data);

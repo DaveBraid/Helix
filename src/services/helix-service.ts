@@ -70,7 +70,9 @@ import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
 import { RemoteWriteGate } from "./remote-write-gate";
 import type {
+  ExistingHelixProjectionCatalogPort,
   ExistingHelixTaskQueuePort,
+  ProjectionCatalogSnapshot,
   ProjectionDeleteReceipt,
   ProjectionRemoteIdentity,
   ProjectionWriteReceipt,
@@ -137,7 +139,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   recoveryIssues: [],
 };
 
-export class HelixService implements ExistingHelixTaskQueuePort {
+export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixProjectionCatalogPort {
   private readonly api: DidaApi;
   private readonly habitService: DidaHabitService;
   private readonly focusService: DidaFocusService;
@@ -733,6 +735,56 @@ export class HelixService implements ExistingHelixTaskQueuePort {
       }
       return project;
     });
+  }
+
+  async readProjectionCatalog(projectId: string): Promise<ProjectionCatalogSnapshot> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      this.assertActive();
+      const [projectResponse, detailResponse, columnsResponse] = await Promise.all([
+        this.api.getProject(projectId),
+        this.api.getProjectData(projectId),
+        this.api.getColumns(projectId),
+      ]);
+      const project = normalizeProject(projectResponse);
+      const detailProject = normalizeProject(detailResponse.project);
+      const detailColumns = normalizeColumns(detailResponse.columns);
+      const endpointColumns = normalizeColumns(columnsResponse);
+      if (project.id !== projectId || detailProject.id !== projectId) {
+        throw new Error("投影目标清单精确复读身份不一致");
+      }
+      if (stableHash(projectSyncValue(project)) !== stableHash(projectSyncValue(detailProject))) {
+        throw new Error("投影目标清单双源复读不一致");
+      }
+      if (!sameColumns(detailColumns, endpointColumns) ||
+        endpointColumns.some((column) => column.projectId !== projectId)) {
+        throw new Error("投影目标看板列双源复读不一致");
+      }
+      const data = await this.store.snapshot();
+      const unknownOperationIds = new Set([
+        ...data.queue.filter((operation) =>
+          operation.status === "reconciliation" || operation.remoteOutcomeUnknown)
+          .map((operation) => operation.id),
+        ...data.projectionOperationReceipts.filter((receipt) => receipt.outcome === "unknown")
+          .map((receipt) => receipt.operationId),
+      ]);
+      return {
+        projects: [project],
+        columns: endpointColumns,
+        readiness: {
+          writable: !this.contractTestRunning && data.recoveryIssues.length === 0,
+          queueEmpty: data.queue.length === 0,
+          authorizationCurrent: Boolean(this.secrets.getDidaToken()) && this.state.taskCrudVerified,
+          parentTaskVerified: this.state.parentTaskVerified,
+          boardPlacementVerified: this.state.boardPlacementVerified,
+          boardFresh: true,
+          taskReopenVerified: this.state.taskReopenVerified,
+          unknownOutcomes: unknownOperationIds.size,
+        },
+      };
+    } finally {
+      release();
+    }
   }
 
   private async verifyRemoteTaskWithAuthorizationLease(

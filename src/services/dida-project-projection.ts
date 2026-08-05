@@ -1,7 +1,10 @@
 import type { DidaColumn, DidaProject, DidaTask } from "../domain/entities";
 import { stableHash } from "../domain/stable";
 import type { HelixDataStore } from "../storage/data-store";
+import type { HelixVaultRepository } from "../storage/vault-repository";
 import {
+  adoptPlanAction,
+  assertProjectionStageIdentity,
   assertProjectionActivation,
   buildProjectionActivationPreview,
   buildProjectionLedger,
@@ -12,11 +15,13 @@ import {
   projectionMarker,
   readProjectProjectionIdentity,
   verifyProjectedTask,
+  PROJECTION_ACTION_EDITABLE_STATES,
   type DidaProjectionTarget,
   type ProjectionActivationPreview,
   type ProjectionFreezeReason,
   type ProjectionLedgerEntry,
   type ProjectionReadiness,
+  type ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
 
 export interface ProjectionMarkdownRevision {
@@ -28,6 +33,19 @@ export interface ProjectionMarkdownRevision {
 export interface ProjectionMarkdownPort {
   read(path: string): Promise<ProjectionMarkdownRevision | null>;
   compareAndWrite(revision: ProjectionMarkdownRevision, content: string): Promise<ProjectionMarkdownRevision>;
+}
+
+export class VaultProjectionMarkdownAdapter implements ProjectionMarkdownPort {
+  constructor(private readonly repository: Pick<HelixVaultRepository, "read" | "compareAndWrite">) {}
+  read(path: string): Promise<ProjectionMarkdownRevision | null> {
+    return this.repository.read(path);
+  }
+  compareAndWrite(
+    revision: ProjectionMarkdownRevision,
+    content: string,
+  ): Promise<ProjectionMarkdownRevision> {
+    return this.repository.compareAndWrite(revision, content);
+  }
 }
 
 /** Existing Helix task pipeline adapter. Implementations must enqueue through the normal queue/contract engine. */
@@ -54,6 +72,16 @@ export interface ExistingHelixTaskQueuePort {
   enqueueProjectionReopen(task: DidaTask): Promise<ProjectionWriteReceipt>;
   enqueueProjectionDelete(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt>;
   verifyRemoteTask(projectId: string, taskId: string): Promise<DidaTask>;
+}
+
+export interface ProjectionCatalogSnapshot {
+  projects: DidaProject[];
+  columns: DidaColumn[];
+  readiness: ProjectionReadiness;
+}
+
+export interface ExistingHelixProjectionCatalogPort {
+  readProjectionCatalog(projectId: string): Promise<ProjectionCatalogSnapshot>;
 }
 
 /** 唯一允许的生产适配器：投影层只翻译结果，写入仍由 HelixService/OfflineQueue 完成。 */
@@ -93,6 +121,13 @@ export class ExistingHelixTaskPipelineAdapter implements ProjectionTaskPipeline 
     }
   }
 
+}
+
+export class ExistingHelixProjectionCatalogAdapter implements ProjectionCatalogPort {
+  constructor(private readonly source: ExistingHelixProjectionCatalogPort) {}
+  read(projectId: string): Promise<ProjectionCatalogSnapshot> {
+    return this.source.readProjectionCatalog(projectId);
+  }
 }
 
 export type ProjectionWriteOutcome =
@@ -139,6 +174,7 @@ export interface ProjectionPersistentState {
     title: string;
     status: number;
   }>;
+  receiptCleanupPending?: ProjectionReceiptCleanupProof[];
 }
 
 export interface ProjectionStatePort {
@@ -172,13 +208,91 @@ export class PersistedProjectionStatePort implements ProjectionStatePort {
   }
 }
 
+export type ProjectionOperationDiagnostic = Awaited<ReturnType<HelixDataStore["snapshot"]>>["projectionOperationReceipts"][number];
+
+export interface ProjectionDiagnosticsPort {
+  list(): Promise<ProjectionOperationDiagnostic[]>;
+  inspect(operationId: string, conflictId?: string): Promise<{
+    receipt?: ProjectionOperationDiagnostic;
+    blocked: boolean;
+    resolvedTask?: DidaTask;
+  }>;
+  removeResolved(operationId: string): Promise<void>;
+  removeReconciled(operationId: string, conflictId?: string): Promise<void>;
+}
+
+export class PersistedProjectionDiagnosticsPort implements ProjectionDiagnosticsPort {
+  constructor(private readonly store: Pick<HelixDataStore, "snapshot" | "mutate">) {}
+  async list(): Promise<ProjectionOperationDiagnostic[]> {
+    return structuredClone((await this.store.snapshot()).projectionOperationReceipts);
+  }
+  async inspect(operationId: string, conflictId?: string): Promise<{
+    receipt?: ProjectionOperationDiagnostic;
+    blocked: boolean;
+    resolvedTask?: DidaTask;
+  }> {
+    const data = await this.store.snapshot();
+    const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operationId);
+    const effectiveConflictId = conflictId ?? receipt?.conflictId;
+    const conflict = effectiveConflictId
+      ? data.conflicts.find((item) => item.id === effectiveConflictId)
+      : undefined;
+    const blocked = data.queue.some((item) => item.id === operationId) ||
+      Boolean(conflict && conflict.status !== "resolved" && conflict.status !== "superseded");
+    const candidates = receipt ? Object.values(data.baseSnapshots)
+      .filter((snapshot) => snapshot.kind === "task" && snapshot.value !== null)
+      .map((snapshot) => snapshot.value as DidaTask)
+      .filter((task) => task.projectId === receipt.projectId && task.content === receipt.marker &&
+        (receipt.remoteTaskId === undefined || task.id === receipt.remoteTaskId)) : [];
+    return {
+      receipt: receipt ? structuredClone(receipt) : undefined,
+      blocked,
+      resolvedTask: candidates.length === 1 ? structuredClone(candidates[0]!) : undefined,
+    };
+  }
+  async removeResolved(operationId: string): Promise<void> {
+    await this.store.mutate((data) => {
+      const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operationId);
+      if (!receipt) throw new Error("找不到投影操作收据");
+      if (data.queue.some((item) => item.id === operationId)) {
+        throw new Error("投影操作仍在队列中，禁止移除收据");
+      }
+      const conflict = receipt.conflictId
+        ? data.conflicts.find((item) => item.id === receipt.conflictId)
+        : undefined;
+      if (conflict && conflict.status !== "resolved" && conflict.status !== "superseded") {
+        throw new Error("投影冲突仍未解决，禁止移除收据");
+      }
+      data.projectionOperationReceipts = data.projectionOperationReceipts
+        .filter((item) => item.operationId !== operationId);
+    });
+  }
+  async removeReconciled(operationId: string, conflictId?: string): Promise<void> {
+    await this.store.mutate((data) => {
+      const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operationId);
+      if (!receipt) throw new Error("找不到投影操作收据");
+      if (data.queue.some((item) => item.id === operationId)) {
+        throw new Error("投影操作仍在队列中，禁止移除收据");
+      }
+      const effectiveConflictId = conflictId ?? receipt.conflictId;
+      const conflict = effectiveConflictId
+        ? data.conflicts.find((item) => item.id === effectiveConflictId)
+        : undefined;
+      if (conflict && conflict.status !== "resolved" && conflict.status !== "superseded") {
+        throw new Error("投影冲突仍未解决，禁止移除收据");
+      }
+      data.projectionOperationReceipts = data.projectionOperationReceipts
+        .filter((item) => item.operationId !== operationId);
+    });
+  }
+}
+
 export interface ProjectionCatalogPort {
-  projects(): Promise<DidaProject[]>;
-  columns(projectId: string): Promise<DidaColumn[]>;
-  readiness(projectId: string): Promise<ProjectionReadiness>;
+  read(projectId: string): Promise<ProjectionCatalogSnapshot>;
 }
 
 export interface ProjectionProjectInput {
+  projectId: string;
   projectPath: string;
   projectTitle: string;
   projectStatus: "planned" | "active" | "paused" | "completed" | "terminated";
@@ -196,6 +310,41 @@ export interface ProjectionSyncSummary {
   frozen: Array<{ uuid: string; reason: ProjectionFreezeReason; message: string }>;
 }
 
+export interface ProjectionProjectReadModel {
+  enabled: boolean;
+  target?: DidaProjectionTarget;
+  project: { id: string; path: string; title: string; status: ProjectionProjectInput["projectStatus"]; parentTaskId?: string };
+  stages: Array<{
+    id: string;
+    path: string;
+    revisionHash: string;
+    managed: Array<{
+      uuid: string;
+      line: number;
+      title: string;
+      state: ProjectionLedgerEntry["state"];
+      remoteId?: string;
+      frozen?: ProjectionFreezeReason;
+      operationId?: string;
+      conflictId?: string;
+    }>;
+    unmanaged: Array<{ line: number; title: string; completed: boolean }>;
+  }>;
+  parentDiagnostic?: ProjectionPersistentState["parentCheckpoints"][number];
+  receipts: ProjectionOperationDiagnostic[];
+  receiptCleanupPending: ProjectionReceiptCleanupProof[];
+  orphanDiagnostics: Array<{
+    uuid: string;
+    stageId: string;
+    state: ProjectionLedgerEntry["state"];
+    frozen?: ProjectionFreezeReason;
+    operationId?: string;
+    conflictId?: string;
+    remoteId?: string;
+    tombstone: boolean;
+  }>;
+}
+
 export class DidaProjectProjectionService {
   constructor(
     private readonly markdown: ProjectionMarkdownPort,
@@ -203,17 +352,297 @@ export class DidaProjectProjectionService {
     private readonly state: ProjectionStatePort,
     private readonly catalog: ProjectionCatalogPort,
     private readonly now: () => string = () => new Date().toISOString(),
+    private readonly diagnostics?: ProjectionDiagnosticsPort,
   ) {}
+
+  async readProject(input: ProjectionProjectInput): Promise<ProjectionProjectReadModel> {
+    const state = await this.state.read();
+    const projectRevision = await this.requireRevision(input.projectPath);
+    const identity = readProjectProjectionIdentity(projectRevision.content);
+    if (identity.projectId !== input.projectId) throw new Error("项目 Markdown 身份与稳定工作区不一致");
+    const stages: ProjectionProjectReadModel["stages"] = [];
+    for (const stage of input.stages) {
+      const revision = await this.requireRevision(stage.path);
+      assertProjectionStageIdentity(revision.content, stage.stageId);
+      const parsed = parseManagedPlanActions(revision.content);
+      stages.push({
+        id: stage.stageId,
+        path: stage.path,
+        revisionHash: revision.hash,
+        managed: parsed.actions.map((action) => {
+          const persisted = state.ledger.find((entry) => entry.uuid === action.uuid &&
+            entry.projectId === input.projectId && entry.stageId === stage.stageId);
+          return {
+            uuid: action.uuid,
+            line: action.line,
+            title: action.title,
+            state: action.state,
+            remoteId: action.remoteId,
+            frozen: persisted?.frozen,
+            operationId: persisted?.operationId,
+            conflictId: persisted?.conflictId,
+          };
+        }),
+        unmanaged: parsed.unmanagedChecklistLines.map((line) => unmanagedAction(revision.content, line)),
+      });
+    }
+    const managedIdentities = new Set(stages.flatMap((stage) => stage.managed.map((action) =>
+      projectionLedgerIdentity({ projectId: identity.projectId, stageId: stage.id, uuid: action.uuid }))));
+    const orphanEntries = state.ledger.filter((entry) => entry.projectId === identity.projectId &&
+      !managedIdentities.has(projectionLedgerIdentity(entry)));
+    const receipts = (await this.diagnostics?.list() ?? []).filter((receipt) =>
+      receipt.marker === `helix-project-projection:${identity.projectId}` ||
+      stages.some((stage) => stage.managed.some((action) =>
+        receipt.marker === projectionMarker(action.uuid))) ||
+      orphanEntries.some((entry) => receipt.marker === projectionMarker(entry.uuid)));
+    return {
+      enabled: state.enabled,
+      target: state.target ? { ...state.target } : undefined,
+      project: {
+        id: identity.projectId,
+        path: input.projectPath,
+        title: input.projectTitle,
+        status: input.projectStatus,
+        parentTaskId: identity.parentTaskId,
+      },
+      stages,
+      parentDiagnostic: state.parentCheckpoints.find((item) => item.projectId === identity.projectId),
+      receipts,
+      receiptCleanupPending: (state.receiptCleanupPending ?? [])
+        .filter((proof) => proof.projectId === identity.projectId)
+        .map((proof) => ({ ...proof })),
+      orphanDiagnostics: orphanEntries.map((entry) => ({
+        uuid: entry.uuid,
+        stageId: entry.stageId,
+        state: entry.state,
+        frozen: entry.frozen,
+        operationId: entry.operationId,
+        conflictId: entry.conflictId,
+        remoteId: entry.remoteId,
+        tombstone: entry.tombstone === true,
+      })),
+    };
+  }
+
+  async adoptAction(input: { stagePath: string; expectedStageId: string; expectedHash: string; line: number }): Promise<ProjectionMarkdownRevision> {
+    const revision = await this.requireRevision(input.stagePath);
+    if (revision.hash !== input.expectedHash) throw new Error("阶段 Markdown 在纳管前发生变化");
+    assertProjectionStageIdentity(revision.content, input.expectedStageId);
+    return this.markdown.compareAndWrite(
+      revision,
+      adoptPlanAction(revision.content, input.line, crypto.randomUUID()),
+    );
+  }
+
+  async editAction(input: {
+    stagePath: string;
+    expectedStageId: string;
+    expectedHash: string;
+    uuid: string;
+    title?: string;
+    state?: ProjectionLedgerEntry["state"];
+  }): Promise<ProjectionMarkdownRevision> {
+    if (input.state !== undefined && !PROJECTION_ACTION_EDITABLE_STATES.includes(input.state)) {
+      throw new Error("计划行动状态无效");
+    }
+    const revision = await this.requireRevision(input.stagePath);
+    if (revision.hash !== input.expectedHash) throw new Error("阶段 Markdown 在编辑前发生变化");
+    assertProjectionStageIdentity(revision.content, input.expectedStageId);
+    return this.markdown.compareAndWrite(revision, patchManagedPlanAction(revision.content, {
+      uuid: input.uuid,
+      title: input.title,
+      state: input.state,
+    }));
+  }
+
+  async disable(): Promise<void> {
+    const current = await this.state.read();
+    if (!current.enabled) return;
+    await this.state.write(current, { ...current, enabled: false });
+  }
+
+  async reconcileFrozen(input:
+    | { kind: "action"; projectId: string; stageId: string; stagePath: string; uuid: string }
+    | { kind: "parent"; projectId: string; projectPath: string; title: string; status: ProjectionProjectInput["projectStatus"] }): Promise<void> {
+    const current = await this.state.read();
+    if (!current.target) throw new Error("投影尚无已确认目标");
+    if (input.kind === "action") {
+      const entry = current.ledger.find((item) => item.uuid === input.uuid &&
+        item.projectId === input.projectId && item.stageId === input.stageId);
+      if (!entry?.frozen) throw new Error("行动没有待复核的冻结状态");
+      const inspection = entry.operationId && this.diagnostics
+        ? await this.diagnostics.inspect(entry.operationId, entry.conflictId)
+        : undefined;
+      if (inspection?.blocked) {
+        throw new Error("该冻结仍由队列或逐字段冲突持有，必须先在冲突中心解决");
+      }
+      if (entry.operationId && !inspection?.receipt) {
+        throw new Error("冻结行动缺少既有操作收据，禁止旁路收口");
+      }
+      if (!inspection && entry.frozen !== "identity-mismatch" && entry.frozen !== "markdown-race") {
+        throw new Error("冻结缺少可证明已由既有冲突流程收口的操作诊断");
+      }
+      const remoteId = entry.remoteId ?? inspection?.resolvedTask?.id;
+      if (!remoteId) throw new Error("冻结行动没有可精确复读的远端 ID");
+      const cleanupProof: ProjectionReceiptCleanupProof | undefined = entry.operationId ? {
+        kind: "action",
+        operationId: entry.operationId,
+        conflictId: entry.conflictId ?? inspection?.receipt?.conflictId,
+        projectId: entry.projectId,
+        stageId: entry.stageId,
+        uuid: entry.uuid,
+        targetProjectId: entry.targetProjectId,
+        marker: projectionMarker(entry.uuid),
+        remoteTaskId: remoteId,
+      } : undefined;
+      if (cleanupProof && inspection?.receipt) {
+        assertReceiptMatchesProof(inspection.receipt, cleanupProof);
+      }
+      const stageRevision = await this.requireRevision(input.stagePath);
+      assertProjectionStageIdentity(stageRevision.content, input.stageId);
+      const remote = await this.pipeline.rereadTask(entry.targetProjectId, remoteId);
+      if (!remote) {
+        if (!entry.tombstone) throw new Error("远端任务不存在，保持冻结");
+        await this.settleReconciliation(current, {
+          ...current,
+          ledger: current.ledger.filter((item) => !(item.uuid === entry.uuid &&
+            item.projectId === entry.projectId && item.stageId === entry.stageId)),
+        }, cleanupProof);
+        return;
+      }
+      if (entry.tombstone) throw new Error("远端任务仍存在，删除冻结保持不变");
+      const verifiedEntry = { ...entry, remoteId };
+      verifyProjectedTask(remote, verifiedEntry, projectionMarker(entry.uuid));
+      const markdownAction = parseManagedPlanActions(stageRevision.content).actions
+        .find((action) => action.uuid === entry.uuid);
+      if (!markdownAction || markdownAction.title !== entry.title || markdownAction.state !== entry.state ||
+        (markdownAction.remoteId !== undefined && markdownAction.remoteId !== remoteId)) {
+        throw new Error("阶段 Markdown 行动在冻结期间发生变化，保持冻结");
+      }
+      if (markdownAction.remoteId !== remoteId) {
+        await this.markdown.compareAndWrite(stageRevision, patchManagedPlanAction(stageRevision.content, {
+          uuid: entry.uuid,
+          remoteId,
+        }));
+      }
+      await this.settleReconciliation(current, {
+        ...current,
+        ledger: current.ledger.map((item) => item.uuid === entry.uuid &&
+          item.projectId === entry.projectId && item.stageId === entry.stageId
+          ? { ...item, remoteId, frozen: undefined, operationId: undefined, conflictId: undefined }
+          : item),
+      }, cleanupProof);
+      return;
+    }
+    const checkpoint = current.parentCheckpoints.find((item) => item.projectId === input.projectId);
+    if (!checkpoint?.frozen) throw new Error("父任务没有待复核的冻结状态");
+    const inspection = checkpoint.operationId && this.diagnostics
+      ? await this.diagnostics.inspect(checkpoint.operationId, checkpoint.conflictId)
+      : undefined;
+    if (inspection?.blocked) {
+      throw new Error("该父任务冻结仍由队列或逐字段冲突持有，必须先在冲突中心解决");
+    }
+    if (checkpoint.operationId && !inspection?.receipt) {
+      throw new Error("冻结父任务缺少既有操作收据，禁止旁路收口");
+    }
+    if (!inspection && checkpoint.frozen !== "identity-mismatch" && checkpoint.frozen !== "markdown-race") {
+      throw new Error("父任务冻结缺少可证明已由既有冲突流程收口的操作诊断");
+    }
+    const remoteId = checkpoint.remoteId ?? inspection?.resolvedTask?.id;
+    if (!remoteId) throw new Error("冻结父任务没有可精确复读的远端 ID");
+    const cleanupProof: ProjectionReceiptCleanupProof | undefined = checkpoint.operationId ? {
+      kind: "parent",
+      operationId: checkpoint.operationId,
+      conflictId: checkpoint.conflictId ?? inspection?.receipt?.conflictId,
+      projectId: input.projectId,
+      targetProjectId: current.target.targetProjectId,
+      marker: `helix-project-projection:${input.projectId}`,
+      remoteTaskId: remoteId,
+    } : undefined;
+    if (cleanupProof && inspection?.receipt) {
+      assertReceiptMatchesProof(inspection.receipt, cleanupProof);
+    }
+    const remote = await this.pipeline.rereadTask(current.target.targetProjectId, remoteId);
+    const desiredStatus = input.status === "completed" ? 2 : 0;
+    if (!remote || !this.sameParentIdentity(remote, input.projectId, remoteId, current.target) ||
+      remote.title !== input.title || remote.status !== desiredStatus) {
+      throw new Error("父任务精确复读身份仍不一致，保持冻结");
+    }
+    const projectRevision = await this.requireRevision(input.projectPath);
+    const projectIdentity = readProjectProjectionIdentity(projectRevision.content);
+    if (projectIdentity.projectId !== input.projectId) {
+      throw new Error("项目 Markdown 身份与稳定工作区不一致");
+    }
+    if (projectIdentity.parentTaskId !== remoteId) {
+      await this.markdown.compareAndWrite(
+        projectRevision,
+        patchProjectParentTaskId(projectRevision.content, remoteId),
+      );
+    }
+    await this.settleReconciliation(current, {
+      ...current,
+      parentCheckpoints: current.parentCheckpoints.filter((item) => item.projectId !== input.projectId),
+    }, cleanupProof);
+  }
+
+  private async settleReconciliation(
+    current: ProjectionPersistentState,
+    next: ProjectionPersistentState,
+    proof?: ProjectionReceiptCleanupProof,
+  ): Promise<void> {
+    if (!proof) {
+      await this.state.write(current, next);
+      return;
+    }
+    const pending = [
+      ...(next.receiptCleanupPending ?? []).filter((item) => item.operationId !== proof.operationId),
+      proof,
+    ];
+    await this.state.write(current, { ...next, receiptCleanupPending: pending });
+    await this.retryReceiptCleanup(proof.operationId);
+  }
+
+  async retryReceiptCleanup(operationId?: string): Promise<void> {
+    if (!this.diagnostics) return;
+    const initial = await this.state.read();
+    const pending = (initial.receiptCleanupPending ?? [])
+      .filter((proof) => operationId === undefined || proof.operationId === operationId);
+    for (const proof of pending) {
+      try {
+        const inspection = await this.diagnostics.inspect(proof.operationId, proof.conflictId);
+        if (inspection.blocked) continue;
+        if (inspection.receipt) {
+          assertReceiptMatchesProof(inspection.receipt, proof);
+          await this.diagnostics.removeReconciled(proof.operationId, proof.conflictId);
+        }
+        const latest = await this.state.read();
+        if (!(latest.receiptCleanupPending ?? []).some((item) => item.operationId === proof.operationId)) continue;
+        await this.state.write(latest, {
+          ...latest,
+          receiptCleanupPending: (latest.receiptCleanupPending ?? [])
+            .filter((item) => item.operationId !== proof.operationId),
+        });
+      } catch {
+        // 保留完整 proof，供重启或下一次读取幂等重试并向 UI 暴露。
+      }
+    }
+  }
+
+  async removeResolvedReceipt(operationId: string): Promise<void> {
+    if (!this.diagnostics) throw new Error("投影诊断存储未配置");
+    const current = await this.state.read();
+    if (current.ledger.some((entry) => entry.operationId === operationId) ||
+      current.parentCheckpoints.some((entry) => entry.operationId === operationId)) {
+      throw new Error("该收据仍被冻结对象引用，禁止移除");
+    }
+    await this.diagnostics.removeResolved(operationId);
+  }
 
   async previewActivation(target: DidaProjectionTarget, counts: {
     projectCount: number;
     actionCount: number;
   }): Promise<ProjectionActivationPreview> {
-    const [projects, columns, readiness] = await Promise.all([
-      this.catalog.projects(),
-      this.catalog.columns(target.targetProjectId),
-      this.catalog.readiness(target.targetProjectId),
-    ]);
+    const { projects, columns, readiness } = await this.catalog.read(target.targetProjectId);
     return buildProjectionActivationPreview({ target, projects, columns, readiness, ...counts });
   }
 
@@ -224,6 +653,11 @@ export class DidaProjectProjectionService {
     });
     assertProjectionActivation(fresh, confirmedHash);
     const current = await this.state.read();
+    if (current.target && (current.target.targetProjectId !== fresh.target.targetProjectId ||
+      current.target.targetColumnId !== fresh.target.targetColumnId) &&
+      (current.ledger.length > 0 || current.parentCheckpoints.length > 0 || (current.parentBases?.length ?? 0) > 0)) {
+      throw new Error("已有投影身份时禁止切换目标清单或分栏");
+    }
     if (current.ledger.some((entry) => entry.frozen) || current.parentCheckpoints.some((item) => item.frozen)) {
       throw new Error("投影仍有冻结对象，禁止激活");
     }
@@ -240,8 +674,13 @@ export class DidaProjectProjectionService {
     if (!initialState.enabled || !initialState.target || !initialState.confirmedPreviewHash) {
       throw new Error("Helix→滴答投影尚未显式预览并激活");
     }
-    const readiness = await this.catalog.readiness(initialState.target.targetProjectId);
-    const currentPreview = await this.previewActivation(initialState.target, {
+    const catalog = await this.catalog.read(initialState.target.targetProjectId);
+    const readiness = catalog.readiness;
+    const currentPreview = buildProjectionActivationPreview({
+      target: initialState.target,
+      projects: catalog.projects,
+      columns: catalog.columns,
+      readiness,
       projectCount: 1,
       actionCount: await this.countActions(input.stages),
     });
@@ -250,6 +689,26 @@ export class DidaProjectProjectionService {
     }
     const projectRevision = await this.requireRevision(input.projectPath);
     const projectIdentity = readProjectProjectionIdentity(projectRevision.content);
+    if (projectIdentity.projectId !== input.projectId) throw new Error("项目 Markdown 身份与稳定工作区不一致");
+    const preflightState = await this.state.read();
+    if (stableHash(preflightState) !== stableHash(initialState)) {
+      throw new Error("投影状态在远端写入前发生变化");
+    }
+    const preflightStages: Array<{
+      stageId: string;
+      revision: ProjectionMarkdownRevision;
+      actions: ReturnType<typeof parseManagedPlanActions>["actions"];
+    }> = [];
+    for (const stage of input.stages) {
+      const revision = await this.requireRevision(stage.path);
+      assertProjectionStageIdentity(revision.content, stage.stageId);
+      preflightStages.push({
+        stageId: stage.stageId,
+        revision,
+        actions: parseManagedPlanActions(revision.content).actions,
+      });
+    }
+    assertProjectionUuidOwnership(preflightState, projectIdentity.projectId, preflightStages);
     const summary: ProjectionSyncSummary = {
       createdParents: 0,
       updatedParents: 0,
@@ -294,27 +753,25 @@ export class DidaProjectProjectionService {
     )) return summary;
 
     const freshState = await this.state.read();
+    assertProjectionUuidOwnership(freshState, projectIdentity.projectId, preflightStages);
     const currentEntries: ProjectionLedgerEntry[] = [];
-    const stageRevisions = new Map<string, ProjectionMarkdownRevision>();
-    for (const stage of input.stages) {
-      const revision = await this.requireRevision(stage.path);
-      stageRevisions.set(stage.stageId, revision);
-      const parsed = parseManagedPlanActions(revision.content);
+    const stageRevisions = new Map(preflightStages.map((stage) => [stage.stageId, stage.revision]));
+    for (const stage of preflightStages) {
       currentEntries.push(...buildProjectionLedger({
         projectId: projectIdentity.projectId,
         stageId: stage.stageId,
         parentTaskId,
         target: initialState.target,
-        actions: parsed.actions,
+        actions: stage.actions,
       }));
     }
     const previous = freshState.ledger.filter((entry) => entry.projectId === projectIdentity.projectId);
     const presentStageIds = new Set(input.stages.map((stage) => stage.stageId));
     const managedPrevious = previous.filter((entry) => presentStageIds.has(entry.stageId));
     const retainedMissingStages = previous.filter((entry) => !presentStageIds.has(entry.stageId));
-    const previousByUuid = new Map(previous.map((entry) => [entry.uuid, entry]));
+    const previousByIdentity = new Map(previous.map((entry) => [projectionLedgerIdentity(entry), entry]));
     let working = currentEntries.map((entry) => {
-      const old = previousByUuid.get(entry.uuid);
+      const old = previousByIdentity.get(projectionLedgerIdentity(entry));
       return old?.frozen
         ? {
             ...entry,
@@ -327,13 +784,14 @@ export class DidaProjectProjectionService {
         : entry;
     });
     working.push(...retainedMissingStages);
-    working.push(...previous.filter((entry) => entry.frozen && !working.some((item) => item.uuid === entry.uuid)));
+    working.push(...previous.filter((entry) => entry.frozen &&
+      !working.some((item) => projectionLedgerIdentity(item) === projectionLedgerIdentity(entry))));
     const managedWorking = working.filter((entry) => presentStageIds.has(entry.stageId));
     for (const intent of planProjectionChanges(managedPrevious, managedWorking, {
       taskReopenVerified: readiness.taskReopenVerified,
     })) {
       const entry = intent.entry;
-      if (working.find((item) => item.uuid === entry.uuid)?.frozen) continue;
+      if (working.find((item) => projectionLedgerIdentity(item) === projectionLedgerIdentity(entry))?.frozen) continue;
       const stageRevision = stageRevisions.get(entry.stageId);
       if (!stageRevision && intent.kind !== "delete-action") throw new Error(`找不到行动所属阶段：${entry.stageId}`);
       if (intent.kind === "freeze-action") {
@@ -829,6 +1287,68 @@ function resultReason(result: { outcome: string }): ProjectionFreezeReason {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function unmanagedAction(markdown: string, lineNumber: number): {
+  line: number;
+  title: string;
+  completed: boolean;
+} {
+  const line = markdown.split(/\r?\n/)[lineNumber - 1] ?? "";
+  const match = /^\s*[-*+] \[([ xX])\]\s+(.+?)\s*$/.exec(line);
+  if (!match) throw new Error(`未受管行动行已变化：第 ${lineNumber} 行`);
+  return {
+    line: lineNumber,
+    title: match[2]!.trim(),
+    completed: match[1]!.toLowerCase() === "x",
+  };
+}
+
+function projectionLedgerIdentity(entry: Pick<ProjectionLedgerEntry, "projectId" | "stageId" | "uuid">): string {
+  return `${entry.projectId}\u0000${entry.stageId}\u0000${entry.uuid}`;
+}
+
+function assertProjectionUuidOwnership(
+  state: ProjectionPersistentState,
+  projectId: string,
+  stages: Array<{ stageId: string; actions: Array<{ uuid: string }> }>,
+): void {
+  const ledgerOwners = new Map<string, string>();
+  for (const entry of state.ledger) {
+    const identity = projectionLedgerIdentity(entry);
+    const existing = ledgerOwners.get(entry.uuid);
+    if (existing !== undefined) {
+      throw new Error("投影账本 UUID 在多个项目或阶段中重复，已拒绝远端写入");
+    }
+    ledgerOwners.set(entry.uuid, identity);
+  }
+  const markdownOwners = new Map<string, string>();
+  for (const stage of stages) {
+    for (const action of stage.actions) {
+      const identity = projectionLedgerIdentity({ projectId, stageId: stage.stageId, uuid: action.uuid });
+      const markdownOwner = markdownOwners.get(action.uuid);
+      if (markdownOwner !== undefined && markdownOwner !== identity) {
+        throw new Error("计划行动 UUID 在多个阶段 Markdown 中重复，已拒绝远端写入");
+      }
+      const ledgerOwner = ledgerOwners.get(action.uuid);
+      if (ledgerOwner !== undefined && ledgerOwner !== identity) {
+        throw new Error("计划行动 UUID 与投影账本归属不一致，已拒绝远端写入");
+      }
+      markdownOwners.set(action.uuid, identity);
+    }
+  }
+}
+
+function assertReceiptMatchesProof(
+  receipt: ProjectionOperationDiagnostic,
+  proof: ProjectionReceiptCleanupProof,
+): void {
+  if (receipt.operationId !== proof.operationId || receipt.projectId !== proof.targetProjectId ||
+    receipt.marker !== proof.marker ||
+    (receipt.remoteTaskId !== undefined && receipt.remoteTaskId !== proof.remoteTaskId) ||
+    receipt.conflictId !== proof.conflictId) {
+    throw new Error("投影操作收据与冻结对象身份不一致，禁止收口");
+  }
 }
 
 function stableStateParentBase(

@@ -732,7 +732,23 @@ describe("HelixDataStore serialization", () => {
         marker: "helix-project-projection:project-a",
       }],
       parentBases: [{ projectId: "project-a", remoteId: "parent-a", title: "Project", status: 0 }],
+      receiptCleanupPending: [{
+        kind: "action" as const,
+        operationId: "op-cleanup-a",
+        targetProjectId: "target-list",
+        marker: "helix-projection:uuid-a",
+        remoteTaskId: "remote-a",
+        projectId: "project-a",
+        stageId: "stage-a",
+        uuid: "uuid-a",
+      }],
     };
+
+    const valid = createDefaultData("device-projection-valid-cleanup");
+    valid.didaProjectionState = structuredClone(validState);
+    expect(hydrateData(valid).didaProjectionState?.receiptCleanupPending).toEqual(
+      validState.receiptCleanupPending,
+    );
 
     const shadow = createDefaultData("device-projection-shadow-state");
     shadow.didaProjectionState = structuredClone(validState);
@@ -783,6 +799,21 @@ describe("HelixDataStore serialization", () => {
     const checkpointLedgerMismatchHydrated = hydrateData(checkpointLedgerMismatch);
     expect(checkpointLedgerMismatchHydrated.didaProjectionState).toBeUndefined();
     expect(checkpointLedgerMismatchHydrated.recoveryIssues.join(" ")).toMatch(/父任务检查点不一致/);
+
+    const invalidCleanup = createDefaultData("device-projection-invalid-cleanup");
+    invalidCleanup.didaProjectionState = structuredClone(validState);
+    invalidCleanup.didaProjectionState.receiptCleanupPending![0]!.marker = "helix-projection:foreign";
+    expect(hydrateData(invalidCleanup).didaProjectionState).toBeUndefined();
+
+    const foreignCleanupTarget = createDefaultData("device-projection-cleanup-target");
+    foreignCleanupTarget.didaProjectionState = structuredClone(validState);
+    foreignCleanupTarget.didaProjectionState.receiptCleanupPending![0]!.targetProjectId = "foreign-list";
+    expect(hydrateData(foreignCleanupTarget).recoveryIssues.join(" ")).toMatch(/目标归属不一致/);
+
+    const cleanupShadow = createDefaultData("device-projection-cleanup-shadow");
+    cleanupShadow.didaProjectionState = structuredClone(validState);
+    (cleanupShadow.didaProjectionState.receiptCleanupPending![0] as unknown as Record<string, unknown>).task = {};
+    expect(hydrateData(cleanupShadow).didaProjectionState).toBeUndefined();
   });
 
   it("makes snapshots wait for an in-flight save and preserves a later interleaved mutation", async () => {

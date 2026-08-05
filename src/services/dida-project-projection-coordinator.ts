@@ -1,0 +1,70 @@
+import type {
+  DidaProjectionTarget,
+  ProjectionActivationPreview,
+} from "../domain/dida-project-projection";
+import type {
+  ProjectWorkspaceProject,
+  ProjectWorkspaceSnapshot,
+} from "./project-workspace";
+import type {
+  ProjectionProjectInput,
+  ProjectionProjectReadModel,
+} from "./dida-project-projection";
+
+export interface ProjectionApplicationPort {
+  readProject(input: ProjectionProjectInput): Promise<ProjectionProjectReadModel>;
+  previewActivation(
+    target: DidaProjectionTarget,
+    counts: { projectCount: number; actionCount: number },
+  ): Promise<ProjectionActivationPreview>;
+  activate(preview: ProjectionActivationPreview, confirmedHash: string): Promise<void>;
+}
+
+export function projectionInputFromProject(project: ProjectWorkspaceProject): ProjectionProjectInput {
+  return {
+    projectId: project.id,
+    projectPath: project.notePath,
+    projectTitle: project.title,
+    projectStatus: project.status,
+    stages: project.cycles.map((stage) => ({ path: stage.notePath, stageId: stage.id })),
+  };
+}
+
+export function projectionStageInProject(
+  snapshot: ProjectWorkspaceSnapshot,
+  projectId: string,
+  stageId: string,
+): ProjectWorkspaceProject["cycles"][number] {
+  const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+  const stage = project?.cycles.find((candidate) => candidate.id === stageId);
+  if (!project || !stage) throw new Error("找不到指定项目中的阶段");
+  return stage;
+}
+
+export async function projectionCounts(
+  snapshot: ProjectWorkspaceSnapshot,
+  projection: Pick<ProjectionApplicationPort, "readProject">,
+): Promise<{ projectCount: number; actionCount: number }> {
+  const inputs = snapshot.projects.map(projectionInputFromProject);
+  const models = await Promise.all(inputs.map((input) => projection.readProject(input)));
+  return {
+    projectCount: inputs.length,
+    actionCount: models.reduce((count, model) =>
+      count + model.stages.reduce((total, stage) => total + stage.managed.length, 0), 0),
+  };
+}
+
+/** 确认时必须基于当前稳定工作区重新计数，并重新读取远端目标。 */
+export async function confirmProjectionActivation(
+  snapshot: ProjectWorkspaceSnapshot,
+  projection: ProjectionApplicationPort,
+  preview: ProjectionActivationPreview,
+  confirmedHash: string,
+): Promise<void> {
+  const counts = await projectionCounts(snapshot, projection);
+  const fresh = await projection.previewActivation(preview.target, counts);
+  if (fresh.previewHash !== confirmedHash) {
+    throw new Error("投影项目或行动数量已变化，请重新预览确认");
+  }
+  await projection.activate(fresh, confirmedHash);
+}

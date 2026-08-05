@@ -69,6 +69,28 @@ import { activeHelixStatusTarget, type ActiveHelixStatusTarget } from "./domain/
 import { HelixSettingTab } from "./ui/settings-tab";
 import { DidaWriteContractConfirmationGate } from "./ui/dida-write-contract-confirmation";
 import { DidaWriteContractCommandController } from "./ui/dida-write-contract-command";
+import {
+  DidaProjectProjectionService,
+  ExistingHelixProjectionCatalogAdapter,
+  ExistingHelixTaskPipelineAdapter,
+  PersistedProjectionDiagnosticsPort,
+  PersistedProjectionStatePort,
+  VaultProjectionMarkdownAdapter,
+  type ProjectionProjectInput,
+  type ProjectionProjectReadModel,
+  type ProjectionSyncSummary,
+} from "./services/dida-project-projection";
+import type {
+  DidaProjectionTarget,
+  ProjectionActivationPreview,
+  ProjectionActionState,
+} from "./domain/dida-project-projection";
+import {
+  confirmProjectionActivation,
+  projectionCounts,
+  projectionInputFromProject,
+  projectionStageInProject,
+} from "./services/dida-project-projection-coordinator";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = {
@@ -82,6 +104,7 @@ export default class HelixPlugin extends Plugin {
   templateManager!: HelixTemplateManager;
   projectWorkspace!: ProjectWorkspaceService;
   taskReferences!: TaskReferenceService;
+  projectProjection!: DidaProjectProjectionService;
   /** 设置页和命令面板使用同一确认规则，但绝不允许跨入口确认。 */
   readonly didaWriteContractSettingsConfirmation = new DidaWriteContractConfirmationGate();
   private readonly didaWriteContractCommandConfirmation = new DidaWriteContractConfirmationGate();
@@ -178,6 +201,15 @@ export default class HelixPlugin extends Plugin {
     }
     this.service = new HelixService(this.store, this.secrets);
     await this.service.initialize();
+    this.projectProjection = new DidaProjectProjectionService(
+      new VaultProjectionMarkdownAdapter(this.vaultRepository),
+      new ExistingHelixTaskPipelineAdapter(this.service),
+      new PersistedProjectionStatePort(this.store),
+      new ExistingHelixProjectionCatalogAdapter(this.service),
+      () => new Date().toISOString(),
+      new PersistedProjectionDiagnosticsPort(this.store),
+    );
+    await this.projectProjection.retryReceiptCleanup();
     if (templateStartupAction(this.recoveryMode, this.settings.templateSetupCompleted) === "prompt") {
       this.showInitialTemplateFolderPrompt();
     }
@@ -506,6 +538,123 @@ export default class HelixPlugin extends Plugin {
       });
     });
     this.refreshAutoSync(runImmediately);
+  }
+
+  async readProjectProjection(projectId: string): Promise<ProjectionProjectReadModel> {
+    return this.withProjectWorkspaceRead(async () =>
+      this.projectProjection.readProject(await this.projectionInput(projectId)));
+  }
+
+  async previewProjectProjection(target: DidaProjectionTarget): Promise<ProjectionActivationPreview> {
+    return this.withProjectWorkspaceRead(async () => {
+      const snapshot = await this.projectWorkspace.snapshot();
+      const counts = await projectionCounts(snapshot, this.projectProjection);
+      return this.projectProjection.previewActivation(target, counts);
+    });
+  }
+
+  async confirmProjectProjection(
+    preview: ProjectionActivationPreview,
+    confirmedHash: string,
+  ): Promise<void> {
+    await this.withWritableProjectMutation(async () => {
+      const snapshot = await this.projectWorkspace.snapshot();
+      await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
+    });
+  }
+
+  async disableProjectProjection(): Promise<void> {
+    await this.withWritableProjectMutation(() => this.projectProjection.disable());
+  }
+
+  async adoptProjectAction(input: {
+    projectId: string;
+    stageId: string;
+    expectedHash: string;
+    line: number;
+  }): Promise<void> {
+    await this.withWritableProjectMutation(async () => {
+      const stage = await this.requireProjectionStage(input.projectId, input.stageId);
+      await this.projectProjection.adoptAction({
+        stagePath: stage.notePath,
+        expectedStageId: stage.id,
+        expectedHash: input.expectedHash,
+        line: input.line,
+      });
+    });
+  }
+
+  async editProjectAction(input: {
+    projectId: string;
+    stageId: string;
+    expectedHash: string;
+    uuid: string;
+    title?: string;
+    state?: ProjectionActionState;
+  }): Promise<void> {
+    await this.withWritableProjectMutation(async () => {
+      const stage = await this.requireProjectionStage(input.projectId, input.stageId);
+      await this.projectProjection.editAction({
+        stagePath: stage.notePath,
+        expectedStageId: stage.id,
+        expectedHash: input.expectedHash,
+        uuid: input.uuid,
+        title: input.title,
+        state: input.state,
+      });
+    });
+  }
+
+  async reconcileProjectProjectionFrozen(input:
+    | { kind: "action"; projectId: string; stageId: string; uuid: string }
+    | { kind: "parent"; projectId: string }): Promise<void> {
+    await this.withWritableProjectMutation(async () => {
+      const projectionInput = await this.projectionInput(input.projectId);
+      if (input.kind === "action") {
+        const stage = await this.requireProjectionStage(input.projectId, input.stageId);
+        await this.projectProjection.reconcileFrozen({
+          kind: "action",
+          projectId: input.projectId,
+          stageId: stage.id,
+          stagePath: stage.notePath,
+          uuid: input.uuid,
+        });
+      } else {
+        await this.projectProjection.reconcileFrozen({
+          kind: "parent",
+          projectId: input.projectId,
+          projectPath: projectionInput.projectPath,
+          title: projectionInput.projectTitle,
+          status: projectionInput.projectStatus,
+        });
+      }
+    });
+  }
+
+  async removeResolvedProjectProjectionReceipt(operationId: string): Promise<void> {
+    await this.withWritableProjectMutation(() =>
+      this.projectProjection.removeResolvedReceipt(operationId));
+  }
+
+  async recoverPendingProjectProjectionReceiptCleanup(): Promise<void> {
+    await this.withWritableProjectMutation(() => this.projectProjection.retryReceiptCleanup());
+  }
+
+  async syncProjectProjection(projectId: string): Promise<ProjectionSyncSummary> {
+    return this.withWritableProjectMutation(async () =>
+      this.projectProjection.synchronizeProject(await this.projectionInput(projectId)));
+  }
+
+  private async projectionInput(projectId: string): Promise<ProjectionProjectInput> {
+    const snapshot = await this.projectWorkspace.snapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("找不到要投影的 Helix 项目");
+    return projectionInputFromProject(project);
+  }
+
+  private async requireProjectionStage(projectId: string, stageId: string) {
+    const snapshot = await this.projectWorkspace.snapshot();
+    return projectionStageInProject(snapshot, projectId, stageId);
   }
 
   async saveTemplateFolderAndEnsure(folder: string): Promise<string[]> {

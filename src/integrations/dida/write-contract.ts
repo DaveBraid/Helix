@@ -61,6 +61,7 @@ export interface DidaWriteContractReport {
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   parentTaskVerified: boolean;
+  taskReopenVerified: boolean;
   manualCleanupRequired?: {
     taskId: string;
     marker: string;
@@ -98,6 +99,7 @@ export class DidaWriteContractRunner {
   private reminderWriteVerified = false;
   private repeatWriteVerified = false;
   private parentTaskVerified = false;
+  private taskReopenVerified = false;
   private manualCleanupRequired: DidaWriteContractReport["manualCleanupRequired"];
   private currentStage = "准备合同测试";
   private readonly timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -119,6 +121,7 @@ export class DidaWriteContractRunner {
     this.reminderWriteVerified = false;
     this.repeatWriteVerified = false;
     this.parentTaskVerified = false;
+    this.taskReopenVerified = false;
     this.manualCleanupRequired = undefined;
     this.currentStage = "准备合同测试";
     const runId = this.createRunId();
@@ -510,6 +513,42 @@ export class DidaWriteContractRunner {
       this.taskCrudVerified = true;
       steps.push("删除测试任务并验证不存在");
 
+      this.beginStage("创建专用任务验证完成后重开");
+      const reopenTask = await this.createCapabilityTask(
+        projectA.id,
+        marker,
+        "重开能力任务",
+        optionalTasks,
+      );
+      try {
+        await this.api.completeTask(projectA.id, reopenTask.id);
+        const completed = normalizeTask(await this.api.getTask(projectA.id, reopenTask.id));
+        this.assertTaskIdentity(completed, reopenTask.id, projectA.id, marker);
+        if (completed.status !== 2) throw new Error("重开探针任务未先完成");
+        await this.updateAndVerifyTaskProperties(
+          reopenTask.id,
+          projectA.id,
+          marker,
+          { id: reopenTask.id, projectId: projectA.id, status: 0 },
+          (reread) => {
+            if (reread.status === 2 ||
+              !sameDidaTaskExcept(completed, reread, ["status", "completedTime"])) {
+              throw new Error("最小 status=0 重开后状态未开放或其他字段发生变化");
+            }
+          },
+        );
+        this.taskReopenVerified = true;
+        steps.push("专用临时任务完成→最小 status=0→精确复读");
+      } catch (error) {
+        if (isUnprovenRemoteOutcome(error)) throw error;
+        this.taskReopenVerified = false;
+        capabilityFailures.push(capabilityFailureSummary("taskReopen"));
+        steps.push("当前账号未通过任务重开合同，重开保持冻结");
+      } finally {
+        await this.cleanupTask(reopenTask, marker);
+        optionalTasks.splice(optionalTasks.indexOf(reopenTask), 1);
+      }
+
       this.beginStage("核对并删除空测试清单");
       for (const project of [...projects].reverse()) {
         await this.deleteVerifiedProject(project, marker);
@@ -571,6 +610,7 @@ export class DidaWriteContractRunner {
       reminderWriteVerified: this.reminderWriteVerified,
       repeatWriteVerified: this.repeatWriteVerified,
       parentTaskVerified: this.parentTaskVerified,
+      taskReopenVerified: this.taskReopenVerified,
       manualCleanupRequired: this.manualCleanupRequired,
       capabilityFailures,
     };
@@ -1357,13 +1397,14 @@ function isUnprovenRemoteOutcome(error: unknown): boolean {
 }
 
 function capabilityFailureSummary(
-  capability: "reminders" | "repeatFlag" | "parentTask" | "boardPlacement",
+  capability: "reminders" | "repeatFlag" | "parentTask" | "boardPlacement" | "taskReopen",
 ): string {
   const name = {
     reminders: "提醒",
     repeatFlag: "重复规则",
     parentTask: "父子任务",
     boardPlacement: "看板归栏",
+    taskReopen: "任务重开",
   }[capability];
   return `${name}：未通过写入合同，保持只读`;
 }

@@ -1,5 +1,6 @@
 import type { DidaColumn, DidaProject, DidaTask } from "../domain/entities";
 import { stableHash } from "../domain/stable";
+import type { HelixDataStore } from "../storage/data-store";
 import {
   assertProjectionActivation,
   buildProjectionActivationPreview,
@@ -143,6 +144,32 @@ export interface ProjectionPersistentState {
 export interface ProjectionStatePort {
   read(): Promise<ProjectionPersistentState>;
   write(expected: ProjectionPersistentState, next: ProjectionPersistentState): Promise<void>;
+}
+
+export class PersistedProjectionStatePort implements ProjectionStatePort {
+  constructor(private readonly store: Pick<HelixDataStore, "snapshot" | "mutate">) {}
+
+  async read(): Promise<ProjectionPersistentState> {
+    return (await this.store.snapshot()).didaProjectionState ?? {
+      enabled: false,
+      ledger: [],
+      parentCheckpoints: [],
+    };
+  }
+
+  async write(expected: ProjectionPersistentState, next: ProjectionPersistentState): Promise<void> {
+    await this.store.mutate((data) => {
+      const current = data.didaProjectionState ?? {
+        enabled: false,
+        ledger: [],
+        parentCheckpoints: [],
+      };
+      if (stableHash(current) !== stableHash(expected)) {
+        throw new Error("滴答项目投影状态在写入前发生竞争");
+      }
+      data.didaProjectionState = structuredClone(next);
+    });
+  }
 }
 
 export interface ProjectionCatalogPort {

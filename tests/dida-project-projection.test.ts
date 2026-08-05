@@ -20,6 +20,7 @@ import {
 import {
   DidaProjectProjectionService,
   ExistingHelixTaskPipelineAdapter,
+  PersistedProjectionStatePort,
   actionCreateClientIdentity,
   parentCreateClientIdentity,
   type ProjectionCatalogPort,
@@ -31,6 +32,8 @@ import {
   type ProjectionWriteReceipt,
   type ExistingHelixTaskQueuePort,
 } from "../src/services/dida-project-projection";
+import { HelixDataStore } from "../src/storage/data-store";
+import { createDefaultData } from "../src/storage/model";
 
 const project: DidaProject = { id: "list-1", name: "科研", viewMode: "kanban", permission: "write" };
 const column: DidaColumn = { id: "column-1", projectId: "list-1", name: "Helix项目" };
@@ -464,6 +467,29 @@ describe("DidaProjectProjectionService with fake remote", () => {
       .resolves.toEqual({ operationId: "op-delete", outcome: "verified-absent" });
     await expect(adapter.rereadTask("list-1", "task")).resolves.toEqual(task);
     expect(calls).toEqual(["queue-create", "queue-recover", "queue-update", "queue-complete", "queue-reopen", "queue-delete", "lease-reread"]);
+  });
+
+  it("persists non-authoritative projection state with compare-and-swap", async () => {
+    let persisted = createDefaultData("device-projection-state");
+    const store = new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    });
+    await store.load();
+    const port = new PersistedProjectionStatePort(store);
+    const initial = await port.read();
+    expect(initial).toEqual({ enabled: false, ledger: [], parentCheckpoints: [] });
+    const activated: ProjectionPersistentState = {
+      enabled: true,
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      confirmedPreviewHash: "a".repeat(64),
+      ledger: [],
+      parentCheckpoints: [],
+    };
+    await port.write(initial, activated);
+    await expect(port.read()).resolves.toEqual(activated);
+    await expect(port.write(initial, { ...initial, enabled: false }))
+      .rejects.toThrow(/写入前发生竞争/);
   });
 });
 

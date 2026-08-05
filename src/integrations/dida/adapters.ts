@@ -90,6 +90,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
       reminderWriteVerified: verified.reminderWriteVerified === true && writeFields.has("reminders"),
       repeatWriteVerified: verified.repeatWriteVerified === true && writeFields.has("repeatFlag"),
       parentTaskVerified: verified.parentTaskVerified === true && writeFields.has("parentId"),
+      taskReopenVerified: verified.taskReopenVerified === true && writeFields.has("status"),
     };
     // 纯跨清单迁移已由 moveTask 表达；不得再发送只有身份字段的空业务更新。
     if (writeFields.size > 0) {
@@ -207,6 +208,8 @@ export interface DidaTaskWriteCapabilities {
   reminderWriteVerified?: boolean;
   repeatWriteVerified?: boolean;
   parentTaskVerified?: boolean;
+  boardPlacementVerified?: boolean;
+  taskReopenVerified?: boolean;
 }
 
 export function taskCreatePayload(
@@ -234,6 +237,9 @@ export function taskCreatePayload(
       : {}),
     ...(capabilities.parentTaskVerified && Object.hasOwn(value, "parentId")
       ? { parentId: value.parentId }
+      : {}),
+    ...(capabilities.boardPlacementVerified && Object.hasOwn(value, "columnId")
+      ? { columnId: value.columnId }
       : {}),
   };
 }
@@ -279,6 +285,9 @@ export function taskUpdatePayload(
       : {}),
     ...(writeFields.has("parentId") && capabilities.parentTaskVerified && Object.hasOwn(value, "parentId")
       ? { parentId: clearedAs(value, "parentId", null) }
+      : {}),
+    ...(writeFields.has("status") && capabilities.taskReopenVerified && value.status === 0
+      ? { status: 0 }
       : {}),
   };
 }

@@ -22,6 +22,11 @@ import {
   type TaskMatrixRules,
 } from "../domain/task-views";
 import { normalizeTemplateFolder } from "../domain/template-path";
+import type {
+  DidaProjectionTarget,
+  ProjectionFreezeReason,
+  ProjectionLedgerEntry,
+} from "../domain/dida-project-projection";
 
 export interface HelixSettings {
   rootFolder: string;
@@ -34,6 +39,9 @@ export interface HelixSettings {
   showSampleDataWhenDisconnected: boolean;
   lineageCanvasPath: string;
   taskMatrixRules: TaskMatrixRules;
+  didaProjectionEnabled: boolean;
+  didaProjectionTargetProjectId?: string;
+  didaProjectionTargetColumnId?: string;
 }
 
 export const DEFAULT_SETTINGS: HelixSettings = {
@@ -45,6 +53,7 @@ export const DEFAULT_SETTINGS: HelixSettings = {
   showSampleDataWhenDisconnected: true,
   lineageCanvasPath: "Helix/Project Lineage.canvas",
   taskMatrixRules: { ...DEFAULT_TASK_MATRIX_RULES },
+  didaProjectionEnabled: false,
 };
 
 export interface HelixPersistedData {
@@ -60,6 +69,36 @@ export interface HelixPersistedData {
   inProgress: InProgressEntry[];
   events: unknown[];
   recoveryIssues: string[];
+  projectionOperationReceipts: Array<{
+    clientIdentity: string;
+    projectId: string;
+    operationId: string;
+    marker: string;
+    outcome: "verified" | "verified-absent" | "unknown" | "conflict" | "retryable" | "authorization" | "capability";
+    remoteTaskId?: string;
+    message?: string;
+    conflictId?: string;
+  }>;
+  didaProjectionState?: {
+    enabled: boolean;
+    target?: DidaProjectionTarget;
+    confirmedPreviewHash?: string;
+    ledger: ProjectionLedgerEntry[];
+    parentCheckpoints: Array<{
+      projectId: string;
+      remoteId?: string;
+      marker: string;
+      frozen?: ProjectionFreezeReason;
+      operationId?: string;
+      conflictId?: string;
+    }>;
+    parentBases?: Array<{
+      projectId: string;
+      remoteId: string;
+      title: string;
+      status: number;
+    }>;
+  };
   didaContractCapabilities?: {
     probeVersion: number;
     authorizationBinding?: string;
@@ -69,6 +108,7 @@ export interface HelixPersistedData {
     reminderWriteVerified?: boolean;
     repeatWriteVerified?: boolean;
     parentTaskVerified?: boolean;
+    taskReopenVerified?: boolean;
     verifiedAt: string;
   };
   lineageConflict?: {
@@ -97,6 +137,7 @@ export function createDefaultData(deviceId?: string): HelixPersistedData {
     inProgress: [],
     events: [],
     recoveryIssues: [],
+    projectionOperationReceipts: [],
   };
 }
 
@@ -182,6 +223,27 @@ export function hydrateData(value: unknown): HelixPersistedData {
     raw.didaContractCapabilities,
     recoveryIssues,
   );
+  const didaProjectionState = validateDidaProjectionState(
+    raw.didaProjectionState,
+    recoveryIssues,
+  );
+  const projectionReceiptsByOperation = uniqueArray(
+    validArray(
+    raw.projectionOperationReceipts,
+    isProjectionCreateReceipt,
+    "滴答项目投影创建收据",
+    recoveryIssues,
+    ),
+    (entry) => entry.operationId,
+    "滴答项目投影操作收据 ID",
+    recoveryIssues,
+  );
+  const projectionOperationReceipts = uniqueArray(
+    projectionReceiptsByOperation,
+    (entry) => entry.clientIdentity,
+    "滴答项目投影 client identity",
+    recoveryIssues,
+  );
   return {
     ...defaults,
     schemaVersion: 2,
@@ -196,6 +258,8 @@ export function hydrateData(value: unknown): HelixPersistedData {
     events,
     recoveryIssues,
     didaContractCapabilities,
+    didaProjectionState,
+    projectionOperationReceipts,
     lineageConflict,
     lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : undefined,
   };
@@ -224,6 +288,7 @@ function validateDidaContractCapabilities(
       "reminderWriteVerified",
       "repeatWriteVerified",
       "parentTaskVerified",
+      "taskReopenVerified",
     ].some((key) => record[key] !== undefined && typeof record[key] !== "boolean")
   ) {
     issues.push("滴答合同能力缓存字段无效，已忽略并进入只读恢复模式");
@@ -238,8 +303,169 @@ function validateDidaContractCapabilities(
     reminderWriteVerified: record.reminderWriteVerified === true,
     repeatWriteVerified: record.repeatWriteVerified === true,
     parentTaskVerified: record.parentTaskVerified === true,
+    taskReopenVerified: record.taskReopenVerified === true,
     verifiedAt: record.verifiedAt,
   };
+}
+
+const PROJECTION_FREEZE_REASONS = new Set<ProjectionFreezeReason>([
+  "conflict", "unknown-outcome", "retryable", "authorization", "capability",
+  "markdown-race", "identity-mismatch",
+]);
+
+function isProjectionCreateReceipt(
+  value: unknown,
+): value is HelixPersistedData["projectionOperationReceipts"][number] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const allowed = new Set([
+    "clientIdentity", "projectId", "operationId", "marker", "outcome",
+    "remoteTaskId", "message", "conflictId",
+  ]);
+  if (Object.keys(record).some((key) => !allowed.has(key))) return false;
+  const id = (candidate: unknown) => typeof candidate === "string" && candidate.length > 0 &&
+    candidate === candidate.trim() && candidate.length <= 512 && !/[\r\n]/u.test(candidate);
+  const outcomes = ["verified", "verified-absent", "unknown", "conflict", "retryable", "authorization", "capability"];
+  return id(record.clientIdentity) && id(record.projectId) && id(record.operationId) && id(record.marker) &&
+    outcomes.includes(String(record.outcome)) &&
+    (record.message === undefined || typeof record.message === "string") &&
+    (record.conflictId === undefined || id(record.conflictId)) &&
+    (record.remoteTaskId === undefined || id(record.remoteTaskId));
+}
+
+function validateDidaProjectionState(
+  value: unknown,
+  issues: string[],
+): HelixPersistedData["didaProjectionState"] {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    issues.push("滴答项目投影状态无效，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const stableId = (candidate: unknown): candidate is string =>
+    typeof candidate === "string" && candidate === candidate.trim() &&
+    candidate.length > 0 && candidate.length <= 512 && !/[\r\n]/u.test(candidate);
+  const onlyKeys = (candidate: Record<string, unknown>, allowed: readonly string[]) =>
+    Object.keys(candidate).every((key) => allowed.includes(key));
+  if (!onlyKeys(record, [
+    "enabled", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
+  ])) {
+    issues.push("滴答项目投影状态含未知字段，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  const target = record.target;
+  const validTarget = target === undefined || (!!target && typeof target === "object" &&
+    !Array.isArray(target) &&
+    onlyKeys(target as Record<string, unknown>, ["targetProjectId", "targetColumnId"]) &&
+    stableId((target as Record<string, unknown>).targetProjectId) &&
+    stableId((target as Record<string, unknown>).targetColumnId));
+  const validFreeze = (candidate: unknown) =>
+    candidate === undefined || PROJECTION_FREEZE_REASONS.has(candidate as ProjectionFreezeReason);
+  const ledger = record.ledger;
+  const checkpoints = record.parentCheckpoints;
+  const bases = record.parentBases;
+  const validLedger = Array.isArray(ledger) && ledger.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const row = item as Record<string, unknown>;
+    if (!onlyKeys(row, [
+      "uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId",
+      "remoteId", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
+    ])) return false;
+    return ["uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId", "title", "sourceHash"]
+      .every((key) => stableId(row[key])) &&
+      /^[a-f0-9]{64}$/u.test(String(row.sourceHash)) &&
+      ["idea", "active", "completed", "paused", "terminated"].includes(String(row.state)) &&
+      (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
+      (row.operationId === undefined || stableId(row.operationId)) &&
+      (row.conflictId === undefined || stableId(row.conflictId)) &&
+      (row.tombstone === undefined || typeof row.tombstone === "boolean");
+  });
+  const validCheckpoints = Array.isArray(checkpoints) && checkpoints.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const row = item as Record<string, unknown>;
+    if (!onlyKeys(row, ["projectId", "remoteId", "marker", "frozen", "operationId", "conflictId"])) {
+      return false;
+    }
+    return stableId(row.projectId) && row.marker === `helix-project-projection:${row.projectId}` &&
+      (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
+      (row.operationId === undefined || stableId(row.operationId)) &&
+      (row.conflictId === undefined || stableId(row.conflictId));
+  });
+  const validBases = bases === undefined || (Array.isArray(bases) && bases.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const row = item as Record<string, unknown>;
+    if (!onlyKeys(row, ["projectId", "remoteId", "title", "status"])) return false;
+    return stableId(row.projectId) && stableId(row.remoteId) && stableId(row.title) &&
+      (row.status === 0 || row.status === 2);
+  }));
+  if (typeof record.enabled !== "boolean" || !validTarget || !validLedger || !validCheckpoints || !validBases ||
+    (record.enabled === true && (target === undefined || record.confirmedPreviewHash === undefined)) ||
+    (record.confirmedPreviewHash !== undefined &&
+      (typeof record.confirmedPreviewHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.confirmedPreviewHash)))) {
+    issues.push("滴答项目投影状态含损坏字段，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  const uuids = (ledger as ProjectionLedgerEntry[]).map((entry) => entry.uuid);
+  const remoteIds = (ledger as ProjectionLedgerEntry[])
+    .map((entry) => entry.remoteId)
+    .filter((id): id is string => id !== undefined);
+  const checkpointProjectIds = (checkpoints as Array<{ projectId: string }>).map((entry) => entry.projectId);
+  const baseRows = (bases ?? []) as Array<{ projectId: string; remoteId: string }>;
+  const baseProjectIds = baseRows.map((entry) => entry.projectId);
+  const baseRemoteIds = baseRows.map((entry) => entry.remoteId);
+  if (new Set(uuids).size !== uuids.length || new Set(remoteIds).size !== remoteIds.length ||
+    new Set(checkpointProjectIds).size !== checkpointProjectIds.length ||
+    new Set(baseProjectIds).size !== baseProjectIds.length ||
+    new Set(baseRemoteIds).size !== baseRemoteIds.length) {
+    issues.push("滴答项目投影状态含重复身份，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  const normalizedTarget = target as DidaProjectionTarget | undefined;
+  const normalizedLedger = ledger as ProjectionLedgerEntry[];
+  if ((!normalizedTarget && (normalizedLedger.length > 0 || checkpointProjectIds.length > 0 || baseRows.length > 0)) ||
+    (normalizedTarget && normalizedLedger.some((entry) =>
+      entry.targetProjectId !== normalizedTarget.targetProjectId ||
+      entry.targetColumnId !== normalizedTarget.targetColumnId))) {
+    issues.push("滴答项目投影目标归属不一致，已忽略并进入只读恢复模式");
+    return undefined;
+  }
+  const baseByProject = new Map(baseRows.map((entry) => [entry.projectId, entry.remoteId]));
+  const parentByProject = new Map<string, string>();
+  for (const entry of normalizedLedger) {
+    const existingParent = parentByProject.get(entry.projectId);
+    if ((existingParent && existingParent !== entry.parentTaskId) ||
+      (baseByProject.has(entry.projectId) && baseByProject.get(entry.projectId) !== entry.parentTaskId)) {
+      issues.push("滴答项目投影父任务归属不一致，已忽略并进入只读恢复模式");
+      return undefined;
+    }
+    parentByProject.set(entry.projectId, entry.parentTaskId);
+  }
+  for (const checkpoint of checkpoints as Array<{ projectId: string; remoteId?: string }>) {
+    if (checkpoint.remoteId &&
+      ((baseByProject.has(checkpoint.projectId) &&
+        baseByProject.get(checkpoint.projectId) !== checkpoint.remoteId) ||
+        (parentByProject.has(checkpoint.projectId) &&
+          parentByProject.get(checkpoint.projectId) !== checkpoint.remoteId))) {
+      issues.push("滴答项目投影父任务检查点不一致，已忽略并进入只读恢复模式");
+      return undefined;
+    }
+  }
+  const normalized: NonNullable<HelixPersistedData["didaProjectionState"]> = {
+    enabled: record.enabled as boolean,
+    ledger: normalizedLedger.map((entry) => ({ ...entry })),
+    parentCheckpoints: (checkpoints as NonNullable<HelixPersistedData["didaProjectionState"]>["parentCheckpoints"])
+      .map((entry) => ({ ...entry })),
+  };
+  if (normalizedTarget) normalized.target = { ...normalizedTarget };
+  if (typeof record.confirmedPreviewHash === "string") {
+    normalized.confirmedPreviewHash = record.confirmedPreviewHash;
+  }
+  if (bases !== undefined) {
+    normalized.parentBases = (bases as NonNullable<HelixPersistedData["didaProjectionState"]>["parentBases"])
+      ?.map((entry) => ({ ...entry }));
+  }
+  return normalized;
 }
 
 function hydrateSettings(
@@ -321,6 +547,27 @@ function hydrateSettings(
     } else {
       issues.push("taskMatrixRules 设置无效，已恢复默认值并进入只读恢复模式");
     }
+  }
+  const projectionId = (value: unknown): value is string =>
+    typeof value === "string" && value === value.trim() && value.length > 0 &&
+    value.length <= 512 && !/[\r\n]/u.test(value);
+  if (raw.didaProjectionTargetProjectId !== undefined) {
+    if (projectionId(raw.didaProjectionTargetProjectId)) {
+      settings.didaProjectionTargetProjectId = raw.didaProjectionTargetProjectId;
+    } else issues.push("didaProjectionTargetProjectId 无效，已禁用投影并进入只读恢复模式");
+  }
+  if (raw.didaProjectionTargetColumnId !== undefined) {
+    if (projectionId(raw.didaProjectionTargetColumnId)) {
+      settings.didaProjectionTargetColumnId = raw.didaProjectionTargetColumnId;
+    } else issues.push("didaProjectionTargetColumnId 无效，已禁用投影并进入只读恢复模式");
+  }
+  if (raw.didaProjectionEnabled !== undefined) {
+    if (typeof raw.didaProjectionEnabled !== "boolean") {
+      issues.push("didaProjectionEnabled 无效，已恢复禁用并进入只读恢复模式");
+    } else if (raw.didaProjectionEnabled &&
+      (!settings.didaProjectionTargetProjectId || !settings.didaProjectionTargetColumnId)) {
+      issues.push("滴答投影缺少精确目标清单或分栏 ID，已恢复禁用并进入只读恢复模式");
+    } else settings.didaProjectionEnabled = raw.didaProjectionEnabled;
   }
   return settings;
 }

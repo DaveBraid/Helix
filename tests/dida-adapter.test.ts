@@ -194,6 +194,25 @@ describe("DidaTaskAdapter", () => {
     expect(taskCreatePayload(value)).not.toHaveProperty("columnName");
     expect(taskUpdatePayload(value)).not.toHaveProperty("columnName");
   });
+  it("emits minimal status=0 only for an explicitly selected verified reopen", () => {
+    const open = desiredTask(0);
+    expect(taskUpdatePayload(open, {}, ["status"])).toEqual({
+      id: open.id,
+      projectId: open.projectId,
+    });
+    expect(taskUpdatePayload(open, { taskReopenVerified: true }, ["title"])).toEqual({
+      id: open.id,
+      projectId: open.projectId,
+      title: open.title,
+    });
+    expect(taskUpdatePayload(open, { taskReopenVerified: true }, ["status"])).toEqual({
+      id: open.id,
+      projectId: open.projectId,
+      status: 0,
+    });
+    expect(taskUpdatePayload({ ...open, status: 2 }, { taskReopenVerified: true }, ["status"]))
+      .toEqual({ id: open.id, projectId: open.projectId });
+  });
   it("keeps server-derived board placement names out of writable task snapshots", async () => {
     const api = new FakeTaskApi();
     api.task = { ...api.task, columnId: "todo", columnName: "待办" };

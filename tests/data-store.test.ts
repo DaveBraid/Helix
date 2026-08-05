@@ -629,6 +629,7 @@ describe("HelixDataStore serialization", () => {
       reminderWriteVerified: false,
       repeatWriteVerified: false,
       parentTaskVerified: false,
+      taskReopenVerified: false,
       verifiedAt: "2026-07-31T00:00:00.000Z",
     });
 
@@ -683,6 +684,105 @@ describe("HelixDataStore serialization", () => {
     });
     expect(stale.didaContractCapabilities).toBeUndefined();
     expect(stale.recoveryIssues).toEqual([]);
+  });
+
+  it("rejects projection receipts carrying task shadow truth and incomplete enabled state", () => {
+    const raw = createDefaultData("device-projection-strict");
+    raw.projectionOperationReceipts = [{
+      clientIdentity: "helix-action:project-a:stage-a:uuid-a",
+      projectId: "target-list",
+      operationId: "op-projection-a",
+      marker: "helix-action-projection:uuid-a",
+      outcome: "verified",
+      remoteTaskId: "remote-a",
+      task: { id: "remote-a", projectId: "target-list", title: "shadow", status: 0 },
+    } as unknown as typeof raw.projectionOperationReceipts[number]];
+    raw.didaProjectionState = {
+      enabled: true,
+      ledger: [],
+      parentCheckpoints: [],
+    };
+
+    const hydrated = hydrateData(raw);
+
+    expect(hydrated.projectionOperationReceipts).toEqual([]);
+    expect(hydrated.didaProjectionState).toBeUndefined();
+    expect(hydrated.recoveryIssues.join(" ")).toMatch(/投影状态.*投影创建收据/);
+  });
+
+  it("rejects projection state shadow fields, duplicate identities, and target ownership mismatch", () => {
+    const validState = {
+      enabled: true,
+      target: { targetProjectId: "target-list", targetColumnId: "target-column" },
+      confirmedPreviewHash: "a".repeat(64),
+      ledger: [{
+        uuid: "uuid-a",
+        projectId: "project-a",
+        stageId: "stage-a",
+        parentTaskId: "parent-a",
+        targetProjectId: "target-list",
+        targetColumnId: "target-column",
+        remoteId: "remote-a",
+        title: "Action",
+        state: "active" as const,
+        sourceHash: "b".repeat(64),
+      }],
+      parentCheckpoints: [{
+        projectId: "project-a",
+        marker: "helix-project-projection:project-a",
+      }],
+      parentBases: [{ projectId: "project-a", remoteId: "parent-a", title: "Project", status: 0 }],
+    };
+
+    const shadow = createDefaultData("device-projection-shadow-state");
+    shadow.didaProjectionState = structuredClone(validState);
+    (shadow.didaProjectionState!.ledger[0] as unknown as Record<string, unknown>).task = {
+      id: "remote-a",
+      title: "shadow truth",
+    };
+    const shadowHydrated = hydrateData(shadow);
+    expect(shadowHydrated.didaProjectionState).toBeUndefined();
+    expect(shadowHydrated.recoveryIssues.join(" ")).toMatch(/投影状态含损坏字段/);
+
+    const duplicate = createDefaultData("device-projection-duplicate-state");
+    duplicate.didaProjectionState = {
+      ...structuredClone(validState),
+      parentCheckpoints: [
+        ...validState.parentCheckpoints,
+        ...validState.parentCheckpoints,
+      ],
+    };
+    const duplicateHydrated = hydrateData(duplicate);
+    expect(duplicateHydrated.didaProjectionState).toBeUndefined();
+    expect(duplicateHydrated.recoveryIssues.join(" ")).toMatch(/重复身份/);
+
+    const mismatch = createDefaultData("device-projection-target-mismatch");
+    mismatch.didaProjectionState = structuredClone(validState);
+    mismatch.didaProjectionState.ledger[0]!.targetProjectId = "foreign-list";
+    const mismatchHydrated = hydrateData(mismatch);
+    expect(mismatchHydrated.didaProjectionState).toBeUndefined();
+    expect(mismatchHydrated.recoveryIssues.join(" ")).toMatch(/目标归属不一致/);
+
+    const parentMismatch = createDefaultData("device-projection-parent-mismatch");
+    parentMismatch.didaProjectionState = structuredClone(validState);
+    parentMismatch.didaProjectionState.parentCheckpoints[0]!.remoteId = "foreign-parent";
+    const parentMismatchHydrated = hydrateData(parentMismatch);
+    expect(parentMismatchHydrated.didaProjectionState).toBeUndefined();
+    expect(parentMismatchHydrated.recoveryIssues.join(" ")).toMatch(/父任务检查点不一致/);
+
+    const checkpointLedgerMismatch = createDefaultData("device-projection-checkpoint-ledger-mismatch");
+    checkpointLedgerMismatch.didaProjectionState = {
+      ...structuredClone(validState),
+      parentBases: undefined,
+      parentCheckpoints: [{
+        projectId: "project-a",
+        remoteId: "foreign-parent",
+        marker: "helix-project-projection:project-a",
+      }],
+    };
+    const checkpointLedgerMismatchHydrated = hydrateData(checkpointLedgerMismatch);
+    expect(checkpointLedgerMismatchHydrated.didaProjectionState).toBeUndefined();
+    expect(checkpointLedgerMismatchHydrated.recoveryIssues.join(" ")).toMatch(/父任务检查点不一致/);
   });
 
   it("makes snapshots wait for an in-flight save and preserves a later interleaved mutation", async () => {

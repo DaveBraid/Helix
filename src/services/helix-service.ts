@@ -69,6 +69,12 @@ import { buildProjectUpdateOperation } from "./project-operations";
 import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
 import { RemoteWriteGate } from "./remote-write-gate";
+import type {
+  ExistingHelixTaskQueuePort,
+  ProjectionDeleteReceipt,
+  ProjectionRemoteIdentity,
+  ProjectionWriteReceipt,
+} from "./dida-project-projection";
 import { claimNextQueueOperation } from "./queue-claim";
 import {
   claimConflictApplication,
@@ -93,6 +99,7 @@ export interface HelixRuntimeState {
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   parentTaskVerified: boolean;
+  taskReopenVerified: boolean;
   demoMode: boolean;
   syncWarnings: string[];
   lastSyncAt?: string;
@@ -123,13 +130,14 @@ const EMPTY_STATE: HelixRuntimeState = {
   reminderWriteVerified: false,
   repeatWriteVerified: false,
   parentTaskVerified: false,
+  taskReopenVerified: false,
   demoMode: false,
   syncWarnings: [],
   attentionCount: 0,
   recoveryIssues: [],
 };
 
-export class HelixService {
+export class HelixService implements ExistingHelixTaskQueuePort {
   private readonly api: DidaApi;
   private readonly habitService: DidaHabitService;
   private readonly focusService: DidaFocusService;
@@ -242,6 +250,7 @@ export class HelixService {
       reminderWriteVerified: verifiedCapabilities?.reminderWriteVerified ?? false,
       repeatWriteVerified: verifiedCapabilities?.repeatWriteVerified ?? false,
       parentTaskVerified: verifiedCapabilities?.parentTaskVerified ?? false,
+      taskReopenVerified: verifiedCapabilities?.taskReopenVerified ?? false,
       demoMode:
         !authorizationConfigured &&
         !hasCachedDidaData &&
@@ -310,6 +319,7 @@ export class HelixService {
         reminderWriteVerified: false,
         repeatWriteVerified: false,
         parentTaskVerified: false,
+        taskReopenVerified: false,
         demoMode:
           !this.secrets.getDidaToken() &&
           this.state.projects.length === 0 &&
@@ -634,6 +644,7 @@ export class HelixService {
         const reminderWriteVerified = report.reminderWriteVerified && contractArtifactsClean;
         const repeatWriteVerified = report.repeatWriteVerified && contractArtifactsClean;
         const parentTaskVerified = report.parentTaskVerified && contractArtifactsClean;
+        const taskReopenVerified = report.taskReopenVerified && contractArtifactsClean;
         const token = this.secrets.getDidaToken();
         if (!token) throw new Error("写入合同结束时滴答授权已缺失");
         const authorizationBinding = await didaAuthorizationBinding(token);
@@ -647,6 +658,7 @@ export class HelixService {
             reminderWriteVerified,
             repeatWriteVerified,
             parentTaskVerified,
+            taskReopenVerified,
             verifiedAt: new Date().toISOString(),
           };
         });
@@ -657,6 +669,7 @@ export class HelixService {
           reminderWriteVerified,
           repeatWriteVerified,
           parentTaskVerified,
+          taskReopenVerified,
         });
         } else {
           await this.store.mutate((data) => {
@@ -684,6 +697,7 @@ export class HelixService {
       reminderWriteVerified: false,
       repeatWriteVerified: false,
       parentTaskVerified: false,
+      taskReopenVerified: false,
     });
   }
 
@@ -794,6 +808,123 @@ export class HelixService {
       await this.createTaskWithAuthorizationLease(title, projectId, attributes);
     } finally {
       releaseAuthorizationLease();
+    }
+  }
+
+  async enqueueProjectionCreate(
+    task: DidaTask,
+    clientIdentity: string,
+  ): Promise<ProjectionWriteReceipt> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      this.assertWritable();
+      this.assertProjectionCapabilities(false);
+      const existing = await this.recoverProjectionCreate(clientIdentity, task.projectId);
+      if (existing) return existing;
+      const now = new Date().toISOString();
+      const localId = `local-projection-${stableHash(clientIdentity).slice(0, 24)}`;
+      const localTask = { ...task, id: localId };
+      const operation: SyncQueueOperation<DidaTask> = {
+        id: `op-projection-${stableHash(clientIdentity).slice(0, 32)}`,
+        kind: "task",
+        entityId: localId,
+        projectId: task.projectId,
+        operation: "create",
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+        status: "pending",
+        idempotencyFingerprint: clientIdentity,
+        local: createSnapshot("task", localId, localTask, { capturedAt: now }),
+        writeFields: ["title", "content", "parentId", "columnId"],
+      };
+      await this.store.mutate((data) => {
+        if (data.projectionOperationReceipts.some((item) => item.clientIdentity === clientIdentity) ||
+          data.queue.some((item) => item.idempotencyFingerprint === clientIdentity)) {
+          throw new Error("投影创建 client identity 已被占用，请恢复既有收据");
+        }
+        data.localSnapshots[`task:${localId}`] = operation.local as EntitySnapshot<unknown>;
+        const queue = new OfflineQueue(data.queue);
+        queue.enqueue(operation);
+        data.queue = queue.list();
+      });
+      await this.queueDrain.run(() => this.runDrainQueueWithRemoteWrite());
+      return (await this.recoverProjectionCreate(clientIdentity, task.projectId)) ?? {
+        operationId: operation.id,
+        outcome: "retryable",
+        message: "投影创建已持久排队，尚未取得写后收据",
+      };
+    } finally {
+      release();
+    }
+  }
+
+  async recoverProjectionCreate(
+    clientIdentity: string,
+    projectId: string,
+  ): Promise<ProjectionWriteReceipt | null> {
+    const data = await this.store.snapshot();
+    const receipt = data.projectionOperationReceipts.find((item) =>
+      item.clientIdentity === clientIdentity && item.projectId === projectId);
+    if (receipt) return projectionWriteReceipt(receipt, data);
+    const operation = data.queue.find((item) =>
+      item.kind === "task" && item.operation === "create" &&
+      item.idempotencyFingerprint === clientIdentity && item.projectId === projectId);
+    if (!operation) return null;
+    return {
+      operationId: operation.id,
+      outcome: operation.remoteOutcomeUnknown || operation.status === "reconciliation"
+        ? "unknown"
+        : operation.status === "blocked" ? "conflict" : "retryable",
+      message: operation.lastError ?? "投影创建仍在现有持久队列中",
+      conflictId: operation.conflictId,
+    };
+  }
+
+  async enqueueProjectionUpdate(task: DidaTask, writeFields: string[]): Promise<ProjectionWriteReceipt> {
+    return this.enqueueProjectionExisting(task, "update", writeFields);
+  }
+
+  async enqueueProjectionComplete(task: DidaTask): Promise<ProjectionWriteReceipt> {
+    return this.enqueueProjectionExisting(task, "complete", []);
+  }
+
+  async enqueueProjectionReopen(task: DidaTask): Promise<ProjectionWriteReceipt> {
+    return this.enqueueProjectionExisting(task, "update", ["status"]);
+  }
+
+  async enqueueProjectionDelete(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      this.assertWritable();
+      this.assertProjectionCapabilities(false);
+      const remote = await this.verifyRemoteTaskWithAuthorizationLease(
+        expected.targetProjectId,
+        expected.taskId,
+      );
+      if (remote.parentId !== expected.parentTaskId || remote.columnId !== expected.targetColumnId ||
+        remote.content !== expected.marker) {
+        return { operationId: `op-projection-delete-${crypto.randomUUID()}`, outcome: "conflict", message: "投影删除写前身份复读不一致" };
+      }
+      const now = new Date().toISOString();
+      const base = createSnapshot("task", remote.id, remote, { capturedAt: now });
+      const operation: SyncQueueOperation<DidaTask> = {
+        id: `op-projection-delete-${crypto.randomUUID()}`,
+        kind: "task",
+        entityId: remote.id,
+        projectId: remote.projectId,
+        operation: "delete",
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+        status: "pending",
+        idempotencyFingerprint: `helix-delete:${expected.marker}`,
+        base,
+        local: createSnapshot("task", remote.id, null as unknown as DidaTask, { capturedAt: now }),
+      };
+      return this.enqueueAndDrainProjectionOperation(operation, true) as Promise<ProjectionDeleteReceipt>;
+    } finally {
+      release();
     }
   }
 
@@ -1243,6 +1374,77 @@ export class HelixService {
       tasks: cachedTaskValues(await this.store.snapshot()),
       inProgress: (await this.store.snapshot()).inProgress,
     });
+  }
+
+  private async enqueueProjectionExisting(
+    task: DidaTask,
+    operationType: "update" | "complete",
+    writeFields: string[],
+  ): Promise<ProjectionWriteReceipt> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      this.assertWritable();
+      this.assertProjectionCapabilities(operationType === "update" && writeFields.includes("status"));
+      const base = (await this.store.snapshot()).baseSnapshots[`task:${task.id}`] as
+        | EntitySnapshot<DidaTask>
+        | undefined;
+      if (!base) return {
+        operationId: `op-projection-${crypto.randomUUID()}`,
+        outcome: "conflict",
+        message: "投影任务缺少现有同步 Base",
+      };
+      const now = new Date().toISOString();
+      const operation = buildTaskUpdateOperation(
+        taskSyncValue(task),
+        base,
+        operationType,
+        now,
+        `op-projection-${crypto.randomUUID()}`,
+        writeFields,
+      );
+      operation.idempotencyFingerprint = `helix-write:${operation.id}`;
+      return this.enqueueAndDrainProjectionOperation(operation, true) as Promise<ProjectionWriteReceipt>;
+    } finally {
+      release();
+    }
+  }
+
+  private async enqueueAndDrainProjectionOperation(
+    operation: SyncQueueOperation<DidaTask>,
+    authorizationLeaseHeld = false,
+  ): Promise<ProjectionWriteReceipt | ProjectionDeleteReceipt> {
+    const release = authorizationLeaseHeld ? () => undefined : this.remoteWriteGate.enterShared();
+    try {
+      await this.store.mutate((data) => {
+        const queue = new OfflineQueue(data.queue);
+        queue.enqueue(operation);
+        data.queue = queue.list();
+        data.localSnapshots[`task:${operation.entityId}`] = operation.local as EntitySnapshot<unknown>;
+      });
+      await this.queueDrain.run(() => this.runDrainQueueWithRemoteWrite());
+      const data = await this.store.snapshot();
+      const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operation.id);
+      if (!receipt) return {
+        operationId: operation.id,
+        outcome: "retryable",
+        message: "投影写入已持久排队，尚未取得收据",
+      };
+      return receipt.outcome === "verified-absent"
+        ? { operationId: receipt.operationId, outcome: "verified-absent", conflictId: receipt.conflictId }
+        : projectionWriteReceipt(receipt, data);
+    } finally {
+      release();
+    }
+  }
+
+  private assertProjectionCapabilities(reopen: boolean): void {
+    this.assertTaskCrudVerified();
+    if (!this.state.parentTaskVerified || !this.state.boardPlacementVerified) {
+      throw new Error("当前授权尚未验证投影所需的父子任务与看板归栏能力");
+    }
+    if (reopen && !this.state.taskReopenVerified) {
+      throw new Error("当前授权尚未验证任务重开能力");
+    }
   }
 
   private assertTaskCrudVerified(): void {
@@ -1702,6 +1904,7 @@ export class HelixService {
           if (result.outcome === "conflict") latest.markBlocked(claimedOperation.id, result.conflict.id);
           else latest.complete(claimedOperation.id);
           data.queue = latest.list();
+          persistProjectionOperationReceipt(data, claimedOperation, result);
           if (
             claimedOperation.operation === "create" &&
             result.outcome === "pushed" &&
@@ -1749,7 +1952,12 @@ export class HelixService {
       } catch (error) {
         if (this.disposed) return;
         const claimedOperation = operation as SyncQueueOperation;
-        await this.mutateQueue((latest) => latest.markFailed(claimedOperation.id, error));
+        await this.store.mutate((data) => {
+          const latest = new OfflineQueue(data.queue);
+          latest.markFailed(claimedOperation.id, error);
+          data.queue = latest.list();
+          persistProjectionFailureReceipt(data, claimedOperation, error);
+        });
       }
     }
   }
@@ -2159,4 +2367,112 @@ function taskContextFromConflict(
     }
   }
   return undefined;
+}
+
+function isProjectionQueueOperation(operation: SyncQueueOperation): boolean {
+  return operation.kind === "task" &&
+    typeof operation.idempotencyFingerprint === "string" &&
+    operation.idempotencyFingerprint.startsWith("helix-");
+}
+
+function persistProjectionOperationReceipt(
+  data: HelixPersistedData,
+  operation: SyncQueueOperation,
+  result:
+    | Awaited<ReturnType<SyncEngine<DidaTask>["process"]>>
+    | Awaited<ReturnType<SyncEngine<DidaProject>["process"]>>,
+): void {
+  if (!isProjectionQueueOperation(operation)) return;
+  const clientIdentity = operation.idempotencyFingerprint!;
+  const conflictId = result.outcome === "conflict" ? result.conflict.id : undefined;
+  const task = "snapshot" in result && result.snapshot.value
+    ? result.snapshot.value as DidaTask
+    : undefined;
+  const outcome = result.outcome === "conflict"
+    ? "conflict"
+    : result.outcome === "deleted" ? "verified-absent" : "verified";
+  upsertProjectionReceipt(data, {
+    clientIdentity,
+    projectId: operation.projectId ?? (operation.local.value as DidaTask).projectId,
+    operationId: operation.id,
+    outcome,
+    marker: projectionOperationMarker(operation),
+    remoteTaskId: task?.id,
+    conflictId,
+    message: result.outcome === "conflict" ? "投影写入进入逐字段冲突" : undefined,
+  });
+}
+
+function persistProjectionFailureReceipt(
+  data: HelixPersistedData,
+  operation: SyncQueueOperation,
+  error: unknown,
+): void {
+  if (!isProjectionQueueOperation(operation)) return;
+  const record = error && typeof error === "object" ? error as Record<string, unknown> : undefined;
+  const category = String(record?.category ?? "");
+  const outcome = record?.remoteOutcomeUnknown === true || category === "unknown-outcome"
+    ? "unknown"
+    : category === "authentication" || category === "authorization"
+      ? "authorization"
+      : category === "permanent" || category === "invalid-response"
+        ? "capability"
+        : "retryable";
+  upsertProjectionReceipt(data, {
+    clientIdentity: operation.idempotencyFingerprint!,
+    projectId: operation.projectId ?? (operation.local.value as DidaTask).projectId,
+    operationId: operation.id,
+    marker: projectionOperationMarker(operation),
+    outcome,
+    message: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function upsertProjectionReceipt(
+  data: HelixPersistedData,
+  receipt: HelixPersistedData["projectionOperationReceipts"][number],
+): void {
+  data.projectionOperationReceipts = [
+    ...data.projectionOperationReceipts.filter((item) => item.clientIdentity !== receipt.clientIdentity),
+    receipt,
+  ];
+}
+
+function projectionOperationMarker(operation: SyncQueueOperation): string {
+  const local = operation.local.value as DidaTask | null;
+  const base = operation.base?.value as DidaTask | null | undefined;
+  return String(local?.content ?? base?.content ?? operation.idempotencyFingerprint ?? operation.id);
+}
+
+function projectionWriteReceipt(
+  receipt: HelixPersistedData["projectionOperationReceipts"][number],
+  data: HelixPersistedData,
+): ProjectionWriteReceipt {
+  const snapshot = receipt.remoteTaskId
+    ? data.baseSnapshots[`task:${receipt.remoteTaskId}`] as EntitySnapshot<DidaTask> | undefined
+    : undefined;
+  const task = snapshot?.value;
+  if (receipt.outcome === "verified" && task && task.id === receipt.remoteTaskId &&
+    task.projectId === receipt.projectId && task.content === receipt.marker) {
+    return {
+      operationId: receipt.operationId,
+      outcome: "verified",
+      task,
+      conflictId: receipt.conflictId,
+    };
+  }
+  if (receipt.outcome === "verified") {
+    return {
+      operationId: receipt.operationId,
+      outcome: "conflict",
+      message: "投影 verified 收据缺少任务快照",
+      conflictId: receipt.conflictId,
+    };
+  }
+  return {
+    operationId: receipt.operationId,
+    outcome: receipt.outcome === "verified-absent" ? "conflict" : receipt.outcome,
+    message: receipt.message ?? "投影写入未取得可验证任务快照",
+    conflictId: receipt.conflictId,
+  };
 }

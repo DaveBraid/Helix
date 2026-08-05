@@ -1,13 +1,13 @@
 # 当前开发状态
 
 最后更新：2026-08-05
-当前基线提交：`68a29a9 fix: keep recovery diagnostics reachable`
-工作树状态：4D 合同残留可恢复清理及文档、测试尚未提交；Vault 测试数据与运行态 `data.json` 不纳入 Git。
-当前阶段：任务／滴答同步功能收尾；完成安全清理闭环后冻结任务扩展，转向项目与复盘打磨。
+当前基线提交：`e03c8ca fix: recover Dida contract artifacts safely`
+工作树状态：Electron 二次确认计时器 receiver 修复、测试与本快照尚未提交；Vault 测试数据与运行态 `data.json` 不纳入 Git。
+当前阶段：4D 已提交，正在解除 Obsidian 实机二次确认的 `Illegal invocation` 阻塞。
 
 ## 本轮目标
 
-- 完成真实写入合同临时对象的可持久恢复安全清理，确保普通同步继续可用且不会误删或重复删除。
+- 修复 Electron 中二次确认计时器的 receiver 绑定，恢复严格领养／清理入口的实机可用性。
 - 非目标：不扩展任务视图或编辑能力；不自动投影生产项目；不发布 Release；本轮不主动运行真实远端合同、领养或删除。
 
 ## 当前事实
@@ -25,11 +25,8 @@
 
 ## 本轮改动
 
-- `dida-contract-cleanup` 领域／服务：严格 plan、旧残留领养、限流只读复核、任务优先与清单后置清理、unknown 永久禁重发。
-- `write-contract`／`helix-service`：报告准确追踪残留，持久化 pending，新合同前置阻塞，提供排他领养／恢复入口。
-- `storage/model`：严格校验授权绑定、运行身份、A/B 名称、完整列、候选归属和 unknown 状态。
-- 冲突中心与命令面板：重载后仍可双确认严格领养；失败提示固定脱敏，不显示稳定 ID、marker 或底层错误。
-- 自动化测试覆盖持久化、重启继续、部分清理、限流、删除结果未知禁重发、项目竞争、多运行组拒绝和 pending 零远端调用。
+- `dida-write-contract-confirmation`：默认 `setTimeout`／`clearTimeout` 改用显式 `globalThis` receiver 的安全包装，依赖注入接口不变。
+- 测试模拟 Electron 对错误 receiver 抛出 `Illegal invocation`，覆盖 `request`、计时器保存与 `disarm` 清除。
 
 ## 相关约束
 
@@ -40,21 +37,21 @@
 
 ## 当前验证
 
-- 已通过：全量 63 个测试文件、774 项；`typecheck`、`build`、`release:check`、`git diff --check`。
+- 已通过：全量 63 个测试文件、775 项；`typecheck`、`build`、`release:check`、`git diff --check`。
+- 本轮已通过：确认门与命令控制器 11 项针对性测试。
 - 已通过：4D 针对性测试覆盖严格领养、多个运行组拒绝、任务先清、CAS 持久化、重启 unknown 禁重发、限流 retryAfter、清单竞争和新合同零远端调用。
-- 尚未完成：看门狗最终审查。
 - 尚未验证：Obsidian 冲突中心双确认入口的实机交互；不得宣称 UI 验收通过。
 - 尚未执行：真实远端严格领养与专用对象清理；不得宣称远端残留已经清洁。
 
 ## 未关闭问题
 
 - 当前真实合同临时对象仍需通过新的严格领养／清理入口核对；执行前不得开始新合同，也不得人工猜测 ID 删除。
-- 4D 尚未完成看门狗审查和 Obsidian CLI 实机验收。
+- Electron 计时器 receiver 修复尚未用 Obsidian CLI 重载实机验收。
 - 项目与复盘是下一阶段重点，现有体验仍需继续打磨。
 
 ## 下一步
 
-1. 运行最终全量门禁并完成看门狗审查，修复所有 P0–P2 问题。
-2. 用 Obsidian CLI 重载插件并最小化验收冲突中心脱敏、双确认和阻塞状态；不执行真实删除。
+1. 运行本轮最终全量门禁并确认 `git diff --check`。
+2. 用 Obsidian CLI 重载插件并最小化验收双确认计时器不再抛错；不执行真实删除。
 3. 仅通过显式入口严格领养当前唯一测试组，再按 plan 精确清理；任何 unknown 或竞争立即停止。
-4. 提交 4D 单一阶段提交，冻结任务功能扩展，把下一阶段计划切换到项目与复盘。
+4. 提交本轮 Electron 二次确认计时器热修复；真实残留清洁并准确更新快照后，冻结任务功能扩展并转向项目与复盘。

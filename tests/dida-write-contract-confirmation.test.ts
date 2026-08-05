@@ -61,4 +61,40 @@ describe("Dida write-contract confirmation gate", () => {
     expect(command.request()).toBe("armed");
     expect(settings.request()).toBe("confirmed");
   });
+
+  it("calls Electron-style default timers with globalThis as their receiver", () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let scheduled: (() => void) | undefined;
+    let cleared = false;
+    const setWithReceiver = function(
+      this: typeof globalThis,
+      callback: TimerHandler,
+    ): ReturnType<typeof globalThis.setTimeout> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      scheduled = callback as () => void;
+      return 42 as unknown as ReturnType<typeof globalThis.setTimeout>;
+    };
+    const clearWithReceiver = function(
+      this: typeof globalThis,
+      timer: ReturnType<typeof globalThis.setTimeout>,
+    ): void {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      expect(timer).toBe(42);
+      cleared = true;
+    };
+    globalThis.setTimeout = setWithReceiver as unknown as typeof globalThis.setTimeout;
+    globalThis.clearTimeout = clearWithReceiver as typeof globalThis.clearTimeout;
+    try {
+      const gate = new DidaWriteContractConfirmationGate(() => 0);
+      expect(gate.request()).toBe("armed");
+      expect(scheduled).toBeTypeOf("function");
+      gate.disarm();
+      expect(cleared).toBe(true);
+      expect(gate.isArmed()).toBe(false);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+  });
 });

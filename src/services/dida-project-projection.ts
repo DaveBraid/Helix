@@ -254,6 +254,9 @@ export class PersistedProjectionDiagnosticsPort implements ProjectionDiagnostics
     await this.store.mutate((data) => {
       const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operationId);
       if (!receipt) throw new Error("找不到投影操作收据");
+      if (receipt.outcome !== "verified" && receipt.outcome !== "verified-absent") {
+        throw new Error("只有已验证收口的投影收据可以安全移除");
+      }
       if (data.queue.some((item) => item.id === operationId)) {
         throw new Error("投影操作仍在队列中，禁止移除收据");
       }
@@ -354,6 +357,10 @@ export class DidaProjectProjectionService {
     private readonly now: () => string = () => new Date().toISOString(),
     private readonly diagnostics?: ProjectionDiagnosticsPort,
   ) {}
+
+  async readConfiguration(): Promise<ProjectionPersistentState> {
+    return this.state.read();
+  }
 
   async readProject(input: ProjectionProjectInput): Promise<ProjectionProjectReadModel> {
     const state = await this.state.read();
@@ -632,7 +639,8 @@ export class DidaProjectProjectionService {
     if (!this.diagnostics) throw new Error("投影诊断存储未配置");
     const current = await this.state.read();
     if (current.ledger.some((entry) => entry.operationId === operationId) ||
-      current.parentCheckpoints.some((entry) => entry.operationId === operationId)) {
+      current.parentCheckpoints.some((entry) => entry.operationId === operationId) ||
+      (current.receiptCleanupPending ?? []).some((entry) => entry.operationId === operationId)) {
       throw new Error("该收据仍被冻结对象引用，禁止移除");
     }
     await this.diagnostics.removeResolved(operationId);

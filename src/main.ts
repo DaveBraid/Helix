@@ -78,6 +78,8 @@ import {
   VaultProjectionMarkdownAdapter,
   type ProjectionProjectInput,
   type ProjectionProjectReadModel,
+  type ProjectionCatalogSnapshot,
+  type ProjectionPersistentState,
   type ProjectionSyncSummary,
 } from "./services/dida-project-projection";
 import type {
@@ -244,6 +246,16 @@ export default class HelixPlugin extends Plugin {
         reviewLegacyMigration: () => this.showLegacyMigrationModal(),
         getTaskMatrixRules: () => ({ ...this.settings.taskMatrixRules }),
         updateTaskMatrixRules: (rules) => this.updateTaskMatrixRules(rules),
+        readProjectProjection: (projectId) => this.readProjectProjection(projectId),
+        previewProjectProjection: (target) => this.previewProjectProjection(target),
+        adoptProjectAction: (input) => this.adoptProjectAction(input),
+        editProjectAction: (input) => this.editProjectAction(input),
+        syncProjectProjection: (projectId) => this.syncProjectProjection(projectId),
+        reconcileProjectProjectionFrozen: (input) => this.reconcileProjectProjectionFrozen(input),
+        recoverPendingProjectProjectionReceiptCleanup: () =>
+          this.recoverPendingProjectProjectionReceiptCleanup(),
+        removeResolvedProjectProjectionReceipt: (operationId) =>
+          this.removeResolvedProjectProjectionReceipt(operationId),
       }),
     );
     this.addRibbonIcon("orbit", "打开 Helix", () => void this.activateView());
@@ -545,6 +557,17 @@ export default class HelixPlugin extends Plugin {
       this.projectProjection.readProject(await this.projectionInput(projectId)));
   }
 
+  async readProjectProjectionConfiguration(): Promise<ProjectionPersistentState> {
+    return this.withProjectWorkspaceRead(() => this.projectProjection.readConfiguration());
+  }
+
+  async readProjectProjectionCatalog(): Promise<ProjectionCatalogSnapshot[]> {
+    const projectIds = [...new Set(this.service.snapshot().projects
+      .map((project) => project.id)
+      .filter((id) => !id.startsWith("local-project-")))];
+    return Promise.all(projectIds.map((projectId) => this.service.readProjectionCatalog(projectId)));
+  }
+
   async previewProjectProjection(target: DidaProjectionTarget): Promise<ProjectionActivationPreview> {
     return this.withProjectWorkspaceRead(async () => {
       const snapshot = await this.projectWorkspace.snapshot();
@@ -767,13 +790,10 @@ export default class HelixPlugin extends Plugin {
     }
     new ProjectPromptModal(
       this.app,
-      this.service.snapshot().projects.filter((project) =>
-        !project.id.startsWith("local-project-")),
-      async (title, didaProjectId, color) => {
+      async (title, color) => {
         this.assertWritable();
-        if (didaProjectId) await this.service.verifyRemoteProject(didaProjectId);
         const created = await this.withWritableProjectMutation(() =>
-          this.projectWorkspace.createProject(title, didaProjectId, color));
+          this.projectWorkspace.createProject(title, undefined, color));
         onCreated?.(created.id);
         await this.service.refreshPersistedEvents();
         new Notice("项目和阶段 1 已加入当前工作区");
@@ -1270,15 +1290,12 @@ class TemplateFolderSetupModal extends Modal {
 
 class ProjectPromptModal extends Modal {
   private title = "";
-  private didaProjectId = "";
   private color = "#5870A8";
 
   constructor(
     app: HelixPlugin["app"],
-    private readonly projects: Array<{ id: string; name: string }>,
     private readonly submit: (
       title: string,
-      didaProjectId?: string,
       color?: string,
     ) => Promise<void>,
   ) {
@@ -1295,16 +1312,6 @@ class ProjectPromptModal extends Modal {
           this.title = value;
         }),
       );
-    new Setting(this.contentEl)
-      .setName("滴答清单映射")
-      .setDesc("默认一个 Helix 项目对应一个滴答清单，也可以稍后配置。")
-      .addDropdown((dropdown) => {
-        dropdown.addOption("", "稍后映射");
-        for (const project of this.projects) dropdown.addOption(project.id, project.name);
-        dropdown.onChange((value) => {
-          this.didaProjectId = value;
-        });
-      });
     new Setting(this.contentEl)
       .setName("项目颜色")
       .setDesc("用于项目卡片左侧的低调渐变，可随时修改。")
@@ -1325,7 +1332,7 @@ class ProjectPromptModal extends Modal {
         return;
       }
       confirm.disabled = true;
-      void this.submit(title, this.didaProjectId || undefined, this.color)
+      void this.submit(title, this.color)
         .then(() => this.close())
         .catch((error) => {
           confirm.disabled = false;

@@ -83,6 +83,15 @@ import {
 import { homeGreeting } from "../domain/home-dashboard";
 import { requestStageBoardStatusChange } from "../domain/stage-board";
 import type {
+  DidaProjectionTarget,
+  ProjectionActionState,
+  ProjectionActivationPreview,
+} from "../domain/dida-project-projection";
+import type {
+  ProjectionProjectReadModel,
+  ProjectionSyncSummary,
+} from "../services/dida-project-projection";
+import type {
   DidaProjectViewModeSyncStatus,
   HelixRuntimeState,
 } from "../services/helix-service";
@@ -119,6 +128,12 @@ import {
   type LineageCamera,
   type ProjectLineageViewMode,
 } from "./project-lineage-workbench";
+import {
+  PROJECTION_STATE_OPTIONS,
+  ProjectionUiActionCoordinator,
+  projectionProjectSummary,
+  projectionSyncSummaryText,
+} from "./project-projection-presenter";
 
 echarts.use([
   LineChart,
@@ -216,6 +231,7 @@ export class HelixView extends ItemView {
   private chartObservers: ResizeObserver[] = [];
   private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
   private focusBridgeConflictCount = 0;
+  private readonly projectionUiActions = new ProjectionUiActionCoordinator();
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -251,6 +267,16 @@ export class HelixView extends ItemView {
       reviewLegacyMigration: () => void;
       getTaskMatrixRules: () => TaskMatrixRules;
       updateTaskMatrixRules: (rules: TaskMatrixRules) => Promise<void>;
+      readProjectProjection: (projectId: string) => Promise<ProjectionProjectReadModel>;
+      previewProjectProjection: (target: DidaProjectionTarget) => Promise<ProjectionActivationPreview>;
+      adoptProjectAction: (input: { projectId: string; stageId: string; expectedHash: string; line: number }) => Promise<void>;
+      editProjectAction: (input: { projectId: string; stageId: string; expectedHash: string; uuid: string; title?: string; state?: ProjectionActionState }) => Promise<void>;
+      syncProjectProjection: (projectId: string) => Promise<ProjectionSyncSummary>;
+      reconcileProjectProjectionFrozen: (input:
+        | { kind: "action"; projectId: string; stageId: string; uuid: string }
+        | { kind: "parent"; projectId: string }) => Promise<void>;
+      recoverPendingProjectProjectionReceiptCleanup: () => Promise<void>;
+      removeResolvedProjectProjectionReceipt: (operationId: string) => Promise<void>;
     },
   ) {
     super(leaf);
@@ -2178,7 +2204,8 @@ export class HelixView extends ItemView {
     ) {
       this.selectedProjectId = workspace.projects[0]!.id;
     }
-    this.renderProjectDidaMappingBar(content, workspace);
+    await this.renderProjectProjectionPanel(content, workspace, token);
+    if (token !== this.renderToken) return;
     const lifecycleGeneration = this.viewGeneration;
     this.renderNativeRelationCandidates(
       content,
@@ -2376,78 +2403,129 @@ export class HelixView extends ItemView {
     await this.render();
   }
 
-  private renderProjectDidaMappingBar(
+  private async renderProjectProjectionPanel(
     content: HTMLElement,
     workspace: ProjectWorkspaceSnapshot,
-  ): void {
+    token: number,
+  ): Promise<void> {
     if (!this.selectedProjectId) return;
     const project = workspace.projects.find((candidate) =>
       candidate.id === this.selectedProjectId);
     if (!project) return;
-    const remoteProjects = (this.state?.projects ?? []).filter((candidate) =>
-      !candidate.id.startsWith("local-project-"));
-    const mappedByOther = new Set(workspace.projects
-      .filter((candidate) => candidate.id !== project.id && candidate.didaProjectId)
-      .map((candidate) => candidate.didaProjectId!));
-    const bar = content.createDiv({ cls: "helix-project-dida-mapping" });
-    const copy = bar.createDiv();
-    copy.createEl("strong", { text: "滴答清单" });
-    copy.createSpan({
-      text: project.didaProjectId
-        ? remoteProjects.find((candidate) => candidate.id === project.didaProjectId)?.name ??
-          `已断开 · ${project.didaProjectId}`
-        : "未映射",
-    });
-    const controls = bar.createDiv({ cls: "helix-project-dida-mapping-controls" });
-    const select = controls.createEl("select", { attr: { "aria-label": "项目滴答清单映射" } });
-    select.createEl("option", { value: "", text: "不映射" });
-    for (const remote of remoteProjects) {
-      const option = select.createEl("option", { value: remote.id, text: remote.name });
-      if (mappedByOther.has(remote.id)) option.disabled = true;
+    const panel = content.createDiv({ cls: "helix-card helix-project-projection-panel" });
+    panel.createEl("h3", { text: "项目投影" });
+    const loading = panel.createEl("p", { cls: "helix-project-projection-loading", text: "读取行动与投影状态…" });
+    let model: ProjectionProjectReadModel;
+    try {
+      model = await this.actions.readProjectProjection(project.id);
+    } catch (error) {
+      if (token !== this.renderToken) return;
+      loading.setText(`无法读取项目投影：${error instanceof Error ? error.message : String(error)}`);
+      return;
     }
-    if (
-      project.didaProjectId &&
-      !remoteProjects.some((candidate) => candidate.id === project.didaProjectId)
-    ) {
-      select.createEl("option", {
-        value: project.didaProjectId,
-        text: `已断开 · ${project.didaProjectId}`,
+    if (token !== this.renderToken) return;
+    loading.remove();
+    const summary = projectionProjectSummary(model);
+    const target = panel.createDiv({ cls: "helix-project-projection-target" });
+    target.createEl("strong", { text: model.enabled ? "全局投影已启用" : "全局投影已禁用" });
+    target.createEl("code", { text: model.target ? `${model.target.targetProjectId} / ${model.target.targetColumnId}` : "尚未配置目标" });
+    target.createSpan({
+      text: model.project.parentTaskId
+        ? `父任务 ${model.project.parentTaskId}`
+        : model.parentDiagnostic?.frozen ? "父任务已冻结" : "父任务尚未创建",
+    });
+    const metrics = panel.createDiv({ cls: "helix-project-projection-metrics" });
+    for (const [label, value] of [
+      ["受管", summary.managed], ["未受管", summary.unmanaged], ["孤儿", summary.orphan],
+      ["冻结", summary.frozen], ["待清理", summary.cleanup],
+    ] as const) metrics.createSpan({ text: `${label} ${value}` });
+
+    let remoteBlockers: string[] = [];
+    if (model.enabled && model.target) {
+      try {
+        remoteBlockers = (await this.actions.previewProjectProjection(model.target)).blockers;
+      } catch (error) {
+        remoteBlockers = [error instanceof Error ? error.message : String(error)];
+      }
+      if (token !== this.renderToken) return;
+    }
+    if (remoteBlockers.length > 0) panel.createEl("p", {
+      cls: "helix-project-projection-blockers",
+      text: `同步阻塞：${remoteBlockers.join("；")}`,
+    });
+    const stageGrid = panel.createDiv({ cls: "helix-project-projection-stages" });
+    for (const stage of model.stages) {
+      const stageCard = stageGrid.createDiv({ cls: "helix-project-projection-stage" });
+      const stageTitle = project.cycles.find((cycle) => cycle.id === stage.id);
+      stageCard.createEl("h4", { text: stageTitle ? `阶段 ${stageTitle.stageCode} · ${stageTitle.title}` : stage.id });
+      for (const action of stage.unmanaged) {
+        const row = stageCard.createDiv({ cls: "helix-project-projection-action is-unmanaged" });
+        row.createSpan({ text: action.title });
+        const adopt = row.createEl("button", { text: "纳管", attr: { "aria-label": `纳管行动：${action.title}` } });
+        adopt.addEventListener("click", () => this.runProjectionUiAction(adopt, token, async () => {
+          await this.actions.adoptProjectAction({
+            projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash, line: action.line,
+          });
+          new Notice("行动已纳管；尚未同步到滴答");
+        }));
+      }
+      for (const action of stage.managed) {
+        const row = stageCard.createDiv({ cls: `helix-project-projection-action${action.frozen ? " is-frozen" : ""}` });
+        const title = row.createEl("input", { type: "text", value: action.title, attr: { "aria-label": "受管行动标题" } });
+        const state = row.createEl("select", { attr: { "aria-label": "受管行动状态" } });
+        for (const option of PROJECTION_STATE_OPTIONS) state.createEl("option", { value: option.value, text: option.label });
+        state.value = action.state;
+        const save = row.createEl("button", { text: "保存" });
+        save.addEventListener("click", () => this.runProjectionUiAction(save, token, async () => {
+          await this.actions.editProjectAction({
+            projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash,
+            uuid: action.uuid, title: title.value, state: state.value as ProjectionActionState,
+          });
+          new Notice("行动已保存；尚未同步到滴答");
+        }, "Markdown 已变化，已刷新最新内容"));
+      }
+    }
+    if (summary.canSync && remoteBlockers.length === 0) {
+      let armed = false;
+      const sync = panel.createEl("button", { cls: "helix-primary-button", text: "同步此项目" });
+      const summaryText = `${summary.managed} 条受管行动；孤儿 ${summary.orphan}；冻结 ${summary.frozen}`;
+      sync.addEventListener("click", () => {
+        if (!armed) {
+          armed = true;
+          sync.setText(`再次确认 · ${summaryText}`);
+          return;
+        }
+        this.runProjectionUiAction(sync, token, async () => {
+          const result = await this.actions.syncProjectProjection(project.id);
+          const presentation = projectionSyncSummaryText(result);
+          new Notice(presentation.text, presentation.warning ? 12_000 : 8_000);
+        });
       });
     }
-    select.value = project.didaProjectId ?? "";
-    const save = controls.createEl("button", { text: "保存映射" });
-    save.disabled = true;
-    select.addEventListener("change", () => {
-      save.disabled = select.value === (project.didaProjectId ?? "");
+  }
+
+  private runProjectionUiAction(
+    button: HTMLButtonElement,
+    _token: number,
+    operation: () => Promise<void>,
+    staleMessage?: string,
+  ): void {
+    if (button.disabled) return;
+    void this.projectionUiActions.run(
+      operation,
+      (busy) => this.setProjectionUiBusy(busy),
+      () => { if (!this.closed) void this.render(); },
+    ).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      new Notice(staleMessage && /变化|竞争|CAS/u.test(message) ? staleMessage : message, 8_000);
     });
-    save.addEventListener("click", () => {
-      save.disabled = true;
-      const nextId = select.value || undefined;
-      void this.actions.readProjectWorkspace(() =>
-        this.actions.projectWorkspace.prepareProjectDidaMappingUpdate(project.id))
-        .then((plan) => {
-          new ProjectDidaMappingConfirmModal(
-            this.app,
-            project,
-            remoteProjects.find((candidate) => candidate.id === nextId),
-            nextId,
-            async () => {
-              if (nextId) await this.service.verifyRemoteProject(nextId);
-              await this.actions.mutateProjectWorkspace(() =>
-                this.actions.projectWorkspace.updateProjectDidaMapping(plan, nextId));
-              new Notice(nextId ? "项目滴答清单映射已保存" : "项目滴答清单映射已解除");
-              await this.render();
-            },
-            () => {
-              save.disabled = select.value === (project.didaProjectId ?? "");
-            },
-          ).open();
-        })
-        .catch((error) => {
-          save.disabled = false;
-          new Notice(error instanceof Error ? error.message : String(error), 8_000);
-        });
-    });
+  }
+
+  private setProjectionUiBusy(busy: boolean): void {
+    for (const button of this.contentEl.querySelectorAll<HTMLButtonElement>(
+      ".helix-project-projection-panel button, .helix-projection-conflict-group button",
+    )) button.disabled = busy;
+    this.contentEl.toggleClass("is-projection-action-busy", busy);
   }
 
   private renderNativeRelationCandidates(
@@ -2862,6 +2940,15 @@ export class HelixView extends ItemView {
         this.actions.projectWorkspace.listFocusBridgeConflicts()),
     ]);
     if (token !== this.renderToken) return;
+    const projectionWorkspace = await this.actions.readProjectWorkspace(() =>
+      this.actions.projectWorkspace.loadStableWorkspace());
+    const projectionResults = await Promise.allSettled(
+      projectionWorkspace.projects.map((project) => this.actions.readProjectProjection(project.id)),
+    );
+    if (token !== this.renderToken) return;
+    const projectionModels = projectionResults.flatMap((result) =>
+      result.status === "fulfilled" ? [result.value] : []);
+    const projectionIssueCount = this.renderProjectionConflicts(content, projectionModels, token);
     if (persisted.lineageConflict) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", {
@@ -2980,6 +3067,7 @@ export class HelixView extends ItemView {
       reconciliation.length === 0 &&
       failed.length === 0 &&
       orphanedBlocked.length === 0 &&
+      projectionIssueCount === 0 &&
       !persisted.lineageConflict
     ) {
       const empty = content.createDiv({ cls: "helix-empty-state" });
@@ -2990,6 +3078,92 @@ export class HelixView extends ItemView {
       return;
     }
     for (const conflict of conflicts) this.renderConflict(content, conflict);
+  }
+
+  private renderProjectionConflicts(
+    content: HTMLElement,
+    models: ProjectionProjectReadModel[],
+    token: number,
+  ): number {
+    const pending = models.flatMap((model) => model.receiptCleanupPending);
+    const frozenActions = models.flatMap((model) => model.stages.flatMap((stage) =>
+      stage.managed.filter((action) => action.frozen).map((action) => ({ model, stageId: stage.id, action }))));
+    const orphaned = models.flatMap((model) => model.orphanDiagnostics.map((action) => ({ model, action })));
+    const frozenParents = models.filter((model) => model.parentDiagnostic?.frozen);
+    const referenced = new Set([
+      ...pending.map((item) => item.operationId),
+      ...frozenActions.flatMap((item) => item.action.operationId ? [item.action.operationId] : []),
+      ...orphaned.flatMap((item) => item.action.operationId ? [item.action.operationId] : []),
+      ...frozenParents.flatMap((model) => model.parentDiagnostic?.operationId ? [model.parentDiagnostic.operationId] : []),
+    ]);
+    const receipts = [...new Map(models.flatMap((model) => model.receipts)
+      .map((receipt) => [receipt.operationId, receipt])).values()]
+      .filter((receipt) => !referenced.has(receipt.operationId));
+    const count = pending.length + frozenActions.length + orphaned.length + frozenParents.length + receipts.length;
+    if (count === 0) return 0;
+    const group = content.createDiv({ cls: "helix-projection-conflict-group" });
+    group.createEl("h2", { text: "项目投影" });
+    if (pending.length > 0) {
+      const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
+      card.createEl("strong", { text: `${pending.length} 条收据清理等待重试` });
+      card.createEl("p", { text: "冻结状态已经安全收口；这里只幂等清理持久收据，不触发远端写入。" });
+      const retry = card.createEl("button", { text: "重试安全清理" });
+      retry.addEventListener("click", () => this.runProjectionUiAction(retry, token,
+        () => this.actions.recoverPendingProjectProjectionReceiptCleanup()));
+    }
+    for (const { model, stageId, action } of frozenActions) {
+      this.renderProjectionReconcileCard(group, token, model, stageId, action.uuid,
+        `${action.title} · ${action.frozen}`, true);
+    }
+    for (const { model, action } of orphaned) {
+      this.renderProjectionReconcileCard(group, token, model, action.stageId, action.uuid,
+        `孤儿行动 ${action.uuid} · ${action.frozen ?? action.state}`, Boolean(action.frozen));
+    }
+    for (const model of frozenParents) {
+      const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
+      card.createEl("strong", { text: `${model.project.title} · 父任务冻结` });
+      card.createEl("code", { text: model.parentDiagnostic?.operationId ?? "无操作 ID" });
+      const reconcile = card.createEl("button", { text: "精确复读并收口" });
+      reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
+        () => this.actions.reconcileProjectProjectionFrozen({ kind: "parent", projectId: model.project.id })));
+    }
+    for (const receipt of receipts) {
+      const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
+      card.createEl("strong", { text: `投影操作收据 · ${receipt.outcome}` });
+      card.createEl("code", { text: receipt.operationId });
+      if (receipt.outcome !== "verified" && receipt.outcome !== "verified-absent") {
+        card.createEl("p", { text: "该收据尚未完成既有队列、冲突或结果未知收口；此处不提供清理。" });
+        continue;
+      }
+      card.createEl("p", { text: "只有既有队列与逐字段冲突均已收口时，安全检查才允许移除此收据。" });
+      const cleanup = card.createEl("button", { text: "安全检查并清理" });
+      cleanup.addEventListener("click", () => this.runProjectionUiAction(cleanup, token,
+        () => this.actions.removeResolvedProjectProjectionReceipt(receipt.operationId)));
+    }
+    return count;
+  }
+
+  private renderProjectionReconcileCard(
+    group: HTMLElement,
+    token: number,
+    model: ProjectionProjectReadModel,
+    stageId: string,
+    uuid: string,
+    label: string,
+    actionable: boolean,
+  ): void {
+    const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
+    card.createEl("strong", { text: `${model.project.title} · ${label}` });
+    card.createEl("code", { text: `${stageId} / ${uuid}` });
+    if (!actionable) {
+      card.createEl("p", { text: "该行动尚未冻结；返回项目页手动同步可生成并处理删除 tombstone。" });
+      return;
+    }
+    const reconcile = card.createEl("button", { text: "精确复读并收口" });
+    reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
+      () => this.actions.reconcileProjectProjectionFrozen({
+        kind: "action", projectId: model.project.id, stageId, uuid,
+      })));
   }
 
   private renderFocusBridgeConflict(
@@ -4439,53 +4613,6 @@ class ChallengeDetailModal extends Modal {
   }
 
   onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-class ProjectDidaMappingConfirmModal extends Modal {
-  constructor(
-    app: HelixView["app"],
-    private readonly project: ProjectWorkspaceProject,
-    private readonly didaProject: DidaProject | undefined,
-    private readonly nextDidaProjectId: string | undefined,
-    private readonly submit: () => Promise<void>,
-    private readonly closed: () => void,
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    this.setTitle(this.nextDidaProjectId ? "确认项目映射" : "确认解除映射");
-    const summary = this.contentEl.createDiv({ cls: "helix-project-mapping-confirm" });
-    summary.createEl("strong", { text: this.project.title });
-    summary.createSpan({ text: "→" });
-    summary.createEl("strong", {
-      text: this.nextDidaProjectId
-        ? this.didaProject?.name ?? this.nextDidaProjectId
-        : "不映射滴答清单",
-    });
-    this.contentEl.createEl("p", {
-      text: this.nextDidaProjectId
-        ? "后续项目行动只能稳定关联到该清单中的滴答任务；不会按标题自动猜测或移动现有任务。"
-        : "已有任务引用会保留稳定 ID 并显示映射断开，不会被静默删除。",
-    });
-    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
-    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
-    const confirm = actions.createEl("button", { cls: "mod-cta", text: "确认保存" });
-    confirm.addEventListener("click", () => {
-      confirm.disabled = true;
-      void this.submit()
-        .then(() => this.close())
-        .catch((error) => {
-          confirm.disabled = false;
-          new Notice(error instanceof Error ? error.message : String(error), 8_000);
-        });
-    });
-  }
-
-  onClose(): void {
-    this.closed();
     this.contentEl.empty();
   }
 }

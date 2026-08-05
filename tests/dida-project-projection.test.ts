@@ -524,6 +524,10 @@ describe("DidaProjectProjectionService with fake remote", () => {
     });
     await expect(port.inspect("op-1")).resolves.toMatchObject({ resolvedTask: { id: "task-expected" } });
     await expect(port.removeReconciled("missing-op")).rejects.toThrow(/找不到投影操作收据/);
+    await expect(port.removeResolved("op-1")).rejects.toThrow(/只有已验证收口/);
+    await store.mutate((data) => {
+      data.projectionOperationReceipts[0]!.outcome = "verified";
+    });
     await port.removeResolved("op-1");
     await expect(port.list()).resolves.toEqual([]);
   });
@@ -685,6 +689,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
     const model = await service.readProject(input());
     expect(model.receiptCleanupPending).toHaveLength(1);
     expect(diagnostics.removed).toEqual([]);
+    await expect(service.removeResolvedReceipt("op-cleanup")).rejects.toThrow(/仍被冻结对象引用/);
     await service.retryReceiptCleanup();
     expect(state.value.receiptCleanupPending).toEqual([]);
     expect(diagnostics.removed).toEqual(["op-cleanup"]);

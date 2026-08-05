@@ -12,15 +12,26 @@ import {
   HELIX_DEVELOPMENT_TESTS_LABEL,
   HELIX_DEVELOPMENT_TESTS_WARNING,
 } from "./settings-development-tests";
+import type { ProjectionActivationPreview } from "../domain/dida-project-projection";
+import {
+  ProjectionUiActionCoordinator,
+  projectionActivationText,
+  projectionCatalogChoices,
+  projectionTargetText,
+} from "./project-projection-presenter";
 
 export class HelixSettingTab extends PluginSettingTab {
   private writeTestResult: string | null = null;
+  private projectionRenderToken = 0;
+  private armedProjection?: ProjectionActivationPreview;
+  private readonly projectionUiActions = new ProjectionUiActionCoordinator();
 
   constructor(app: App, private readonly plugin: HelixPlugin) {
     super(app, plugin);
   }
 
   display(): void {
+    this.armedProjection = undefined;
     this.containerEl.empty();
     this.containerEl.createEl("h2", { text: "Helix 设置" });
     this.containerEl.createEl("p", {
@@ -97,6 +108,15 @@ export class HelixSettingTab extends PluginSettingTab {
           }
         }),
       );
+
+    const projectionHost = this.containerEl.createDiv({ cls: "helix-settings-projection" });
+    projectionHost.createEl("h3", { text: "项目投影" });
+    projectionHost.createEl("p", {
+      cls: "setting-item-description",
+      text: "将 Helix 项目与受管计划行动投影到同一滴答看板分栏。默认关闭，只能手动同步单个项目。",
+    });
+    const projectionToken = ++this.projectionRenderToken;
+    void this.renderProjectProjectionSettings(projectionHost, projectionToken);
 
     let templateFolder = this.plugin.settings.templateFolder;
     new Setting(this.containerEl)
@@ -197,6 +217,138 @@ export class HelixSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+  }
+
+  private async renderProjectProjectionSettings(host: HTMLElement, token: number): Promise<void> {
+    const loading = host.createDiv({ cls: "setting-item-description", text: "正在精确读取清单与分栏…" });
+    try {
+      const [configuration, catalogs] = await Promise.all([
+        this.plugin.readProjectProjectionConfiguration(),
+        this.plugin.readProjectProjectionCatalog(),
+      ]);
+      if (token !== this.projectionRenderToken || !host.isConnected) return;
+      loading.remove();
+      const choices = projectionCatalogChoices(catalogs);
+      let projectId = configuration.target?.targetProjectId ?? "";
+      let columnId = configuration.target?.targetColumnId ?? "";
+      const status = host.createDiv({ cls: "helix-projection-settings-status" });
+      status.createEl("strong", { text: projectionTargetText(configuration) });
+      const previewBox = host.createDiv({ cls: "helix-projection-preview", attr: { "aria-live": "polite" } });
+      const setting = new Setting(host).setName("目标清单与已有分栏")
+        .setDesc("名称与稳定 ID 同时显示；未选择时不会按名称猜测。")
+        .addDropdown((dropdown) => {
+          dropdown.addOption("", "选择清单…");
+          for (const choice of choices) dropdown.addOption(choice.projectId, choice.projectLabel);
+          dropdown.setValue(projectId);
+          dropdown.onChange((value) => {
+            projectId = value;
+            columnId = "";
+            this.armedProjection = undefined;
+            this.renderProjectionColumnOptions(columnSelect, choices, projectId, columnId);
+            action.setButtonText("预览并检查");
+            action.buttonEl.removeClass("mod-cta");
+          });
+        });
+      let columnSelect!: HTMLSelectElement;
+      setting.addDropdown((dropdown) => {
+        columnSelect = dropdown.selectEl;
+        this.renderProjectionColumnOptions(columnSelect, choices, projectId, columnId);
+        dropdown.onChange((value) => {
+          columnId = value;
+          this.armedProjection = undefined;
+          action.setButtonText("预览并检查");
+          action.buttonEl.removeClass("mod-cta");
+        });
+      });
+      let action!: Parameters<Setting["addButton"]>[0] extends (button: infer B) => unknown ? B : never;
+      setting.addButton((button) => {
+        action = button;
+        button.setButtonText("预览并检查").onClick(() => {
+          if (!projectId || !columnId) {
+            new Notice("请先明确选择清单与已有分栏");
+            return;
+          }
+          void this.projectionUiActions.run(async () => {
+            try {
+              if (this.armedProjection?.target.targetProjectId === projectId &&
+                this.armedProjection.target.targetColumnId === columnId) {
+                await this.plugin.confirmProjectProjection(
+                  this.armedProjection,
+                  this.armedProjection.previewHash,
+                );
+                this.armedProjection = undefined;
+                new Notice("项目投影已显式启用；不会自动同步项目");
+                this.display();
+                return;
+              }
+              const preview = await this.plugin.previewProjectProjection({
+                targetProjectId: projectId,
+                targetColumnId: columnId,
+              });
+              if (token !== this.projectionRenderToken) return;
+              previewBox.empty();
+              for (const line of projectionActivationText(preview)) previewBox.createEl("div", { text: line });
+              if (preview.blockers.length === 0) {
+                this.armedProjection = preview;
+                button.setButtonText("再次点击确认启用").setCta();
+              } else {
+                this.armedProjection = undefined;
+                button.setButtonText("重新预览");
+                button.buttonEl.removeClass("mod-cta");
+              }
+            } catch (error) {
+              this.armedProjection = undefined;
+              button.setButtonText("重新预览");
+              button.buttonEl.removeClass("mod-cta");
+              previewBox.empty();
+              previewBox.createEl("div", { text: "确认失败或状态已变化，必须重新预览后再确认。" });
+              new Notice(error instanceof Error ? error.message : String(error), 8_000);
+            }
+          }, (busy) => this.setProjectionSettingsBusy(host, busy), () => undefined);
+        });
+      });
+      if (configuration.enabled) {
+        new Setting(host).setName("停用项目投影")
+          .setDesc("保留已验证身份与诊断；停用后手动同步入口立即关闭。")
+          .addButton((button) => button.setButtonText("显式禁用").setWarning().onClick(() => {
+            void this.projectionUiActions.run(async () => {
+              try {
+                await this.plugin.disableProjectProjection();
+                new Notice("项目投影已禁用");
+                this.display();
+              } catch (error) {
+                new Notice(error instanceof Error ? error.message : String(error), 8_000);
+              }
+            }, (busy) => this.setProjectionSettingsBusy(host, busy), () => undefined);
+          }));
+      }
+      if (choices.length === 0 || choices.every((choice) => choice.columns.length === 0)) {
+        host.createDiv({ cls: "helix-projection-empty-column", text: "当前没有可选分栏；4C 的分栏创建入口尚未开放。" });
+      }
+    } catch (error) {
+      if (token !== this.projectionRenderToken || !host.isConnected) return;
+      loading.setText(`无法读取项目投影目录：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private setProjectionSettingsBusy(host: HTMLElement, busy: boolean): void {
+    host.toggleClass("is-projection-action-busy", busy);
+    for (const button of host.querySelectorAll<HTMLButtonElement>("button")) button.disabled = busy;
+  }
+
+  private renderProjectionColumnOptions(
+    select: HTMLSelectElement,
+    choices: ReturnType<typeof projectionCatalogChoices>,
+    projectId: string,
+    selected: string,
+  ): void {
+    select.empty();
+    select.createEl("option", { value: "", text: projectId ? "选择已有分栏…" : "先选择清单" });
+    for (const column of choices.find((choice) => choice.projectId === projectId)?.columns ?? []) {
+      select.createEl("option", { value: column.id, text: column.label });
+    }
+    select.value = selected;
+    select.disabled = !projectId;
   }
 
   private writeTestDescription(): string {

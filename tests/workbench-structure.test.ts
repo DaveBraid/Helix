@@ -107,4 +107,37 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/this\.pendingKanbanArrivalCycleId = null;/);
     expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
+
+  it("replaces the old project mapping bar with explicit projection actions", () => {
+    const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    expect(view).not.toContain("renderProjectDidaMappingBar");
+    expect(view).not.toContain("ProjectDidaMappingConfirmModal");
+    expect(view).toMatch(/renderProjectProjectionPanel[\s\S]*未受管[\s\S]*adoptProjectAction/);
+    expect(view).toMatch(/editProjectAction[\s\S]*syncProjectProjection/);
+    expect(view).toMatch(/再次确认 ·/);
+    expect(settings).toMatch(/项目投影[\s\S]*选择清单[\s\S]*选择已有分栏/);
+    expect(settings).toMatch(/再次点击确认启用/);
+    expect(settings).toContain("4C 的分栏创建入口尚未开放");
+  });
+
+  it("routes projection conflicts only through strict reconciliation and safe cleanup", () => {
+    expect(view).toMatch(/renderProjectionConflicts[\s\S]*receiptCleanupPending/);
+    expect(view).toMatch(/kind: "action", projectId: model\.project\.id, stageId, uuid/);
+    expect(view).toMatch(/removeResolvedProjectProjectionReceipt\(receipt\.operationId\)/);
+    expect(view).toMatch(/receipt\.outcome !== "verified"[\s\S]*receipt\.outcome !== "verified-absent"[\s\S]*此处不提供清理[\s\S]*continue;/);
+    expect(view).not.toMatch(/项目投影[\s\S]*强制删除收据/);
+    expect(css).toMatch(/\.helix-project-projection-panel[\s\S]*var\(--text-normal\)/);
+    expect(css).toMatch(/\.helix-project-projection-action[\s\S]*grid-template-columns/);
+  });
+
+  it("serializes projection UI actions and removes Dida mapping from project creation", () => {
+    const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const modal = main.slice(main.indexOf("class ProjectPromptModal"), main.indexOf("class CyclePromptModal"));
+    expect(view).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
+    expect(settings).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
+    expect(settings).toMatch(/setButtonText\("重新预览"\)[\s\S]*removeClass\("mod-cta"\)[\s\S]*确认失败或状态已变化，必须重新预览/);
+    expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
+    expect(modal).toMatch(/submit\(title, this\.color\)/);
+  });
 });

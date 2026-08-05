@@ -130,6 +130,20 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-project-projection-action[\s\S]*grid-template-columns/);
   });
 
+  it("keeps contract cleanup controls double-confirmed and their failure notice redacted", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(view).toMatch(/严格领养本轮残留[\s\S]*再次确认：执行只读领养/);
+    expect(view).toMatch(/冷却后精确清理[\s\S]*再次确认：只清理专用对象/);
+    expect(view).toContain("安全操作未完成；对象保持冻结，请查看脱敏诊断");
+    const cleanupRegion = view.slice(
+      view.indexOf("const cleanupPending"),
+      view.indexOf("if (projectionLoad.diagnostic)"),
+    );
+    expect(cleanupRegion).not.toMatch(/error\.message|String\(error\)/);
+    expect(main).toMatch(/strict-adopt-dida-contract-residual[\s\S]*didaContractAdoptConfirmation\.request\(\)[\s\S]*adoptPendingContractRunFromRemote/);
+    expect(main).toContain("安全操作未完成；对象保持冻结，请查看脱敏诊断");
+  });
+
   it("serializes projection UI actions and removes Dida mapping from project creation", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");

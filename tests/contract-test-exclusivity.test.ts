@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 import type { App } from "obsidian";
 import type { DidaApi } from "../src/integrations/dida/api";
@@ -147,6 +147,186 @@ describe("HelixService contract-test exclusivity", () => {
     expect(secrets.getDidaToken()).toBe("initial-contract-token");
     allowCreate.resolve();
     await ordinaryWrite;
+  });
+
+  it("blocks a new contract before any remote call while cleanup is pending", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    await store.mutate((data) => {
+      data.pendingDidaContractCleanup = {
+        authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+        plan: {
+          runId: "pending-run",
+          marker: "[Helix 合同测试 pending-run]",
+          projects: [{
+            id: "temporary-a",
+            name: "[Helix 合同测试 pending-run] 清单 A",
+            expectedColumns: [],
+            baselineSource: "contract",
+          }],
+          tasks: [],
+        },
+      };
+    });
+
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/待安全清理/);
+    expect(getProjects).not.toHaveBeenCalled();
+  });
+
+  it("persists an empty cleanup placeholder before the first remote create", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    api.getProjects = async () => [];
+    let placeholderSeen = false;
+    api.createProject = async () => {
+      const pending = (await store.snapshot()).pendingDidaContractCleanup;
+      placeholderSeen = Boolean(pending && pending.plan.projects.length === 0 &&
+        pending.plan.tasks.length === 0 && pending.plan.marker.includes(pending.plan.runId));
+      throw new Error("stop after placeholder assertion");
+    };
+    const report = await service.runDidaWriteContractTest();
+    expect(report.status).toBe("failed");
+    expect(placeholderSeen).toBe(true);
+  });
+
+  it("preserves a competing plan at the first runner checkpoint and stops later remote calls", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    api.getProjects = async () => [];
+    let createCalls = 0;
+    let rereadCalls = 0;
+    let deleteCalls = 0;
+    api.createProject = async (value) => {
+      createCalls += 1;
+      await store.mutate((data) => {
+        data.pendingDidaContractCleanup = competingCleanupPlan();
+      });
+      return { id: "created-before-competition", name: value.name } as DidaProject;
+    };
+    api.getProject = async () => { rereadCalls += 1; throw new Error("must not reread"); };
+    api.deleteProject = async () => { deleteCalls += 1; };
+
+    let failure: unknown;
+    try { await service.runDidaWriteContractTest(); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/竞争/);
+    expect({ createCalls, rereadCalls, deleteCalls }).toEqual({
+      createCalls: 1, rereadCalls: 0, deleteCalls: 0,
+    });
+    await store.mutate(() => undefined);
+    expect((await store.snapshot()).pendingDidaContractCleanup).toEqual(competingCleanupPlan());
+  });
+
+  it("preserves a plan that competes before final clear and performs no later remote calls", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    let remoteCalls = 0;
+    api.getProjects = async () => {
+      remoteCalls += 1;
+      await store.mutate((data) => {
+        data.pendingDidaContractCleanup = competingCleanupPlan();
+      });
+      throw new Error("stop after final-plan competition");
+    };
+    api.createProject = async () => { remoteCalls += 1; throw new Error("must not create"); };
+
+    let failure: unknown;
+    try { await service.runDidaWriteContractTest(); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/竞争/);
+    expect(remoteCalls).toBe(1);
+    await store.mutate(() => undefined);
+    expect((await store.snapshot()).pendingDidaContractCleanup).toEqual(competingCleanupPlan());
+  });
+
+  it("performs zero remote calls when the initial placeholder cannot persist", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    const originalMutate = store.mutate.bind(store);
+    let mutations = 0;
+    store.mutate = async (mutator) => {
+      mutations += 1;
+      if (mutations === 2) throw new Error("placeholder persist failed");
+      return originalMutate(mutator);
+    };
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/placeholder persist failed/);
+    expect(getProjects).not.toHaveBeenCalled();
+  });
+
+  it("blocks after a placeholder crash and strictly adopts only the same remote run after reload", async () => {
+    const { store, reload } = await serviceFixture();
+    const runId = "123e4567-e89b-42d3-a456-426614174000";
+    const marker = `[Helix 合同测试 ${runId}]`;
+    await store.mutate((data) => {
+      data.pendingDidaContractCleanup = {
+        authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+        plan: { runId, marker, projects: [], tasks: [] },
+      };
+    });
+    const replacement = await reload();
+    const api = serviceApi(replacement);
+    const projects = [
+      { id: "temporary-a", name: `${marker} 清单 A` },
+      { id: "temporary-b", name: `${marker} 清单 B` },
+    ];
+    const getProjects = vi.fn(async () => projects);
+    api.getProjects = getProjects;
+    api.getProjectData = async (id) => ({
+      project: projects.find((project) => project.id === id)!,
+      tasks: [],
+      columns: [],
+    });
+    api.getColumns = async () => [];
+    api.getCompletedTasks = async () => [];
+
+    await expect(replacement.runDidaWriteContractTest()).rejects.toThrow(/待安全清理/);
+    expect(getProjects).not.toHaveBeenCalled();
+    await replacement.adoptPendingContractRunFromRemote();
+    const replacementStore = (replacement as unknown as { store: HelixDataStore }).store;
+    expect((await replacementStore.snapshot()).pendingDidaContractCleanup?.plan.projects)
+      .toHaveLength(2);
+  });
+
+  it("rechecks pending cleanup inside the exclusive gate before any remote call", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    const snapshotEntered = deferred<void>();
+    const releaseSnapshot = deferred<void>();
+    const originalSnapshot = store.snapshot.bind(store);
+    let intercept = true;
+    store.snapshot = async () => {
+      if (intercept) {
+        intercept = false;
+        snapshotEntered.resolve();
+        await releaseSnapshot.promise;
+      }
+      return originalSnapshot();
+    };
+
+    const run = service.runDidaWriteContractTest();
+    await snapshotEntered.promise;
+    await expect(service.createTask("竞争写入", "project-a")).rejects.toThrow(/合同测试正在运行/);
+    await store.mutate((data) => {
+      data.pendingDidaContractCleanup = {
+        authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+        plan: {
+          runId: "run-race",
+          marker: "[Helix 合同测试 run-race]",
+          projects: [],
+          tasks: [],
+        },
+      };
+    });
+    releaseSnapshot.resolve();
+
+    await expect(run).rejects.toThrow(/待安全清理/);
+    expect(getProjects).not.toHaveBeenCalled();
   });
 
   it("blocks new writes and credential mutation until the contract run exits", async () => {
@@ -448,6 +628,19 @@ function serviceApi(service: HelixService): DidaApi {
   const api = (service as unknown as { api: DidaApi }).api;
   api.withRequestPolicy = () => api;
   return api;
+}
+
+function competingCleanupPlan() {
+  const runId = "run-competing";
+  return {
+    authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+    plan: {
+      runId,
+      marker: `[Helix 合同测试 ${runId}]`,
+      projects: [],
+      tasks: [],
+    },
+  };
 }
 
 function deferred<T>(): {

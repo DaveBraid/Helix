@@ -2955,6 +2955,48 @@ export class HelixView extends ItemView {
       persisted.didaProjectionState?.columnCreation,
       token,
     );
+    const cleanupPending = persisted.pendingDidaContractCleanup;
+    const cleanupRuntime = this.service.didaContractCleanupRuntimeStatus();
+    const cleanupNeedsAdoption = Boolean(cleanupPending &&
+      cleanupPending.plan.tasks.length === 0 && cleanupPending.plan.projects.length === 0);
+    if (cleanupPending || cleanupRuntime.adoptionSuggested) {
+      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      card.createEl("span", { cls: "helix-chip is-danger", text: "合同残留已冻结" });
+      card.createEl("h3", { text: cleanupPending && !cleanupNeedsAdoption
+        ? "专用测试对象等待安全清理"
+        : "旧合同残留等待严格领养" });
+      card.createEl("p", {
+        text: cleanupPending && !cleanupNeedsAdoption
+          ? `仅限本轮专用对象：${cleanupPending.plan.tasks.length} 个任务、${cleanupPending.plan.projects.length} 个清单。不会触碰其他数据。`
+          : "只会领养唯一且身份完整的 A/B 测试组；存在多个运行组、普通任务或任何歧义都会拒绝。",
+      });
+      const action = card.createEl("button", {
+        cls: "helix-secondary-button",
+        text: cleanupPending && !cleanupNeedsAdoption ? "冷却后精确清理" : "严格领养本轮残留",
+      });
+      let armed = false;
+      action.addEventListener("click", () => {
+        if (!armed) {
+          armed = true;
+          action.textContent = cleanupPending && !cleanupNeedsAdoption
+            ? "再次确认：只清理专用对象"
+            : "再次确认：执行只读领养";
+          return;
+        }
+        action.disabled = true;
+        const run = cleanupPending && !cleanupNeedsAdoption
+          ? this.service.recoverPendingDidaContractCleanup()
+          : this.service.adoptPendingContractRunFromRemote();
+        void run.then(() => this.render()).catch(() => {
+          action.disabled = false;
+          armed = false;
+          action.textContent = cleanupPending && !cleanupNeedsAdoption
+            ? "冷却后精确清理"
+            : "严格领养本轮残留";
+          new Notice("安全操作未完成；对象保持冻结，请查看脱敏诊断", 8_000);
+        });
+      });
+    }
     if (projectionLoad.diagnostic) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "项目工作区只读" });
@@ -3082,6 +3124,7 @@ export class HelixView extends ItemView {
       projectionIssues: projectionIssueCount,
       workspaceDiagnostic: Boolean(projectionLoad.diagnostic),
       lineageConflict: Boolean(persisted.lineageConflict),
+      contractCleanup: Boolean(cleanupPending || cleanupRuntime.adoptionSuggested),
     })) {
       const empty = content.createDiv({ cls: "helix-empty-state" });
       const icon = empty.createDiv();

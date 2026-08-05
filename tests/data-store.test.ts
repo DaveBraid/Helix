@@ -937,7 +937,88 @@ describe("HelixDataStore serialization", () => {
     invalidateDataGeneration(newGeneration);
     newStore.dispose();
   });
+
+  it("persists only a strict, authorization-bound Dida contract cleanup plan", () => {
+    const raw = pendingDidaContractCleanupFixture();
+    const hydrated = hydrateData({ schemaVersion: 2, pendingDidaContractCleanup: raw });
+    expect(hydrated.pendingDidaContractCleanup).toEqual(raw);
+    expect(hydrated.recoveryIssues).toEqual([]);
+
+    const unknownField = structuredClone(raw);
+    (unknownField.plan.projects[0] as Record<string, unknown>).unexpected = true;
+    const rejectedUnknown = hydrateData({
+      schemaVersion: 2,
+      pendingDidaContractCleanup: unknownField,
+    });
+    expect(rejectedUnknown.pendingDidaContractCleanup).toBeUndefined();
+    expect(rejectedUnknown.recoveryIssues.join(" ")).toMatch(/合同残留清理计划无效/);
+
+    const foreignCandidate = structuredClone(raw);
+    foreignCandidate.plan.tasks[0]!.candidateProjectIds = ["user-project"];
+    const rejectedForeign = hydrateData({
+      schemaVersion: 2,
+      pendingDidaContractCleanup: foreignCandidate,
+    });
+    expect(rejectedForeign.pendingDidaContractCleanup).toBeUndefined();
+    expect(rejectedForeign.recoveryIssues.join(" ")).toMatch(/合同残留清理计划无效/);
+  });
+
+  it("rejects forged cleanup marker, project identity and unsafe delete state", () => {
+    const markerMismatch = pendingDidaContractCleanupFixture();
+    markerMismatch.plan.marker = "[Helix 合同测试 other-run]";
+    expect(hydrateData({ schemaVersion: 2, pendingDidaContractCleanup: markerMismatch })
+      .pendingDidaContractCleanup).toBeUndefined();
+
+    const renamedProject = pendingDidaContractCleanupFixture();
+    renamedProject.plan.projects[1]!.name = `${renamedProject.plan.marker} 清单 C`;
+    expect(hydrateData({ schemaVersion: 2, pendingDidaContractCleanup: renamedProject })
+      .pendingDidaContractCleanup).toBeUndefined();
+
+    const unsafeOutcome = pendingDidaContractCleanupFixture();
+    (unsafeOutcome.plan.tasks[0] as Record<string, unknown>).deleteState = "retry";
+    expect(hydrateData({ schemaVersion: 2, pendingDidaContractCleanup: unsafeOutcome })
+      .pendingDidaContractCleanup).toBeUndefined();
+
+    const spacedRun = pendingDidaContractCleanupFixture();
+    spacedRun.plan.runId = "run bad";
+    spacedRun.plan.marker = "[Helix 合同测试 run bad]";
+    expect(hydrateData({ schemaVersion: 2, pendingDidaContractCleanup: spacedRun })
+      .pendingDidaContractCleanup).toBeUndefined();
+  });
 });
+
+function pendingDidaContractCleanupFixture() {
+  const runId = "run-4d";
+  const marker = `[Helix 合同测试 ${runId}]`;
+  return {
+    authorizationBinding: "a".repeat(64),
+    plan: {
+      runId,
+      marker,
+      projects: [
+        {
+          id: "temporary-a",
+          name: `${marker} 清单 A`,
+          expectedColumns: [{ id: "column-a", projectId: "temporary-a", name: "待办", sortOrder: 1 }],
+          baselineSource: "contract" as const,
+        },
+        {
+          id: "temporary-b",
+          name: `${marker} 清单 B`,
+          expectedColumns: [],
+          baselineSource: "adopted" as const,
+          deleteState: "sent-unknown" as const,
+        },
+      ],
+      tasks: [{
+        id: "temporary-task",
+        candidateProjectIds: ["temporary-a", "temporary-b"],
+        state: "unknown" as const,
+        deleteState: "sent-unknown" as const,
+      }],
+    },
+  };
+}
 
 function legacyHash(value: unknown): string {
   const input = stableStringify(value);

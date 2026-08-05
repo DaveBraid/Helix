@@ -653,12 +653,47 @@ describe("DidaWriteContractRunner", () => {
     }]);
     expect(report.steps.join(" ")).toMatch(/创建唯一标记分栏.*列表→看板→列表.*4 个看板列/);
     expect(report.columnCreateVerified).toBe(true);
+    expect(report.cleanupPlan).toBeUndefined();
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");
     expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1", "test-task-7"]);
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
+  });
+
+  it("checkpoints sent-unknown before every temporary task and project delete", async () => {
+    const api = new ContractApiFake();
+    let latest: import("../src/domain/dida-contract-cleanup").DidaContractCleanupPlan | undefined;
+    const taskArmed: Array<{ taskId: string; armed: boolean }> = [];
+    const projectArmed: boolean[] = [];
+    const originalDeleteTask = api.deleteTask.bind(api);
+    api.deleteTask = async (projectId, taskId) => {
+      taskArmed.push({
+        taskId,
+        armed: latest?.tasks.find((task) => task.id === taskId)?.deleteState === "sent-unknown",
+      });
+      return originalDeleteTask(projectId, taskId);
+    };
+    const originalDeleteProject = api.deleteProject.bind(api);
+    api.deleteProject = async (projectId) => {
+      projectArmed.push(latest?.projects.find((project) => project.id === projectId)?.deleteState === "sent-unknown");
+      return originalDeleteProject(projectId);
+    };
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-delete-checkpoint",
+      fixedNow,
+      undefined,
+      undefined,
+      undefined,
+      async (plan) => { latest = structuredClone(plan); },
+    ).run();
+    expect(report.status).toBe("passed");
+    expect(taskArmed.length).toBeGreaterThan(0);
+    expect(taskArmed.filter((entry) => !entry.armed)).toEqual([]);
+    expect(projectArmed).toEqual([true, true]);
+    expect(latest).toBeUndefined();
   });
 
   it("keeps the successful contract at the recorded 110-call local-fake upper bound", async () => {
@@ -1591,6 +1626,15 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(true);
     expect(report.cleanupErrors.join(" ")).toMatch(/可观察任务集合/);
+    expect(report.cleanupPlan).toMatchObject({
+      runId: "run-task-cleanup-failed",
+      marker: "[Helix 合同测试 run-task-cleanup-failed]",
+      projects: [
+        { id: "test-project-1", baselineSource: "contract" },
+        { id: "test-project-2", baselineSource: "contract" },
+      ],
+    });
+    expect(report.cleanupPlan?.tasks.length).toBeGreaterThan(0);
     expect(api.deletedProjects).toEqual([]);
     expect(api.projects.has("test-project-1")).toBe(true);
     expect(api.projects.has("test-project-2")).toBe(true);
@@ -1637,6 +1681,12 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(report.cleanupPlan).toMatchObject({
+      runId: "run-untracked",
+      marker: "[Helix 合同测试 run-untracked]",
+      projects: [],
+      tasks: [],
+    });
     expect(api.deletedProjects).toEqual([]);
     expect(api.deletedTasks).toEqual([]);
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");

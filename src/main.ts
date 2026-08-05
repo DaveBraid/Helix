@@ -111,6 +111,7 @@ export default class HelixPlugin extends Plugin {
   /** 设置页和命令面板使用同一确认规则，但绝不允许跨入口确认。 */
   readonly didaWriteContractSettingsConfirmation = new DidaWriteContractConfirmationGate();
   private readonly didaWriteContractCommandConfirmation = new DidaWriteContractConfirmationGate();
+  private readonly didaContractAdoptConfirmation = new DidaWriteContractConfirmationGate();
   private didaWriteContractCommands!: DidaWriteContractCommandController;
   private syncIntervalId: number | null = null;
   private immediateSyncTimerId: number | null = null;
@@ -282,6 +283,19 @@ export default class HelixPlugin extends Plugin {
       id: "run-dida-write-contract-test",
       name: "运行滴答写入合同测试",
       callback: () => this.didaWriteContractCommands.requestRun(),
+    });
+    this.addCommand({
+      id: "strict-adopt-dida-contract-residual",
+      name: "严格检查并领养滴答合同残留",
+      callback: () => {
+        if (this.didaContractAdoptConfirmation.request() === "armed") {
+          new Notice("已武装：请在 15 秒内再次运行此命令，才会严格检查并领养唯一测试组。", 10_000);
+          return;
+        }
+        void this.service.adoptPendingContractRunFromRemote()
+          .then(() => new Notice("合同残留严格检查已完成；如已领养，请到冲突中心继续安全清理。", 10_000))
+          .catch(() => new Notice("安全操作未完成；对象保持冻结，请查看脱敏诊断", 8_000));
+      },
     });
     this.addCommand({
       id: "create-project",
@@ -522,6 +536,7 @@ export default class HelixPlugin extends Plugin {
   onunload(): void {
     this.unloaded = true;
     this.didaWriteContractSettingsConfirmation.disarm();
+    this.didaContractAdoptConfirmation.disarm();
     this.didaWriteContractCommands?.dispose();
     if (this.projectRefreshTimer !== null) {
       window.clearTimeout(this.projectRefreshTimer);

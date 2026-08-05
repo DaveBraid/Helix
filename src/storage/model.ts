@@ -1,5 +1,6 @@
 import type {
   DidaBoardSnapshot,
+  DidaColumn,
   EntityKind,
   EntitySnapshot,
   InProgressEntry,
@@ -29,6 +30,12 @@ import type {
   ProjectionLedgerEntry,
   ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
+import {
+  didaContractMarker,
+  isDidaContractRunId,
+  parseDidaContractProjectName,
+  type PendingDidaContractCleanup,
+} from "../domain/dida-contract-cleanup";
 
 export interface HelixSettings {
   rootFolder: string;
@@ -112,6 +119,8 @@ export interface HelixPersistedData {
     taskReopenVerified?: boolean;
     verifiedAt: string;
   };
+  /** 合同测试临时对象的唯一可恢复删除门票；不含凭证，也不可作为普通诊断展示。 */
+  pendingDidaContractCleanup?: PendingDidaContractCleanup;
   lineageConflict?: {
     detectedAt: string;
     canvasPath: string;
@@ -224,6 +233,10 @@ export function hydrateData(value: unknown): HelixPersistedData {
     raw.didaContractCapabilities,
     recoveryIssues,
   );
+  const pendingDidaContractCleanup = validatePendingDidaContractCleanup(
+    raw.pendingDidaContractCleanup,
+    recoveryIssues,
+  );
   const didaProjectionState = validateDidaProjectionState(
     raw.didaProjectionState,
     recoveryIssues,
@@ -259,6 +272,7 @@ export function hydrateData(value: unknown): HelixPersistedData {
     events,
     recoveryIssues,
     didaContractCapabilities,
+    pendingDidaContractCleanup,
     didaProjectionState,
     projectionOperationReceipts,
     lineageConflict,
@@ -309,6 +323,126 @@ function validateDidaContractCapabilities(
     taskReopenVerified: record.taskReopenVerified === true,
     verifiedAt: record.verifiedAt,
   };
+}
+
+function validatePendingDidaContractCleanup(
+  value: unknown,
+  issues: string[],
+): HelixPersistedData["pendingDidaContractCleanup"] {
+  if (value === undefined) return undefined;
+  const invalid = () => {
+    issues.push("滴答合同残留清理计划无效，已忽略并进入只读恢复模式");
+    return undefined;
+  };
+  if (!isRecord(value) || !onlyKeys(value, ["authorizationBinding", "plan"])) return invalid();
+  if (typeof value.authorizationBinding !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.authorizationBinding) ||
+    !isRecord(value.plan) || !isValidDidaContractCleanupPlan(value.plan)) {
+    return invalid();
+  }
+
+  const plan = value.plan;
+  return {
+    authorizationBinding: value.authorizationBinding,
+    plan: {
+      runId: plan.runId as string,
+      marker: plan.marker as string,
+      projects: (plan.projects as unknown[]).map((project) => {
+        const item = project as Record<string, unknown>;
+        return {
+          id: item.id as string,
+          name: item.name as string,
+          expectedColumns: (item.expectedColumns as unknown[]).map((column) => ({
+            ...(column as DidaColumn),
+          })),
+          baselineSource: item.baselineSource as "contract" | "adopted",
+          ...(item.deleteState === "sent-unknown" ? { deleteState: "sent-unknown" as const } : {}),
+        };
+      }),
+      tasks: (plan.tasks as unknown[]).map((task) => {
+        const item = task as Record<string, unknown>;
+        return {
+          id: item.id as string,
+          candidateProjectIds: [...(item.candidateProjectIds as string[])],
+          state: item.state as "open" | "completed" | "unknown",
+          ...(item.deleteState === "sent-unknown" ? { deleteState: "sent-unknown" as const } : {}),
+        };
+      }),
+    },
+  };
+}
+
+function isValidDidaContractCleanupPlan(value: Record<string, unknown>): boolean {
+  if (!onlyKeys(value, ["runId", "marker", "projects", "tasks"]) ||
+    !isDidaContractRunId(value.runId) ||
+    value.marker !== didaContractMarker(value.runId) ||
+    !Array.isArray(value.projects) || !Array.isArray(value.tasks)) {
+    return false;
+  }
+  const projectIds = new Set<string>();
+  const projectLanes = new Set<string>();
+  for (const project of value.projects) {
+    if (!isRecord(project) || !onlyKeys(project, [
+      "id", "name", "expectedColumns", "baselineSource", "deleteState",
+    ]) || !isSafeDidaCleanupIdentity(project.id) ||
+      typeof project.name !== "string" ||
+      !Array.isArray(project.expectedColumns) ||
+      (project.baselineSource !== "contract" && project.baselineSource !== "adopted") ||
+      (project.deleteState !== undefined && project.deleteState !== "sent-unknown")) {
+      return false;
+    }
+    const parsed = parseDidaContractProjectName(project.name);
+    const lane = parsed?.runId === value.runId ? parsed.side : undefined;
+    if (!lane || projectIds.has(project.id) || projectLanes.has(lane)) return false;
+    const columnIds = new Set<string>();
+    for (const column of project.expectedColumns) {
+      if (!isDidaContractCleanupColumn(column, project.id) || columnIds.has(column.id)) return false;
+      columnIds.add(column.id);
+    }
+    projectIds.add(project.id);
+    projectLanes.add(lane);
+  }
+  const taskIds = new Set<string>();
+  for (const task of value.tasks) {
+    if (!isRecord(task) || !onlyKeys(task, ["id", "candidateProjectIds", "state", "deleteState"]) ||
+      !isSafeDidaCleanupIdentity(task.id) || !Array.isArray(task.candidateProjectIds) ||
+      task.candidateProjectIds.length === 0 ||
+      (task.state !== "open" && task.state !== "completed" && task.state !== "unknown") ||
+      (task.deleteState !== undefined && task.deleteState !== "sent-unknown") || taskIds.has(task.id)) {
+      return false;
+    }
+    const candidates = new Set<string>();
+    for (const projectId of task.candidateProjectIds) {
+      if (!isSafeDidaCleanupIdentity(projectId) || !projectIds.has(projectId) || candidates.has(projectId)) {
+        return false;
+      }
+      candidates.add(projectId);
+    }
+    taskIds.add(task.id);
+  }
+  return true;
+}
+
+function isDidaContractCleanupColumn(value: unknown, projectId: string): value is DidaColumn {
+  if (!isRecord(value) || !onlyKeys(value, ["id", "projectId", "name", "sortOrder", "sortOrderUnsafe"]) ||
+    !isSafeDidaCleanupIdentity(value.id) || value.projectId !== projectId ||
+    typeof value.name !== "string" || !isSafeDidaCleanupIdentity(value.name) ||
+    (value.sortOrder !== undefined &&
+      (typeof value.sortOrder !== "number" || !Number.isSafeInteger(value.sortOrder))) ||
+    (value.sortOrderUnsafe !== undefined && value.sortOrderUnsafe !== true) ||
+    (value.sortOrderUnsafe === true && value.sortOrder !== undefined)) {
+    return false;
+  }
+  return true;
+}
+
+function isSafeDidaCleanupIdentity(value: unknown): value is string {
+  return typeof value === "string" && value === value.trim() && value.length > 0 &&
+    value.length <= 512 && !/[\r\n]/u.test(value);
+}
+
+function onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
 }
 
 const PROJECTION_FREEZE_REASONS = new Set<ProjectionFreezeReason>([

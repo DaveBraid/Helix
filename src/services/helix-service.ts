@@ -13,6 +13,10 @@ import type {
 import { InProgressRegistry } from "../domain/in-progress";
 import { didaAuthorizationBinding } from "../domain/dida-authorization";
 import {
+  didaContractMarker,
+  type PendingDidaContractCleanup,
+} from "../domain/dida-contract-cleanup";
+import {
   DIDA_CONTRACT_PROBE_VERSION,
   validateTaskScheduleWrite,
   type TaskScheduleMode,
@@ -75,6 +79,7 @@ import { buildProjectUpdateOperation } from "./project-operations";
 import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
 import { RemoteWriteGate } from "./remote-write-gate";
+import { DidaContractCleanupService } from "./dida-contract-cleanup";
 import type {
   ExistingHelixProjectionCatalogPort,
   ExistingHelixTaskQueuePort,
@@ -262,7 +267,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         recoveredAttention +
         data.conflicts.length +
         data.recoveryIssues.length +
-        (data.lineageConflict ? 1 : 0),
+        (data.lineageConflict ? 1 : 0) +
+        (data.pendingDidaContractCleanup ? 1 : 0),
       recoveryIssues: data.recoveryIssues,
       connected: false,
       authorizationConfigured,
@@ -602,7 +608,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           finalData.conflicts.length +
           finalData.queue.filter(needsAttention).length +
           finalData.recoveryIssues.length +
-          (finalData.lineageConflict ? 1 : 0),
+          (finalData.lineageConflict ? 1 : 0) +
+          (finalData.pendingDidaContractCleanup ? 1 : 0),
         recoveryIssues: finalData.recoveryIssues,
         capabilities,
         demoMode: false,
@@ -639,6 +646,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.contractTestRunning = true;
     this.patch({ loading: true, error: undefined });
     try {
+      if ((await this.store.snapshot()).pendingDidaContractCleanup) {
+        throw new Error("存在待安全清理的合同测试对象，已阻止开始新合同");
+      }
       // 任何远端写入前先让旧能力缓存失效并发布只读；失败则绝不启动合同。
       try {
         await this.store.mutate((data) => {
@@ -649,15 +659,84 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         throw error;
       }
       this.publishContractReadOnly();
+      const token = this.secrets.getDidaToken();
+      if (!token) throw new Error("写入合同开始时滴答授权已缺失");
+      const authorizationBinding = await didaAuthorizationBinding(token);
+      const runId = crypto.randomUUID();
+      await this.store.mutate((data) => {
+        if (data.pendingDidaContractCleanup) {
+          throw new Error("合同清理计划发生竞争，已阻止开始新合同");
+        }
+        data.pendingDidaContractCleanup = {
+          authorizationBinding,
+          plan: {
+            runId,
+            marker: didaContractMarker(runId),
+            projects: [],
+            tasks: [],
+          },
+        };
+      });
       const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 });
       const report = await new DidaWriteContractRunner(
         contractApi,
-        undefined,
+        () => runId,
         undefined,
         undefined,
         onProgress,
+        undefined,
+        async (plan) => {
+          await this.store.mutate((data) => {
+            assertOwnedContractCleanupPlan(
+              data.pendingDidaContractCleanup,
+              authorizationBinding,
+              runId,
+              didaContractMarker(runId),
+            );
+            if (plan) {
+              if (plan.runId !== runId || plan.marker !== didaContractMarker(runId)) {
+                throw new Error("合同运行身份发生竞争，拒绝覆盖清理计划");
+              }
+              data.pendingDidaContractCleanup = { authorizationBinding, plan };
+            } else {
+              delete data.pendingDidaContractCleanup;
+            }
+          });
+        },
       ).run();
       this.lastDidaWriteContractReport = report;
+      await this.store.mutate((data) => {
+        if (report.cleanupPlan) {
+          assertOwnedContractCleanupPlan(
+            data.pendingDidaContractCleanup,
+            authorizationBinding,
+            runId,
+            didaContractMarker(runId),
+          );
+          data.pendingDidaContractCleanup = {
+            authorizationBinding,
+            plan: report.cleanupPlan,
+          };
+        } else if (!report.remoteArtifactsRemaining && report.cleanupErrors.length === 0) {
+          if (data.pendingDidaContractCleanup) {
+            assertOwnedContractCleanupPlan(
+              data.pendingDidaContractCleanup,
+              authorizationBinding,
+              runId,
+              didaContractMarker(runId),
+            );
+            delete data.pendingDidaContractCleanup;
+          }
+        }
+      });
+      const persistedAfterContract = await this.store.snapshot();
+      this.patch({
+        attentionCount: persistedAfterContract.conflicts.length +
+          persistedAfterContract.queue.filter(needsAttention).length +
+          persistedAfterContract.recoveryIssues.length +
+          (persistedAfterContract.lineageConflict ? 1 : 0) +
+          (persistedAfterContract.pendingDidaContractCleanup ? 1 : 0),
+      });
       const contractComplete = report.status === "passed" &&
         !report.remoteArtifactsRemaining &&
         !report.manualCleanupRequired &&
@@ -672,9 +751,6 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         const repeatWriteVerified = report.repeatWriteVerified && contractArtifactsClean;
         const parentTaskVerified = report.parentTaskVerified && contractArtifactsClean;
         const taskReopenVerified = report.taskReopenVerified && contractArtifactsClean;
-        const token = this.secrets.getDidaToken();
-        if (!token) throw new Error("写入合同结束时滴答授权已缺失");
-        const authorizationBinding = await didaAuthorizationBinding(token);
         await this.store.mutate((data) => {
           data.didaContractCapabilities = {
             probeVersion: DIDA_CONTRACT_PROBE_VERSION,
@@ -716,6 +792,63 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       releaseExclusive();
       this.patch({ loading: false });
     }
+  }
+
+  async adoptPendingContractRunFromRemote(): Promise<void> {
+    this.assertWritable();
+    if (this.state.loading) throw new Error("同步正在进行，请稍后再领养合同残留");
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答合同残留领养");
+    this.patch({ loading: true, error: undefined });
+    try {
+      const token = this.secrets.getDidaToken();
+      if (!token) throw new Error("尚未配置滴答授权");
+      const authorizationBinding = await didaAuthorizationBinding(token);
+      await new DidaContractCleanupService(
+        this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 }),
+        this.store,
+      ).adoptStrictRemoteRun(authorizationBinding);
+    } finally {
+      await this.refreshAttentionCountFromStore().catch(() => undefined);
+      releaseExclusive();
+      this.patch({ loading: false });
+    }
+  }
+
+  async recoverPendingDidaContractCleanup(): Promise<void> {
+    this.assertWritable();
+    if (this.state.loading) throw new Error("同步正在进行，请稍后再清理合同残留");
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答合同残留清理");
+    this.patch({ loading: true, error: undefined });
+    try {
+      const token = this.secrets.getDidaToken();
+      if (!token) throw new Error("尚未配置滴答授权");
+      const authorizationBinding = await didaAuthorizationBinding(token);
+      await new DidaContractCleanupService(
+        this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 }),
+        this.store,
+      ).recover(authorizationBinding);
+    } finally {
+      await this.refreshAttentionCountFromStore().catch(() => undefined);
+      releaseExclusive();
+      this.patch({ loading: false });
+    }
+  }
+
+  didaContractCleanupRuntimeStatus(): { pending: boolean; adoptionSuggested: boolean } {
+    return {
+      pending: false,
+      adoptionSuggested: !!this.lastDidaWriteContractReport?.remoteArtifactsRemaining &&
+        !this.lastDidaWriteContractReport.cleanupPlan,
+    };
+  }
+
+  private async refreshAttentionCountFromStore(): Promise<void> {
+    const data = await this.store.snapshot();
+    this.patch({
+      attentionCount: data.conflicts.length + data.queue.filter(needsAttention).length +
+        data.recoveryIssues.length + (data.lineageConflict ? 1 : 0) +
+        (data.pendingDidaContractCleanup ? 1 : 0),
+    });
   }
 
   private publishContractReadOnly(): void {
@@ -1019,7 +1152,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         data.conflicts.length +
         data.queue.filter(needsAttention).length +
         data.recoveryIssues.length +
-        (data.lineageConflict ? 1 : 0),
+        (data.lineageConflict ? 1 : 0) +
+        (data.pendingDidaContractCleanup ? 1 : 0),
     });
   }
 
@@ -1581,7 +1715,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         data.conflicts.filter((conflict) => conflict.status !== "resolved" &&
           conflict.status !== "superseded").length +
         data.recoveryIssues.length +
-        (data.lineageConflict ? 1 : 0),
+        (data.lineageConflict ? 1 : 0) +
+        (data.pendingDidaContractCleanup ? 1 : 0),
     });
   }
 
@@ -2238,7 +2373,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         data.conflicts.length +
         data.queue.filter(needsAttention).length +
         data.recoveryIssues.length +
-        (data.lineageConflict ? 1 : 0),
+        (data.lineageConflict ? 1 : 0) +
+        (data.pendingDidaContractCleanup ? 1 : 0),
       recoveryIssues: data.recoveryIssues,
     });
   }
@@ -2797,4 +2933,16 @@ function projectionWriteReceipt(
     message: receipt.message ?? "投影写入未取得可验证任务快照",
     conflictId: receipt.conflictId,
   };
+}
+
+function assertOwnedContractCleanupPlan(
+  pending: PendingDidaContractCleanup | undefined,
+  authorizationBinding: string,
+  runId: string,
+  marker: string,
+): asserts pending is PendingDidaContractCleanup {
+  if (!pending || pending.authorizationBinding !== authorizationBinding ||
+    pending.plan.runId !== runId || pending.plan.marker !== marker) {
+    throw new Error("合同清理计划发生竞争，拒绝覆盖并停止后续远端操作");
+  }
 }

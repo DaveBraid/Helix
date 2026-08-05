@@ -5,6 +5,10 @@ import {
   sameDidaTaskExcept,
 } from "../../domain/dida-task-metadata";
 import type { TaskScheduleMode } from "../../domain/task-schedule";
+import {
+  isDidaContractTaskTitle,
+  type DidaContractCleanupPlan,
+} from "../../domain/dida-contract-cleanup";
 import { deepEqual } from "../../domain/stable";
 import type { DidaApi, DidaTaskUpdateWirePayload } from "./api";
 import {
@@ -70,6 +74,8 @@ export interface DidaWriteContractReport {
     reason: string;
   };
   capabilityFailures: string[];
+  /** 仅供持久恢复使用；不得进入 Notice 或普通诊断。 */
+  cleanupPlan?: DidaContractCleanupPlan;
 }
 
 export function verifiedBoardPlacementCapability(
@@ -83,6 +89,8 @@ interface CreatedProject {
   name: string;
   viewMode?: DidaProject["viewMode"];
   expectedColumns: DidaColumn[];
+  columnsCaptured: boolean;
+  deleteState?: "sent-unknown";
 }
 
 interface CreatedTask {
@@ -90,6 +98,7 @@ interface CreatedTask {
   projectId: string;
   candidateProjectIds: string[];
   state: "open" | "completed" | "unknown";
+  deleteState?: "sent-unknown";
 }
 
 export class DidaWriteContractRunner {
@@ -104,6 +113,8 @@ export class DidaWriteContractRunner {
   private taskReopenVerified = false;
   private manualCleanupRequired: DidaWriteContractReport["manualCleanupRequired"];
   private currentStage = "准备合同测试";
+  private cleanupCheckpoint: (() => Promise<void>) | undefined;
+  private cleanupCheckpointFailed = false;
   private readonly timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
   constructor(
@@ -113,6 +124,9 @@ export class DidaWriteContractRunner {
     private readonly sleep: (milliseconds: number) => Promise<void> = delay,
     private readonly onProgress: (progress: DidaWriteContractProgress) => void = () => undefined,
     private readonly monotonicNow: () => number = () => Date.now(),
+    private readonly onCleanupPlanChange: (
+      plan: DidaContractCleanupPlan | undefined,
+    ) => Promise<void> = async () => undefined,
   ) {}
 
   async run(): Promise<DidaWriteContractReport> {
@@ -127,6 +141,7 @@ export class DidaWriteContractRunner {
     this.taskReopenVerified = false;
     this.manualCleanupRequired = undefined;
     this.currentStage = "准备合同测试";
+    this.cleanupCheckpointFailed = false;
     const runId = this.createRunId();
     const marker = `[Helix 合同测试 ${runId}]`;
     const projectAName = `${marker} 清单 A`;
@@ -141,6 +156,23 @@ export class DidaWriteContractRunner {
     const optionalTasks: CreatedTask[] = [];
     let failure: string | undefined;
     let failureStage: string | undefined;
+    this.cleanupCheckpoint = async () => {
+      try {
+        await this.onCleanupPlanChange(buildCleanupPlan(
+          runId,
+          marker,
+          projects,
+          [task, childTask, ...optionalTasks].filter((entry): entry is CreatedTask => entry !== null),
+          this.manualCleanupRequired,
+          projects.length > 0 || task !== null || childTask !== null || optionalTasks.length > 0 ||
+            this.untrackedCreateOutcome,
+          this.untrackedCreateOutcome,
+        ));
+      } catch {
+        this.cleanupCheckpointFailed = true;
+        throw new Error("合同清理计划持久化发生竞争，已停止后续远端操作");
+      }
+    };
 
     try {
       this.beginStage("冻结测试前清单范围");
@@ -258,6 +290,7 @@ export class DidaWriteContractRunner {
         }));
       } catch (error) {
         this.untrackedCreateOutcome = true;
+        await this.cleanupCheckpoint();
         throw error;
       }
       task = {
@@ -266,6 +299,7 @@ export class DidaWriteContractRunner {
         candidateProjectIds: [projectA.id, projectB.id],
         state: "open",
       };
+      await this.cleanupCheckpoint();
       this.assertTaskIdentity(created, created.id, projectA.id, marker);
       const rereadCreated = normalizeTask(await this.api.getTask(projectA.id, created.id));
       this.assertTaskIdentity(rereadCreated, created.id, projectA.id, marker);
@@ -338,6 +372,7 @@ export class DidaWriteContractRunner {
       );
       await this.deleteVerifiedTask(reminderTask, marker);
       optionalTasks.splice(optionalTasks.indexOf(reminderTask), 1);
+      await this.cleanupCheckpoint();
       steps.push(this.reminderWriteVerified
         ? "独立写入并清空 10 分钟前提醒"
         : "当前账号未通过提醒写入合同，保持生产只读");
@@ -362,6 +397,7 @@ export class DidaWriteContractRunner {
       );
       await this.deleteVerifiedTask(repeatTask, marker);
       optionalTasks.splice(optionalTasks.indexOf(repeatTask), 1);
+      await this.cleanupCheckpoint();
       steps.push(this.repeatWriteVerified
         ? "独立写入并清空每日重复规则"
         : "当前账号未通过重复规则写入合同，保持生产只读");
@@ -386,7 +422,10 @@ export class DidaWriteContractRunner {
           status: 0,
           }, { parentTaskVerified: true })));
         } catch (error) {
-          if (isUnknownRemoteOutcome(error)) this.untrackedCreateOutcome = true;
+          if (isUnknownRemoteOutcome(error)) {
+            this.untrackedCreateOutcome = true;
+            await this.cleanupCheckpoint();
+          }
           throw error;
         }
         childTask = {
@@ -395,6 +434,7 @@ export class DidaWriteContractRunner {
         candidateProjectIds: [projectA.id],
         state: "open",
       };
+        await this.cleanupCheckpoint();
         this.assertTaskIdentity(createdChild, createdChild.id, projectA.id, marker);
         const rereadChild = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
         this.assertTaskIdentity(rereadChild, createdChild.id, projectA.id, marker);
@@ -424,8 +464,10 @@ export class DidaWriteContractRunner {
         this.beginStage("删除并核对子任务");
         await this.deleteVerifiedTask(childTask, marker);
         childTask = null;
+        await this.cleanupCheckpoint();
         await this.deleteVerifiedTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
+        await this.cleanupCheckpoint();
         steps.push("先删除测试子任务并验证不存在");
       } catch (error) {
         if (this.untrackedCreateOutcome) throw error;
@@ -441,9 +483,11 @@ export class DidaWriteContractRunner {
           }
           await this.cleanupTask(childTask, marker);
           childTask = null;
+          await this.cleanupCheckpoint();
         }
         await this.cleanupTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
+        await this.cleanupCheckpoint();
         this.parentTaskVerified = false;
         capabilityFailures.push(capabilityFailureSummary("parentTask"));
         steps.push("当前账号未通过父子任务合同，保持生产只读");
@@ -492,6 +536,7 @@ export class DidaWriteContractRunner {
       }
       await this.deleteVerifiedTask(boardTask, marker);
       optionalTasks.splice(optionalTasks.indexOf(boardTask), 1);
+      await this.cleanupCheckpoint();
 
       this.beginStage("移动测试任务并核对来源清单");
       const beforeMove = normalizeTask(await this.api.getTask(projectA.id, created.id));
@@ -507,6 +552,7 @@ export class DidaWriteContractRunner {
         throw new Error("移动复读确认任务仍在来源清单；已停止继续流程且未重发");
       }
       task.projectId = projectB.id;
+      await this.cleanupCheckpoint();
       steps.push(
         move.responseUnknown
           ? "移动响应未知；未重发，目标清单精确复读且来源清单确认移出"
@@ -515,16 +561,19 @@ export class DidaWriteContractRunner {
 
       this.beginStage("完成并复读测试任务");
       task.state = "unknown";
+      await this.cleanupCheckpoint();
       await this.api.completeTask(projectB.id, created.id);
       const rereadCompleted = normalizeTask(await this.api.getTask(projectB.id, created.id));
       this.assertTaskIdentity(rereadCompleted, created.id, projectB.id, marker);
       if (rereadCompleted.status !== 2) throw new Error("任务完成后 status 未变为 2");
       task.state = "completed";
+      await this.cleanupCheckpoint();
       steps.push("完成任务并复读状态");
 
       this.beginStage("删除并核对测试任务");
       await this.deleteVerifiedTask(task, marker);
       task = null;
+      await this.cleanupCheckpoint();
       this.taskCrudVerified = true;
       steps.push("删除测试任务并验证不存在");
 
@@ -536,10 +585,14 @@ export class DidaWriteContractRunner {
         optionalTasks,
       );
       try {
+        reopenTask.state = "unknown";
+        await this.cleanupCheckpoint();
         await this.api.completeTask(projectA.id, reopenTask.id);
         const completed = normalizeTask(await this.api.getTask(projectA.id, reopenTask.id));
         this.assertTaskIdentity(completed, reopenTask.id, projectA.id, marker);
         if (completed.status !== 2) throw new Error("重开探针任务未先完成");
+        reopenTask.state = "completed";
+        await this.cleanupCheckpoint();
         await this.updateAndVerifyTaskProperties(
           reopenTask.id,
           projectA.id,
@@ -552,6 +605,8 @@ export class DidaWriteContractRunner {
             }
           },
         );
+        reopenTask.state = "open";
+        await this.cleanupCheckpoint();
         this.taskReopenVerified = true;
         steps.push("专用临时任务完成→最小 status=0→精确复读");
       } catch (error) {
@@ -562,12 +617,14 @@ export class DidaWriteContractRunner {
       } finally {
         await this.cleanupTask(reopenTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(reopenTask), 1);
+        await this.cleanupCheckpoint();
       }
 
       this.beginStage("核对并删除空测试清单");
       for (const project of [...projects].reverse()) {
         await this.deleteVerifiedProject(project, marker);
         projects.splice(projects.indexOf(project), 1);
+        await this.cleanupCheckpoint();
       }
       steps.push("删除两个空测试清单并验证身份");
     } catch (error) {
@@ -575,43 +632,68 @@ export class DidaWriteContractRunner {
       failure = `${failureStage}：${messageOf(error)}`;
     } finally {
       let taskCleanupFailed = false;
-      if (this.manualCleanupRequired) {
+      if (this.cleanupCheckpointFailed) {
+        taskCleanupFailed = true;
+        cleanupErrors.push("合同清理计划未能安全持久化；已停止后续远端操作");
+      } else if (this.manualCleanupRequired) {
         cleanupErrors.push(
           "移动结果未决：已停止自动清理，请按报告中的任务 ID、唯一标记与候选清单人工核对",
         );
       } else if (childTask) {
         this.reportProgress("安全清理测试子任务");
-        await this.cleanupTask(childTask, marker).catch((error) => {
+        await this.cleanupTask(childTask, marker).then(() => {
+          childTask = null;
+          return this.cleanupCheckpoint?.();
+        }).catch((error) => {
           taskCleanupFailed = true;
           cleanupErrors.push(`测试子任务：${messageOf(error)}`);
         });
       }
-      if (!this.manualCleanupRequired) {
+      if (!this.cleanupCheckpointFailed && !this.manualCleanupRequired) {
         for (const optionalTask of [...optionalTasks].reverse()) {
           this.reportProgress("安全清理可选能力测试任务");
-          await this.cleanupTask(optionalTask, marker).catch((error) => {
+          await this.cleanupTask(optionalTask, marker).then(() => {
+            optionalTasks.splice(optionalTasks.indexOf(optionalTask), 1);
+            return this.cleanupCheckpoint?.();
+          }).catch((error) => {
             taskCleanupFailed = true;
             cleanupErrors.push(`可选能力测试任务：${messageOf(error)}`);
           });
         }
       }
-      if (!this.manualCleanupRequired && task) {
+      if (!this.cleanupCheckpointFailed && !this.manualCleanupRequired && task) {
         this.reportProgress("安全清理测试任务");
-        await this.cleanupTask(task, marker).catch((error) => {
+        await this.cleanupTask(task, marker).then(() => {
+          task = null;
+          return this.cleanupCheckpoint?.();
+        }).catch((error) => {
           taskCleanupFailed = true;
           cleanupErrors.push(`测试任务：${messageOf(error)}`);
         });
       }
-      if (!this.manualCleanupRequired && !taskCleanupFailed) {
+      if (!this.cleanupCheckpointFailed && !this.manualCleanupRequired && !taskCleanupFailed) {
         this.reportProgress("安全清理测试清单");
         for (const project of [...projects].reverse()) {
-          await this.cleanupProject(project, marker).catch((error) => {
+          await this.cleanupProject(project, marker).then(() => {
+            projects.splice(projects.indexOf(project), 1);
+            return this.cleanupCheckpoint?.();
+          }).catch((error) => {
             cleanupErrors.push(`测试清单：${messageOf(error)}`);
           });
         }
       }
     }
 
+    const cleanupPlan = buildCleanupPlan(
+      runId,
+      marker,
+      projects,
+      [task, childTask, ...optionalTasks].filter((entry): entry is CreatedTask => entry !== null),
+      this.manualCleanupRequired,
+      cleanupErrors.length > 0 || this.untrackedCreateOutcome,
+      this.untrackedCreateOutcome,
+    );
+    this.cleanupCheckpoint = undefined;
     return {
       status: failure ? "failed" : "passed",
       steps,
@@ -630,6 +712,7 @@ export class DidaWriteContractRunner {
       taskReopenVerified: this.taskReopenVerified,
       manualCleanupRequired: this.manualCleanupRequired,
       capabilityFailures,
+      cleanupPlan,
     };
   }
 
@@ -735,7 +818,10 @@ export class DidaWriteContractRunner {
         priority: 0,
       }));
     } catch (error) {
-      if (isUnknownRemoteOutcome(error)) this.untrackedCreateOutcome = true;
+      if (isUnknownRemoteOutcome(error)) {
+        this.untrackedCreateOutcome = true;
+        await this.cleanupCheckpoint?.();
+      }
       throw error;
     }
     this.assertTaskIdentity(created, created.id, projectId, marker);
@@ -748,6 +834,7 @@ export class DidaWriteContractRunner {
       state: "open",
     };
     tracking.push(task);
+    await this.cleanupCheckpoint?.();
     return task;
   }
 
@@ -865,6 +952,7 @@ export class DidaWriteContractRunner {
         candidateProjectIds: [fromProjectId, toProjectId],
         reason: messageOf(error),
       };
+      await this.cleanupCheckpoint?.();
       if (!unknownOutcome) throw error;
       throw new Error(
         "移动响应未知，复读未能同时证明目标清单身份与来源清单移出；未重发。" +
@@ -958,19 +1046,28 @@ export class DidaWriteContractRunner {
       created = normalizeProject(await this.api.createProject({ name }));
     } catch (error) {
       this.untrackedCreateOutcome = true;
+      await this.cleanupCheckpoint?.();
       throw error;
     }
     if (created.name !== name) {
       this.untrackedCreateOutcome = true;
+      await this.cleanupCheckpoint?.();
       throw new Error("新建清单返回的名称与本轮唯一标记不一致");
     }
     if (forbiddenIds.has(created.id)) {
       this.untrackedCreateOutcome = true;
+      await this.cleanupCheckpoint?.();
       throw new Error("新建清单返回了测试前已存在或本轮已使用的 ID，拒绝继续");
     }
-    const project: CreatedProject = { id: created.id, name, expectedColumns: [] };
+    const project: CreatedProject = {
+      id: created.id,
+      name,
+      expectedColumns: [],
+      columnsCaptured: false,
+    };
     tracked.push(project);
     forbiddenIds.add(created.id);
+    await this.cleanupCheckpoint?.();
     const reread = normalizeProject(await this.api.getProject(created.id));
     if (reread.id !== created.id || reread.name !== name) {
       throw new Error("新建清单复读身份与本轮唯一标记不一致");
@@ -981,6 +1078,8 @@ export class DidaWriteContractRunner {
       throw new Error("新建清单的初始分栏归属与清单 ID 不一致");
     }
     project.expectedColumns = initialColumns;
+    project.columnsCaptured = true;
+    await this.cleanupCheckpoint?.();
     return project;
   }
 
@@ -1013,6 +1112,7 @@ export class DidaWriteContractRunner {
     this.assertExactColumns(normalizeColumns(afterDetail.columns), reread, "创建分栏后双源列复读不一致");
     this.assertExactColumns(reread, expected, "创建分栏后的同 ID 复读不一致");
     project.expectedColumns = reread;
+    await this.cleanupCheckpoint?.();
     return created;
   }
 
@@ -1038,6 +1138,7 @@ export class DidaWriteContractRunner {
     const reread = normalizeColumns(await this.api.getColumns(project.id));
     this.assertExactColumns(reread, expected, "改名分栏后的同 ID 复读不一致");
     project.expectedColumns = reread;
+    await this.cleanupCheckpoint?.();
   }
 
   private async updateAndVerifyProjectViewMode(
@@ -1075,7 +1176,8 @@ export class DidaWriteContractRunner {
     projectId: string,
     marker: string,
   ): void {
-    if (task.id !== taskId || task.projectId !== projectId || !task.title.includes(marker)) {
+    if (task.id !== taskId || task.projectId !== projectId ||
+      !isDidaContractTaskTitle(task.title, marker)) {
       throw new Error("任务身份、清单或本轮唯一标记不一致");
     }
   }
@@ -1153,6 +1255,12 @@ export class DidaWriteContractRunner {
     if (current.id !== task.id) throw new Error("删除前任务 ID 复读不一致");
     this.assertTaskIdentity(current, task.id, task.projectId, marker);
     await this.assertTaskPresentInObservableCollection(task);
+    if (task.deleteState === "sent-unknown") {
+      await this.waitForTaskAbsentFromObservableCollection(task);
+      return;
+    }
+    task.deleteState = "sent-unknown";
+    await this.cleanupCheckpoint?.();
     try {
       await this.api.deleteTask(task.projectId, task.id);
     } catch (error) {
@@ -1174,12 +1282,12 @@ export class DidaWriteContractRunner {
     const data = await this.api.getProjectData(project.id);
     const tasks = Array.isArray(data.tasks) ? data.tasks.map(normalizeTask) : null;
     if (!tasks) throw new Error("删除前清单任务列表不是数组");
-    if (tasks.some((candidate) => !candidate.title.includes(marker))) {
+    if (tasks.some((candidate) => !isDidaContractTaskTitle(candidate.title, marker))) {
       throw new Error("测试清单出现非本轮任务，拒绝删除清单");
     }
     if (tasks.length > 0) throw new Error("测试清单仍有任务，拒绝删除清单");
     const completedTasks = await this.readCompletedTasks(project.id, "full-history");
-    if (completedTasks.some((candidate) => !candidate.title.includes(marker))) {
+    if (completedTasks.some((candidate) => !isDidaContractTaskTitle(candidate.title, marker))) {
       throw new Error("测试清单出现非本轮已完成任务，拒绝删除清单");
     }
     if (completedTasks.length > 0) {
@@ -1190,6 +1298,12 @@ export class DidaWriteContractRunner {
       project.expectedColumns,
       "测试清单分栏集合在运行期间出现未知变化，拒绝删除清单",
     );
+    if (project.deleteState === "sent-unknown") {
+      await this.waitForProjectAbsentFromCollection(project.id);
+      return;
+    }
+    project.deleteState = "sent-unknown";
+    await this.cleanupCheckpoint?.();
     try {
       await this.api.deleteProject(project.id);
     } catch (error) {
@@ -1323,10 +1437,14 @@ export class DidaWriteContractRunner {
       const matches: CreatedTask[] = [];
       for (const projectId of task.candidateProjectIds) {
         const candidate = { ...task, projectId };
-        const tasks = await this.readObservableTasks(candidate);
+        const tasks = await this.readObservableTasksWithRateLimit(candidate, deadline);
         if (tasks.some((current) => current.id === task.id)) matches.push(candidate);
       }
-      if (matches.length === 1) return matches[0]!;
+      if (matches.length === 1) {
+        task.projectId = matches[0]!.projectId;
+        await this.cleanupCheckpoint?.();
+        return task;
+      }
       ambiguous = matches.length > 1;
       if (attempt < ABSENCE_CHECK_ATTEMPTS - 1) {
         const remaining = deadline - this.monotonicNow();
@@ -1336,6 +1454,22 @@ export class DidaWriteContractRunner {
     }
     if (ambiguous) throw new Error("测试任务同时存在于多个候选清单集合，拒绝猜测归属");
     return null;
+  }
+
+  private async readObservableTasksWithRateLimit(
+    task: CreatedTask,
+    deadline: number,
+  ): Promise<DidaTask[]> {
+    while (true) {
+      try {
+        return await this.readObservableTasks(task);
+      } catch (error) {
+        if (!(error instanceof DidaHttpError) || error.category !== "rate-limit") throw error;
+        const remaining = deadline - this.monotonicNow();
+        if (remaining <= 0) throw error;
+        await this.sleep(Math.min(error.retryAfterMs ?? 60_000, remaining));
+      }
+    }
   }
 
   private async cleanupProject(project: CreatedProject, marker: string): Promise<void> {
@@ -1466,6 +1600,64 @@ function taskMoveInvariant(task: DidaTask): Omit<
     ...invariant
   } = withoutMetadata;
   return invariant;
+}
+
+function buildCleanupPlan(
+  runId: string,
+  marker: string,
+  projects: CreatedProject[],
+  tasks: CreatedTask[],
+  manual: DidaWriteContractReport["manualCleanupRequired"],
+  force: boolean,
+  requiresAdoption: boolean,
+): DidaContractCleanupPlan | undefined {
+  const byTaskId = new Map<string, CreatedTask>();
+  for (const task of tasks) {
+    const previous = byTaskId.get(task.id);
+    byTaskId.set(task.id, previous
+      ? {
+          ...task,
+          candidateProjectIds: [...new Set([
+            ...previous.candidateProjectIds,
+            ...task.candidateProjectIds,
+          ])],
+          state: previous.state === task.state ? task.state : "unknown",
+        }
+      : task);
+  }
+  if (manual) {
+    const previous = byTaskId.get(manual.taskId);
+    byTaskId.set(manual.taskId, {
+      id: manual.taskId,
+      projectId: previous?.projectId ?? manual.candidateProjectIds[0] ?? "",
+      candidateProjectIds: [...new Set([
+        ...(previous?.candidateProjectIds ?? []),
+        ...manual.candidateProjectIds,
+      ])],
+      state: "unknown",
+    });
+  }
+  if (!force && projects.length === 0 && byTaskId.size === 0) return undefined;
+  if (requiresAdoption || projects.some((project) => !project.columnsCaptured)) {
+    return { runId, marker, projects: [], tasks: [] };
+  }
+  return {
+    runId,
+    marker,
+    projects: projects.map((project) => ({
+      id: project.id,
+      name: project.name,
+      expectedColumns: project.expectedColumns,
+      baselineSource: "contract",
+      ...(project.deleteState ? { deleteState: project.deleteState } : {}),
+    })),
+    tasks: [...byTaskId.values()].map(({ id, candidateProjectIds, state, deleteState }) => ({
+      id,
+      candidateProjectIds,
+      state,
+      ...(deleteState ? { deleteState } : {}),
+    })),
+  };
 }
 
 function delay(milliseconds: number): Promise<void> {

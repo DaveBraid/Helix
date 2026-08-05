@@ -4,7 +4,7 @@ import { createDefaultData, hydrateData } from "../src/storage/model";
 import { createSnapshot } from "../src/sync/snapshots";
 import { buildConflictFields } from "../src/sync/three-way-merge";
 import { deterministicEventId } from "../src/domain/events";
-import { stableStringify } from "../src/domain/stable";
+import { stableHash, stableStringify } from "../src/domain/stable";
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import { rotatingChallenges } from "../src/domain/gamification";
@@ -625,6 +625,7 @@ describe("HelixDataStore serialization", () => {
       authorizationBinding: didaAuthorizationBinding("token"),
       taskScheduleMode: "point",
       boardPlacementVerified: true,
+      columnCreateVerified: false,
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
@@ -814,6 +815,41 @@ describe("HelixDataStore serialization", () => {
     cleanupShadow.didaProjectionState = structuredClone(validState);
     (cleanupShadow.didaProjectionState.receiptCleanupPending![0] as unknown as Record<string, unknown>).task = {};
     expect(hydrateData(cleanupShadow).didaProjectionState).toBeUndefined();
+  });
+
+  it("strictly validates the projection column creation checkpoint without secret-shaped extras", () => {
+    const baselineColumns = [{ id: "todo", projectId: "target-list", name: "待处理" }];
+    const valid = createDefaultData("projection-column-checkpoint");
+    valid.didaProjectionState = {
+      enabled: false,
+      ledger: [],
+      parentCheckpoints: [],
+      columnCreation: {
+        operationId: "projection-column:op-1",
+        targetProjectId: "target-list",
+        desiredName: "Helix项目",
+        baselineColumns,
+        baselineHash: stableHash(baselineColumns),
+        previewHash: "a".repeat(64),
+        status: "unknown",
+        errorSummary: "分栏创建远端结果未知",
+      },
+    };
+    expect(hydrateData(valid).didaProjectionState?.columnCreation).toEqual(
+      valid.didaProjectionState.columnCreation,
+    );
+
+    const forged = structuredClone(valid);
+    (forged.didaProjectionState!.columnCreation as unknown as Record<string, unknown>).token = "secret";
+    expect(hydrateData(forged).didaProjectionState).toBeUndefined();
+
+    const badHash = structuredClone(valid);
+    badHash.didaProjectionState!.columnCreation!.baselineHash = "b".repeat(64);
+    expect(hydrateData(badHash).didaProjectionState).toBeUndefined();
+
+    const badPrepared = structuredClone(valid);
+    badPrepared.didaProjectionState!.columnCreation!.status = "prepared";
+    expect(hydrateData(badPrepared).didaProjectionState).toBeUndefined();
   });
 
   it("makes snapshots wait for an in-flight save and preserves a later interleaved mutation", async () => {

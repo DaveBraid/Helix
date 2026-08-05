@@ -46,6 +46,36 @@ export interface ProjectionActivationPreview {
   blockers: string[];
 }
 
+export const PROJECTION_COLUMN_NAME = "Helix项目";
+
+export interface ProjectionColumnBaseline {
+  id: string;
+  projectId: string;
+  name: string;
+}
+
+export interface ProjectionColumnCreationCheckpoint {
+  operationId: string;
+  targetProjectId: string;
+  desiredName: typeof PROJECTION_COLUMN_NAME;
+  baselineColumns: ProjectionColumnBaseline[];
+  baselineHash: string;
+  previewHash: string;
+  status: "prepared" | "running" | "unknown";
+  remoteColumnId?: string;
+  errorSummary?: string;
+}
+
+export interface ProjectionColumnCreationPreview {
+  targetProjectId: string;
+  projectName: string;
+  desiredName: typeof PROJECTION_COLUMN_NAME;
+  baselineColumns: ProjectionColumnBaseline[];
+  baselineHash: string;
+  previewHash: string;
+  blockers: string[];
+}
+
 export interface ManagedPlanAction {
   uuid: string;
   title: string;

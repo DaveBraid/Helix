@@ -57,6 +57,7 @@ export interface DidaWriteContractReport {
   remoteArtifactsRemaining: boolean;
   taskScheduleMode: TaskScheduleMode;
   boardPlacementVerified: boolean;
+  columnCreateVerified: boolean;
   taskCrudVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
@@ -95,6 +96,7 @@ export class DidaWriteContractRunner {
   private untrackedCreateOutcome = false;
   private taskScheduleMode: TaskScheduleMode = "unknown";
   private boardPlacementVerified = false;
+  private columnCreateVerified = false;
   private taskCrudVerified = false;
   private reminderWriteVerified = false;
   private repeatWriteVerified = false;
@@ -117,6 +119,7 @@ export class DidaWriteContractRunner {
     this.untrackedCreateOutcome = false;
     this.taskScheduleMode = "unknown";
     this.boardPlacementVerified = false;
+    this.columnCreateVerified = false;
     this.taskCrudVerified = false;
     this.reminderWriteVerified = false;
     this.repeatWriteVerified = false;
@@ -188,10 +191,19 @@ export class DidaWriteContractRunner {
         projectA.expectedColumns,
         "切换看板后列基线出现未知变化",
       );
-      if (columns.length === 0) {
+      const existingPlacementColumnId = columns[0]?.id;
+      const baselineWasEmpty = columns.length === 0;
+      projectA.expectedColumns = columns;
+      const createCapabilityColumn = await this.createAndVerifyColumn(
+        projectA,
+        `${marker} 分栏创建能力`,
+      );
+      this.columnCreateVerified = true;
+      columns = projectA.expectedColumns;
+      steps.push("创建唯一标记分栏并经详情与列端点双源精确复读");
+      if (baselineWasEmpty) {
         const firstColumnName = `${marker} 待处理`;
         const secondColumnName = `${marker} 进行中`;
-        projectA.expectedColumns = columns;
         const firstColumn = await this.createAndVerifyColumn(
           projectA,
           firstColumnName,
@@ -206,6 +218,9 @@ export class DidaWriteContractRunner {
         if (!columns.some((column) => column.id === firstColumn.id)) {
           throw new Error("首个测试分栏在后续列操作中消失");
         }
+      }
+      if (!columns.some((column) => column.id === createCapabilityColumn.id)) {
+        throw new Error("分栏创建能力测试对象在后续列操作中消失");
       }
       const columnIds = new Set<string>();
       for (const column of columns) {
@@ -451,7 +466,7 @@ export class DidaWriteContractRunner {
       try {
         const reconciledUnknownPlacement = await this.placeAndVerifyTask(
           beforePlacement,
-          columns[0]!.id,
+          existingPlacementColumnId ?? createCapabilityColumn.id,
           marker,
         );
         this.boardPlacementVerified = true;
@@ -606,6 +621,8 @@ export class DidaWriteContractRunner {
       remoteArtifactsRemaining: cleanupErrors.length > 0 || this.untrackedCreateOutcome,
       taskScheduleMode: this.taskScheduleMode,
       boardPlacementVerified: this.boardPlacementVerified,
+      columnCreateVerified: this.columnCreateVerified &&
+        cleanupErrors.length === 0 && !this.untrackedCreateOutcome,
       taskCrudVerified: this.taskCrudVerified,
       reminderWriteVerified: this.reminderWriteVerified,
       repeatWriteVerified: this.repeatWriteVerified,
@@ -971,11 +988,14 @@ export class DidaWriteContractRunner {
     project: CreatedProject,
     name: string,
   ): Promise<DidaColumn> {
-    this.assertExactColumns(
-      normalizeColumns(await this.api.getColumns(project.id)),
-      project.expectedColumns,
-      "创建分栏前的完整列基线已变化",
-    );
+    const beforeDetail = await this.api.getProjectData(project.id);
+    const beforeEndpoint = normalizeColumns(await this.api.getColumns(project.id));
+    if (normalizeProject(beforeDetail.project).id !== project.id) {
+      throw new Error("创建分栏前详情清单身份不一致");
+    }
+    const beforeDetailColumns = normalizeColumns(beforeDetail.columns);
+    this.assertExactColumns(beforeDetailColumns, beforeEndpoint, "创建分栏前双源列基线不一致");
+    this.assertExactColumns(beforeEndpoint, project.expectedColumns, "创建分栏前的完整列基线已变化");
     const created = normalizeColumns([await this.api.createColumn(project.id, { name })])[0]!;
     if (
       created.projectId !== project.id ||
@@ -985,7 +1005,12 @@ export class DidaWriteContractRunner {
       throw new Error("创建分栏响应的 ID、归属、名称或唯一性无效");
     }
     const expected = normalizeColumns([...project.expectedColumns, created]);
+    const afterDetail = await this.api.getProjectData(project.id);
     const reread = normalizeColumns(await this.api.getColumns(project.id));
+    if (normalizeProject(afterDetail.project).id !== project.id) {
+      throw new Error("创建分栏后详情清单身份不一致");
+    }
+    this.assertExactColumns(normalizeColumns(afterDetail.columns), reread, "创建分栏后双源列复读不一致");
     this.assertExactColumns(reread, expected, "创建分栏后的同 ID 复读不一致");
     project.expectedColumns = reread;
     return created;

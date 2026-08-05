@@ -26,6 +26,12 @@ import {
 import { focusMinutes } from "../domain/focus-duration";
 import { challengeProgress, rotatingChallenges } from "../domain/gamification";
 import { stableHash } from "../domain/stable";
+import {
+  PROJECTION_COLUMN_NAME,
+  type ProjectionColumnBaseline,
+  type ProjectionColumnCreationCheckpoint,
+  type ProjectionColumnCreationPreview,
+} from "../domain/dida-project-projection";
 import { DidaApi, type DidaCapabilities } from "../integrations/dida/api";
 import {
   DidaFocusService,
@@ -97,6 +103,7 @@ export interface HelixRuntimeState {
   capabilities: DidaCapabilities | null;
   taskScheduleMode: TaskScheduleMode;
   boardPlacementVerified: boolean;
+  columnCreateVerified: boolean;
   taskCrudVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
@@ -128,6 +135,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   capabilities: null,
   taskScheduleMode: "unknown",
   boardPlacementVerified: false,
+  columnCreateVerified: false,
   taskCrudVerified: false,
   reminderWriteVerified: false,
   repeatWriteVerified: false,
@@ -187,6 +195,20 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     if (data.recoveryIssues.length === 0) {
       await this.store.mutate((draft) => {
         draft.queue = recoveredQueue.list();
+        const checkpoint = draft.didaProjectionState?.columnCreation;
+        if (checkpoint?.status === "prepared") {
+          const { columnCreation: _columnCreation, ...state } = draft.didaProjectionState!;
+          draft.didaProjectionState = state;
+        } else if (checkpoint?.status === "running") {
+          draft.didaProjectionState = {
+            ...draft.didaProjectionState!,
+            columnCreation: {
+              ...checkpoint,
+              status: "unknown",
+              errorSummary: "插件在分栏创建收口前中断",
+            },
+          };
+        }
       });
       data = await this.store.snapshot();
     }
@@ -248,6 +270,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         verifiedCapabilities?.taskScheduleMode ?? "unknown",
       boardPlacementVerified:
         verifiedCapabilities?.boardPlacementVerified ?? false,
+      columnCreateVerified: verifiedCapabilities?.columnCreateVerified ?? false,
       taskCrudVerified: verifiedCapabilities?.taskCrudVerified ?? false,
       reminderWriteVerified: verifiedCapabilities?.reminderWriteVerified ?? false,
       repeatWriteVerified: verifiedCapabilities?.repeatWriteVerified ?? false,
@@ -317,6 +340,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         capabilities: null,
         taskScheduleMode: "unknown",
         boardPlacementVerified: false,
+        columnCreateVerified: false,
         taskCrudVerified: false,
         reminderWriteVerified: false,
         repeatWriteVerified: false,
@@ -642,6 +666,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         if (contractComplete) {
         const boardPlacementVerified = verifiedBoardPlacementCapability(report);
         const contractArtifactsClean = !report.remoteArtifactsRemaining;
+        const columnCreateVerified = report.columnCreateVerified && contractArtifactsClean;
         const taskCrudVerified = report.taskCrudVerified && contractArtifactsClean;
         const reminderWriteVerified = report.reminderWriteVerified && contractArtifactsClean;
         const repeatWriteVerified = report.repeatWriteVerified && contractArtifactsClean;
@@ -656,6 +681,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
             authorizationBinding,
             taskScheduleMode: report.taskScheduleMode as Exclude<TaskScheduleMode, "unknown">,
             boardPlacementVerified,
+            columnCreateVerified,
             taskCrudVerified,
             reminderWriteVerified,
             repeatWriteVerified,
@@ -667,6 +693,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         this.patch({
           taskScheduleMode: report.taskScheduleMode,
           boardPlacementVerified,
+          columnCreateVerified,
           taskCrudVerified,
           reminderWriteVerified,
           repeatWriteVerified,
@@ -695,6 +722,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.patch({
       taskScheduleMode: "unknown",
       boardPlacementVerified: false,
+      columnCreateVerified: false,
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
@@ -716,6 +744,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       capability("重复：", this.state.repeatWriteVerified),
       capability("父子：", this.state.parentTaskVerified),
       capability("看板：", this.state.boardPlacementVerified),
+      capability("分栏创建：", this.state.columnCreateVerified),
       recent,
     ].join("；");
   }
@@ -738,8 +767,12 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async readProjectionCatalog(projectId: string): Promise<ProjectionCatalogSnapshot> {
-    const release = this.remoteWriteGate.enterShared();
-    try {
+    return this.withAuthorizationLease(() => this.readProjectionCatalogWithLeaseHeld(projectId));
+  }
+
+  private async readProjectionCatalogWithLeaseHeld(
+    projectId: string,
+  ): Promise<ProjectionCatalogSnapshot> {
       this.assertActive();
       const [projectResponse, detailResponse, columnsResponse] = await Promise.all([
         this.api.getProject(projectId),
@@ -782,9 +815,188 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           unknownOutcomes: unknownOperationIds.size,
         },
       };
+  }
+
+  async previewProjectionColumnCreation(projectId: string): Promise<ProjectionColumnCreationPreview> {
+    return this.withAuthorizationLease(() => this.previewProjectionColumnCreationWithLease(projectId));
+  }
+
+  async confirmProjectionColumnCreation(
+    preview: ProjectionColumnCreationPreview,
+    confirmedHash: string,
+  ): Promise<DidaColumn> {
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("项目投影分栏创建");
+    try {
+      this.assertWritable();
+      const fresh = await this.previewProjectionColumnCreationWithLease(preview.targetProjectId);
+      if (confirmedHash !== preview.previewHash || fresh.previewHash !== preview.previewHash) {
+        throw new Error("分栏创建预览已经变化，必须重新预览");
+      }
+      if (fresh.blockers.length > 0) throw new Error(`分栏创建被阻止：${fresh.blockers.join("；")}`);
+      const checkpoint: ProjectionColumnCreationCheckpoint = {
+        operationId: `projection-column:${crypto.randomUUID()}`,
+        targetProjectId: fresh.targetProjectId,
+        desiredName: PROJECTION_COLUMN_NAME,
+        baselineColumns: structuredClone(fresh.baselineColumns),
+        baselineHash: fresh.baselineHash,
+        previewHash: fresh.previewHash,
+        status: "prepared",
+      };
+      await this.store.mutate((data) => {
+        const state = projectionStateOrDefault(data);
+        if (state.columnCreation) throw new Error("已有分栏创建结果等待收口，禁止再次发送");
+        data.didaProjectionState = { ...state, columnCreation: structuredClone(checkpoint) };
+      });
+      try {
+        await this.updateProjectionColumnCheckpoint(checkpoint.operationId, (current) => ({
+          ...current,
+          status: "running",
+        }));
+      } catch (error) {
+        await this.clearPreparedProjectionColumnCheckpoint(checkpoint.operationId);
+        throw error;
+      }
+      let created: DidaColumn;
+      try {
+        created = normalizeColumns([
+          await this.api.createColumn(checkpoint.targetProjectId, { name: PROJECTION_COLUMN_NAME }),
+        ])[0]!;
+        if (!created.id || created.projectId !== checkpoint.targetProjectId ||
+          created.name !== PROJECTION_COLUMN_NAME) {
+          throw new Error("分栏创建响应的 ID、名称或清单归属无效");
+        }
+        await this.updateProjectionColumnCheckpoint(checkpoint.operationId, (current) => ({
+          ...current,
+          remoteColumnId: created.id,
+        }));
+        const catalog = await this.readProjectionCatalogWithLeaseHeld(checkpoint.targetProjectId);
+        if (uniqueCreatedProjectionColumnId(checkpoint, catalog.columns) !== created.id) {
+          throw new Error("分栏创建后出现并发列变化或返回 ID 不一致");
+        }
+        verifyCreatedProjectionColumn(checkpoint, catalog.columns, created.id);
+        await this.clearProjectionColumnCheckpoint(checkpoint.operationId);
+        return created;
+      } catch (error) {
+        await this.freezeProjectionColumnCreation(checkpoint.operationId);
+        throw new Error("分栏创建结果未知，已冻结；请前往冲突中心精确复核", { cause: error });
+      }
     } finally {
-      release();
+      releaseExclusive();
     }
+  }
+
+  async reconcileProjectionColumnCreation(): Promise<DidaColumn> {
+    this.assertWritable();
+    return this.withAuthorizationLease(async () => {
+      const data = await this.store.snapshot();
+      const checkpoint = data.didaProjectionState?.columnCreation;
+      if (!checkpoint || checkpoint.status !== "unknown") {
+        throw new Error("没有等待复核的分栏创建结果");
+      }
+      const catalog = await this.readProjectionCatalogWithLeaseHeld(checkpoint.targetProjectId);
+      const columnId = checkpoint.remoteColumnId ?? uniqueCreatedProjectionColumnId(checkpoint, catalog.columns);
+      verifyCreatedProjectionColumn(checkpoint, catalog.columns, columnId);
+      const column = catalog.columns.find((candidate) => candidate.id === columnId)!;
+      await this.clearProjectionColumnCheckpoint(checkpoint.operationId);
+      return column;
+    });
+  }
+
+  private async previewProjectionColumnCreationWithLease(
+    projectId: string,
+  ): Promise<ProjectionColumnCreationPreview> {
+    const catalog = await this.readProjectionCatalogWithLeaseHeld(projectId);
+    const project = catalog.projects[0];
+    if (!project || project.id !== projectId) throw new Error("分栏创建目标清单身份不一致");
+    const baselineColumns = projectionColumnBaseline(catalog.columns, projectId);
+    const baselineHash = stableHash(baselineColumns);
+    const state = (await this.store.snapshot()).didaProjectionState;
+    const blockers = [
+      !catalog.readiness.writable ? "当前处于只读恢复状态" : undefined,
+      !catalog.readiness.queueEmpty ? "待写队列非空" : undefined,
+      !catalog.readiness.authorizationCurrent ? "当前授权的基础写入合同已失效" : undefined,
+      !this.state.columnCreateVerified ? "当前授权尚未通过分栏创建合同" : undefined,
+      catalog.readiness.unknownOutcomes > 0 ? "存在结果未知操作" : undefined,
+      state?.columnCreation ? "已有分栏创建结果等待冲突中心收口" : undefined,
+      state?.target && state.target.targetProjectId !== projectId
+        ? `当前项目投影已绑定其他清单 ${state.target.targetProjectId}`
+        : undefined,
+      baselineColumns.some((column) => column.name === PROJECTION_COLUMN_NAME)
+        ? `已存在同名分栏“${PROJECTION_COLUMN_NAME}”`
+        : undefined,
+    ].filter((item): item is string => Boolean(item));
+    const previewHash = stableHash({
+      targetProjectId: projectId,
+      projectName: project.name,
+      desiredName: PROJECTION_COLUMN_NAME,
+      baselineColumns,
+      baselineHash,
+      blockers,
+    });
+    return {
+      targetProjectId: projectId,
+      projectName: project.name,
+      desiredName: PROJECTION_COLUMN_NAME,
+      baselineColumns,
+      baselineHash,
+      previewHash,
+      blockers,
+    };
+  }
+
+  private async updateProjectionColumnCheckpoint(
+    operationId: string,
+    update: (current: ProjectionColumnCreationCheckpoint) => ProjectionColumnCreationCheckpoint,
+  ): Promise<void> {
+    await this.store.mutate((data) => {
+      const state = projectionStateOrDefault(data);
+      if (!state.columnCreation || state.columnCreation.operationId !== operationId) {
+        throw new Error("分栏创建 checkpoint 在持久化前发生竞争");
+      }
+      data.didaProjectionState = { ...state, columnCreation: update(state.columnCreation) };
+    });
+  }
+
+  private async freezeProjectionColumnCreation(operationId: string): Promise<void> {
+    try {
+      await this.updateProjectionColumnCheckpoint(operationId, (current) => ({
+        ...current,
+        status: "unknown",
+        errorSummary: "分栏创建远端结果未知",
+      }));
+    } catch {
+      // 保留竞争后的权威持久状态；绝不为补写 checkpoint 重发远端请求。
+    }
+  }
+
+  private async clearPreparedProjectionColumnCheckpoint(operationId: string): Promise<void> {
+    try {
+      await this.store.mutate((data) => {
+        const state = projectionStateOrDefault(data);
+        const checkpoint = state.columnCreation;
+        if (!checkpoint) return;
+        if (checkpoint.operationId === operationId && checkpoint.status === "prepared") {
+          const { columnCreation: _columnCreation, ...rest } = state;
+          data.didaProjectionState = rest;
+          return;
+        }
+        const issue = "分栏创建 prepared→running 持久化发生竞争；未发送远端请求，已保留权威状态";
+        if (!data.recoveryIssues.includes(issue)) data.recoveryIssues.push(issue);
+      });
+    } catch {
+      // 原始持久化错误优先返回；prepared 仍证明请求未发送，重启恢复会安全清除。
+    }
+  }
+
+  private async clearProjectionColumnCheckpoint(operationId: string): Promise<void> {
+    await this.store.mutate((data) => {
+      const state = projectionStateOrDefault(data);
+      if (!state.columnCreation || state.columnCreation.operationId !== operationId) {
+        throw new Error("分栏创建 checkpoint 在收口前发生竞争");
+      }
+      const { columnCreation: _columnCreation, ...rest } = state;
+      data.didaProjectionState = rest;
+    });
   }
 
   private async verifyRemoteTaskWithAuthorizationLease(
@@ -2082,6 +2294,64 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     } finally {
       release();
     }
+  }
+}
+
+function projectionStateOrDefault(
+  data: HelixPersistedData,
+): NonNullable<HelixPersistedData["didaProjectionState"]> {
+  return data.didaProjectionState ?? { enabled: false, ledger: [], parentCheckpoints: [] };
+}
+
+function projectionColumnBaseline(columns: DidaColumn[], projectId: string): ProjectionColumnBaseline[] {
+  return columns.map((column) => {
+    if (!column.id || column.projectId !== projectId || !column.name) {
+      throw new Error("分栏基线含无效身份、名称或清单归属");
+    }
+    return { id: column.id, projectId: column.projectId, name: column.name };
+  }).sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function verifyProjectionColumnBaseline(
+  checkpoint: ProjectionColumnCreationCheckpoint,
+  columns: DidaColumn[],
+): void {
+  if (stableHash(checkpoint.baselineColumns) !== checkpoint.baselineHash) {
+    throw new Error("分栏创建 checkpoint 的基线哈希无效");
+  }
+  const current = new Map(projectionColumnBaseline(columns, checkpoint.targetProjectId)
+    .map((column) => [column.id, column]));
+  for (const baseline of checkpoint.baselineColumns) {
+    const value = current.get(baseline.id);
+    if (!value || value.projectId !== baseline.projectId || value.name !== baseline.name) {
+      throw new Error("分栏创建后既有列基线发生竞争变化");
+    }
+  }
+}
+
+function uniqueCreatedProjectionColumnId(
+  checkpoint: ProjectionColumnCreationCheckpoint,
+  columns: DidaColumn[],
+): string {
+  verifyProjectionColumnBaseline(checkpoint, columns);
+  const baselineIds = new Set(checkpoint.baselineColumns.map((column) => column.id));
+  const additions = columns.filter((column) => !baselineIds.has(column.id));
+  if (additions.length !== 1 || additions[0]!.projectId !== checkpoint.targetProjectId ||
+    additions[0]!.name !== checkpoint.desiredName) {
+    throw new Error("相对基线不存在唯一且名称精确匹配的新分栏，保持冻结");
+  }
+  return additions[0]!.id;
+}
+
+function verifyCreatedProjectionColumn(
+  checkpoint: ProjectionColumnCreationCheckpoint,
+  columns: DidaColumn[],
+  columnId: string,
+): void {
+  verifyProjectionColumnBaseline(checkpoint, columns);
+  const column = columns.find((candidate) => candidate.id === columnId);
+  if (!column || column.projectId !== checkpoint.targetProjectId || column.name !== checkpoint.desiredName) {
+    throw new Error("待收口分栏的 ID、名称或清单归属不一致，保持冻结");
   }
 }
 

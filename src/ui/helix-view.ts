@@ -277,6 +277,7 @@ export class HelixView extends ItemView {
         | { kind: "parent"; projectId: string }) => Promise<void>;
       recoverPendingProjectProjectionReceiptCleanup: () => Promise<void>;
       removeResolvedProjectProjectionReceipt: (operationId: string) => Promise<void>;
+      reconcileProjectProjectionColumn: () => Promise<void>;
     },
   ) {
     super(leaf);
@@ -2948,7 +2949,12 @@ export class HelixView extends ItemView {
     if (token !== this.renderToken) return;
     const projectionModels = projectionResults.flatMap((result) =>
       result.status === "fulfilled" ? [result.value] : []);
-    const projectionIssueCount = this.renderProjectionConflicts(content, projectionModels, token);
+    const projectionIssueCount = this.renderProjectionConflicts(
+      content,
+      projectionModels,
+      persisted.didaProjectionState?.columnCreation,
+      token,
+    );
     if (persisted.lineageConflict) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", {
@@ -3083,9 +3089,11 @@ export class HelixView extends ItemView {
   private renderProjectionConflicts(
     content: HTMLElement,
     models: ProjectionProjectReadModel[],
+    persistedColumnCreation: ProjectionProjectReadModel["columnCreation"],
     token: number,
   ): number {
     const pending = models.flatMap((model) => model.receiptCleanupPending);
+    const columnCreation = persistedColumnCreation?.status === "unknown" ? persistedColumnCreation : undefined;
     const frozenActions = models.flatMap((model) => model.stages.flatMap((stage) =>
       stage.managed.filter((action) => action.frozen).map((action) => ({ model, stageId: stage.id, action }))));
     const orphaned = models.flatMap((model) => model.orphanDiagnostics.map((action) => ({ model, action })));
@@ -3099,10 +3107,20 @@ export class HelixView extends ItemView {
     const receipts = [...new Map(models.flatMap((model) => model.receipts)
       .map((receipt) => [receipt.operationId, receipt])).values()]
       .filter((receipt) => !referenced.has(receipt.operationId));
-    const count = pending.length + frozenActions.length + orphaned.length + frozenParents.length + receipts.length;
+    const count = pending.length + frozenActions.length + orphaned.length + frozenParents.length + receipts.length +
+      (columnCreation ? 1 : 0);
     if (count === 0) return 0;
     const group = content.createDiv({ cls: "helix-projection-conflict-group" });
     group.createEl("h2", { text: "项目投影" });
+    if (columnCreation) {
+      const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
+      card.createEl("strong", { text: `分栏创建结果未知 · ${columnCreation.desiredName}` });
+      card.createEl("code", { text: `${columnCreation.targetProjectId} / ${columnCreation.operationId}` });
+      card.createEl("p", { text: "只会双源复读并精确领养；不会重发创建、删除或改名任何分栏。" });
+      const reconcile = card.createEl("button", { text: "精确复读并收口" });
+      reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
+        () => this.actions.reconcileProjectProjectionColumn()));
+    }
     if (pending.length > 0) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
       card.createEl("strong", { text: `${pending.length} 条收据清理等待重试` });

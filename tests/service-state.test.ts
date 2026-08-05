@@ -23,6 +23,7 @@ function grantTaskCrud(
     authorizationBinding: didaAuthorizationBinding("token"),
     taskScheduleMode,
     boardPlacementVerified: true,
+    columnCreateVerified: true,
     taskCrudVerified: true,
     reminderWriteVerified: true,
     repeatWriteVerified: true,
@@ -339,7 +340,7 @@ describe("HelixService runtime recovery", () => {
       repeatWriteVerified: false,
       parentTaskVerified: false,
     });
-    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 5.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 6.*本次插件运行尚未执行合同测试/);
     expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
   });
 

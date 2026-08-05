@@ -24,6 +24,7 @@ import {
 import { normalizeTemplateFolder } from "../domain/template-path";
 import type {
   DidaProjectionTarget,
+  ProjectionColumnCreationCheckpoint,
   ProjectionFreezeReason,
   ProjectionLedgerEntry,
   ProjectionReceiptCleanupProof,
@@ -96,12 +97,14 @@ export interface HelixPersistedData {
       status: number;
     }>;
     receiptCleanupPending?: ProjectionReceiptCleanupProof[];
+    columnCreation?: ProjectionColumnCreationCheckpoint;
   };
   didaContractCapabilities?: {
     probeVersion: number;
     authorizationBinding?: string;
     taskScheduleMode: Exclude<TaskScheduleMode, "unknown">;
     boardPlacementVerified?: boolean;
+    columnCreateVerified?: boolean;
     taskCrudVerified?: boolean;
     reminderWriteVerified?: boolean;
     repeatWriteVerified?: boolean;
@@ -282,6 +285,7 @@ function validateDidaContractCapabilities(
     !/^[a-f0-9]{64}$/u.test(record.authorizationBinding) ||
     [
       "boardPlacementVerified",
+      "columnCreateVerified",
       "taskCrudVerified",
       "reminderWriteVerified",
       "repeatWriteVerified",
@@ -297,6 +301,7 @@ function validateDidaContractCapabilities(
     authorizationBinding: record.authorizationBinding,
     taskScheduleMode: record.taskScheduleMode,
     boardPlacementVerified: record.boardPlacementVerified === true,
+    columnCreateVerified: record.columnCreateVerified === true,
     taskCrudVerified: record.taskCrudVerified === true,
     reminderWriteVerified: record.reminderWriteVerified === true,
     repeatWriteVerified: record.repeatWriteVerified === true,
@@ -348,7 +353,7 @@ function validateDidaProjectionState(
     Object.keys(candidate).every((key) => allowed.includes(key));
   if (!onlyKeys(record, [
     "enabled", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
-    "receiptCleanupPending",
+    "receiptCleanupPending", "columnCreation",
   ])) {
     issues.push("滴答项目投影状态含未知字段，已忽略并进入只读恢复模式");
     return undefined;
@@ -365,6 +370,7 @@ function validateDidaProjectionState(
   const checkpoints = record.parentCheckpoints;
   const bases = record.parentBases;
   const cleanupPending = record.receiptCleanupPending;
+  const columnCreation = record.columnCreation;
   const validLedger = Array.isArray(ledger) && ledger.every((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const row = item as Record<string, unknown>;
@@ -411,8 +417,40 @@ function validateDidaProjectionState(
       if (row.kind === "parent") return row.marker === `helix-project-projection:${row.projectId}`;
       return stableId(row.stageId) && stableId(row.uuid) && row.marker === `helix-projection:${row.uuid}`;
     }));
+  const validColumnCreation = columnCreation === undefined || (() => {
+    if (!columnCreation || typeof columnCreation !== "object" || Array.isArray(columnCreation)) return false;
+    const row = columnCreation as Record<string, unknown>;
+    if (!onlyKeys(row, [
+      "operationId", "targetProjectId", "desiredName", "baselineColumns", "baselineHash",
+      "previewHash", "status", "remoteColumnId", "errorSummary",
+    ])) return false;
+    if (!stableId(row.operationId) || !stableId(row.targetProjectId) || row.desiredName !== "Helix项目" ||
+      !["prepared", "running", "unknown"].includes(String(row.status)) ||
+      typeof row.baselineHash !== "string" || !/^[a-f0-9]{64}$/u.test(row.baselineHash) ||
+      typeof row.previewHash !== "string" || !/^[a-f0-9]{64}$/u.test(row.previewHash) ||
+      (row.remoteColumnId !== undefined && !stableId(row.remoteColumnId)) ||
+      (row.errorSummary !== undefined &&
+        (typeof row.errorSummary !== "string" || row.errorSummary.length === 0 ||
+          row.errorSummary.length > 512 || /[\r\n]/u.test(row.errorSummary)))) return false;
+    if ((row.status === "prepared" && (row.remoteColumnId !== undefined || row.errorSummary !== undefined)) ||
+      (row.status === "running" && row.errorSummary !== undefined) ||
+      (row.status === "unknown" && row.errorSummary === undefined)) return false;
+    if (!Array.isArray(row.baselineColumns)) return false;
+    const baseline = row.baselineColumns as unknown[];
+    const ids = new Set<string>();
+    for (const item of baseline) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const identity = item as Record<string, unknown>;
+      if (!onlyKeys(identity, ["id", "projectId", "name"]) || !stableId(identity.id) ||
+        identity.projectId !== row.targetProjectId || !stableId(identity.name) || ids.has(identity.id as string)) {
+        return false;
+      }
+      ids.add(identity.id as string);
+    }
+    return stableHash(baseline) === row.baselineHash;
+  })();
   if (typeof record.enabled !== "boolean" || !validTarget || !validLedger || !validCheckpoints || !validBases ||
-    !validCleanupPending ||
+    !validCleanupPending || !validColumnCreation ||
     (record.enabled === true && (target === undefined || record.confirmedPreviewHash === undefined)) ||
     (record.confirmedPreviewHash !== undefined &&
       (typeof record.confirmedPreviewHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.confirmedPreviewHash)))) {
@@ -438,6 +476,7 @@ function validateDidaProjectionState(
     return undefined;
   }
   const normalizedTarget = target as DidaProjectionTarget | undefined;
+  const normalizedColumnCreation = columnCreation as ProjectionColumnCreationCheckpoint | undefined;
   const normalizedLedger = ledger as ProjectionLedgerEntry[];
   if ((!normalizedTarget && (normalizedLedger.length > 0 || checkpointProjectIds.length > 0 || baseRows.length > 0)) ||
     (normalizedTarget && normalizedLedger.some((entry) =>
@@ -445,7 +484,9 @@ function validateDidaProjectionState(
       entry.targetColumnId !== normalizedTarget.targetColumnId)) ||
     (!normalizedTarget && cleanupRows.length > 0) ||
     (normalizedTarget && cleanupRows.some((entry) =>
-      entry.targetProjectId !== normalizedTarget.targetProjectId))) {
+      entry.targetProjectId !== normalizedTarget.targetProjectId)) ||
+    (normalizedTarget && normalizedColumnCreation &&
+      normalizedColumnCreation.targetProjectId !== normalizedTarget.targetProjectId)) {
     issues.push("滴答项目投影目标归属不一致，已忽略并进入只读恢复模式");
     return undefined;
   }
@@ -486,6 +527,9 @@ function validateDidaProjectionState(
   }
   if (cleanupPending !== undefined) {
     normalized.receiptCleanupPending = cleanupRows.map((entry) => ({ ...entry }));
+  }
+  if (normalizedColumnCreation) {
+    normalized.columnCreation = structuredClone(normalizedColumnCreation);
   }
   return normalized;
 }

@@ -18,6 +18,7 @@ import {
   PROJECTION_ACTION_EDITABLE_STATES,
   type DidaProjectionTarget,
   type ProjectionActivationPreview,
+  type ProjectionColumnCreationCheckpoint,
   type ProjectionFreezeReason,
   type ProjectionLedgerEntry,
   type ProjectionReadiness,
@@ -175,6 +176,7 @@ export interface ProjectionPersistentState {
     status: number;
   }>;
   receiptCleanupPending?: ProjectionReceiptCleanupProof[];
+  columnCreation?: ProjectionColumnCreationCheckpoint;
 }
 
 export interface ProjectionStatePort {
@@ -316,6 +318,7 @@ export interface ProjectionSyncSummary {
 export interface ProjectionProjectReadModel {
   enabled: boolean;
   target?: DidaProjectionTarget;
+  columnCreation?: ProjectionColumnCreationCheckpoint;
   project: { id: string; path: string; title: string; status: ProjectionProjectInput["projectStatus"]; parentTaskId?: string };
   stages: Array<{
     id: string;
@@ -405,6 +408,7 @@ export class DidaProjectProjectionService {
     return {
       enabled: state.enabled,
       target: state.target ? { ...state.target } : undefined,
+      columnCreation: state.columnCreation ? structuredClone(state.columnCreation) : undefined,
       project: {
         id: identity.projectId,
         path: input.projectPath,

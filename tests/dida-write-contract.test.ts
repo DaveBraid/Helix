@@ -551,6 +551,7 @@ describe("DidaWriteContractRunner", () => {
     ).run();
     expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(true);
+    expect(report.columnCreateVerified).toBe(false);
     expect(report.cleanupErrors.join(" ")).toMatch(/分栏集合.*未知变化/);
     expect(api.projects.has("test-project-2")).toBe(true);
     expect(api.projects.has("original-project")).toBe(true);
@@ -650,7 +651,8 @@ describe("DidaWriteContractRunner", () => {
       projectId: "test-project-1",
       status: 0,
     }]);
-    expect(report.steps.join(" ")).toMatch(/列表→看板→列表.*3 个看板列/);
+    expect(report.steps.join(" ")).toMatch(/创建唯一标记分栏.*列表→看板→列表.*4 个看板列/);
+    expect(report.columnCreateVerified).toBe(true);
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");
     expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
@@ -681,7 +683,7 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report.status).toBe("passed");
     // 此数只记录无传输重试的本地合同假体调用；不推断真实服务的分钟配额。
-    expect(calls).toBeLessThanOrEqual(110);
+    expect(calls).toBeLessThanOrEqual(112);
   });
 
   it("creates and renames uniquely marked columns when a new board has none", async () => {
@@ -694,7 +696,8 @@ describe("DidaWriteContractRunner", () => {
     ).run();
     expect(report.status).toBe("passed");
     expect(report.boardPlacementVerified).toBe(true);
-    expect(report.steps.join(" ")).toMatch(/复读 2 个看板列/);
+    expect(report.steps.join(" ")).toMatch(/创建唯一标记分栏.*复读 3 个看板列/);
+    expect(report.columnCreateVerified).toBe(true);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
   });
 

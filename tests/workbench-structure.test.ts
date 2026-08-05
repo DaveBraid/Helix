@@ -117,7 +117,7 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/再次确认 ·/);
     expect(settings).toMatch(/项目投影[\s\S]*选择清单[\s\S]*选择已有分栏/);
     expect(settings).toMatch(/再次点击确认启用/);
-    expect(settings).toContain("4C 的分栏创建入口尚未开放");
+    expect(settings).toContain("请选择清单以查看已有分栏或安全创建目标分栏");
   });
 
   it("routes projection conflicts only through strict reconciliation and safe cleanup", () => {
@@ -139,5 +139,21 @@ describe("workbench layout and navigation structure", () => {
     expect(settings).toMatch(/setButtonText\("重新预览"\)[\s\S]*removeClass\("mod-cta"\)[\s\S]*确认失败或状态已变化，必须重新预览/);
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
     expect(modal).toMatch(/submit\(title, this\.color\)/);
+  });
+
+  it("exposes column creation only as a double-confirmed preview and unknown reconciliation", () => {
+    const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
+    const confirm = service.slice(
+      service.indexOf("async confirmProjectionColumnCreation"),
+      service.indexOf("async reconcileProjectionColumnCreation"),
+    );
+    expect(settings).toMatch(/创建“\$\{PROJECTION_COLUMN_NAME\}”分栏[\s\S]*预览创建/);
+    expect(settings).toMatch(/完整列基线[\s\S]*baselineHash[\s\S]*再次点击确认创建/);
+    expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
+    expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
+    expect(confirm).toMatch(/enterExclusive\("项目投影分栏创建"\)/);
+    expect(confirm).not.toContain("withAuthorizationLease");
+    expect(service).not.toMatch(/reconcileProjectionColumnCreation[\s\S]*deleteColumn|reconcileProjectionColumnCreation[\s\S]*updateColumn/);
   });
 });

@@ -12,7 +12,11 @@ import {
   HELIX_DEVELOPMENT_TESTS_LABEL,
   HELIX_DEVELOPMENT_TESTS_WARNING,
 } from "./settings-development-tests";
-import type { ProjectionActivationPreview } from "../domain/dida-project-projection";
+import {
+  PROJECTION_COLUMN_NAME,
+  type ProjectionActivationPreview,
+  type ProjectionColumnCreationPreview,
+} from "../domain/dida-project-projection";
 import {
   ProjectionUiActionCoordinator,
   projectionActivationText,
@@ -24,6 +28,9 @@ export class HelixSettingTab extends PluginSettingTab {
   private writeTestResult: string | null = null;
   private projectionRenderToken = 0;
   private armedProjection?: ProjectionActivationPreview;
+  private armedColumnCreation?: ProjectionColumnCreationPreview;
+  private preferredProjectionProjectId?: string;
+  private preferredProjectionColumnId?: string;
   private readonly projectionUiActions = new ProjectionUiActionCoordinator();
 
   constructor(app: App, private readonly plugin: HelixPlugin) {
@@ -32,6 +39,7 @@ export class HelixSettingTab extends PluginSettingTab {
 
   display(): void {
     this.armedProjection = undefined;
+    this.armedColumnCreation = undefined;
     this.containerEl.empty();
     this.containerEl.createEl("h2", { text: "Helix 设置" });
     this.containerEl.createEl("p", {
@@ -229,8 +237,8 @@ export class HelixSettingTab extends PluginSettingTab {
       if (token !== this.projectionRenderToken || !host.isConnected) return;
       loading.remove();
       const choices = projectionCatalogChoices(catalogs);
-      let projectId = configuration.target?.targetProjectId ?? "";
-      let columnId = configuration.target?.targetColumnId ?? "";
+      let projectId = this.preferredProjectionProjectId ?? configuration.target?.targetProjectId ?? "";
+      let columnId = this.preferredProjectionColumnId ?? configuration.target?.targetColumnId ?? "";
       const status = host.createDiv({ cls: "helix-projection-settings-status" });
       status.createEl("strong", { text: projectionTargetText(configuration) });
       const previewBox = host.createDiv({ cls: "helix-projection-preview", attr: { "aria-live": "polite" } });
@@ -243,10 +251,14 @@ export class HelixSettingTab extends PluginSettingTab {
           dropdown.onChange((value) => {
             projectId = value;
             columnId = "";
+            this.preferredProjectionProjectId = value || undefined;
+            this.preferredProjectionColumnId = undefined;
             this.armedProjection = undefined;
+            this.armedColumnCreation = undefined;
             this.renderProjectionColumnOptions(columnSelect, choices, projectId, columnId);
             action.setButtonText("预览并检查");
             action.buttonEl.removeClass("mod-cta");
+            renderColumnCreation();
           });
         });
       let columnSelect!: HTMLSelectElement;
@@ -255,11 +267,77 @@ export class HelixSettingTab extends PluginSettingTab {
         this.renderProjectionColumnOptions(columnSelect, choices, projectId, columnId);
         dropdown.onChange((value) => {
           columnId = value;
+          this.preferredProjectionColumnId = value || undefined;
           this.armedProjection = undefined;
           action.setButtonText("预览并检查");
           action.buttonEl.removeClass("mod-cta");
         });
       });
+      const columnCreationHost = host.createDiv({ cls: "helix-projection-column-creation" });
+      const renderColumnCreation = () => {
+        columnCreationHost.empty();
+        const choice = choices.find((candidate) => candidate.projectId === projectId);
+        const catalog = catalogs.find((candidate) => candidate.projects[0]?.id === projectId);
+        if (!choice || catalog?.columns.some((column) => column.name === PROJECTION_COLUMN_NAME)) return;
+        const box = columnCreationHost.createDiv({ cls: "helix-projection-preview", attr: { "aria-live": "polite" } });
+        const createSetting = new Setting(columnCreationHost)
+          .setName(`创建“${PROJECTION_COLUMN_NAME}”分栏`)
+          .setDesc("只在所选清单单发创建；不删除、改名或重排任何既有分栏。");
+        createSetting.addButton((createButton) => createButton.setButtonText("预览创建").onClick(() => {
+          void this.projectionUiActions.run(async () => {
+            try {
+              if (this.armedColumnCreation?.targetProjectId === projectId) {
+                const created = await this.plugin.confirmProjectProjectionColumn(
+                  this.armedColumnCreation,
+                  this.armedColumnCreation.previewHash,
+                );
+                this.preferredProjectionProjectId = projectId;
+                this.preferredProjectionColumnId = created.id;
+                this.armedColumnCreation = undefined;
+                new Notice("分栏已双源复读确认；请重新预览后再激活项目投影");
+                this.display();
+                return;
+              }
+              const preview = await this.plugin.previewProjectProjectionColumn(projectId);
+              box.empty();
+              box.createEl("div", { text: `${preview.projectName} · ${preview.targetProjectId}` });
+              box.createEl("div", {
+                text: preview.baselineColumns.length === 0
+                  ? "完整列基线：空"
+                  : `完整列基线：${preview.baselineColumns.map((column) => `${column.name} · ${column.id}`).join("；")}`,
+              });
+              box.createEl("code", { text: `基线摘要 ${preview.baselineHash}` });
+              box.createEl("div", {
+                text: preview.blockers.length === 0
+                  ? "能力、授权、队列与结果未知检查已通过"
+                  : `阻塞：${preview.blockers.join("；")}`,
+              });
+              if (preview.blockers.length === 0) {
+                this.armedColumnCreation = preview;
+                createButton.setButtonText("再次点击确认创建").setCta();
+              } else {
+                this.armedColumnCreation = undefined;
+                createButton.setButtonText("重新预览");
+                createButton.buttonEl.removeClass("mod-cta");
+              }
+            } catch (error) {
+              this.armedColumnCreation = undefined;
+              const message = error instanceof Error ? error.message : String(error);
+              if (message.includes("结果未知")) {
+                new Notice(message, 10_000);
+                this.display();
+                return;
+              }
+              createButton.setButtonText("重新预览");
+              createButton.buttonEl.removeClass("mod-cta");
+              box.empty();
+              box.createEl("div", { text: "创建条件或基线已经变化，必须重新预览。" });
+              new Notice(message, 8_000);
+            }
+          }, (busy) => this.setProjectionSettingsBusy(host, busy), () => undefined);
+        }));
+      };
+      renderColumnCreation();
       let action!: Parameters<Setting["addButton"]>[0] extends (button: infer B) => unknown ? B : never;
       setting.addButton((button) => {
         action = button;
@@ -323,7 +401,12 @@ export class HelixSettingTab extends PluginSettingTab {
           }));
       }
       if (choices.length === 0 || choices.every((choice) => choice.columns.length === 0)) {
-        host.createDiv({ cls: "helix-projection-empty-column", text: "当前没有可选分栏；4C 的分栏创建入口尚未开放。" });
+        host.createDiv({
+          cls: "helix-projection-empty-column",
+          text: projectId
+            ? `所选清单没有可用分栏；可在上方预览并创建“${PROJECTION_COLUMN_NAME}”。`
+            : "请选择清单以查看已有分栏或安全创建目标分栏。",
+        });
       }
     } catch (error) {
       if (token !== this.projectionRenderToken || !host.isConnected) return;

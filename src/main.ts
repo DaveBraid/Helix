@@ -86,6 +86,7 @@ import type {
   DidaProjectionTarget,
   ProjectionActivationPreview,
   ProjectionActionState,
+  ProjectionColumnCreationPreview,
 } from "./domain/dida-project-projection";
 import {
   confirmProjectionActivation,
@@ -256,6 +257,9 @@ export default class HelixPlugin extends Plugin {
           this.recoverPendingProjectProjectionReceiptCleanup(),
         removeResolvedProjectProjectionReceipt: (operationId) =>
           this.removeResolvedProjectProjectionReceipt(operationId),
+        reconcileProjectProjectionColumn: async () => {
+          await this.reconcileProjectProjectionColumn();
+        },
       }),
     );
     this.addRibbonIcon("orbit", "打开 Helix", () => void this.activateView());
@@ -588,6 +592,21 @@ export default class HelixPlugin extends Plugin {
 
   async disableProjectProjection(): Promise<void> {
     await this.withWritableProjectMutation(() => this.projectProjection.disable());
+  }
+
+  previewProjectProjectionColumn(projectId: string): Promise<ProjectionColumnCreationPreview> {
+    return this.service.previewProjectionColumnCreation(projectId);
+  }
+
+  confirmProjectProjectionColumn(
+    preview: ProjectionColumnCreationPreview,
+    confirmedHash: string,
+  ) {
+    return this.service.confirmProjectionColumnCreation(preview, confirmedHash);
+  }
+
+  reconcileProjectProjectionColumn() {
+    return this.service.reconcileProjectionColumnCreation();
   }
 
   async adoptProjectAction(input: {

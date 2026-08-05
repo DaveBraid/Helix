@@ -1,14 +1,14 @@
 # 当前开发状态
 
-最后更新：2026-08-04
-当前基线提交：`a21fddd feat: derive stage focus from project relations`
-工作树状态：3C 删除事务服务、专项测试及本快照尚未提交；Vault 文件与运行态 `data.json` 不纳入 Git。
-当前阶段：阶段 3C 已完成；准备实施 3D 双向监听与冲突 UI。
+最后更新：2026-08-05
+当前基线提交：`f9892ec feat: coordinate stage focus edits safely`
+工作树状态：工作树干净；Vault 测试数据与运行态 `data.json` 不纳入 Git。
+当前阶段：阶段 3D 第一批已提交；准备接入监听、持久冲突与 UI。
 
 ## 本轮目标
 
-- 让新建、连接、纳管、替换和断开关系只按 Canvas 托管入边派生 Stage 聚焦引用，并与 Canvas 同事务。
-- 本批已接删除／桥接阶段；非目标为监听、冲突 UI、滴答同步、发布或迁移。
+- 接入源小节与派生引用的串行监听和安全多 Markdown CAS。
+- 本批非目标为滴答同步、发布或迁移。
 
 ## 当前事实
 
@@ -21,11 +21,12 @@
 - 活动 Project/Stage 笔记通过公开状态栏和命令编辑状态；项目页状态、关系、布局、折叠、颜色、撤销/重做及修复均经过恢复模式写入闸门。
 - 项目页纯读取仅报告 `canvasRepairRequired/reasons`，绝不写 Canvas；显式修复使用稳定双快照、受管 Markdown 最终复核和 Canvas CAS，竞争时零写入。
 - 阶段 2 看板仅从 Project/Stage Markdown 快照派生阶段卡片，不依赖 Canvas 节点或完成折叠；状态迁移只写对应 Stage Markdown，并复用恢复模式写闸门。
+- 阶段 3D 纯领域协调器区分源单边、派生单边、双边冲突和结构损坏；通用重派生拒绝非 canonical 受管块。
 
 ## 本轮改动
 
-- `src/services/project-workspace.ts`：共享 v2 事务增加受管删除；删除导致存活目标入链变化时，同步重派生引用、提交 Canvas 并删除 Stage。
-- `tests/project-workspace.test.ts`：覆盖桥接删除、引用换源、受管编辑拒绝及删除撤销／重做。
+- 工作树干净；3D 第一批已提交为 `f9892ec`。
+- Vault 旧项目测试文件及旧 Canvas 已通过 Obsidian CLI 移入废纸篓；新建 2 项目、6 阶段的分支／合并／五状态隔离夹具（不纳入 Git）。
 
 ## 相关约束
 
@@ -37,13 +38,11 @@
 
 ## 当前验证
 
-- 已通过：全量 58 个测试文件、629 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿。
-- 审查：3A P0/P1/P2=0，3B P0/P1=0；两段均未接入 UI。
-- 3C 第一批：专项 145/145、看门狗 P0/P1/P2=0；新建／连线／纳管／替换／断开已通过并提交。
-- 3C 第二批：项目工作区专项 108/108、看门狗 P0/P1/P2=0；桥接／无桥接删除、撤销重做和受管编辑拒绝均通过。
+- 已通过：全量 58 个测试文件、641 项，`typecheck`、`build`、`release:check`、`git diff --check` 全绿。
+- 3C 已提交：关系变化、阶段删除、撤销重做与受管编辑拒绝均经专项测试和看门狗审查通过。
+- 3D 第一批：聚焦桥专项 39/39、项目工作区 108/108；结构与隐藏哈希联合篡改、断边和删除旧来源均已覆盖；看门狗最终复审 P0/P1/P2/P3=0。
 - 实机（提交基线）：Obsidian 1.13.4 深色模式五列横排／独立横滚正常；隔离 Stage 跨列写入与计数一致，同列拖拽零写，键盘和 ARIA 正常，`dev:errors` 为 0。
-- 实机：临时 Project/Stage 已移入 Obsidian 废纸篓并移除空目录；当时既有 Project/Stage、模板和 Canvas 前后哈希一致。
-- 实机：3A/3B 尚未接入 UI，不适用；阶段 3C 接入后统一用 Obsidian CLI 验收。
+- 本轮实机：Obsidian CLI 工作台读出 2 个项目、6 个阶段、2 条分支、2 条合并、1 条继承；五种阶段状态齐全，`dev:errors` 为 0。
 
 ## 未关闭问题
 
@@ -51,6 +50,7 @@
 
 ## 下一步
 
-1. 实施 3D：监听源／派生编辑，单边变化自动 CAS，双边变化冻结并进入手动冲突解决。
-2. 用 Obsidian CLI 完成 Live Preview、隐藏标记、关系与反向编辑实机验收。
-3. 阶段 3 稳定后开始 Helix→滴答隔离投影。
+1. 接入串行监听与非权威 Base 检查点；单边变化通过多 Markdown CAS 安全传播。
+2. 持久化双边冲突并接入手动选择源、派生或自定义值的 UI。
+3. 用 Obsidian CLI 完成 Live Preview、隐藏标记、正反向编辑和冲突实机验收。
+4. 阶段 3 稳定后开始 Helix→滴答隔离投影。

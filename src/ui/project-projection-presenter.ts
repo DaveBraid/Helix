@@ -107,3 +107,50 @@ export class ProjectionUiActionCoordinator {
     });
   }
 }
+
+export async function loadProjectionConflictModels(
+  loadProjectIds: () => Promise<string[]>,
+  readProject: (projectId: string) => Promise<ProjectionProjectReadModel>,
+): Promise<{ models: ProjectionProjectReadModel[]; diagnostic?: string }> {
+  let projectIds: string[];
+  try {
+    projectIds = await loadProjectIds();
+  } catch (error) {
+    return { models: [], diagnostic: projectWorkspaceReadDiagnostic(error) };
+  }
+  const results = await Promise.allSettled(projectIds.map(readProject));
+  return {
+    models: results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []),
+  };
+}
+
+export function conflictCenterIsEmpty(input: {
+  conflicts: number;
+  focusConflicts: number;
+  recoveryIssues: number;
+  reconciliation: number;
+  failed: number;
+  orphanedBlocked: number;
+  projectionIssues: number;
+  workspaceDiagnostic: boolean;
+  lineageConflict: boolean;
+}): boolean {
+  return input.conflicts === 0 && input.focusConflicts === 0 && input.recoveryIssues === 0 &&
+    input.reconciliation === 0 && input.failed === 0 && input.orphanedBlocked === 0 &&
+    input.projectionIssues === 0 && !input.workspaceDiagnostic && !input.lineageConflict;
+}
+
+export function projectWorkspaceReadDiagnostic(error: unknown): string {
+  const source = error instanceof Error ? error.message : String(error);
+  const redacted = source
+    .replace(/\b(token|secret|authorization|bearer)\b\s*[:=]?\s*\S+/giu, "$1 [敏感信息已隐藏]")
+    .replace(/口令\s*[:：=]?\s*\S+/gu, "口令 [敏感信息已隐藏]")
+    .replace(/https?:\/\/\S+/giu, "[URL 已隐藏]")
+    .replace(/[A-Za-z]:\\(?:[^\s\\]+\\){1,}[^\s\\]*/gu, "[路径已隐藏]")
+    .replace(/(?:\/[^\s/:]+){2,}/gu, "[路径已隐藏]")
+    .replace(/\b[A-Za-z0-9_-]{12,}\b/gu, "[标识已隐藏]")
+    .replace(/[\r\n]+/gu, " ")
+    .trim()
+    .slice(0, 240);
+  return redacted || "未知读取错误";
+}

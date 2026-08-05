@@ -131,6 +131,8 @@ import {
 import {
   PROJECTION_STATE_OPTIONS,
   ProjectionUiActionCoordinator,
+  conflictCenterIsEmpty,
+  loadProjectionConflictModels,
   projectionProjectSummary,
   projectionSyncSummaryText,
 } from "./project-projection-presenter";
@@ -2938,23 +2940,27 @@ export class HelixView extends ItemView {
       this.store.snapshot(),
       this.service.listQueue(),
       this.actions.readProjectWorkspace(() =>
-        this.actions.projectWorkspace.listFocusBridgeConflicts()),
+        this.actions.projectWorkspace.listFocusBridgeConflicts()).catch(() => []),
     ]);
     if (token !== this.renderToken) return;
-    const projectionWorkspace = await this.actions.readProjectWorkspace(() =>
-      this.actions.projectWorkspace.loadStableWorkspace());
-    const projectionResults = await Promise.allSettled(
-      projectionWorkspace.projects.map((project) => this.actions.readProjectProjection(project.id)),
+    const projectionLoad = await loadProjectionConflictModels(
+      async () => (await this.actions.readProjectWorkspace(() =>
+        this.actions.projectWorkspace.loadStableWorkspace())).projects.map((project) => project.id),
+      (projectId) => this.actions.readProjectProjection(projectId),
     );
     if (token !== this.renderToken) return;
-    const projectionModels = projectionResults.flatMap((result) =>
-      result.status === "fulfilled" ? [result.value] : []);
     const projectionIssueCount = this.renderProjectionConflicts(
       content,
-      projectionModels,
+      projectionLoad.models,
       persisted.didaProjectionState?.columnCreation,
       token,
     );
+    if (projectionLoad.diagnostic) {
+      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      card.createEl("span", { cls: "helix-chip is-danger", text: "项目工作区只读" });
+      card.createEl("h3", { text: "投影诊断暂不可读" });
+      card.createEl("p", { text: `脱敏错误：${projectionLoad.diagnostic}` });
+    }
     if (persisted.lineageConflict) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", {
@@ -3066,16 +3072,17 @@ export class HelixView extends ItemView {
       });
     }
     for (const conflict of focusConflicts) this.renderFocusBridgeConflict(content, conflict);
-    if (
-      conflicts.length === 0 &&
-      focusConflicts.length === 0 &&
-      (this.state?.recoveryIssues.length ?? 0) === 0 &&
-      reconciliation.length === 0 &&
-      failed.length === 0 &&
-      orphanedBlocked.length === 0 &&
-      projectionIssueCount === 0 &&
-      !persisted.lineageConflict
-    ) {
+    if (conflictCenterIsEmpty({
+      conflicts: conflicts.length,
+      focusConflicts: focusConflicts.length,
+      recoveryIssues: this.state?.recoveryIssues.length ?? 0,
+      reconciliation: reconciliation.length,
+      failed: failed.length,
+      orphanedBlocked: orphanedBlocked.length,
+      projectionIssues: projectionIssueCount,
+      workspaceDiagnostic: Boolean(projectionLoad.diagnostic),
+      lineageConflict: Boolean(persisted.lineageConflict),
+    })) {
       const empty = content.createDiv({ cls: "helix-empty-state" });
       const icon = empty.createDiv();
       setIcon(icon, "shield-check");

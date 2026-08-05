@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   ProjectionUiActionCoordinator,
+  conflictCenterIsEmpty,
+  loadProjectionConflictModels,
   projectionActivationText,
   projectionCatalogChoices,
   projectionProjectSummary,
@@ -94,6 +96,28 @@ describe("project projection presenter", () => {
       text: "部分冻结，转冲突中心处理。创建 5 · 更新 7 · 完成 9 · 删除 7 · 冻结 1",
       warning: true,
     });
+  });
+
+  it("degrades a rejected project workspace to a redacted read-only diagnostic", async () => {
+    const result = await loadProjectionConflictModels(
+      async () => { throw new Error("failed /Users/test/private token_abcdefghijklmnop"); },
+      async () => baseModel(),
+    );
+    expect(result.models).toEqual([]);
+    expect(result.diagnostic).toMatch(/路径已隐藏|标识已隐藏/);
+    expect(result.diagnostic).not.toMatch(/\/Users\/test|abcdefghijklmnop/);
+  });
+
+  it("never shows the conflict empty state over recovery, column unknown, or workspace diagnostics", () => {
+    const empty = {
+      conflicts: 0, focusConflicts: 0, recoveryIssues: 0, reconciliation: 0,
+      failed: 0, orphanedBlocked: 0, projectionIssues: 0,
+      workspaceDiagnostic: false, lineageConflict: false,
+    };
+    expect(conflictCenterIsEmpty(empty)).toBe(true);
+    expect(conflictCenterIsEmpty({ ...empty, recoveryIssues: 1 })).toBe(false);
+    expect(conflictCenterIsEmpty({ ...empty, projectionIssues: 1 })).toBe(false);
+    expect(conflictCenterIsEmpty({ ...empty, workspaceDiagnostic: true })).toBe(false);
   });
 });
 

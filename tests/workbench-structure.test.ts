@@ -156,4 +156,10 @@ describe("workbench layout and navigation structure", () => {
     expect(confirm).not.toContain("withAuthorizationLease");
     expect(service).not.toMatch(/reconcileProjectionColumnCreation[\s\S]*deleteColumn|reconcileProjectionColumnCreation[\s\S]*updateColumn/);
   });
+
+  it("keeps recovery and column-unknown diagnostics visible when the project workspace is unreadable", () => {
+    expect(view).toMatch(/loadProjectionConflictModels[\s\S]*persisted\.didaProjectionState\?\.columnCreation/);
+    expect(view).toMatch(/项目工作区只读[\s\S]*投影诊断暂不可读[\s\S]*脱敏错误/);
+    expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)/);
+  });
 });

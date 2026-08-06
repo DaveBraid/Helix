@@ -245,17 +245,17 @@ export function hydrateData(value: unknown): HelixPersistedData {
     validArray(
     raw.projectionOperationReceipts,
     isProjectionCreateReceipt,
-    "滴答项目投影创建收据",
+    "滴答项目同步创建收据",
     recoveryIssues,
     ),
     (entry) => entry.operationId,
-    "滴答项目投影操作收据 ID",
+    "滴答项目同步操作收据 ID",
     recoveryIssues,
   );
   const projectionOperationReceipts = uniqueArray(
     projectionReceiptsByOperation,
     (entry) => entry.clientIdentity,
-    "滴答项目投影 client identity",
+    "滴答项目同步 client identity",
     recoveryIssues,
   );
   return {
@@ -476,7 +476,7 @@ function validateDidaProjectionState(
 ): HelixPersistedData["didaProjectionState"] {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    issues.push("滴答项目投影状态无效，已忽略并进入只读恢复模式");
+    issues.push("滴答项目同步状态无效，已忽略并进入只读恢复模式");
     return undefined;
   }
   const record = value as Record<string, unknown>;
@@ -489,7 +489,7 @@ function validateDidaProjectionState(
     "enabled", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
     "receiptCleanupPending", "columnCreation",
   ])) {
-    issues.push("滴答项目投影状态含未知字段，已忽略并进入只读恢复模式");
+    issues.push("滴答项目同步状态含未知字段，已忽略并进入只读恢复模式");
     return undefined;
   }
   const target = record.target;
@@ -588,7 +588,7 @@ function validateDidaProjectionState(
     (record.enabled === true && (target === undefined || record.confirmedPreviewHash === undefined)) ||
     (record.confirmedPreviewHash !== undefined &&
       (typeof record.confirmedPreviewHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.confirmedPreviewHash)))) {
-    issues.push("滴答项目投影状态含损坏字段，已忽略并进入只读恢复模式");
+    issues.push("滴答项目同步状态含损坏字段，已忽略并进入只读恢复模式");
     return undefined;
   }
   const uuids = (ledger as ProjectionLedgerEntry[]).map((entry) => entry.uuid);
@@ -606,7 +606,7 @@ function validateDidaProjectionState(
     new Set(baseProjectIds).size !== baseProjectIds.length ||
     new Set(baseRemoteIds).size !== baseRemoteIds.length ||
     new Set(cleanupOperationIds).size !== cleanupOperationIds.length) {
-    issues.push("滴答项目投影状态含重复身份，已忽略并进入只读恢复模式");
+    issues.push("滴答项目同步状态含重复身份，已忽略并进入只读恢复模式");
     return undefined;
   }
   const normalizedTarget = target as DidaProjectionTarget | undefined;
@@ -621,7 +621,7 @@ function validateDidaProjectionState(
       entry.targetProjectId !== normalizedTarget.targetProjectId)) ||
     (normalizedTarget && normalizedColumnCreation &&
       normalizedColumnCreation.targetProjectId !== normalizedTarget.targetProjectId)) {
-    issues.push("滴答项目投影目标归属不一致，已忽略并进入只读恢复模式");
+    issues.push("滴答项目同步目标归属不一致，已忽略并进入只读恢复模式");
     return undefined;
   }
   const baseByProject = new Map(baseRows.map((entry) => [entry.projectId, entry.remoteId]));
@@ -630,7 +630,7 @@ function validateDidaProjectionState(
     const existingParent = parentByProject.get(entry.projectId);
     if ((existingParent && existingParent !== entry.parentTaskId) ||
       (baseByProject.has(entry.projectId) && baseByProject.get(entry.projectId) !== entry.parentTaskId)) {
-      issues.push("滴答项目投影父任务归属不一致，已忽略并进入只读恢复模式");
+      issues.push("滴答项目同步父任务归属不一致，已忽略并进入只读恢复模式");
       return undefined;
     }
     parentByProject.set(entry.projectId, entry.parentTaskId);
@@ -641,7 +641,7 @@ function validateDidaProjectionState(
         baseByProject.get(checkpoint.projectId) !== checkpoint.remoteId) ||
         (parentByProject.has(checkpoint.projectId) &&
           parentByProject.get(checkpoint.projectId) !== checkpoint.remoteId))) {
-      issues.push("滴答项目投影父任务检查点不一致，已忽略并进入只读恢复模式");
+      issues.push("滴答项目同步父任务检查点不一致，已忽略并进入只读恢复模式");
       return undefined;
     }
   }

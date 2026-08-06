@@ -117,11 +117,11 @@ export function coordinateStageFocusBridge(input: {
 }): FocusBridgeCoordination {
   const parsed = parseFocusBridgeEnvelope(input.targetMarkdown);
   if (parsed.kind !== "present") {
-    throw new FocusBridgeError("source-missing", `目标阶段缺少来源 ${input.source.id} 的受管引用`);
+    throw new FocusBridgeError("source-missing", `目标阶段缺少来源 ${input.source.id} 的自动引用`);
   }
   const matches = parsed.blocks.filter((block) => block.sourceId === input.source.id);
   if (matches.length !== 1) {
-    throw new FocusBridgeError("source-missing", `目标阶段无法唯一定位来源 ${input.source.id} 的受管引用`);
+    throw new FocusBridgeError("source-missing", `目标阶段无法唯一定位来源 ${input.source.id} 的自动引用`);
   }
   const block = matches[0]!;
   if (block.state === "conflict") {
@@ -131,7 +131,7 @@ export function coordinateStageFocusBridge(input: {
   const baseContent = normalizeFocusHashContent(input.baseContent);
   const baseHash = focusContentHash(baseContent);
   if (baseHash !== block.baseHash) {
-    throw corrupt(`来源 ${block.sourceId} 的 Base 快照与受管标记不一致`);
+    throw corrupt(`来源 ${block.sourceId} 的 Base 快照与自动引用标记不一致`);
   }
   // synced 状态的 sourceHash 必须指向同一个同步基线；否则标记本身已损坏。
   if (block.sourceHash !== block.baseHash) {
@@ -143,7 +143,7 @@ export function coordinateStageFocusBridge(input: {
   const derivedBodyHash = focusContentHash(block.content);
   const derivedBodyChanged = derivedBodyHash !== block.baseHash;
   const derivedVisibleChanged = block.currentDerivedHash !== block.derivedHash;
-  const canonicalCurrentBlock = renderBlock({
+  const canonicalInput = {
     sourceId: input.source.id,
     notePath: input.source.notePath,
     title: input.source.title,
@@ -151,9 +151,9 @@ export function coordinateStageFocusBridge(input: {
     baseHash: block.baseHash,
     sourceHash: block.sourceHash,
     state: "synced",
-  });
+  } as const;
   const derivedStructureChanged =
-    renderedBlockDerivedHash(canonicalCurrentBlock) !== block.currentDerivedHash;
+    !canonicalDerivedHashes(canonicalInput).has(block.currentDerivedHash);
 
   if (derivedStructureChanged || (derivedBodyChanged && !derivedVisibleChanged)) {
     return focusBridgeConflict(
@@ -276,11 +276,11 @@ export function resolveStageFocusBridge(input: {
 }): { sourceMarkdown: string; targetMarkdown: string; acceptedHash: string } {
   const parsed = parseFocusBridgeEnvelope(input.targetMarkdown);
   if (parsed.kind !== "present") {
-    throw new FocusBridgeError("source-missing", `目标阶段缺少来源 ${input.source.id} 的受管引用`);
+    throw new FocusBridgeError("source-missing", `目标阶段缺少来源 ${input.source.id} 的自动引用`);
   }
   const blocks = parsed.blocks.filter((block) => block.sourceId === input.source.id);
   if (blocks.length !== 1) {
-    throw new FocusBridgeError("source-missing", `目标阶段无法唯一定位来源 ${input.source.id} 的受管引用`);
+    throw new FocusBridgeError("source-missing", `目标阶段无法唯一定位来源 ${input.source.id} 的自动引用`);
   }
   const sourceSection = scanFocusSection(input.source.markdown, FOCUS_SOURCE_HEADING, 2);
   const content = normalizeFocusHashContent(input.acceptedContent);
@@ -366,7 +366,7 @@ export function scanFocusSections(markdown: string, heading: string):
 
 export function renderFocusBridgeEnvelope(sources: readonly FocusSource[]): string {
   if (sources.length === 0) {
-    throw new FocusBridgeError("source-empty", "无前置阶段时不得生成聚焦问题受管包络");
+    throw new FocusBridgeError("source-empty", "无前置阶段时不得生成聚焦问题自动引用区域");
   }
   assertUniqueSourceIds(sources.map((source) => source.id));
   const ordered = [...sources].sort(compareSources);
@@ -393,7 +393,7 @@ export function parseFocusBridgeEnvelope(markdown: string): ParsedFocusEnvelope 
   const documentMarkers = managedMarkerLines(document.lines);
   if (documentMarkers.some((item) =>
     item.line < target.bodyStartLine || item.line >= target.bodyEndLine)) {
-    throw corrupt("受管标记位于本阶段问题聚焦小节之外");
+    throw corrupt("自动引用标记位于本阶段问题聚焦小节之外");
   }
   const markerLines = documentMarkers.map((item) => ({
     line: item.line - target.bodyStartLine,
@@ -403,12 +403,12 @@ export function parseFocusBridgeEnvelope(markdown: string): ParsedFocusEnvelope 
   const outerStarts = markerLines.filter((item) => item.text === OUTER_START);
   const outerEnds = markerLines.filter((item) => item.text === OUTER_END);
   if (outerStarts.length !== 1 || outerEnds.length !== 1 || outerStarts[0]!.line >= outerEnds[0]!.line) {
-    throw corrupt("受管包络缺失、重复或顺序错误");
+    throw corrupt("自动引用区域缺失、重复或顺序错误");
   }
   const outerStart = outerStarts[0]!.line;
   const outerEnd = outerEnds[0]!.line;
   if (markerLines.some((item) => item.line < outerStart || item.line > outerEnd)) {
-    throw corrupt("受管标记发生嵌套或越界");
+    throw corrupt("自动引用标记发生嵌套或越界");
   }
   const blocks: FocusBridgeBlock[] = [];
   const sourceIds = new Set<string>();
@@ -419,7 +419,7 @@ export function parseFocusBridgeEnvelope(markdown: string): ParsedFocusEnvelope 
       continue;
     }
     const match = CHILD_START.exec(body[cursor]!);
-    if (!match) throw corrupt(`受管包络中存在未知内容（第 ${cursor + 1} 行）`);
+    if (!match) throw corrupt(`自动引用区域中存在未知内容（第 ${cursor + 1} 行）`);
     const startLine = cursor;
     const sourceId = decodeSourceId(match[1]!);
     if (!sourceId || sourceIds.has(sourceId)) throw corrupt(`来源 ID 重复或为空：${sourceId}`);
@@ -547,9 +547,9 @@ function assertEnvelopeSafeToReplace(
     }
     const source = sources.get(block.sourceId);
     if (!source) {
-      throw corrupt(`缺少来源 ${block.sourceId}，无法校验受管引用的 canonical 结构`);
+      throw corrupt(`缺少来源 ${block.sourceId}，无法校验自动引用的 canonical 结构`);
     }
-    const canonical = renderBlock({
+    const canonicalInput = {
       sourceId: source.id,
       notePath: source.notePath,
       title: source.title,
@@ -557,14 +557,27 @@ function assertEnvelopeSafeToReplace(
       baseHash: block.baseHash,
       sourceHash: block.sourceHash,
       state: block.state,
-    });
-    if (renderedBlockDerivedHash(canonical) !== block.currentDerivedHash) {
+    } as const;
+    if (!canonicalDerivedHashes(canonicalInput).has(block.currentDerivedHash)) {
       throw new FocusBridgeError(
         "managed-edit-would-be-lost",
         `来源 ${block.sourceId} 的引用结构或链接已变化，拒绝覆盖或移除`,
       );
     }
   }
+}
+
+/**
+ * Obsidian 将 `[[path]]` 与 `[[path.md]]` 解析为同一 Markdown 文件。早期 Helix
+ * 测试数据曾写入带扩展名的链接，当前渲染器则省略扩展名。这里只放宽这一项
+ * 可证明等价的结构差异；标题、正文、来源身份或其他可见结构变化仍会冻结。
+ */
+function canonicalDerivedHashes(input: Parameters<typeof renderBlock>[0]): Set<string> {
+  const notePaths = new Set([input.notePath]);
+  if (/\.md$/i.test(input.notePath)) notePaths.add(input.notePath.replace(/\.md$/i, ""));
+  else notePaths.add(`${input.notePath}.md`);
+  return new Set([...notePaths].map((notePath) =>
+    renderedBlockDerivedHash(renderBlock({ ...input, notePath }))));
 }
 
 function renderBlock(input: {

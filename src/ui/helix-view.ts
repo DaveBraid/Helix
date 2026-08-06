@@ -2416,30 +2416,45 @@ export class HelixView extends ItemView {
       candidate.id === this.selectedProjectId);
     if (!project) return;
     const panel = content.createDiv({ cls: "helix-card helix-project-projection-panel" });
-    panel.createEl("h3", { text: "项目投影" });
-    const loading = panel.createEl("p", { cls: "helix-project-projection-loading", text: "读取行动与投影状态…" });
+    panel.createEl("h3", { text: "滴答项目同步" });
+    const loading = panel.createEl("p", { cls: "helix-project-projection-loading", text: "读取行动与同步状态…" });
     let model: ProjectionProjectReadModel;
     try {
       model = await this.actions.readProjectProjection(project.id);
     } catch (error) {
       if (token !== this.renderToken) return;
-      loading.setText(`无法读取项目投影：${error instanceof Error ? error.message : String(error)}`);
+      loading.setText(`无法读取滴答项目同步：${error instanceof Error ? error.message : String(error)}`);
       return;
     }
     if (token !== this.renderToken) return;
     loading.remove();
     const summary = projectionProjectSummary(model);
     const target = panel.createDiv({ cls: "helix-project-projection-target" });
-    target.createEl("strong", { text: model.enabled ? "全局投影已启用" : "全局投影已禁用" });
+    target.createEl("strong", {
+      text: model.enabled
+        ? "滴答项目同步已启用"
+        : "本地行动编辑可用 · 滴答项目同步未启用",
+    });
     target.createEl("code", { text: model.target ? `${model.target.targetProjectId} / ${model.target.targetColumnId}` : "尚未配置目标" });
     target.createSpan({
       text: model.project.parentTaskId
         ? `父任务 ${model.project.parentTaskId}`
         : model.parentDiagnostic?.frozen ? "父任务已冻结" : "父任务尚未创建",
     });
+    target.createSpan({
+      text: this.state?.connected
+        ? "滴答读取连接正常"
+        : this.state?.authorizationConfigured
+          ? "滴答读取连接待恢复"
+          : "未配置滴答 API 授权",
+    });
+    panel.createEl("p", {
+      cls: "helix-project-projection-local-note",
+      text: "加入同步、标题与状态编辑当前只写入 Stage Markdown，尚未发送滴答；仅“同步此项目到滴答”会请求远端写入。",
+    });
     const metrics = panel.createDiv({ cls: "helix-project-projection-metrics" });
     for (const [label, value] of [
-      ["受管", summary.managed], ["未受管", summary.unmanaged], ["孤儿", summary.orphan],
+      ["已加入", summary.managed], ["未加入", summary.unmanaged], ["失联关联", summary.orphan],
       ["冻结", summary.frozen], ["待清理", summary.cleanup],
     ] as const) metrics.createSpan({ text: `${label} ${value}` });
 
@@ -2454,7 +2469,7 @@ export class HelixView extends ItemView {
     }
     if (remoteBlockers.length > 0) panel.createEl("p", {
       cls: "helix-project-projection-blockers",
-      text: `同步阻塞：${remoteBlockers.join("；")}`,
+      text: `远端同步暂不可用：${remoteBlockers.join("；")}。本地 Stage 编辑不受影响。`,
     });
     const stageGrid = panel.createDiv({ cls: "helix-project-projection-stages" });
     for (const stage of model.stages) {
@@ -2464,18 +2479,21 @@ export class HelixView extends ItemView {
       for (const action of stage.unmanaged) {
         const row = stageCard.createDiv({ cls: "helix-project-projection-action is-unmanaged" });
         row.createSpan({ text: action.title });
-        const adopt = row.createEl("button", { text: "纳管", attr: { "aria-label": `纳管行动：${action.title}` } });
+        const adopt = row.createEl("button", {
+          text: "加入同步",
+          attr: { "aria-label": `将行动加入滴答项目同步：${action.title}；当前只写 Stage，尚未发送滴答` },
+        });
         adopt.addEventListener("click", () => this.runProjectionUiAction(adopt, token, async () => {
           await this.actions.adoptProjectAction({
             projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash, line: action.line,
           });
-          new Notice("行动已纳管；尚未同步到滴答");
+          new Notice("行动已加入同步；当前只写入 Stage Markdown，尚未发送滴答");
         }));
       }
       for (const action of stage.managed) {
         const row = stageCard.createDiv({ cls: `helix-project-projection-action${action.frozen ? " is-frozen" : ""}` });
-        const title = row.createEl("input", { type: "text", value: action.title, attr: { "aria-label": "受管行动标题" } });
-        const state = row.createEl("select", { attr: { "aria-label": "受管行动状态" } });
+        const title = row.createEl("input", { type: "text", value: action.title, attr: { "aria-label": "已加入同步的行动标题" } });
+        const state = row.createEl("select", { attr: { "aria-label": "已加入同步的行动状态" } });
         for (const option of PROJECTION_STATE_OPTIONS) state.createEl("option", { value: option.value, text: option.label });
         state.value = action.state;
         const save = row.createEl("button", { text: "保存" });
@@ -2490,8 +2508,8 @@ export class HelixView extends ItemView {
     }
     if (summary.canSync && remoteBlockers.length === 0) {
       let armed = false;
-      const sync = panel.createEl("button", { cls: "helix-primary-button", text: "同步此项目" });
-      const summaryText = `${summary.managed} 条受管行动；孤儿 ${summary.orphan}；冻结 ${summary.frozen}`;
+      const sync = panel.createEl("button", { cls: "helix-primary-button", text: "同步此项目到滴答" });
+      const summaryText = `${summary.managed} 条已加入行动；失联关联 ${summary.orphan}；冻结 ${summary.frozen}`;
       sync.addEventListener("click", () => {
         if (!armed) {
           armed = true;
@@ -2553,7 +2571,7 @@ export class HelixView extends ItemView {
       if (candidate.crossProject) copy.createSpan({ text: "跨项目" });
       const adopt = row.createEl("button", {
         cls: "helix-primary-button",
-        text: "纳入 Helix",
+        text: "交由 Helix 管理",
       });
       adopt.addEventListener("click", () => {
         adopt.disabled = true;
@@ -3000,7 +3018,7 @@ export class HelixView extends ItemView {
     if (projectionLoad.diagnostic) {
       const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "项目工作区只读" });
-      card.createEl("h3", { text: "投影诊断暂不可读" });
+      card.createEl("h3", { text: "滴答项目同步诊断暂不可读" });
       card.createEl("p", { text: `脱敏错误：${projectionLoad.diagnostic}` });
     }
     if (persisted.lineageConflict) {
@@ -3161,7 +3179,7 @@ export class HelixView extends ItemView {
       (columnCreation ? 1 : 0);
     if (count === 0) return 0;
     const group = content.createDiv({ cls: "helix-projection-conflict-group" });
-    group.createEl("h2", { text: "项目投影" });
+    group.createEl("h2", { text: "滴答项目同步" });
     if (columnCreation) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
       card.createEl("strong", { text: `分栏创建结果未知 · ${columnCreation.desiredName}` });
@@ -3185,7 +3203,7 @@ export class HelixView extends ItemView {
     }
     for (const { model, action } of orphaned) {
       this.renderProjectionReconcileCard(group, token, model, action.stageId, action.uuid,
-        `孤儿行动 ${action.uuid} · ${action.frozen ?? action.state}`, Boolean(action.frozen));
+        `失联关联 ${action.uuid} · ${action.frozen ?? action.state}`, Boolean(action.frozen));
     }
     for (const model of frozenParents) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
@@ -3197,7 +3215,7 @@ export class HelixView extends ItemView {
     }
     for (const receipt of receipts) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
-      card.createEl("strong", { text: `投影操作收据 · ${receipt.outcome}` });
+      card.createEl("strong", { text: `滴答项目同步收据 · ${receipt.outcome}` });
       card.createEl("code", { text: receipt.operationId });
       if (receipt.outcome !== "verified" && receipt.outcome !== "verified-absent") {
         card.createEl("p", { text: "该收据尚未完成既有队列、冲突或结果未知收口；此处不提供清理。" });
@@ -3258,7 +3276,7 @@ export class HelixView extends ItemView {
         conflict.derivedContent !== "<派生受管块结构损坏>") {
         const rebuild = actions.createEl("button", {
           cls: "helix-primary-button",
-          text: "按来源重建受管块",
+          text: "按来源重建自动引用",
         });
         rebuild.addEventListener("click", () => {
           rebuild.disabled = true;
@@ -3718,7 +3736,7 @@ class NativeRelationAdoptionModal extends Modal {
   }
 
   onOpen(): void {
-    this.setTitle("纳管 Canvas 连线");
+    this.setTitle("将 Canvas 连线交由 Helix 管理");
     this.contentEl.createEl("p", {
       text: `${this.candidate.fromTitle} → ${this.candidate.toTitle}`,
     });
@@ -3732,14 +3750,14 @@ class NativeRelationAdoptionModal extends Modal {
       cls: "helix-modal-note",
       text: this.candidate.relabeledEdgeCount > 0
         ? `另有 ${this.candidate.relabeledEdgeCount} 条已有边会同步改为继承、分支或合并。`
-        : "已有托管边的关系类型不会变化。",
+        : "Helix 已管理的其他连线关系类型不会变化。",
     });
     if (this.candidate.crossProject) {
       const confirmation = this.contentEl.createEl("label", {
         cls: "helix-branch-confirm",
       });
       const checkbox = confirmation.createEl("input", { type: "checkbox" });
-      confirmation.createSpan({ text: "我确认纳管这条跨项目连线" });
+      confirmation.createSpan({ text: "我确认将这条跨项目连线交由 Helix 管理" });
       checkbox.addEventListener("change", () => {
         this.crossProjectConfirmed = checkbox.checked;
         confirm.disabled = !this.crossProjectConfirmed;
@@ -3750,7 +3768,7 @@ class NativeRelationAdoptionModal extends Modal {
       .addEventListener("click", () => this.close());
     const confirm = actions.createEl("button", {
       cls: "mod-cta",
-      text: "确认纳管",
+      text: "确认管理",
     });
     confirm.disabled = this.candidate.crossProject;
     confirm.addEventListener("click", () => {

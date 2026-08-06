@@ -523,7 +523,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
       data.baseSnapshots["task:task-expected"] = createSnapshot("task", expected.id, expected);
     });
     await expect(port.inspect("op-1")).resolves.toMatchObject({ resolvedTask: { id: "task-expected" } });
-    await expect(port.removeReconciled("missing-op")).rejects.toThrow(/找不到投影操作收据/);
+    await expect(port.removeReconciled("missing-op")).rejects.toThrow(/找不到同步操作收据/);
     await expect(port.removeResolved("op-1")).rejects.toThrow(/只有已验证收口/);
     await store.mutate((data) => {
       data.projectionOperationReceipts[0]!.outcome = "verified";

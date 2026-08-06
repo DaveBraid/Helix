@@ -203,7 +203,7 @@ export class PersistedProjectionStatePort implements ProjectionStatePort {
         parentCheckpoints: [],
       };
       if (stableHash(current) !== stableHash(expected)) {
-        throw new Error("滴答项目投影状态在写入前发生竞争");
+        throw new Error("滴答项目同步状态在写入前发生竞争");
       }
       data.didaProjectionState = structuredClone(next);
     });
@@ -255,18 +255,18 @@ export class PersistedProjectionDiagnosticsPort implements ProjectionDiagnostics
   async removeResolved(operationId: string): Promise<void> {
     await this.store.mutate((data) => {
       const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operationId);
-      if (!receipt) throw new Error("找不到投影操作收据");
+      if (!receipt) throw new Error("找不到同步操作收据");
       if (receipt.outcome !== "verified" && receipt.outcome !== "verified-absent") {
-        throw new Error("只有已验证收口的投影收据可以安全移除");
+        throw new Error("只有已验证收口的同步收据可以安全移除");
       }
       if (data.queue.some((item) => item.id === operationId)) {
-        throw new Error("投影操作仍在队列中，禁止移除收据");
+        throw new Error("同步操作仍在队列中，禁止移除收据");
       }
       const conflict = receipt.conflictId
         ? data.conflicts.find((item) => item.id === receipt.conflictId)
         : undefined;
       if (conflict && conflict.status !== "resolved" && conflict.status !== "superseded") {
-        throw new Error("投影冲突仍未解决，禁止移除收据");
+        throw new Error("同步冲突仍未解决，禁止移除收据");
       }
       data.projectionOperationReceipts = data.projectionOperationReceipts
         .filter((item) => item.operationId !== operationId);
@@ -275,16 +275,16 @@ export class PersistedProjectionDiagnosticsPort implements ProjectionDiagnostics
   async removeReconciled(operationId: string, conflictId?: string): Promise<void> {
     await this.store.mutate((data) => {
       const receipt = data.projectionOperationReceipts.find((item) => item.operationId === operationId);
-      if (!receipt) throw new Error("找不到投影操作收据");
+      if (!receipt) throw new Error("找不到同步操作收据");
       if (data.queue.some((item) => item.id === operationId)) {
-        throw new Error("投影操作仍在队列中，禁止移除收据");
+        throw new Error("同步操作仍在队列中，禁止移除收据");
       }
       const effectiveConflictId = conflictId ?? receipt.conflictId;
       const conflict = effectiveConflictId
         ? data.conflicts.find((item) => item.id === effectiveConflictId)
         : undefined;
       if (conflict && conflict.status !== "resolved" && conflict.status !== "superseded") {
-        throw new Error("投影冲突仍未解决，禁止移除收据");
+        throw new Error("同步冲突仍未解决，禁止移除收据");
       }
       data.projectionOperationReceipts = data.projectionOperationReceipts
         .filter((item) => item.operationId !== operationId);
@@ -437,7 +437,7 @@ export class DidaProjectProjectionService {
 
   async adoptAction(input: { stagePath: string; expectedStageId: string; expectedHash: string; line: number }): Promise<ProjectionMarkdownRevision> {
     const revision = await this.requireRevision(input.stagePath);
-    if (revision.hash !== input.expectedHash) throw new Error("阶段 Markdown 在纳管前发生变化");
+    if (revision.hash !== input.expectedHash) throw new Error("阶段 Markdown 在加入同步前发生变化");
     assertProjectionStageIdentity(revision.content, input.expectedStageId);
     return this.markdown.compareAndWrite(
       revision,
@@ -476,7 +476,7 @@ export class DidaProjectProjectionService {
     | { kind: "action"; projectId: string; stageId: string; stagePath: string; uuid: string }
     | { kind: "parent"; projectId: string; projectPath: string; title: string; status: ProjectionProjectInput["projectStatus"] }): Promise<void> {
     const current = await this.state.read();
-    if (!current.target) throw new Error("投影尚无已确认目标");
+    if (!current.target) throw new Error("滴答项目同步尚无已确认目标");
     if (input.kind === "action") {
       const entry = current.ledger.find((item) => item.uuid === input.uuid &&
         item.projectId === input.projectId && item.stageId === input.stageId);
@@ -640,7 +640,7 @@ export class DidaProjectProjectionService {
   }
 
   async removeResolvedReceipt(operationId: string): Promise<void> {
-    if (!this.diagnostics) throw new Error("投影诊断存储未配置");
+    if (!this.diagnostics) throw new Error("同步诊断存储未配置");
     const current = await this.state.read();
     if (current.ledger.some((entry) => entry.operationId === operationId) ||
       current.parentCheckpoints.some((entry) => entry.operationId === operationId) ||
@@ -668,10 +668,10 @@ export class DidaProjectProjectionService {
     if (current.target && (current.target.targetProjectId !== fresh.target.targetProjectId ||
       current.target.targetColumnId !== fresh.target.targetColumnId) &&
       (current.ledger.length > 0 || current.parentCheckpoints.length > 0 || (current.parentBases?.length ?? 0) > 0)) {
-      throw new Error("已有投影身份时禁止切换目标清单或分栏");
+      throw new Error("已有同步身份时禁止切换目标清单或分栏");
     }
     if (current.ledger.some((entry) => entry.frozen) || current.parentCheckpoints.some((item) => item.frozen)) {
-      throw new Error("投影仍有冻结对象，禁止激活");
+      throw new Error("滴答项目同步仍有冻结对象，禁止启用");
     }
     await this.state.write(current, {
       ...current,
@@ -684,7 +684,7 @@ export class DidaProjectProjectionService {
   async synchronizeProject(input: ProjectionProjectInput): Promise<ProjectionSyncSummary> {
     const initialState = await this.state.read();
     if (!initialState.enabled || !initialState.target || !initialState.confirmedPreviewHash) {
-      throw new Error("Helix→滴答投影尚未显式预览并激活");
+      throw new Error("Helix→滴答同步尚未显式预览并启用");
     }
     const catalog = await this.catalog.read(initialState.target.targetProjectId);
     const readiness = catalog.readiness;
@@ -697,14 +697,14 @@ export class DidaProjectProjectionService {
       actionCount: await this.countActions(input.stages),
     });
     if (readiness.queueEmpty === false || currentPreview.blockers.length > 0) {
-      throw new Error(`投影写入条件不满足：${currentPreview.blockers.join("；")}`);
+      throw new Error(`同步写入条件不满足：${currentPreview.blockers.join("；")}`);
     }
     const projectRevision = await this.requireRevision(input.projectPath);
     const projectIdentity = readProjectProjectionIdentity(projectRevision.content);
     if (projectIdentity.projectId !== input.projectId) throw new Error("项目 Markdown 身份与稳定工作区不一致");
     const preflightState = await this.state.read();
     if (stableHash(preflightState) !== stableHash(initialState)) {
-      throw new Error("投影状态在远端写入前发生变化");
+      throw new Error("同步状态在远端写入前发生变化");
     }
     const preflightStages: Array<{
       stageId: string;
@@ -742,7 +742,7 @@ export class DidaProjectProjectionService {
     }
     if (projectIdentity.parentTaskId && storedParent && !storedParent.frozen) {
       if (storedParent.remoteId !== projectIdentity.parentTaskId) {
-        throw new Error("Project Markdown 与临时父任务回填检查点竞争，已拒绝投影");
+        throw new Error("Project Markdown 与临时父任务回填检查点竞争，已拒绝同步");
       }
       await this.clearParentCheckpoint(initialState, projectIdentity.projectId);
     }
@@ -1001,7 +1001,7 @@ export class DidaProjectProjectionService {
   ): Promise<string | undefined> {
     const checkpoint = state.parentCheckpoints.find((item) => item.projectId === projectId);
     if (checkpoint?.frozen) {
-      summary.frozen.push({ uuid: `project:${projectId}`, reason: checkpoint.frozen, message: "父任务投影已冻结" });
+      summary.frozen.push({ uuid: `project:${projectId}`, reason: checkpoint.frozen, message: "父任务同步已冻结" });
       return undefined;
     }
     if (checkpoint?.remoteId) {
@@ -1229,14 +1229,14 @@ export class DidaProjectProjectionService {
 
   private async requireRemote(entry: ProjectionLedgerEntry): Promise<DidaTask> {
     const remote = await this.pipeline.rereadTask(entry.targetProjectId, entry.remoteId!);
-    if (!remote) throw new Error("远端投影任务不存在，拒绝按标题重建或领养");
+    if (!remote) throw new Error("远端同步任务不存在，拒绝按标题重建或领养");
     verifyProjectedTask(remote, entry, projectionMarker(entry.uuid), { title: false, state: false });
     return remote;
   }
 
   private async requireRevision(path: string): Promise<ProjectionMarkdownRevision> {
     const revision = await this.markdown.read(path);
-    if (!revision) throw new Error(`找不到投影 Markdown：${path}`);
+    if (!revision) throw new Error(`找不到同步所需的 Markdown：${path}`);
     return revision;
   }
 
@@ -1308,7 +1308,7 @@ function unmanagedAction(markdown: string, lineNumber: number): {
 } {
   const line = markdown.split(/\r?\n/)[lineNumber - 1] ?? "";
   const match = /^\s*[-*+] \[([ xX])\]\s+(.+?)\s*$/.exec(line);
-  if (!match) throw new Error(`未受管行动行已变化：第 ${lineNumber} 行`);
+  if (!match) throw new Error(`未加入同步的行动行已变化：第 ${lineNumber} 行`);
   return {
     line: lineNumber,
     title: match[2]!.trim(),
@@ -1330,7 +1330,7 @@ function assertProjectionUuidOwnership(
     const identity = projectionLedgerIdentity(entry);
     const existing = ledgerOwners.get(entry.uuid);
     if (existing !== undefined) {
-      throw new Error("投影账本 UUID 在多个项目或阶段中重复，已拒绝远端写入");
+      throw new Error("同步账本 UUID 在多个项目或阶段中重复，已拒绝远端写入");
     }
     ledgerOwners.set(entry.uuid, identity);
   }
@@ -1344,7 +1344,7 @@ function assertProjectionUuidOwnership(
       }
       const ledgerOwner = ledgerOwners.get(action.uuid);
       if (ledgerOwner !== undefined && ledgerOwner !== identity) {
-        throw new Error("计划行动 UUID 与投影账本归属不一致，已拒绝远端写入");
+        throw new Error("计划行动 UUID 与同步账本归属不一致，已拒绝远端写入");
       }
       markdownOwners.set(action.uuid, identity);
     }
@@ -1359,7 +1359,7 @@ function assertReceiptMatchesProof(
     receipt.marker !== proof.marker ||
     (receipt.remoteTaskId !== undefined && receipt.remoteTaskId !== proof.remoteTaskId) ||
     receipt.conflictId !== proof.conflictId) {
-    throw new Error("投影操作收据与冻结对象身份不一致，禁止收口");
+    throw new Error("同步操作收据与冻结对象身份不一致，禁止收口");
   }
 }
 

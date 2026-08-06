@@ -134,7 +134,14 @@ export default class HelixPlugin extends Plugin {
     this.dataGeneration = beginDataGeneration();
     this.store = new HelixDataStore(this, this.dataGeneration);
     this.secrets = new HelixSecretStore(this.app);
-    this.vaultRepository = new HelixVaultRepository(this.app.vault);
+    const data = await this.store.load();
+    this.settings = data.settings;
+    const transactionRoot = normalizePath(`${this.settings.rootFolder}/.transactions`);
+    this.vaultRepository = new HelixVaultRepository(this.app.vault, [
+      normalizePath(`${transactionRoot}/stage-delete.json`),
+      normalizePath(`${transactionRoot}/workspace-history.json`),
+      normalizePath(`${transactionRoot}/stage-focus-bridge.json`),
+    ]);
     this.templateManager = new HelixTemplateManager(
       this.vaultRepository,
       () => this.settings.templateFolder,
@@ -153,8 +160,6 @@ export default class HelixPlugin extends Plugin {
       this.projectWorkspace,
       () => this.settings.rootFolder,
     );
-    const data = await this.store.load();
-    this.settings = data.settings;
     this.recoveryMode = data.recoveryIssues.length > 0;
     if (this.recoveryMode) {
       this.projectWorkspace.freezePendingStageDeletion(
@@ -705,7 +710,7 @@ export default class HelixPlugin extends Plugin {
   private async projectionInput(projectId: string): Promise<ProjectionProjectInput> {
     const snapshot = await this.projectWorkspace.snapshot();
     const project = snapshot.projects.find((candidate) => candidate.id === projectId);
-    if (!project) throw new Error("找不到要投影的 Helix 项目");
+    if (!project) throw new Error("找不到要同步到滴答的 Helix 项目");
     return projectionInputFromProject(project);
   }
 

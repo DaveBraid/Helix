@@ -276,4 +276,82 @@ describe("HelixVaultRepository", () => {
 
     expect(await repository.read(revision!.path)).toBeNull();
   });
+
+  it("CAS-writes the allowlisted hidden focus state outside the TFile index", async () => {
+    const path = "Helix/.transactions/stage-focus-bridge.json";
+    const files = new Map([[path, '{"version":1}']]);
+    const repository = new HelixVaultRepository({
+      getAbstractFileByPath: () => null,
+      adapter: {
+        exists: async (candidate: string) => files.has(candidate),
+        read: async (candidate: string) => files.get(candidate)!,
+        write: async (candidate: string, content: string) => {
+          files.set(candidate, content);
+        },
+      },
+    } as never, [path]);
+    const revision = await repository.read(path);
+
+    const written = await repository.compareAndWrite(revision!, '{"version":1,"ok":true}');
+
+    expect(written.content).toBe('{"version":1,"ok":true}');
+    expect(files.get(path)).toBe(written.content);
+  });
+
+  it("never uses adapter writes for unindexed user Markdown", async () => {
+    const path = "Helix/Projects/Alpha/Stage-02.md";
+    let writes = 0;
+    const repository = new HelixVaultRepository({
+      getAbstractFileByPath: () => null,
+      adapter: {
+        exists: async () => true,
+        read: async () => "阶段内容",
+        write: async () => { writes += 1; },
+      },
+    } as never);
+    const revision = await repository.read(path);
+
+    await expect(repository.compareAndWrite(revision!, "修改后"))
+      .rejects.toThrow(`目标不是文件：${path}`);
+    expect(writes).toBe(0);
+  });
+
+  it("rejects an internal transaction change at the second read fence", async () => {
+    const path = "Helix/.transactions/stage-focus-bridge.json";
+    let content = '{"version":1}';
+    let writes = 0;
+    const repository = new HelixVaultRepository({
+      getAbstractFileByPath: () => null,
+      adapter: {
+        exists: async () => true,
+        read: async () => content,
+        write: async () => { writes += 1; },
+      },
+    } as never, [path]);
+    const revision = await repository.read(path);
+
+    await expect(repository.compareAndWrite(revision!, "next", () => {
+      content = "competing";
+    })).rejects.toMatchObject({ name: "VaultWriteConflictError" });
+    expect(writes).toBe(0);
+  });
+
+  it("rejects the same transaction suffix outside the injected root", async () => {
+    const configured = "Helix/.transactions/stage-focus-bridge.json";
+    const foreign = "Other/.transactions/stage-focus-bridge.json";
+    let writes = 0;
+    const repository = new HelixVaultRepository({
+      getAbstractFileByPath: () => null,
+      adapter: {
+        exists: async () => true,
+        read: async () => "state",
+        write: async () => { writes += 1; },
+      },
+    } as never, [configured]);
+    const revision = await repository.read(foreign);
+
+    await expect(repository.compareAndWrite(revision!, "next"))
+      .rejects.toThrow(`目标不是文件：${foreign}`);
+    expect(writes).toBe(0);
+  });
 });

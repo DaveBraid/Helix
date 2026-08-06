@@ -16,7 +16,7 @@ export function patchManagedFrontmatter(
     const indices = lines.flatMap((line, index) =>
       new RegExp(`^${escaped}\\s*:`).test(line) ? [index] : [],
     );
-    if (indices.length > 1) throw new Error(`重复的受管属性：${key}`);
+    if (indices.length > 1) throw new Error(`重复的 Helix 管理属性：${key}`);
     const index = indices[0];
     if (value === undefined) {
       if (index === undefined) continue;

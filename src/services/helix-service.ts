@@ -917,14 +917,14 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       const detailColumns = normalizeColumns(detailResponse.columns);
       const endpointColumns = normalizeColumns(columnsResponse);
       if (project.id !== projectId || detailProject.id !== projectId) {
-        throw new Error("投影目标清单精确复读身份不一致");
+        throw new Error("同步目标清单精确复读身份不一致");
       }
       if (stableHash(projectSyncValue(project)) !== stableHash(projectSyncValue(detailProject))) {
-        throw new Error("投影目标清单双源复读不一致");
+        throw new Error("同步目标清单双源复读不一致");
       }
       if (!sameColumns(detailColumns, endpointColumns) ||
         endpointColumns.some((column) => column.projectId !== projectId)) {
-        throw new Error("投影目标看板列双源复读不一致");
+        throw new Error("同步目标看板列双源复读不一致");
       }
       const data = await this.store.snapshot();
       const unknownOperationIds = new Set([
@@ -958,7 +958,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     preview: ProjectionColumnCreationPreview,
     confirmedHash: string,
   ): Promise<DidaColumn> {
-    const releaseExclusive = this.remoteWriteGate.enterExclusive("项目投影分栏创建");
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答项目同步分栏创建");
     try {
       this.assertWritable();
       const fresh = await this.previewProjectionColumnCreationWithLease(preview.targetProjectId);
@@ -1052,7 +1052,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       catalog.readiness.unknownOutcomes > 0 ? "存在结果未知操作" : undefined,
       state?.columnCreation ? "已有分栏创建结果等待冲突中心收口" : undefined,
       state?.target && state.target.targetProjectId !== projectId
-        ? `当前项目投影已绑定其他清单 ${state.target.targetProjectId}`
+        ? `当前滴答项目同步已绑定其他清单 ${state.target.targetProjectId}`
         : undefined,
       baselineColumns.some((column) => column.name === PROJECTION_COLUMN_NAME)
         ? `已存在同名分栏“${PROJECTION_COLUMN_NAME}”`
@@ -1239,7 +1239,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       await this.store.mutate((data) => {
         if (data.projectionOperationReceipts.some((item) => item.clientIdentity === clientIdentity) ||
           data.queue.some((item) => item.idempotencyFingerprint === clientIdentity)) {
-          throw new Error("投影创建 client identity 已被占用，请恢复既有收据");
+          throw new Error("同步创建 client identity 已被占用，请恢复既有收据");
         }
         data.localSnapshots[`task:${localId}`] = operation.local as EntitySnapshot<unknown>;
         const queue = new OfflineQueue(data.queue);
@@ -1250,7 +1250,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       return (await this.recoverProjectionCreate(clientIdentity, task.projectId)) ?? {
         operationId: operation.id,
         outcome: "retryable",
-        message: "投影创建已持久排队，尚未取得写后收据",
+        message: "同步创建已持久排队，尚未取得写后收据",
       };
     } finally {
       release();
@@ -1274,7 +1274,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       outcome: operation.remoteOutcomeUnknown || operation.status === "reconciliation"
         ? "unknown"
         : operation.status === "blocked" ? "conflict" : "retryable",
-      message: operation.lastError ?? "投影创建仍在现有持久队列中",
+      message: operation.lastError ?? "同步创建仍在现有持久队列中",
       conflictId: operation.conflictId,
     };
   }
@@ -1302,7 +1302,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       );
       if (remote.parentId !== expected.parentTaskId || remote.columnId !== expected.targetColumnId ||
         remote.content !== expected.marker) {
-        return { operationId: `op-projection-delete-${crypto.randomUUID()}`, outcome: "conflict", message: "投影删除写前身份复读不一致" };
+        return { operationId: `op-projection-delete-${crypto.randomUUID()}`, outcome: "conflict", message: "同步删除写前身份复读不一致" };
       }
       const now = new Date().toISOString();
       const base = createSnapshot("task", remote.id, remote, { capturedAt: now });
@@ -1790,7 +1790,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       if (!base) return {
         operationId: `op-projection-${crypto.randomUUID()}`,
         outcome: "conflict",
-        message: "投影任务缺少现有同步 Base",
+        message: "同步任务缺少现有 Base",
       };
       const now = new Date().toISOString();
       const operation = buildTaskUpdateOperation(
@@ -1826,7 +1826,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       if (!receipt) return {
         operationId: operation.id,
         outcome: "retryable",
-        message: "投影写入已持久排队，尚未取得收据",
+        message: "同步写入已持久排队，尚未取得收据",
       };
       return receipt.outcome === "verified-absent"
         ? { operationId: receipt.operationId, outcome: "verified-absent", conflictId: receipt.conflictId }
@@ -1839,7 +1839,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private assertProjectionCapabilities(reopen: boolean): void {
     this.assertTaskCrudVerified();
     if (!this.state.parentTaskVerified || !this.state.boardPlacementVerified) {
-      throw new Error("当前授权尚未验证投影所需的父子任务与看板归栏能力");
+      throw new Error("当前授权尚未验证滴答项目同步所需的父子任务与看板归栏能力");
     }
     if (reopen && !this.state.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");
@@ -2857,7 +2857,7 @@ function persistProjectionOperationReceipt(
     marker: projectionOperationMarker(operation),
     remoteTaskId: task?.id,
     conflictId,
-    message: result.outcome === "conflict" ? "投影写入进入逐字段冲突" : undefined,
+    message: result.outcome === "conflict" ? "同步写入进入逐字段冲突" : undefined,
   });
 }
 
@@ -2923,14 +2923,14 @@ function projectionWriteReceipt(
     return {
       operationId: receipt.operationId,
       outcome: "conflict",
-      message: "投影 verified 收据缺少任务快照",
+      message: "同步 verified 收据缺少任务快照",
       conflictId: receipt.conflictId,
     };
   }
   return {
     operationId: receipt.operationId,
     outcome: receipt.outcome === "verified-absent" ? "conflict" : receipt.outcome,
-    message: receipt.message ?? "投影写入未取得可验证任务快照",
+    message: receipt.message ?? "同步写入未取得可验证任务快照",
     conflictId: receipt.conflictId,
   };
 }

@@ -64,7 +64,7 @@ export async function confirmProjectionActivation(
   const counts = await projectionCounts(snapshot, projection);
   const fresh = await projection.previewActivation(preview.target, counts);
   if (fresh.previewHash !== confirmedHash) {
-    throw new Error("投影项目或行动数量已变化，请重新预览确认");
+    throw new Error("同步项目或行动数量已变化，请重新预览确认");
   }
   await projection.activate(fresh, confirmedHash);
 }

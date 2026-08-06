@@ -708,7 +708,7 @@ describe("HelixDataStore serialization", () => {
 
     expect(hydrated.projectionOperationReceipts).toEqual([]);
     expect(hydrated.didaProjectionState).toBeUndefined();
-    expect(hydrated.recoveryIssues.join(" ")).toMatch(/投影状态.*投影创建收据/);
+    expect(hydrated.recoveryIssues.join(" ")).toMatch(/同步状态.*同步创建收据/);
   });
 
   it("rejects projection state shadow fields, duplicate identities, and target ownership mismatch", () => {
@@ -759,7 +759,7 @@ describe("HelixDataStore serialization", () => {
     };
     const shadowHydrated = hydrateData(shadow);
     expect(shadowHydrated.didaProjectionState).toBeUndefined();
-    expect(shadowHydrated.recoveryIssues.join(" ")).toMatch(/投影状态含损坏字段/);
+    expect(shadowHydrated.recoveryIssues.join(" ")).toMatch(/同步状态含损坏字段/);
 
     const duplicate = createDefaultData("device-projection-duplicate-state");
     duplicate.didaProjectionState = {

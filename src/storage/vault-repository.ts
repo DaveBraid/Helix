@@ -31,8 +31,16 @@ export class VaultDeletionClaimError extends Error {
 
 export class HelixVaultRepository {
   private static readonly DELETE_CLAIM_SUFFIX = ".helix-delete-claim";
+  private readonly internalTransactionPaths: ReadonlySet<string>;
 
-  constructor(private readonly vault: Vault) {}
+  constructor(
+    private readonly vault: Vault,
+    internalTransactionPaths: readonly string[] = [],
+  ) {
+    this.internalTransactionPaths = new Set(
+      internalTransactionPaths.map((path) => normalizePath(path)),
+    );
+  }
 
   async read(path: string): Promise<VaultRevision | null> {
     const normalized = normalizePath(path);
@@ -72,8 +80,10 @@ export class HelixVaultRepository {
     nextContent: string,
     beforeWrite?: () => void,
   ): Promise<VaultRevision> {
-    const file = this.vault.getAbstractFileByPath(revision.path);
-    if (!(file instanceof TFile)) throw new Error(`目标不是文件：${revision.path}`);
+    const file = this.resolveFile(revision.path);
+    if (!(file instanceof TFile)) {
+      return this.compareAndWriteInternalTransaction(revision, nextContent, beforeWrite);
+    }
     const written = await this.vault.process(file, (currentContent) => {
       const actualHash = stableHash(currentContent);
       if (actualHash !== revision.hash) {
@@ -91,6 +101,61 @@ export class HelixVaultRepository {
       content: written,
       hash: stableHash(written),
     };
+  }
+
+  /**
+   * `.transactions` 下三份 JSON 是 Helix 独占的内部状态，不是用户笔记，也不会
+   * 稳定进入 Obsidian 的 TFile 索引。它们仍需执行双读 fence；此适配器路径绝不
+   * 对普通 Markdown、Canvas 或任意其他隐藏文件开放。
+   */
+  private async compareAndWriteInternalTransaction(
+    revision: VaultRevision,
+    nextContent: string,
+    beforeWrite?: () => void,
+  ): Promise<VaultRevision> {
+    if (!this.internalTransactionPaths.has(normalizePath(revision.path))) {
+      throw new Error(`目标不是文件：${revision.path}`);
+    }
+    const adapter = this.vault.adapter;
+    if (!adapter || !(await adapter.exists(revision.path))) {
+      throw new VaultWriteConflictError(revision.path, revision.hash, "<missing>");
+    }
+    const first = await adapter.read(revision.path);
+    const firstHash = stableHash(first);
+    if (firstHash !== revision.hash) {
+      throw new VaultWriteConflictError(revision.path, revision.hash, firstHash);
+    }
+    beforeWrite?.();
+    const fenced = await adapter.read(revision.path);
+    const fencedHash = stableHash(fenced);
+    if (fencedHash !== revision.hash) {
+      throw new VaultWriteConflictError(revision.path, revision.hash, fencedHash);
+    }
+    await adapter.write(revision.path, nextContent);
+    const accepted = await adapter.read(revision.path);
+    if (accepted !== nextContent) {
+      throw new VaultWriteConflictError(
+        revision.path,
+        stableHash(nextContent),
+        stableHash(accepted),
+      );
+    }
+    return {
+      path: revision.path,
+      content: accepted,
+      hash: stableHash(accepted),
+    };
+  }
+
+  /** 优先使用 Vault 的文件专用解析，兼容缓存刷新期间的 AbstractFile 查询差异。 */
+  private resolveFile(path: string): TFile | null {
+    const normalized = normalizePath(path);
+    const direct = this.vault.getFileByPath?.(normalized);
+    if (direct instanceof TFile) return direct;
+    const abstract = this.vault.getAbstractFileByPath(normalized);
+    if (abstract instanceof TFile) return abstract;
+    return this.vault.getFiles?.().find((candidate) =>
+      normalizePath(candidate.path) === normalized) ?? null;
   }
 
   async trashIfUnchanged(

@@ -218,6 +218,28 @@ describe("阶段聚焦桥接纯领域协议", () => {
       })).toEqual({ action: "noop", sourceId: "a" });
     });
 
+    it("accepts only the Obsidian-equivalent .md WikiLink form as canonical", () => {
+      const pair = syncedPair();
+      const withoutExtension = pair.targetMarkdown.replace("a.md|A]]", "a|A]]");
+      const parsed = parseFocusBridgeEnvelope(withoutExtension);
+      if (parsed.kind !== "present") throw new Error("missing envelope");
+      const legacyEquivalent = withoutExtension.replace(
+        `derivedHash=${parsed.blocks[0]!.derivedHash}`,
+        `derivedHash=${parsed.blocks[0]!.currentDerivedHash}`,
+      );
+
+      expect(coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: legacyEquivalent,
+        baseContent: "Base",
+      })).toEqual({ action: "noop", sourceId: "a" });
+      expect(planStageFocusBridge(
+        ["a"],
+        new Map([["a", pair.sourceNote]]),
+        legacyEquivalent,
+      ).action).toBe("replace");
+    });
+
     it("turns a source-only edit into one derived block update", () => {
       const pair = syncedPair();
       const changedSource = source("a", "Source changed");

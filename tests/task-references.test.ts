@@ -392,7 +392,7 @@ describe("TaskReferenceService", () => {
 
     const snapshot = await service.snapshot();
     expect(snapshot.blockingIssues).toEqual(expect.arrayContaining([
-      expect.stringMatching(/受管链接区块无效/),
+      expect.stringMatching(/Helix 自动链接区块无效/),
     ]));
   });
 

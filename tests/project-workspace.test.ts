@@ -198,7 +198,7 @@ describe("ProjectWorkspaceService", () => {
         cycles: [expect.objectContaining({ status: "completed" })],
       })],
       canvasRepairRequired: true,
-      canvasRepairReasons: expect.arrayContaining(["托管节点摘要需要更新"]),
+      canvasRepairReasons: expect.arrayContaining(["Helix 管理节点摘要需要更新"]),
     });
     expect(repo.json(CANVAS).nodes[1]!.text).toContain("已关闭");
     repo.beforeCompare = undefined;
@@ -228,7 +228,7 @@ describe("ProjectWorkspaceService", () => {
     expect(loaded.canvasRepairReasons).toEqual(expect.arrayContaining([
       "缺少项目 Canvas 节点",
       "阶段编号高水位需要补齐",
-      "托管阶段关系需要正规化",
+      "Helix 管理的阶段关系需要正规化",
     ]));
   });
 
@@ -986,7 +986,7 @@ describe("ProjectWorkspaceService", () => {
     const plan = await service.planCycleDeletion("cycle-2");
     const before = (await repo.read(CANVAS))!.content;
 
-    await expect(service.deleteCycle(plan)).rejects.toThrow(/非托管连线/);
+    await expect(service.deleteCycle(plan)).rejects.toThrow(/尚未交由 Helix 管理/);
     expect((await repo.read(CANVAS))!.content).toBe(before);
     expect(await repo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
   });
@@ -1010,7 +1010,7 @@ describe("ProjectWorkspaceService", () => {
     const plan = await service.planCycleDeletion("cycle-2");
     const before = (await repo.read(CANVAS))!.content;
 
-    await expect(service.deleteCycle(plan)).rejects.toThrow(/非托管连线/);
+    await expect(service.deleteCycle(plan)).rejects.toThrow(/尚未交由 Helix 管理/);
     expect((await repo.read(CANVAS))!.content).toBe(before);
     expect(repo.json(CANVAS).edges).toContainEqual(
       expect.objectContaining({ id: "legacy-derived-edge" }),
@@ -1580,7 +1580,7 @@ describe("ProjectWorkspaceService", () => {
       const service = workspace(repo);
       const plan = await service.planConnection("cycle-1", "cycle-2");
       const before = (await repo.read(CANVAS))!.content;
-      await expect(service.connectCycles(plan)).rejects.toThrow(/标题|标记|包络/);
+      await expect(service.connectCycles(plan)).rejects.toThrow(/标题|标记|自动引用区域/);
       expect((await repo.read(CANVAS))!.content).toBe(before);
     }
   });
@@ -1751,7 +1751,7 @@ describe("ProjectWorkspaceService", () => {
     }));
     expect((await service.snapshot()).nativeRelationCandidates).toEqual([]);
     expect(service.historyState()).toMatchObject({
-      undoLabel: "纳管原生阶段连线",
+      undoLabel: "由 Helix 管理原生阶段连线",
       undoCount: 1,
     });
   });

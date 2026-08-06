@@ -6,6 +6,27 @@ import { WORKBENCH_NAVIGATION } from "../src/domain/workbench-navigation";
 describe("workbench layout and navigation structure", () => {
   const view = readFileSync(resolve(process.cwd(), "src/ui/helix-view.ts"), "utf8");
   const css = readFileSync(resolve(process.cwd(), "styles.css"), "utf8");
+  const projectWorkspace = readFileSync(
+    resolve(process.cwd(), "src/services/project-workspace.ts"),
+    "utf8",
+  );
+  const didaProjectSync = [
+    readFileSync(resolve(process.cwd(), "src/services/dida-project-projection.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/domain/dida-project-projection.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/domain/project-identity.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/storage/frontmatter.ts"), "utf8"),
+  ].join("\n");
+  const userReachableDiagnostics = [
+    readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/services/dida-project-projection.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/services/dida-project-projection-coordinator.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/domain/dida-project-projection.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/storage/model.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/services/task-references.ts"), "utf8"),
+    readFileSync(resolve(process.cwd(), "src/domain/stage-focus-bridge.ts"), "utf8"),
+    projectWorkspace,
+  ].join("\n");
 
   it("uses the intended navigation order without an independent analytics tab", () => {
     expect(WORKBENCH_NAVIGATION.map((item) => item.label))
@@ -53,6 +74,13 @@ describe("workbench layout and navigation structure", () => {
     );
   });
 
+  it("injects only the configured Helix transaction paths after settings load", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(main).toMatch(
+      /const data = await this\.store\.load\(\);[\s\S]*this\.settings = data\.settings;[\s\S]*new HelixVaultRepository\(this\.app\.vault, \[[\s\S]*stage-delete\.json[\s\S]*workspace-history\.json[\s\S]*stage-focus-bridge\.json[\s\S]*\]\)/,
+    );
+  });
+
   it("keeps project reads available while recovery mode rejects all View mutations before writing", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(main).toMatch(/readProjectWorkspace: \(operation\) => this\.withProjectWorkspaceRead\(operation\)/);
@@ -85,9 +113,34 @@ describe("workbench layout and navigation structure", () => {
   });
 
   it("offers structural focus repair without invalid content choices", () => {
-    expect(view).toMatch(/conflict\.reason !== "simultaneous-edit"[\s\S]*按来源重建受管块/);
+    expect(view).toMatch(/conflict\.reason !== "simultaneous-edit"[\s\S]*按来源重建自动引用/);
     expect(view).toMatch(/打开 Markdown 手工修复/);
     expect(view).toMatch(/return;[\s\S]*addChoice\("来源"/);
+  });
+
+  it("keeps internal managed-block and adoption jargon out of visible UI strings", () => {
+    expect(view).not.toMatch(/(?:text:\s*|setTitle\()["`][^"`]*(?:纳管|受管块)/u);
+    expect(view).toContain('text: "交由 Helix 管理"');
+    expect(view).toContain('this.setTitle("将 Canvas 连线交由 Helix 管理")');
+    expect(view).toContain('text: "确认管理"');
+  });
+
+  it("keeps internal adoption jargon out of user-facing service errors", () => {
+    const oldTerms = /throw new Error\([^\n]*(?:纳管|受管块|未受管|受管计划行动|受管属性)/u;
+    expect(projectWorkspace).not.toMatch(oldTerms);
+    expect(didaProjectSync).not.toMatch(oldTerms);
+    expect(projectWorkspace).toContain("请重建自动引用或打开 Markdown 手工修复");
+    expect(didaProjectSync).toContain("阶段 Markdown 在加入同步前发生变化");
+    expect(didaProjectSync).toContain("尚未加入同步的清单项加入同步");
+  });
+
+  it("keeps legacy projection and managed-region jargon out of all diagnostic constructors", () => {
+    const diagnosticOldTerms = /(?:new (?:Error|FocusBridgeError)|corrupt\(|issues\.push\(|reasons\.add\(|message:\s*)[^\n]*(?:投影|受管链接区块|托管|非托管|受管(?:引用|标记|包络|块))/u;
+    expect(userReachableDiagnostics).not.toMatch(diagnosticOldTerms);
+    expect(userReachableDiagnostics).toContain("滴答项目同步分栏创建");
+    expect(userReachableDiagnostics).toContain("Helix 自动链接区块无效");
+    expect(userReachableDiagnostics).toContain("自动引用区域缺失、重复或顺序错误");
+    expect(userReachableDiagnostics).toContain("尚未交由 Helix 管理");
   });
 
   it("keeps the five-column stage board isolated, horizontally scrollable and write-gated", () => {
@@ -112,10 +165,13 @@ describe("workbench layout and navigation structure", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     expect(view).not.toContain("renderProjectDidaMappingBar");
     expect(view).not.toContain("ProjectDidaMappingConfirmModal");
-    expect(view).toMatch(/renderProjectProjectionPanel[\s\S]*未受管[\s\S]*adoptProjectAction/);
+    expect(view).toMatch(/renderProjectProjectionPanel[\s\S]*未加入[\s\S]*adoptProjectAction/);
     expect(view).toMatch(/editProjectAction[\s\S]*syncProjectProjection/);
+    expect(view).toContain("加入同步、标题与状态编辑当前只写入 Stage Markdown");
+    expect(view).toContain("仅“同步此项目到滴答”会请求远端写入");
+    expect(view).toContain("当前只写 Stage，尚未发送滴答");
     expect(view).toMatch(/再次确认 ·/);
-    expect(settings).toMatch(/项目投影[\s\S]*选择清单[\s\S]*选择已有分栏/);
+    expect(settings).toMatch(/滴答项目同步[\s\S]*选择清单[\s\S]*选择已有分栏/);
     expect(settings).toMatch(/再次点击确认启用/);
     expect(settings).toContain("请选择清单以查看已有分栏或安全创建目标分栏");
   });
@@ -125,7 +181,7 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/kind: "action", projectId: model\.project\.id, stageId, uuid/);
     expect(view).toMatch(/removeResolvedProjectProjectionReceipt\(receipt\.operationId\)/);
     expect(view).toMatch(/receipt\.outcome !== "verified"[\s\S]*receipt\.outcome !== "verified-absent"[\s\S]*此处不提供清理[\s\S]*continue;/);
-    expect(view).not.toMatch(/项目投影[\s\S]*强制删除收据/);
+    expect(view).not.toMatch(/滴答项目同步[\s\S]*强制删除收据/);
     expect(css).toMatch(/\.helix-project-projection-panel[\s\S]*var\(--text-normal\)/);
     expect(css).toMatch(/\.helix-project-projection-action[\s\S]*grid-template-columns/);
   });
@@ -166,14 +222,14 @@ describe("workbench layout and navigation structure", () => {
     expect(settings).toMatch(/完整列基线[\s\S]*baselineHash[\s\S]*再次点击确认创建/);
     expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
     expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
-    expect(confirm).toMatch(/enterExclusive\("项目投影分栏创建"\)/);
+    expect(confirm).toMatch(/enterExclusive\("滴答项目同步分栏创建"\)/);
     expect(confirm).not.toContain("withAuthorizationLease");
     expect(service).not.toMatch(/reconcileProjectionColumnCreation[\s\S]*deleteColumn|reconcileProjectionColumnCreation[\s\S]*updateColumn/);
   });
 
   it("keeps recovery and column-unknown diagnostics visible when the project workspace is unreadable", () => {
     expect(view).toMatch(/loadProjectionConflictModels[\s\S]*persisted\.didaProjectionState\?\.columnCreation/);
-    expect(view).toMatch(/项目工作区只读[\s\S]*投影诊断暂不可读[\s\S]*脱敏错误/);
+    expect(view).toMatch(/项目工作区只读[\s\S]*滴答项目同步诊断暂不可读[\s\S]*脱敏错误/);
     expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)/);
   });
 });

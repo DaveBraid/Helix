@@ -732,7 +732,7 @@ export class ProjectWorkspaceService {
         let baseContent: string | null = null;
         try {
           const parsed = parseFocusBridgeEnvelope(targetRevision.content);
-          if (parsed.kind !== "present") throw new Error("目标缺少聚焦桥接受管块");
+          if (parsed.kind !== "present") throw new Error("目标缺少聚焦桥接自动引用");
           const block = parsed.blocks.find((candidate) => candidate.sourceId === pair.source.id);
           if (!block || focusContentHash(block.content) !== block.baseHash) {
             throw new Error("聚焦桥接正文无法证明同步基线");
@@ -800,7 +800,7 @@ export class ProjectWorkspaceService {
       const conflict = loaded.state.conflicts.find((candidate) => candidate.id === conflictId);
       if (!conflict) throw new Error("聚焦桥接冲突不存在或已经解决");
       if (conflict.reason !== "simultaneous-edit") {
-        throw new Error("结构或检查点冲突不能使用内容三选一；请重建受管块或打开 Markdown 手工修复");
+        throw new Error("结构或检查点冲突不能使用内容三选一；请重建自动引用或打开 Markdown 手工修复");
       }
       const accepted = choice === "source"
         ? conflict.sourceContent
@@ -914,7 +914,7 @@ export class ProjectWorkspaceService {
       if (!conflict) throw new Error("聚焦桥接冲突不存在或已经解决");
       if (conflict.reason !== "derived-structure-changed" ||
         conflict.derivedContent === "<派生受管块结构损坏>") {
-        throw new Error("该冲突不能安全重建，请打开 Markdown 手工修复受管块");
+        throw new Error("该冲突不能安全重建，请打开 Markdown 手工修复自动引用");
       }
       const snapshot = await this.snapshot();
       const pair = this.focusBridgePairs(snapshot).find((candidate) => candidate.key === conflict.key);
@@ -939,13 +939,13 @@ export class ProjectWorkspaceService {
           acceptedContent: accepted,
         });
       } catch {
-        throw new Error("受管块结构无法安全定位，请打开 Markdown 手工修复");
+        throw new Error("自动引用结构无法安全定位，请打开 Markdown 手工修复");
       }
       loaded.state.conflicts = loaded.state.conflicts.filter((candidate) => candidate.id !== conflictId);
       loaded.state.checkpoints[pair.key] = this.focusCheckpoint(pair, accepted);
       const finalState = structuredClone(loaded.state);
       await this.applyFocusResolution(loaded, stateBefore, finalState, conflict.id, {
-        label: "重建阶段聚焦受管块",
+        label: "重建阶段聚焦自动引用",
         canvasBeforeHash: canvas.hash,
         canvasAfterContent: canvas.content,
         markdownUpdates: [{
@@ -1958,7 +1958,7 @@ export class ProjectWorkspaceService {
         continue;
       }
       if (node.helixNodeKind !== "stage" && node.helixNodeKind !== "cycle") {
-        throw new Error(`Helix 托管节点类型无效：${node.id}`);
+        throw new Error(`Helix 管理节点类型无效：${node.id}`);
       }
       const stageId = managedStageId(node);
       if (!stageId) {
@@ -1991,7 +1991,7 @@ export class ProjectWorkspaceService {
       if (isLegacyDerivesEdge(edge)) continue;
       if (edge.helixManaged === true) {
         if (!from || !to) {
-          throw new Error(`Helix 托管边引用缺失或非阶段节点：${edge.id}`);
+          throw new Error(`Helix 管理边引用缺失或非阶段节点：${edge.id}`);
         }
         physicalEdges.push({
           id: edge.id,
@@ -2138,7 +2138,7 @@ export class ProjectWorkspaceService {
           ? `cycle:${managedStageId(node)}`
           : undefined;
       const entity = identity ? entityById.get(identity) : undefined;
-      if (!entity) throw new Error(`无法修复 Helix 托管节点：${node.id}`);
+      if (!entity) throw new Error(`无法修复 Helix 管理节点：${node.id}`);
       const path = normalizePath(entity.path);
       const nextText = canvasCardText(path, entity.title, entity.status);
       if (
@@ -2151,7 +2151,7 @@ export class ProjectWorkspaceService {
         node.text = nextText;
         delete node.file;
         changed = true;
-        reasons.add("托管节点摘要需要更新");
+        reasons.add("Helix 管理节点摘要需要更新");
       }
     }
     const existingProjects = new Set(
@@ -2223,7 +2223,7 @@ export class ProjectWorkspaceService {
     applyNormalizedManagedEdges(canvas.document, normalized.edges);
     if (JSON.stringify(canvas.document.edges) !== edgeBefore) {
       changed = true;
-      reasons.add("托管阶段关系需要正规化");
+      reasons.add("Helix 管理的阶段关系需要正规化");
     }
     if (changed) {
       if (!options.allowWrite) return {
@@ -2664,7 +2664,7 @@ export class ProjectWorkspaceService {
       canvas.revision.hash !== canonical.canvasRevisionHash ||
       snapshot.canvasRevisionHash !== canonical.canvasRevisionHash
     ) {
-      throw new Error("Canvas 在纳管确认期间已经变化，本次操作未写入");
+      throw new Error("Canvas 在确认交由 Helix 管理期间已经变化，本次操作未写入");
     }
     const stageByNode = new Map(canvas.document.nodes.flatMap((node) => {
       const stageId = managedStageId(node);
@@ -2703,7 +2703,7 @@ export class ProjectWorkspaceService {
     applyManagedLayout(canvas.document, snapshot, physical, affected);
     this.assertActive(generation);
     return this.applyAtomicWorkspaceChange({
-      label: "纳管原生阶段连线",
+      label: "由 Helix 管理原生阶段连线",
       canvasBeforeHash: canvas.revision.hash,
       canvasAfterContent: JSON.stringify(canvas.document, null, 2),
       markdownUpdates: await this.focusMarkdownUpdates(
@@ -2729,7 +2729,7 @@ export class ProjectWorkspaceService {
       canvas.revision.hash !== canonical.canvasRevisionHash ||
       snapshot.canvasRevisionHash !== canonical.canvasRevisionHash
     ) {
-      throw new Error("Canvas 在纳管预览期间已经变化，请重试");
+      throw new Error("Canvas 在管理操作预览期间已经变化，请重试");
     }
     const physical = physicalManagedEdges(canvas.document);
     const before = normalizeProjectGraph(
@@ -2972,8 +2972,8 @@ export class ProjectWorkspaceService {
       (edge.helixManaged !== true || isLegacyDerivesEdge(edge)));
     if (unmanagedAttachments.length > 0) {
       throw new Error(
-        `该阶段还有 ${unmanagedAttachments.length} 条原生 Canvas 非托管连线；` +
-        "为避免删除用户关系，请先在 Canvas 中移除或显式纳管这些连线",
+        `该阶段还有 ${unmanagedAttachments.length} 条原生 Canvas 连线尚未交由 Helix 管理；` +
+        "为避免删除用户关系，请先在 Canvas 中移除这些连线，或明确交由 Helix 管理",
       );
     }
     const physical = physicalManagedEdges(canvas.document).filter((edge) =>
@@ -5316,7 +5316,7 @@ function managedFrontmatterString(
   if (frontmatter === undefined) return { present: false };
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const matches = [...frontmatter.matchAll(new RegExp(`^${escaped}:\\s*(.*?)\\s*$`, "gm"))];
-  if (matches.length > 1) throw new Error(`重复的受管属性：${key}`);
+  if (matches.length > 1) throw new Error(`重复的 Helix 管理属性：${key}`);
   if (matches.length === 0) return { present: false };
   const raw = matches[0]![1]!.trim();
   const quoted = /^(?:"([\s\S]*)"|'([\s\S]*)')$/.exec(raw);

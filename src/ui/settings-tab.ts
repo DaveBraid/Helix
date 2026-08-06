@@ -118,10 +118,10 @@ export class HelixSettingTab extends PluginSettingTab {
       );
 
     const projectionHost = this.containerEl.createDiv({ cls: "helix-settings-projection" });
-    projectionHost.createEl("h3", { text: "项目投影" });
+    projectionHost.createEl("h3", { text: "滴答项目同步" });
     projectionHost.createEl("p", {
       cls: "setting-item-description",
-      text: "将 Helix 项目与受管计划行动投影到同一滴答看板分栏。默认关闭，只能手动同步单个项目。",
+      text: "将 Helix 项目与已加入的计划行动同步到同一滴答看板分栏。默认关闭，只能手动同步单个项目。",
     });
     const projectionToken = ++this.projectionRenderToken;
     void this.renderProjectProjectionSettings(projectionHost, projectionToken);
@@ -294,7 +294,7 @@ export class HelixSettingTab extends PluginSettingTab {
                 this.preferredProjectionProjectId = projectId;
                 this.preferredProjectionColumnId = created.id;
                 this.armedColumnCreation = undefined;
-                new Notice("分栏已双源复读确认；请重新预览后再激活项目投影");
+                new Notice("分栏已双源复读确认；请重新预览后再启用滴答项目同步");
                 this.display();
                 return;
               }
@@ -355,7 +355,7 @@ export class HelixSettingTab extends PluginSettingTab {
                   this.armedProjection.previewHash,
                 );
                 this.armedProjection = undefined;
-                new Notice("项目投影已显式启用；不会自动同步项目");
+                new Notice("滴答项目同步已显式启用；不会自动同步项目");
                 this.display();
                 return;
               }
@@ -386,13 +386,13 @@ export class HelixSettingTab extends PluginSettingTab {
         });
       });
       if (configuration.enabled) {
-        new Setting(host).setName("停用项目投影")
+        new Setting(host).setName("停用滴答项目同步")
           .setDesc("保留已验证身份与诊断；停用后手动同步入口立即关闭。")
           .addButton((button) => button.setButtonText("显式禁用").setWarning().onClick(() => {
             void this.projectionUiActions.run(async () => {
               try {
                 await this.plugin.disableProjectProjection();
-                new Notice("项目投影已禁用");
+                new Notice("滴答项目同步已禁用");
                 this.display();
               } catch (error) {
                 new Notice(error instanceof Error ? error.message : String(error), 8_000);
@@ -410,7 +410,7 @@ export class HelixSettingTab extends PluginSettingTab {
       }
     } catch (error) {
       if (token !== this.projectionRenderToken || !host.isConnected) return;
-      loading.setText(`无法读取项目投影目录：${error instanceof Error ? error.message : String(error)}`);
+      loading.setText(`无法读取滴答项目同步目录：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

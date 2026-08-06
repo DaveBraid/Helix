@@ -30,11 +30,11 @@ describe("projection column creation", () => {
     const first = harness.service.confirmProjectionColumnCreation(preview, preview.previewHash);
     await started;
     await expect(harness.service.confirmProjectionColumnCreation(preview, preview.previewHash))
-      .rejects.toThrow(/项目投影分栏创建已经在运行/);
-    await expect(harness.service.sync()).rejects.toThrow(/项目投影分栏创建正在进行/);
-    await expect(harness.service.runDidaWriteContractTest()).rejects.toThrow(/项目投影分栏创建已经在运行/);
+      .rejects.toThrow(/滴答项目同步分栏创建已经在运行/);
+    await expect(harness.service.sync()).rejects.toThrow(/滴答项目同步分栏创建正在进行/);
+    await expect(harness.service.runDidaWriteContractTest()).rejects.toThrow(/滴答项目同步分栏创建已经在运行/);
     await expect(harness.service.replaceDidaToken("replacement-token-12345"))
-      .rejects.toThrow(/项目投影分栏创建已经在运行/);
+      .rejects.toThrow(/滴答项目同步分栏创建已经在运行/);
     expect(harness.control.createCalls).toBe(1);
     releaseCreate();
     await first;

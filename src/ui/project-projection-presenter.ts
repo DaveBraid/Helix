@@ -23,7 +23,7 @@ export interface ProjectionCatalogChoice {
 export function projectionCatalogChoices(catalogs: ProjectionCatalogSnapshot[]): ProjectionCatalogChoice[] {
   return catalogs.map((catalog) => {
     const project = catalog.projects[0];
-    if (!project) throw new Error("投影目录缺少精确清单");
+    if (!project) throw new Error("滴答项目同步目录缺少精确清单");
     return {
       projectId: project.id,
       projectLabel: `${project.name} · ${project.id}`,
@@ -60,7 +60,7 @@ export function projectionActivationText(preview: ProjectionActivationPreview): 
   return [
     `${preview.projectName} · ${preview.target.targetProjectId}`,
     `${preview.columnName} · ${preview.target.targetColumnId}`,
-    `${preview.projectCount} 个 Helix 项目 · ${preview.actionCount} 条受管行动`,
+    `${preview.projectCount} 个 Helix 项目 · ${preview.actionCount} 条已加入同步的行动`,
     preview.blockers.length === 0 ? "能力与安全条件已满足" : `阻塞：${preview.blockers.join("；")}`,
   ];
 }

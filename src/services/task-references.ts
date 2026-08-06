@@ -464,7 +464,7 @@ function updateTaskReferenceContent(
   const start = patched.indexOf(BLOCK_START);
   const end = patched.indexOf(BLOCK_END);
   if (start === -1 || end === -1 || end < start) {
-    throw new Error("任务引用 Markdown 缺少受管链接区块");
+    throw new Error("任务引用 Markdown 缺少 Helix 自动链接区块");
   }
   return `${patched.slice(0, start)}${nextBlock}${patched.slice(end + BLOCK_END.length)}`;
 }
@@ -561,7 +561,7 @@ function assertSingleManagedBlock(revision: VaultRevision): void {
     ends.length !== 1 ||
     starts[0]! >= ends[0]!
   ) {
-    throw new Error(`任务引用受管链接区块无效：${revision.path}`);
+    throw new Error(`任务引用 Helix 自动链接区块无效：${revision.path}`);
   }
 }
 

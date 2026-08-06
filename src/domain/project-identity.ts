@@ -41,7 +41,7 @@ function assertOneOfKinds(content: string, expected: string[], path: string): vo
 function managedScalar(content: string, key: string): string | undefined {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const matches = [...content.matchAll(new RegExp(`^${escaped}:\\s*(.*?)\\s*$`, "gm"))];
-  if (matches.length > 1) throw new Error(`重复的受管属性：${key}`);
+  if (matches.length > 1) throw new Error(`重复的 Helix 管理属性：${key}`);
   const raw = matches[0]?.[1];
   if (raw === undefined) return undefined;
   return raw.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");

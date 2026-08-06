@@ -162,8 +162,8 @@ export function buildProjectionActivationPreview(input: {
 }
 
 export function assertProjectionActivation(preview: ProjectionActivationPreview, confirmedHash: string): void {
-  if (preview.previewHash !== confirmedHash) throw new Error("投影预览已变化，请重新确认精确清单与分栏");
-  if (preview.blockers.length > 0) throw new Error(`投影尚不可激活：${preview.blockers.join("；")}`);
+  if (preview.previewHash !== confirmedHash) throw new Error("同步预览已变化，请重新确认精确清单与分栏");
+  if (preview.blockers.length > 0) throw new Error(`滴答项目同步尚不可启用：${preview.blockers.join("；")}`);
 }
 
 export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
@@ -197,7 +197,7 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     }
     const markerText = line.slice(markerStart).trim();
     const marker = ACTION_MARKER.exec(markerText);
-    if (!marker) throw new Error(`计划行动受管标记损坏：第 ${index + 1} 行`);
+    if (!marker) throw new Error(`计划行动同步标记损坏：第 ${index + 1} 行`);
     const uuid = decodeMarkerValue(marker[1]!, "行动 UUID");
     const remote = marker[2] === "-" ? undefined : decodeMarkerValue(marker[2]!, "远端任务 ID");
     const state = marker[3] as ProjectionActionState;
@@ -207,10 +207,10 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     uuids.add(uuid);
     if (remote) remoteIds.add(remote);
     const rawTitle = line.slice(0, markerStart).replace(/^\s*[-*+] \[[ xX]\]\s*/, "").trim();
-    if (!rawTitle) throw new Error(`受管计划行动标题为空：第 ${index + 1} 行`);
+    if (!rawTitle) throw new Error(`已加入同步的计划行动标题为空：第 ${index + 1} 行`);
     const checked = checkbox[2]!.toLowerCase() === "x";
     if (checked !== (state === "completed")) {
-      throw new Error(`计划行动勾选状态与受管状态不一致：第 ${index + 1} 行`);
+      throw new Error(`计划行动勾选状态与同步状态不一致：第 ${index + 1} 行`);
     }
     actions.push({ uuid, title: rawTitle, state, remoteId: remote, line: index + 1 });
   }
@@ -220,7 +220,7 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
 export function adoptPlanAction(markdown: string, lineNumber: number, uuid: string): string {
   assertStableId(uuid, "行动 UUID");
   const parsed = parseManagedPlanActions(markdown);
-  if (!parsed.unmanagedChecklistLines.includes(lineNumber)) throw new Error("只能显式纳管计划行动中的未受管清单项");
+  if (!parsed.unmanagedChecklistLines.includes(lineNumber)) throw new Error("只能将计划行动中尚未加入同步的清单项加入同步");
   if (parsed.actions.some((action) => action.uuid === uuid)) throw new Error("行动 UUID 已存在");
   const lines = markdown.split(/\r?\n/);
   const index = lineNumber - 1;
@@ -239,7 +239,7 @@ export function patchManagedPlanAction(markdown: string, input: {
 }): string {
   const parsed = parseManagedPlanActions(markdown);
   const current = parsed.actions.find((action) => action.uuid === input.uuid);
-  if (!current) throw new Error("找不到需要修改的受管计划行动");
+  if (!current) throw new Error("找不到需要修改的已加入同步计划行动");
   const title = input.title === undefined ? current.title : input.title.trim();
   if (!title) throw new Error("计划行动标题不能为空");
   const state = input.state ?? current.state;
@@ -248,7 +248,7 @@ export function patchManagedPlanAction(markdown: string, input: {
   const lines = markdown.split(/\r?\n/);
   const original = lines[current.line - 1] ?? "";
   const layout = /^(\s*)([-*+]) \[[ xX]\]/.exec(original);
-  if (!layout) throw new Error("受管计划行动行结构已变化");
+  if (!layout) throw new Error("已加入同步的计划行动行结构已变化");
   lines[current.line - 1] = `${layout[1]}${layout[2]} [${state === "completed" ? "x" : " "}] ${title} ${renderActionMarker(current.uuid, remoteId, state)}`;
   return lines.join(parsed.section.eol);
 }
@@ -293,7 +293,7 @@ export function buildProjectionLedger(input: {
 }): ProjectionLedgerEntry[] {
   const seen = new Set<string>();
   return input.actions.map((action) => {
-    if (seen.has(action.uuid)) throw new Error(`投影行动 UUID 重复：${action.uuid}`);
+    if (seen.has(action.uuid)) throw new Error(`同步行动 UUID 重复：${action.uuid}`);
     seen.add(action.uuid);
     return {
       uuid: action.uuid,
@@ -428,12 +428,12 @@ function readUniqueFrontmatterScalar(markdown: string, key: string): string | un
   if (block === undefined) throw new Error("文件没有可识别的 YAML frontmatter");
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const values = [...block.matchAll(new RegExp(`^${escaped}\\s*:\\s*(.*?)\\s*$`, "gm"))];
-  if (values.length > 1) throw new Error(`受管属性重复：${key}`);
+  if (values.length > 1) throw new Error(`Helix 同步属性重复：${key}`);
   if (values.length === 0) return undefined;
   const raw = values[0]![1]!.trim();
   if (!raw || raw === "null") return undefined;
   if (raw.startsWith('"')) {
-    try { return String(JSON.parse(raw)); } catch { throw new Error(`受管属性无效：${key}`); }
+    try { return String(JSON.parse(raw)); } catch { throw new Error(`Helix 同步属性无效：${key}`); }
   }
   return raw;
 }
@@ -445,7 +445,7 @@ function patchFrontmatterScalar(markdown: string, key: string, value: string): s
   const lines = match[2]!.split(/\r?\n/);
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const indices = lines.flatMap((line, index) => new RegExp(`^${escaped}\\s*:`).test(line) ? [index] : []);
-  if (indices.length > 1) throw new Error(`受管属性重复：${key}`);
+  if (indices.length > 1) throw new Error(`Helix 同步属性重复：${key}`);
   const rendered = `${key}: ${JSON.stringify(value)}`;
   if (indices.length === 1) lines[indices[0]!] = rendered;
   else lines.push(rendered);
@@ -471,7 +471,7 @@ function actionSourceHash(action: Pick<ManagedPlanAction, "uuid" | "title" | "st
 function uniqueLedger(entries: ProjectionLedgerEntry[]): Map<string, ProjectionLedgerEntry> {
   const map = new Map<string, ProjectionLedgerEntry>();
   for (const entry of entries) {
-    if (map.has(entry.uuid)) throw new Error(`投影账本 UUID 重复：${entry.uuid}`);
+    if (map.has(entry.uuid)) throw new Error(`同步账本 UUID 重复：${entry.uuid}`);
     map.set(entry.uuid, { ...entry });
   }
   return map;

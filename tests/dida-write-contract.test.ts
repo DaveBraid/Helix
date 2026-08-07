@@ -88,6 +88,7 @@ class ContractApiFake {
   startWithoutColumns = false;
   private readonly columns = new Map<string, DidaColumn[]>();
   private columnSequence = 0;
+  private itemSequence = 0;
   private updateRereadPending = false;
   private wrongUpdateIdPending = false;
   private staleReminderClearRead?: DidaTask;
@@ -369,6 +370,9 @@ class ContractApiFake {
     if (this.rejectRepeatWrites && Object.hasOwn(value, "repeatFlag")) {
       throw new DidaHttpError("permanent", this.rejectRepeatWrites, 400);
     }
+    if (this.rejectParentCreate && Object.hasOwn(value, "items")) {
+      throw new DidaHttpError("permanent", this.rejectParentCreate, 400);
+    }
     const placement = Object.prototype.hasOwnProperty.call(value, "columnId") &&
       !Object.prototype.hasOwnProperty.call(value, "title");
     if (placement && this.rejectPlacementWrites) {
@@ -378,7 +382,7 @@ class ContractApiFake {
       ? this.placementOutcome
       : Object.hasOwn(value, "reminders")
         ? (this.reminderUpdateOutcome ?? this.updateOutcome)
-        : Object.hasOwn(value, "parentId")
+        : Object.hasOwn(value, "items")
           ? (this.parentUpdateOutcome ?? this.updateOutcome)
           : this.updateOutcome;
     if (outcome === "not-applied-unknown") {
@@ -395,6 +399,23 @@ class ContractApiFake {
         ? { etimestamp: Number(current.etimestamp ?? 0) + 1 }
         : {}),
     };
+    if (Object.hasOwn(value, "items")) {
+      updated.items = (value.items ?? []).map((item) => ({
+        ...item,
+        id: item.id || `test-item-${++this.itemSequence}`,
+      })).map((item) => {
+        const before = current.items?.find((candidate) => candidate.id === item.id);
+        if (before?.status === 0 && item.status === 2) {
+          return { ...item, completedTime: "2026-07-31T00:00:00.000Z" };
+        }
+        if (before?.status === 2 && item.status === 0) {
+          const reopened = { ...item };
+          delete reopened.completedTime;
+          return reopened;
+        }
+        return item;
+      });
+    }
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
     if (this.corruptSchedule) updated.dueDate = "2030-01-01T00:00:00.000Z";
     if (this.corruptUpdatedAllDay) updated.isAllDay = true;
@@ -631,7 +652,8 @@ describe("DidaWriteContractRunner", () => {
       taskCrudVerified: true,
       reminderWriteVerified: true,
       repeatWriteVerified: true,
-      parentTaskVerified: true,
+      itemsRoundTripVerified: true,
+      itemIdStableVerified: true,
       taskReopenVerified: true,
     });
     expect(api.updatePayloads).toContainEqual(expect.objectContaining({
@@ -644,10 +666,10 @@ describe("DidaWriteContractRunner", () => {
       reminders: null,
     }));
     expect(api.updatePayloads).toContainEqual(expect.objectContaining({ repeatFlag: null }));
-    expect(api.updatePayloads).toContainEqual(expect.objectContaining({ parentId: null }));
-    expect(api.updatePayloads).toContainEqual(expect.objectContaining({ parentId: "test-task-4" }));
+    expect(api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"))).toHaveLength(5);
+    expect(api.updatePayloads.some((payload) => Object.hasOwn(payload, "parentId"))).toBe(false);
     expect(api.updatePayloads.filter((payload) => Object.hasOwn(payload, "status"))).toEqual([{
-      id: "test-task-7",
+      id: "test-task-6",
       projectId: "test-project-1",
       status: 0,
     }]);
@@ -657,7 +679,7 @@ describe("DidaWriteContractRunner", () => {
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");
     expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1", "test-task-7"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
   });
@@ -749,7 +771,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.taskCrudVerified).toBe(true);
     expect(report.reminderWriteVerified).toBe(false);
     expect(report.repeatWriteVerified).toBe(true);
-    expect(report.parentTaskVerified).toBe(true);
+    expect(report.itemsRoundTripVerified).toBe(true);
     expect(report.boardPlacementVerified).toBe(true);
     expect(report.capabilityFailures).toEqual(["提醒：未通过写入合同，保持只读"]);
     expect(report.remoteArtifactsRemaining).toBe(false);
@@ -770,7 +792,7 @@ describe("DidaWriteContractRunner", () => {
       taskCrudVerified: true,
       reminderWriteVerified: false,
       repeatWriteVerified: true,
-      parentTaskVerified: true,
+      itemsRoundTripVerified: true,
       boardPlacementVerified: true,
       remoteArtifactsRemaining: false,
       cleanupErrors: [],
@@ -794,7 +816,7 @@ describe("DidaWriteContractRunner", () => {
       status: "failed",
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
       boardPlacementVerified: false,
       remoteArtifactsRemaining: false,
       cleanupErrors: [],
@@ -869,9 +891,9 @@ describe("DidaWriteContractRunner", () => {
     ).run();
 
     expect(report.status).toBe("passed");
-    expect(report.parentTaskVerified).toBe(false);
+    expect(report.itemsRoundTripVerified).toBe(false);
     expect(report.taskCrudVerified).toBe(true);
-    expect(report.capabilityFailures).toEqual(["父子任务：未通过写入合同，保持只读"]);
+    expect(report.capabilityFailures).toEqual(["检查项：未通过写入合同，保持只读"]);
     expect(report.remoteArtifactsRemaining).toBe(false);
     expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
@@ -880,7 +902,7 @@ describe("DidaWriteContractRunner", () => {
   it.each([
     ["提醒", "提醒远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectReminderWrites = secret; }],
     ["重复规则", "重复规则远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectRepeatWrites = secret; }],
-    ["父子任务", "父子任务远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectParentCreate = secret; }],
+    ["检查项", "检查项远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectParentCreate = secret; }],
     ["看板归栏", "看板归栏远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectPlacementWrites = secret; }],
   ])("uses only a fixed settings-visible summary for a safely rejected %s capability", async (
     capability,
@@ -915,14 +937,14 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report).toMatchObject({
       status: "failed",
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
       boardPlacementVerified: false,
       remoteArtifactsRemaining: false,
       cleanupErrors: [],
     });
     expect(report.failure).toMatch(/属性写入响应未知.*未重发/);
     expect(api.updatePayloads.some((payload) => "columnId" in payload)).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-1"]);
     expect([...api.tasks]).toHaveLength(1);
   });
 
@@ -944,7 +966,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1", "test-task-7"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
   });
 
   it("classifies a server-collapsed schedule as point mode and completes the core contract", async () => {
@@ -964,7 +986,7 @@ describe("DidaWriteContractRunner", () => {
     });
     expect(report.steps.join(" ")).toMatch(/单点任务时间/);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1", "test-task-7"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
   });
 
   it("treats server-managed etimestamp changes as metadata across all field probes", async () => {
@@ -982,7 +1004,7 @@ describe("DidaWriteContractRunner", () => {
       taskCrudVerified: true,
       reminderWriteVerified: true,
       repeatWriteVerified: true,
-      parentTaskVerified: true,
+      itemsRoundTripVerified: true,
       remoteArtifactsRemaining: false,
     });
   });
@@ -1002,7 +1024,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(report.steps.join(" ")).toMatch(/未重发.*精确复读已证明字段生效/);
-    expect(api.updateCalls).toBe(9);
+    expect(api.updateCalls).toBe(12);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 
@@ -1016,7 +1038,7 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report.status).toBe("passed");
     expect(api.updatePayloads.find((payload) => "columnId" in payload)).toEqual({
-      id: "test-task-6",
+      id: "test-task-5",
       projectId: "test-project-1",
       columnId: "test-project-1-doing",
     });
@@ -1379,7 +1401,7 @@ describe("DidaWriteContractRunner", () => {
       "移动响应未知；未重发，目标清单精确复读且来源清单确认移出",
     );
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1", "test-task-7"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
     expect(api.sourceTombstoneReads).toBe(0);
@@ -1400,7 +1422,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(true);
     expect(report.cleanupErrors.join(" ")).toMatch(/停止自动清理/);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5"]);
     expect(api.deletedProjects).toEqual([]);
     expect(report.manualCleanupRequired).toMatchObject({
       taskId: "test-task-1",
@@ -1423,7 +1445,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.remoteArtifactsRemaining).toBe(false);
     expect(report.manualCleanupRequired).toBeUndefined();
     expect(api.moveCalls).toBe(1);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("test-task-1")).toBe(false);
   });
@@ -1606,7 +1628,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.failure).toMatch(/complete unknown/);
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
@@ -1669,7 +1691,7 @@ describe("DidaWriteContractRunner", () => {
     expect(api.projects.has("test-project-2")).toBe(true);
     expect(api.tasks.get("foreign-task")?.title).toBe("用户意外放入的任务");
     expect(api.deletedProjects).toEqual(["test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-5", "test-task-4", "test-task-6", "test-task-1", "test-task-7"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 

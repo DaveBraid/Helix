@@ -32,6 +32,8 @@ export interface SyncConflict<T = unknown> {
   fields: ConflictField[];
   remoteRecheckCount: number;
   sourceDeviceId: string;
+  scope?: "helix-projection-owned-items";
+  ownedItemIds?: string[];
 }
 
 export type QueueOperationType = "create" | "update" | "complete" | "delete";
@@ -61,6 +63,8 @@ export interface SyncQueueOperation<T = unknown> {
   lastError?: string;
   /** 由用户显式修改的字段；禁止通过本地/远端值差异反推。 */
   writeFields?: string[];
+  conflictScope?: "helix-projection-owned-items";
+  conflictOwnedItemIds?: string[];
 }
 
 export interface RemoteWriteContext {

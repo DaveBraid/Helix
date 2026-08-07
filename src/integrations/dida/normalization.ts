@@ -39,31 +39,25 @@ function preservedOptionalString(value: unknown, label: string): string | null {
 }
 
 function normalizeChecklist(items: DidaChecklistItem[] | undefined): DidaChecklistItem[] {
-  return (items ?? [])
-    .map((item) => {
+  return (items ?? []).map((item) => {
+      if (typeof item.title !== "string" || typeof item.status !== "number") {
+        throw new Error("Dida 检查项标题或状态格式无效");
+      }
+      if (item.startDate !== undefined &&
+        (typeof item.startDate !== "string" || Number.isNaN(new Date(item.startDate.replace(/([+-]\d{2})(\d{2})$/, "$1:$2")).getTime()))) {
+        throw new Error("Dida 检查项开始日期格式无效");
+      }
       if (
-        typeof item.completedTime === "number" &&
-        !Number.isFinite(new Date(item.completedTime).getTime())
+        item.completedTime !== undefined &&
+        ((typeof item.completedTime === "number" && !Number.isFinite(new Date(item.completedTime).getTime())) ||
+          (typeof item.completedTime === "string" &&
+            Number.isNaN(new Date(item.completedTime.replace(/([+-]\d{2})(\d{2})$/, "$1:$2")).getTime())))
       ) {
         throw new Error("Dida 检查项完成日期格式无效");
       }
-      const sortOrderUnsafe = item.sortOrder !== undefined && !Number.isSafeInteger(item.sortOrder);
-      return {
-        ...item,
-        title: item.title.trim(),
-        startDate: normalizedDate(item.startDate, "检查项开始日期") ?? undefined,
-        completedTime:
-          typeof item.completedTime === "string"
-            ? normalizedDate(item.completedTime, "检查项完成日期") ?? undefined
-            : item.completedTime,
-        sortOrder: sortOrderUnsafe ? undefined : item.sortOrder,
-        sortOrderUnsafe: sortOrderUnsafe || undefined,
-      };
-    })
-    .sort((left, right) => {
-      const leftKey = left.id || `${left.sortOrder ?? 0}:${left.title}`;
-      const rightKey = right.id || `${right.sortOrder ?? 0}:${right.title}`;
-      return leftKey.localeCompare(rightKey);
+      // items 必须可按远端原值完整回写。标题空格、日期字面量、不安全排序值、
+      // 未知字段及数组顺序都属于父任务检查项合同的一部分，规范化层只校验不改写。
+      return { ...item };
     });
 }
 

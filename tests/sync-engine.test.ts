@@ -212,6 +212,128 @@ describe("SyncEngine safety gates", () => {
     expect(adapter.lastContext?.writeFields).toEqual(["items"]);
   });
 
+  it("applies a custom owned title with completion and adopts the API reread completedTime", async () => {
+    const baseTask = { ...task("base"), items: [{ id: "owned", title: "base", status: 0 }] };
+    const localTask = { ...baseTask, items: [{ id: "owned", title: "local", status: 2 }] };
+    let remote: DidaTask = { ...baseTask, items: [{ id: "owned", title: "remote", status: 0 }] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter: RemoteEntityAdapter<DidaTask> = {
+      kind: "task",
+      async get() { return structuredClone(remote); },
+      async create(value) { return structuredClone(value); },
+      async update(_id, value) {
+        remote = {
+          ...value,
+          items: value.items?.map((item) => item.status === 2
+            ? { ...item, completedTime: "2026-08-05T00:00:00.000Z" }
+            : item),
+        };
+        return structuredClone(remote);
+      },
+      async delete() { throw new Error("not used"); },
+    };
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process(operation(localTask, base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected items conflict");
+    await engine.choose(result.conflict.id, "items[owned].title", "custom", "人工标题");
+    const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(applied.outcome).toBe("resolved");
+    expect((applied as { snapshot: EntitySnapshot<DidaTask> }).snapshot.value.items?.[0]).toEqual({
+      id: "owned", title: "人工标题", status: 2,
+      completedTime: "2026-08-05T00:00:00.000Z",
+    });
+  });
+
+  it.each([
+    ["local", " 本地标题 ", "远端标题"],
+    ["remote", "本地标题", " 远端标题 "],
+    ["remote", "本地标题", "远端\n标题"],
+    ["remote", "本地标题", "<!-- helix-dida-action:伪造 -->"],
+  ] as const)("rejects an unsafe %s checklist title before conflict apply writes", async (choice, localTitle, remoteTitle) => {
+    const baseTask = { ...task("base"), items: [{ id: "owned", title: "base", status: 0 }] };
+    const localTask = { ...baseTask, items: [{ id: "owned", title: localTitle, status: 0 }] };
+    const remoteTask = { ...baseTask, items: [{ id: "owned", title: remoteTitle, status: 0 }] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process({
+      ...operation(localTask, base),
+      conflictScope: "helix-projection-owned-items",
+      conflictOwnedItemIds: ["owned"],
+    });
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected items conflict");
+    await engine.choose(result.conflict.id, "items[owned].title", choice);
+    await expect(engine.applyConflict(result.conflict.id, { projectId: "project-1" }))
+      .rejects.toThrow(/所选检查项标题/);
+    expect(adapter.updateCount).toBe(0);
+    expect(repository.conflicts).toHaveLength(1);
+  });
+
+  it("allows an ordinary task checklist title with surrounding spaces to be resolved byte-exactly", async () => {
+    const baseTask = { ...task("base"), items: [{ id: "ordinary", title: "base", status: 0 }] };
+    const localTask = { ...baseTask, items: [{ id: "ordinary", title: "  普通滴答项  ", status: 0 }] };
+    const remoteTask = { ...baseTask, items: [{ id: "ordinary", title: "remote", status: 0 }] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process(operation(localTask, base));
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected items conflict");
+    await engine.choose(result.conflict.id, "items[ordinary].title", "local");
+    await expect(engine.applyConflict(result.conflict.id, { projectId: "project-1" })).resolves.toMatchObject({
+      outcome: "resolved",
+    });
+    expect(adapter.value?.items?.[0]?.title).toBe("  普通滴答项  ");
+  });
+
+  it("validates only the persisted owned item ID inside a projection conflict", async () => {
+    const baseTask = { ...task("base"), items: [
+      { id: "owned", title: "base-owned", status: 0 },
+      { id: "ordinary", title: "base-ordinary", status: 0 },
+    ] };
+    const localTask = { ...baseTask, items: [
+      { id: "owned", title: "local-owned", status: 0 },
+      { id: "ordinary", title: "base-ordinary", status: 0 },
+    ] };
+    const remoteTask = { ...baseTask, items: [
+      { id: "owned", title: "remote-owned", status: 0 },
+      { id: "ordinary", title: "  普通远端项  ", status: 0 },
+    ] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process({
+      ...operation(localTask, base),
+      conflictScope: "helix-projection-owned-items",
+      conflictOwnedItemIds: ["owned"],
+    });
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected items conflict");
+    await engine.choose(result.conflict.id, "items[owned].title", "local");
+    await engine.choose(result.conflict.id, "items[ordinary].title", "remote");
+    await expect(engine.applyConflict(result.conflict.id, { projectId: "project-1" })).resolves.toMatchObject({
+      outcome: "resolved",
+    });
+    expect(adapter.value?.items).toEqual([
+      { id: "owned", title: "local-owned", status: 0 },
+      { id: "ordinary", title: "  普通远端项  ", status: 0 },
+    ]);
+  });
+
   it("keeps App-owned remote completion when applying a local title resolution", async () => {
     const baseTask = { ...task("base"), status: 0, completedTime: null };
     const localTask = { ...baseTask, title: "local" };
@@ -302,6 +424,32 @@ describe("SyncEngine safety gates", () => {
     expect(result.outcome).toBe("conflict");
     expect(adapter.value?.title).toBe("changed-after-first-read");
     expect(repository.conflicts).toHaveLength(1);
+  });
+
+  it("returns a proven-unsent rebaseline result without opening a generic conflict", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", task("local"));
+    const adapter = new TaskAdapter(task("base"));
+    const originalGet = adapter.get.bind(adapter);
+    adapter.get = async () => {
+      const value = await originalGet();
+      if (adapter.getCount === 1) adapter.value = task("changed-after-first-read");
+      return value;
+    };
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+      allowUnsentRebaseline: () => true,
+    });
+    const result = await engine.process(operation(task("local"), base));
+    expect(result.outcome).toBe("preflight-changed");
+    expect(adapter.updateCount).toBe(0);
+    expect(repository.conflicts).toEqual([]);
+    expect((repository.base?.value as DidaTask).title).toBe("changed-after-first-read");
   });
 
   it("requires an explicit whole-record choice for delete versus update", async () => {

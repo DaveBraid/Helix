@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DidaTask } from "../src/domain/entities";
+import type { DidaChecklistItem, DidaTask } from "../src/domain/entities";
 import { taskEditWriteFields } from "../src/domain/task-edit-fields";
 import {
   DidaProjectAdapter,
@@ -103,7 +103,7 @@ function verifiedTaskAdapter(
     taskCrudVerified: true,
     reminderWriteVerified: true,
     repeatWriteVerified: true,
-    parentTaskVerified: true,
+    itemsRoundTripVerified: true,
   }));
 }
 
@@ -364,6 +364,44 @@ describe("DidaTaskAdapter", () => {
     expect(api.lastUpdate?.sortOrder).toBeUndefined();
   });
 
+  it("roundtrips untouched checklist wire values while editing one owned item", async () => {
+    const api = new FakeTaskApi();
+    const unsafe = Number.MAX_SAFE_INTEGER + 17;
+    api.task = {
+      ...api.task,
+      items: [{
+        id: "ordinary",
+        title: "  保留空格  ",
+        status: 0,
+        sortOrder: unsafe,
+        startDate: "2026-08-01T22:37:34+08:00",
+        completedTime: "2026-08-01T23:37:34+0800",
+        serverExtension: { opaque: true },
+      } as DidaChecklistItem & { serverExtension: { opaque: boolean } }, {
+        id: "owned", title: "旧标题", status: 0,
+      }],
+    };
+    const desired = {
+      ...api.task,
+      items: api.task.items?.map((item) => item.id === "owned" ? { ...item, title: "新标题" } : item),
+    };
+
+    await verifiedTaskAdapter(api).update(api.task.id, desired, {
+      projectId: api.task.projectId,
+      writeFields: ["items"],
+    });
+
+    expect(api.lastUpdate?.items?.[0]).toEqual({
+      id: "ordinary",
+      title: "  保留空格  ",
+      status: 0,
+      sortOrder: unsafe,
+      startDate: "2026-08-01T22:37:34+08:00",
+      completedTime: "2026-08-01T23:37:34+0800",
+      serverExtension: { opaque: true },
+    });
+  });
+
   it("keeps reminder and repeat fields out of ordinary task updates", async () => {
     const api = new FakeTaskApi();
     const desired = {
@@ -398,7 +436,7 @@ describe("DidaTaskAdapter", () => {
     expect(api.lastCreate).not.toHaveProperty("repeatFlag");
   });
 
-  it("writes only explicitly changed verified reminder repeat and parent fields", async () => {
+  it("writes verified reminder and repeat fields but never emits unsupported parentId", async () => {
     const api = new FakeTaskApi();
     api.location = "project-old";
     api.task = {
@@ -422,7 +460,7 @@ describe("DidaTaskAdapter", () => {
         taskCrudVerified: true,
         reminderWriteVerified: true,
         repeatWriteVerified: true,
-        parentTaskVerified: true,
+        itemsRoundTripVerified: true,
       }),
     ).update(desired.id, desired, {
       projectId: "project-old",
@@ -432,8 +470,8 @@ describe("DidaTaskAdapter", () => {
     expect(api.lastUpdate).toMatchObject({
       reminders: ["TRIGGER:-PT10M"],
       repeatFlag: "RRULE:FREQ=DAILY;INTERVAL=1",
-      parentId: null,
     });
+    expect(api.lastUpdate).not.toHaveProperty("parentId");
   });
 
   it("uses null only for an explicitly changed verified empty reminder list", async () => {
@@ -534,7 +572,7 @@ describe("DidaTaskAdapter", () => {
     expect(api.lastUpdate).toHaveProperty("reminders", null);
   });
 
-  it("serializes a custom checklist-item resolution as exactly one root items payload", async () => {
+  it("serializes a custom checklist title resolution as one root items payload", async () => {
     const base = {
       ...desiredTask(0), projectId: "project-old",
       items: [{ id: "item-1", title: "base", status: 0 }],
@@ -562,9 +600,7 @@ describe("DidaTaskAdapter", () => {
       remoteRecheckCount: 0,
       sourceDeviceId: "device-a",
     };
-    conflict = setFieldResolution(conflict, "items[item-1]", "custom", {
-      id: "item-1", title: "merged", status: 2,
-    }) as SyncConflict<DidaTask>;
+    conflict = setFieldResolution(conflict, "items[item-1].title", "custom", "merged") as SyncConflict<DidaTask>;
     const api = new FakeTaskApi();
     api.location = "project-old";
     api.task = remote;
@@ -575,10 +611,28 @@ describe("DidaTaskAdapter", () => {
     expect(api.lastUpdate).toMatchObject({
       id: base.id,
       projectId: "project-old",
-      items: [{ id: "item-1", title: "merged", status: 2 }],
+      items: [{ id: "item-1", title: "merged", status: 0 }],
     });
-    expect(Object.keys(api.lastUpdate ?? {})).not.toContain("items[item-1]");
+    expect(Object.keys(api.lastUpdate ?? {})).not.toContain("items[item-1].title");
     expect(Object.keys(api.lastUpdate ?? {})).toEqual(["id", "projectId", "items"]);
+  });
+
+  it("preserves remote checklist order and unknown fields through an items update", async () => {
+    const api = new FakeTaskApi();
+    api.location = "project-old";
+    const items = [
+      { id: "ordinary-b", title: "B", status: 0, vendorFlag: "keep-b" },
+      { id: "ordinary-a", title: "A", status: 0, vendorFlag: "keep-a" },
+    ] as unknown as DidaTask["items"];
+    api.task = { ...api.task, projectId: "project-old", items };
+    await verifiedTaskAdapter(api).update(api.task.id, {
+      ...api.task,
+      items: items!.map((item, index) => index === 1 ? { ...item, title: "A2" } : item),
+    }, { projectId: "project-old", writeFields: ["items"] });
+    expect(api.lastUpdate?.items).toEqual([
+      expect.objectContaining({ id: "ordinary-b", title: "B", vendorFlag: "keep-b" }),
+      expect.objectContaining({ id: "ordinary-a", title: "A2", vendorFlag: "keep-a" }),
+    ]);
   });
 
   it("preserves unknown reminder and repeat rules byte-for-byte without writing untouched fields", async () => {

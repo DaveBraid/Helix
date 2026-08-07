@@ -67,8 +67,11 @@ describe("Dida normalization", () => {
     });
     expect(first.reminders).toEqual(["later", "before"]);
     expect(second.reminders).toEqual(["before", "later"]);
-    const { reminders: _firstReminders, ...firstComparable } = first;
-    const { reminders: _secondReminders, ...secondComparable } = second;
+    expect(first.items?.map((item) => item.id)).toEqual(["b", "a"]);
+    expect(first.items?.map((item) => item.title)).toEqual([" second ", " first "]);
+    expect(second.items?.map((item) => item.id)).toEqual(["a", "b"]);
+    const { reminders: _firstReminders, items: _firstItems, ...firstComparable } = first;
+    const { reminders: _secondReminders, items: _secondItems, ...secondComparable } = second;
     expect(firstComparable).toEqual(secondComparable);
   });
 

@@ -32,6 +32,14 @@ function operation(
 }
 
 describe("OfflineQueue", () => {
+  it("never merges exact projection operations and blocks a competing same-entity operation", () => {
+    const queue = new OfflineQueue();
+    const first = operation("op-exact-a", "update");
+    queue.enqueueExact(first);
+    const competing = operation("op-exact-b", "update");
+    expect(() => queue.enqueueExact(competing)).toThrow(/已有未完成操作/);
+    expect(queue.list()).toHaveLength(1);
+  });
   it("coalesces safe consecutive updates but preserves causal operations", () => {
     const queue = new OfflineQueue();
     queue.enqueue(operation("op-1", "update"));

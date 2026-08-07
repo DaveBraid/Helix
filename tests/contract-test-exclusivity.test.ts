@@ -376,7 +376,7 @@ describe("HelixService contract-test exclusivity", () => {
       boardPlacementVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
     });
     const reloaded = await reload();
     expect(reloaded.snapshot()).toMatchObject({
@@ -386,7 +386,7 @@ describe("HelixService contract-test exclusivity", () => {
       boardPlacementVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
     });
     expect(secrets.getDidaToken()).toBe("initial-contract-token");
   });
@@ -782,7 +782,7 @@ async function serviceFixture(): Promise<{
     taskCrudVerified: true,
     reminderWriteVerified: true,
     repeatWriteVerified: true,
-    parentTaskVerified: true,
+    itemsRoundTripVerified: true,
     verifiedAt: "2026-08-03T00:00:00.000Z",
   };
   const port: PluginDataPort = {

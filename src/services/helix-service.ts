@@ -117,7 +117,8 @@ export interface HelixRuntimeState {
   taskCrudVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
-  parentTaskVerified: boolean;
+  itemsRoundTripVerified: boolean;
+  itemIdStableVerified: boolean;
   taskReopenVerified: boolean;
   demoMode: boolean;
   syncWarnings: string[];
@@ -141,11 +142,11 @@ export interface ProjectProjectionWriteReadiness {
 export function projectProjectionGlobalCapabilitiesReady(
   state: Pick<HelixRuntimeState,
     "connected" | "authorizationConfigured" | "taskCrudVerified" |
-    "parentTaskVerified" | "boardPlacementVerified">,
+    "itemsRoundTripVerified" | "itemIdStableVerified" | "boardPlacementVerified">,
 ): boolean {
   // 重开只在具体 reopen 操作门禁检查；不能阻止普通创建、更新或完成从队列阻塞中恢复。
   return state.connected && state.authorizationConfigured && state.taskCrudVerified &&
-    state.parentTaskVerified && state.boardPlacementVerified;
+    state.itemsRoundTripVerified && state.itemIdStableVerified && state.boardPlacementVerified;
 }
 
 export type StateListener = (state: HelixRuntimeState) => void;
@@ -168,7 +169,8 @@ const EMPTY_STATE: HelixRuntimeState = {
   taskCrudVerified: false,
   reminderWriteVerified: false,
   repeatWriteVerified: false,
-  parentTaskVerified: false,
+  itemsRoundTripVerified: false,
+  itemIdStableVerified: false,
   taskReopenVerified: false,
   demoMode: false,
   syncWarnings: [],
@@ -299,6 +301,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           this.state.taskScheduleMode,
           remoteBeforeWrite,
         ),
+      allowUnsentRebaseline: isProjectionUnidentifiedItemAppend,
     });
     this.projectEngine = new SyncEngine({
       adapter: new DidaProjectAdapter(this.api),
@@ -346,7 +349,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       taskCrudVerified: verifiedCapabilities?.taskCrudVerified ?? false,
       reminderWriteVerified: verifiedCapabilities?.reminderWriteVerified ?? false,
       repeatWriteVerified: verifiedCapabilities?.repeatWriteVerified ?? false,
-      parentTaskVerified: verifiedCapabilities?.parentTaskVerified ?? false,
+      itemsRoundTripVerified: verifiedCapabilities?.itemsRoundTripVerified ?? false,
+      itemIdStableVerified: verifiedCapabilities?.itemIdStableVerified ?? false,
       taskReopenVerified: verifiedCapabilities?.taskReopenVerified ?? false,
       demoMode:
         !authorizationConfigured &&
@@ -496,7 +500,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         taskCrudVerified: false,
         reminderWriteVerified: false,
         repeatWriteVerified: false,
-        parentTaskVerified: false,
+        itemsRoundTripVerified: false,
+        itemIdStableVerified: false,
         taskReopenVerified: false,
         recoveryIssues,
         attentionCount: Math.max(0, this.state.attentionCount - clearedRecoveryIssues),
@@ -826,7 +831,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           },
         };
       });
-      const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1, maxCalls: 60 });
+      const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1, maxCalls: 120 });
       const cleanupApi = this.api.withRequestPolicy({
         timeoutMs: 5_000,
         maxAttempts: 1,
@@ -905,7 +910,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         const taskCrudVerified = report.taskCrudVerified && contractArtifactsClean;
         const reminderWriteVerified = report.reminderWriteVerified && contractArtifactsClean;
         const repeatWriteVerified = report.repeatWriteVerified && contractArtifactsClean;
-        const parentTaskVerified = report.parentTaskVerified && contractArtifactsClean;
+        const itemsRoundTripVerified = report.itemsRoundTripVerified && contractArtifactsClean;
+        const itemIdStableVerified = report.itemIdStableVerified && contractArtifactsClean;
         const taskReopenVerified = report.taskReopenVerified && contractArtifactsClean;
         await this.store.mutate((data) => {
           data.didaContractCapabilities = {
@@ -917,7 +923,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
             taskCrudVerified,
             reminderWriteVerified,
             repeatWriteVerified,
-            parentTaskVerified,
+            itemsRoundTripVerified,
+            itemIdStableVerified,
             taskReopenVerified,
             verifiedAt: new Date().toISOString(),
           };
@@ -929,7 +936,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           taskCrudVerified,
           reminderWriteVerified,
           repeatWriteVerified,
-          parentTaskVerified,
+          itemsRoundTripVerified,
+          itemIdStableVerified,
           taskReopenVerified,
         });
         } else {
@@ -1023,7 +1031,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
+      itemIdStableVerified: false,
       taskReopenVerified: false,
     });
   }
@@ -1039,7 +1048,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       capability("基础任务：", this.state.taskCrudVerified),
       capability("提醒：", this.state.reminderWriteVerified),
       capability("重复：", this.state.repeatWriteVerified),
-      capability("父子：", this.state.parentTaskVerified),
+      capability("检查项：", this.state.itemsRoundTripVerified),
+      capability("检查项 ID：", this.state.itemIdStableVerified),
       capability("看板：", this.state.boardPlacementVerified),
       capability("分栏创建：", this.state.columnCreateVerified),
       recent,
@@ -1105,7 +1115,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           writable: !this.contractTestRunning && data.recoveryIssues.length === 0,
           queueEmpty: data.queue.length === 0,
           authorizationCurrent: Boolean(this.secrets.getDidaToken()) && this.state.taskCrudVerified,
-          parentTaskVerified: this.state.parentTaskVerified,
+          itemsRoundTripVerified: this.state.itemsRoundTripVerified,
+          itemIdStableVerified: this.state.itemIdStableVerified,
           boardPlacementVerified: this.state.boardPlacementVerified,
           boardFresh: true,
           taskReopenVerified: this.state.taskReopenVerified,
@@ -1407,7 +1418,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         }
         data.localSnapshots[`task:${localId}`] = operation.local as EntitySnapshot<unknown>;
         const queue = new OfflineQueue(data.queue);
-        queue.enqueue(operation);
+        queue.enqueueExact(operation);
         data.queue = queue.list();
       });
       await this.queueDrain.run(() => this.runDrainQueueWithRemoteWrite());
@@ -1443,8 +1454,73 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     };
   }
 
-  async enqueueProjectionUpdate(task: DidaTask, writeFields: string[]): Promise<ProjectionWriteReceipt> {
-    return this.enqueueProjectionExisting(task, "update", writeFields);
+  async enqueueProjectionUpdate(
+    task: DidaTask,
+    writeFields: string[],
+    operationId?: string,
+    freshBase?: DidaTask,
+  ): Promise<ProjectionWriteReceipt> {
+    return this.enqueueProjectionExisting(task, "update", writeFields, operationId, freshBase);
+  }
+
+  async stageProjectionItemsConflict(
+    local: DidaTask,
+    remote: DidaTask,
+    projectionBase: DidaTask,
+    operationId: string,
+  ): Promise<ProjectionWriteReceipt> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      this.assertWritable();
+      this.assertProjectionCapabilities(false);
+      const data = await this.store.snapshot();
+      const base = createSnapshot("task", projectionBase.id, projectionBase);
+      const now = new Date().toISOString();
+      const localSnapshot = createSnapshot("task", local.id, local, { capturedAt: now });
+      const remoteSnapshot = createSnapshot("task", remote.id, remote, { capturedAt: now });
+      const ownedItemIds = changedChecklistItemIds(projectionBase, local);
+      if (ownedItemIds.length !== 1) throw new Error("owned item 冲突必须精确绑定一个检查项 ID");
+      const conflictId = `conflict-${stableHash(["task", local.id, base.stamp.hash, remoteSnapshot.stamp.hash])}`;
+      const conflict: SyncConflict<DidaTask> = {
+        id: conflictId,
+        kind: "task",
+        entityId: local.id,
+        title: local.title,
+        createdAt: now,
+        updatedAt: now,
+        status: "open",
+        base,
+        local: localSnapshot,
+        remote: remoteSnapshot,
+        fields: buildConflictFields(base.value, local, remote),
+        remoteRecheckCount: 0,
+        sourceDeviceId: data.deviceId,
+        scope: "helix-projection-owned-items",
+        ownedItemIds,
+      };
+      const operation = buildTaskUpdateOperation(local, base, "update", now, operationId, ["items"]);
+      operation.status = "blocked";
+      operation.conflictId = conflictId;
+      operation.idempotencyFingerprint = `helix-write:${operationId}`;
+      await this.store.mutate((current) => {
+        current.conflicts = [...current.conflicts.filter((item) => item.id !== conflictId), conflict];
+        current.queue = [...current.queue.filter((item) => item.id !== operationId), operation];
+        current.localSnapshots[`task:${local.id}`] = localSnapshot as EntitySnapshot<unknown>;
+        upsertProjectionReceipt(current, {
+          clientIdentity: operation.idempotencyFingerprint!,
+          projectId: local.projectId,
+          operationId,
+          marker: local.content ?? "",
+          outcome: "conflict",
+          remoteTaskId: local.id,
+          conflictId,
+          message: "owned item 进入逐子字段冲突",
+        });
+      });
+      return { operationId, outcome: "conflict", message: "owned item 进入逐子字段冲突", conflictId };
+    } finally {
+      release();
+    }
   }
 
   async enqueueProjectionComplete(task: DidaTask): Promise<ProjectionWriteReceipt> {
@@ -1943,14 +2019,18 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     task: DidaTask,
     operationType: "update" | "complete",
     writeFields: string[],
+    requestedOperationId?: string,
+    freshBase?: DidaTask,
   ): Promise<ProjectionWriteReceipt> {
     const release = this.remoteWriteGate.enterShared();
     try {
       this.assertWritable();
       this.assertProjectionCapabilities(operationType === "update" && writeFields.includes("status"));
-      const base = (await this.store.snapshot()).baseSnapshots[`task:${task.id}`] as
-        | EntitySnapshot<DidaTask>
-        | undefined;
+      const base = freshBase
+        ? createSnapshot("task", freshBase.id, taskSyncValue(freshBase))
+        : (await this.store.snapshot()).baseSnapshots[`task:${task.id}`] as
+          | EntitySnapshot<DidaTask>
+          | undefined;
       if (!base) return {
         operationId: `op-projection-${crypto.randomUUID()}`,
         outcome: "conflict",
@@ -1962,10 +2042,18 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         base,
         operationType,
         now,
-        `op-projection-${crypto.randomUUID()}`,
+        requestedOperationId ?? `op-projection-${crypto.randomUUID()}`,
         writeFields,
       );
       operation.idempotencyFingerprint = `helix-write:${operation.id}`;
+      if (writeFields.length === 1 && writeFields[0] === "items" &&
+        requestedOperationId?.startsWith("op-projection-item-")) {
+        const ownedItemIds = changedChecklistItemIds(freshBase ?? task, task);
+        if (ownedItemIds.length > 0) {
+          operation.conflictScope = "helix-projection-owned-items";
+          operation.conflictOwnedItemIds = ownedItemIds;
+        }
+      }
       return this.enqueueAndDrainProjectionOperation(operation, true) as Promise<ProjectionWriteReceipt>;
     } finally {
       release();
@@ -1980,7 +2068,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     try {
       await this.store.mutate((data) => {
         const queue = new OfflineQueue(data.queue);
-        queue.enqueue(operation);
+        queue.enqueueExact(operation);
         data.queue = queue.list();
         data.localSnapshots[`task:${operation.entityId}`] = operation.local as EntitySnapshot<unknown>;
       });
@@ -2002,8 +2090,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   private assertProjectionCapabilities(reopen: boolean): void {
     this.assertTaskCrudVerified();
-    if (!this.state.parentTaskVerified || !this.state.boardPlacementVerified) {
-      throw new Error("当前授权尚未验证滴答项目同步所需的父子任务与看板归栏能力");
+    if (!this.state.itemsRoundTripVerified || !this.state.itemIdStableVerified || !this.state.boardPlacementVerified) {
+      throw new Error("当前授权尚未验证滴答项目同步所需的检查项往返、ID 稳定与看板归栏能力");
     }
     if (reopen && !this.state.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");
@@ -3012,6 +3100,7 @@ function persistProjectionOperationReceipt(
     : undefined;
   const outcome = result.outcome === "conflict"
     ? "conflict"
+    : result.outcome === "preflight-changed" ? "preflight-changed"
     : result.outcome === "deleted" ? "verified-absent" : "verified";
   upsertProjectionReceipt(data, {
     clientIdentity,
@@ -3074,6 +3163,15 @@ function projectionWriteReceipt(
     ? data.baseSnapshots[`task:${receipt.remoteTaskId}`] as EntitySnapshot<DidaTask> | undefined
     : undefined;
   const task = snapshot?.value;
+  if (receipt.outcome === "preflight-changed" && task && task.id === receipt.remoteTaskId &&
+    task.projectId === receipt.projectId) {
+    return {
+      operationId: receipt.operationId,
+      outcome: "preflight-changed",
+      task,
+      message: receipt.message ?? "远端在请求发送前变化，允许基于最新快照重试",
+    };
+  }
   if (receipt.outcome === "verified" && task && task.id === receipt.remoteTaskId &&
     task.projectId === receipt.projectId && task.content === receipt.marker) {
     return {
@@ -3093,10 +3191,33 @@ function projectionWriteReceipt(
   }
   return {
     operationId: receipt.operationId,
-    outcome: receipt.outcome === "verified-absent" ? "conflict" : receipt.outcome,
+    outcome: receipt.outcome === "verified-absent" || receipt.outcome === "preflight-changed"
+      ? "conflict"
+      : receipt.outcome,
     message: receipt.message ?? "同步写入未取得可验证任务快照",
     conflictId: receipt.conflictId,
   };
+}
+
+function isProjectionUnidentifiedItemAppend(
+  operation: SyncQueueOperation<DidaTask>,
+  base: EntitySnapshot<DidaTask>,
+  desired: EntitySnapshot<DidaTask>,
+): boolean {
+  if (operation.kind !== "task" || operation.operation !== "update" ||
+    operation.writeFields?.length !== 1 || operation.writeFields[0] !== "items" ||
+    !operation.idempotencyFingerprint?.startsWith("helix-write:")) return false;
+  const before = base.value.items ?? [];
+  const after = desired.value.items ?? [];
+  if (after.length !== before.length + 1 || after.at(-1)?.id) return false;
+  return stableHash(after.slice(0, -1)) === stableHash(before);
+}
+
+function changedChecklistItemIds(before: DidaTask, after: DidaTask): string[] {
+  const beforeById = new Map((before.items ?? []).filter((item) => item.id).map((item) => [item.id, item]));
+  const afterById = new Map((after.items ?? []).filter((item) => item.id).map((item) => [item.id, item]));
+  return [...new Set([...beforeById.keys(), ...afterById.keys()])]
+    .filter((id) => stableHash(beforeById.get(id)) !== stableHash(afterById.get(id)));
 }
 
 function assertOwnedContractCleanupPlan(

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
+import type { DidaChecklistItem, DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
 import { stableHash } from "../src/domain/stable";
 import {
   adoptPlanAction,
@@ -45,7 +45,7 @@ const ready: ProjectionReadiness = {
   writable: true,
   queueEmpty: true,
   authorizationCurrent: true,
-  parentTaskVerified: true,
+  itemsRoundTripVerified: true, itemIdStableVerified: true,
   boardPlacementVerified: true,
   boardFresh: true,
   taskReopenVerified: false,
@@ -122,6 +122,8 @@ describe("Dida project projection domain", () => {
       uuid: "uuid-1", title: "修改论文", remoteId: "task-1", state: "completed", line: 10,
     }]);
     expect(patched).toContain("- [x] 修改论文");
+    expect(() => patchManagedPlanAction(adopted, { uuid: "uuid-1", title: " 修改论文 " }))
+      .toThrow(/首尾空格/);
   });
 
   it("preserves the managed action indentation and bullet style", () => {
@@ -165,7 +167,8 @@ describe("Dida project projection domain", () => {
   it("plans create, title update, completion and persistent deletion tombstone", () => {
     const base = ledger({ remoteId: "task-1", title: "旧", state: "active" });
     const changed = ledger({ remoteId: "task-1", title: "新", state: "completed" });
-    expect(planProjectionChanges([base], [changed]).map((item) => item.kind)).toEqual(["update-action", "complete-action"]);
+    expect(planProjectionChanges([base], [changed]).map((item) => item.kind)).toEqual(["update-action"]);
+    expect(planProjectionChanges([base], [changed])[0]).toMatchObject({ writeFields: ["title", "status"] });
     expect(planProjectionChanges([], [ledger({ remoteId: undefined })])[0]?.kind).toBe("create-action");
     const deletion = planProjectionChanges([base], [])[0];
     expect(deletion).toMatchObject({ kind: "delete-action", entry: { tombstone: true } });
@@ -199,16 +202,165 @@ describe("DidaProjectProjectionService with fake remote", () => {
     expect((await harness.state.read()).enabled).toBe(true);
   });
 
-  it("creates parent then child through the injected normal task pipeline and writes verified IDs", async () => {
+  it("creates one parent task then appends an owned checklist item without creating a child task", async () => {
     const harness = makeHarness(true);
     const summary = await harness.service.synchronizeProject(input());
     expect(summary).toMatchObject({ createdParents: 1, createdActions: 1, frozen: [] });
-    expect(harness.pipeline.created).toHaveLength(2);
+    expect(harness.pipeline.created).toHaveLength(1);
     expect(harness.markdown.content("Project.md")).toContain("helix-dida-parent-task-id");
     expect((await harness.state.read()).parentCheckpoints).toEqual([]);
-    expect(harness.markdown.content("Stage.md")).toMatch(/remoteId=remote-2/);
-    const child = harness.pipeline.created[1]!;
-    expect(child).toMatchObject({ projectId: "list-1", columnId: "column-1", parentId: "remote-1", content: "helix-projection:uuid-1" });
+    expect(harness.markdown.content("Stage.md")).toMatch(/remoteId=item-\d+/);
+    expect(harness.pipeline.tasks.get("remote-1")?.items).toEqual([
+      expect.objectContaining({ id: expect.stringMatching(/^item-/), title: "行动", status: 0 }),
+    ]);
+    expect(harness.pipeline.updateOperationIds[0]).toMatch(/^op-projection-item-create-/);
+    expect(harness.pipeline.updateBases[0]).toMatchObject({ id: "remote-1" });
+    expect(harness.pipeline.updateBases[0]).not.toHaveProperty("items");
+    expect(harness.state.value.ledger[0]?.operationId).toBeUndefined();
+  });
+
+  it("rebaselines an unidentified append that loses the unsent preflight race", async () => {
+    const harness = makeHarness(true);
+    const ordinary = { id: "ordinary-race", title: "并发普通项", status: 0 };
+    harness.pipeline.afterCreate = () => {
+      harness.pipeline.nextResult = {
+        operationId: "ignored-by-fake",
+        outcome: "preflight-changed",
+        message: "尚未发送",
+        task: {
+          id: "remote-1", projectId: "list-1", columnId: "column-1", title: "Alpha",
+          content: "helix-project-projection:project-1", status: 0, items: [ordinary],
+        },
+      };
+    };
+    const summary = await harness.service.synchronizeProject(input());
+    expect(summary.frozen).toEqual([]);
+    expect(harness.pipeline.updateOperationIds).toHaveLength(2);
+    expect(new Set(harness.pipeline.updateOperationIds).size).toBe(1);
+    expect(harness.pipeline.updateBases[1]?.items).toEqual([ordinary]);
+    expect(harness.pipeline.stagedConflicts).toBe(0);
+    expect(harness.pipeline.tasks.get("remote-1")?.items).toEqual([
+      ordinary,
+      expect.objectContaining({ id: expect.stringMatching(/^item-/), title: "行动" }),
+    ]);
+  });
+
+  it("recovers after three proven-unsent append races with the same operation ID", async () => {
+    const harness = makeHarness(true);
+    harness.pipeline.afterCreate = () => {
+      harness.pipeline.nextResults = [1, 2, 3].map((count) => ({
+        operationId: "ignored-by-fake",
+        outcome: "preflight-changed" as const,
+        message: "尚未发送",
+        task: {
+          id: "remote-1", projectId: "list-1", columnId: "column-1", title: "Alpha",
+          content: "helix-project-projection:project-1", status: 0,
+          items: Array.from({ length: count }, (_, index) => ({
+            id: `ordinary-${index + 1}`, title: `并发普通项 ${index + 1}`, status: 0,
+          })),
+        },
+      }));
+    };
+    const first = await harness.service.synchronizeProject(input());
+    expect(first.frozen).toEqual([expect.objectContaining({ reason: "retryable" })]);
+    const frozen = harness.state.value.ledger[0]!;
+    const beforeRecovery = harness.pipeline.tasks.get(frozen.parentTaskId)!;
+    harness.pipeline.tasks.set(frozen.parentTaskId, {
+      ...beforeRecovery,
+      items: [...(beforeRecovery.items ?? []), { id: "ordinary-4", title: "恢复前第 4 次变化", status: 0 }],
+    });
+    const diagnostics = new MemoryDiagnostics({
+      operationId: frozen.operationId!, blocked: false,
+      resolvedTask: harness.pipeline.tasks.get(frozen.parentTaskId),
+      receiptOverride: { outcome: "preflight-changed" },
+    });
+    const recovered = projectionHarnessWithDiagnostics(harness.state, harness.pipeline, diagnostics);
+    await recovered.service.reconcileFrozen(reconcileAction(frozen));
+    expect(new Set(harness.pipeline.updateOperationIds).size).toBe(1);
+    expect(harness.pipeline.updateOperationIds).toHaveLength(4);
+    expect(harness.state.value.ledger[0]).toMatchObject({
+      remoteId: expect.stringMatching(/^item-/), frozen: undefined, operationId: undefined,
+    });
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.slice(0, 4).map((item) => item.id))
+      .toEqual(["ordinary-1", "ordinary-2", "ordinary-3", "ordinary-4"]);
+  });
+
+  it("preserves preexisting ordinary items byte-equivalent while creating and deleting owned items", async () => {
+    const harness = makeHarness(true);
+    const unsafeOrder = Number.MAX_SAFE_INTEGER + 11;
+    const ordinary = {
+      id: "ordinary-1",
+      title: "  用户检查项  ",
+      status: 0,
+      sortOrder: unsafeOrder,
+      startDate: "2026-08-01T22:37:34+08:00",
+      completedTime: "2026-08-01T23:37:34+0800",
+      opaque: { server: true },
+    } as DidaChecklistItem & { opaque: { server: boolean } };
+    harness.pipeline.onCreate = async (task) => {
+      if (!task.content?.startsWith("helix-project-projection:")) return;
+      task.items = [ordinary];
+    };
+    await harness.service.synchronizeProject(input());
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.[0]).toEqual(ordinary);
+    harness.markdown.set("Stage.md", stage("行动已删"));
+    const deleted = await harness.service.synchronizeProject(input());
+    expect(deleted.deletedActions).toBe(1);
+    expect(harness.pipeline.tasks.get("remote-1")?.items).toEqual([ordinary]);
+  });
+
+  it("freezes item creation when the write result has an ambiguous ID delta", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", harness.markdown.content("Stage.md").replace(
+      "# 行动结果",
+      "- [ ] 重复标题\n# 行动结果",
+    ));
+    const parsed = parseManagedPlanActions(harness.markdown.content("Stage.md"));
+    harness.markdown.set("Stage.md", adoptPlanAction(
+      harness.markdown.content("Stage.md"),
+      parsed.unmanagedChecklistLines[0]!,
+      "uuid-2",
+    ));
+    const parent = harness.pipeline.tasks.get("remote-1")!;
+    harness.pipeline.nextResult = {
+      operationId: "op-ambiguous-items",
+      outcome: "verified",
+      task: {
+        ...parent,
+        items: [
+          ...(parent.items ?? []),
+          { id: "ambiguous-a", title: "重复标题", status: 0 },
+          { id: "ambiguous-b", title: "重复标题", status: 0 },
+        ],
+      },
+    };
+    const result = await harness.service.synchronizeProject(input());
+    expect(result.frozen).toContainEqual(expect.objectContaining({
+      uuid: "uuid-2", reason: "identity-mismatch", message: expect.stringMatching(/唯一证明/),
+    }));
+    expect(harness.markdown.content("Stage.md")).toContain("uuid=uuid-2 remoteId=-");
+  });
+
+  it("freezes a competing owned item field and does not overwrite the remote value", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    const parent = harness.pipeline.tasks.get("remote-1")!;
+    harness.pipeline.tasks.set("remote-1", {
+      ...parent,
+      items: parent.items?.map((item) => ({ ...item, title: "远端标题" })),
+    });
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"),
+      { uuid: "uuid-1", title: "本地标题" },
+    ));
+    const writes = harness.pipeline.updated.length;
+    const result = await harness.service.synchronizeProject(input());
+    expect(result.frozen).toContainEqual(expect.objectContaining({ uuid: "uuid-1", reason: "conflict" }));
+    expect(harness.pipeline.updated).toHaveLength(writes);
+    expect(harness.pipeline.stagedConflicts).toBe(1);
+    expect(harness.pipeline.stagedBases[0]?.items?.[0]?.title).toBe("行动");
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.[0]?.title).toBe("远端标题");
   });
 
   it("recovers a missing ledger from a Markdown remote ID by exact reread without creating", async () => {
@@ -219,10 +371,10 @@ describe("DidaProjectProjectionService with fake remote", () => {
     const recovered = await harness.service.synchronizeProject(input());
     expect(recovered.createdActions).toBe(0);
     expect(harness.pipeline.created).toHaveLength(creates);
-    expect(harness.state.value.ledger[0]).toMatchObject({ uuid: "uuid-1", remoteId: "remote-2" });
+    expect(harness.state.value.ledger[0]).toMatchObject({ uuid: "uuid-1", remoteId: expect.stringMatching(/^item-/) });
   });
 
-  it("recovers a durable create receipt after crash before Markdown/state landing without resending", async () => {
+  it("freezes a lost item-create landing checkpoint and never resends the append", async () => {
     const harness = makeHarness(true);
     await harness.service.synchronizeProject(input());
     const creates = harness.pipeline.created.length;
@@ -231,11 +383,11 @@ describe("DidaProjectProjectionService with fake remote", () => {
       { uuid: "uuid-1", remoteId: null },
     ));
     harness.state.value.ledger = [];
+    harness.state.value.ledger = [ledger({ remoteId: undefined, frozen: "unknown-outcome" })];
     const recovered = await harness.service.synchronizeProject(input());
     expect(recovered.createdActions).toBe(0);
     expect(harness.pipeline.created).toHaveLength(creates);
-    expect(harness.markdown.content("Stage.md")).toContain("remoteId=remote-2");
-    expect(harness.state.value.ledger[0]).toMatchObject({ operationId: expect.stringMatching(/^op-/) });
+    expect(harness.markdown.content("Stage.md")).toContain("remoteId=-");
   });
 
   it("rereads the exact parent immediately before every child create", async () => {
@@ -253,13 +405,44 @@ describe("DidaProjectProjectionService with fake remote", () => {
   it("updates title and completes, then freezes unsupported action reopen", async () => {
     const harness = makeHarness(true);
     await harness.service.synchronizeProject(input());
+    const writes = harness.pipeline.updated.length;
     harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), { uuid: "uuid-1", title: "新标题", state: "completed" }));
     const completed = await harness.service.synchronizeProject(input());
     expect(completed).toMatchObject({ updatedActions: 1, completedActions: 1 });
+    expect(harness.pipeline.updated).toHaveLength(writes + 1);
+    expect(harness.state.value.ledger[0]?.operationId).toBeUndefined();
     harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), { uuid: "uuid-1", state: "terminated" }));
     const terminated = await harness.service.synchronizeProject(input());
     expect(terminated.frozen[0]).toMatchObject({ uuid: "uuid-1", reason: "capability" });
-    expect(harness.pipeline.tasks.get("remote-2")?.status).toBe(2);
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.[0]?.status).toBe(2);
+  });
+
+  it("rejects a server completedTime mutation during a title-only owned item update", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    const parent = harness.pipeline.tasks.get("remote-1")!;
+    const owned = parent.items![0]!;
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"),
+      { uuid: "uuid-1", title: "仅改标题" },
+    ));
+    harness.pipeline.nextResult = {
+      operationId: "ignored-by-stable-checkpoint",
+      outcome: "verified",
+      task: {
+        ...parent,
+        items: [{ ...owned, title: "仅改标题", completedTime: "2026-08-05T00:00:00.000Z" }],
+      },
+    };
+
+    const result = await harness.service.synchronizeProject(input());
+
+    expect(result.frozen).toContainEqual(expect.objectContaining({ uuid: "uuid-1", reason: "identity-mismatch" }));
+    expect(harness.state.value.ledger[0]).toMatchObject({
+      updateExpectedTitle: "仅改标题",
+      updateExpectedStatus: 0,
+      operationId: expect.stringMatching(/^op-projection-item-update-/),
+    });
   });
 
   it("projects parent rename and completion, then freezes unsupported reopen", async () => {
@@ -294,9 +477,8 @@ describe("DidaProjectProjectionService with fake remote", () => {
     harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), { uuid: "uuid-1", state: "paused", title: "行动新标题" }));
     const action = await harness.service.synchronizeProject(input({ projectTitle: "父任务新标题" }));
     expect(action.frozen).toEqual([]);
-    expect(harness.pipeline.reopened).toBe(2);
-    expect(harness.pipeline.tasks.get("remote-2")?.status).toBe(0);
-    expect(harness.pipeline.tasks.get("remote-2")?.title).toBe("行动新标题");
+    expect(harness.pipeline.reopened).toBe(1);
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.[0]).toMatchObject({ status: 0, title: "行动新标题" });
   });
 
   it("freezes with the exact title-update receipt after reopen partially succeeds", async () => {
@@ -314,11 +496,11 @@ describe("DidaProjectProjectionService with fake remote", () => {
     const result = await harness.service.synchronizeProject(input());
     expect(result.frozen[0]).toMatchObject({ uuid: "uuid-1", reason: "unknown-outcome" });
     expect(harness.state.value.ledger[0]).toMatchObject({
-      operationId: "op-title-after-reopen",
+      operationId: expect.stringMatching(/^op-projection-item-update-/),
       conflictId: "conflict-title",
       frozen: "unknown-outcome",
     });
-    expect(harness.pipeline.tasks.get("remote-2")).toMatchObject({ status: 0, title: "行动" });
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.[0]).toMatchObject({ status: 2, title: "行动" });
   });
 
   it("freezes parent remote competition and unknown writes without retrying or title adoption", async () => {
@@ -327,7 +509,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
     competing.pipeline.tasks.set("remote-1", { ...competing.pipeline.tasks.get("remote-1")!, title: "远端改名" });
     const conflict = await competing.service.synchronizeProject(input({ projectTitle: "Helix 改名" }));
     expect(conflict.frozen[0]).toMatchObject({ uuid: "project:project-1", reason: "conflict" });
-    expect(competing.pipeline.updated).toHaveLength(0);
+    expect(competing.pipeline.updated).toHaveLength(1);
 
     const unknown = makeHarness(true);
     await unknown.service.synchronizeProject(input());
@@ -349,7 +531,8 @@ describe("DidaProjectProjectionService with fake remote", () => {
     };
     const summary = await harness.service.synchronizeProject(input());
     expect(summary.deletedActions).toBe(1);
-    expect(harness.pipeline.deleted).toEqual(["remote-2"]);
+    expect(harness.pipeline.deleted).toEqual([]);
+    expect(harness.pipeline.tasks.get("remote-1")?.items).toEqual([]);
     expect((await harness.state.read()).ledger).toEqual([]);
   });
 
@@ -369,18 +552,22 @@ describe("DidaProjectProjectionService with fake remote", () => {
     const harness = makeHarness(true);
     await harness.service.synchronizeProject(input());
     harness.markdown.set("Stage.md", stage("行动已删"));
-    harness.pipeline.nextDeleteResult = { operationId: "op-delete-unknown", outcome: "unknown", message: "delete timeout" };
+    harness.pipeline.nextResult = { operationId: "op-delete-unknown", outcome: "unknown", message: "delete timeout" };
     const first = await harness.service.synchronizeProject(input());
     expect(first.frozen[0]).toMatchObject({ uuid: "uuid-1", reason: "unknown-outcome" });
-    expect(harness.pipeline.deleteAttempts).toBe(1);
+    const writes = harness.pipeline.updated.length;
     await harness.service.synchronizeProject(input());
-    expect(harness.pipeline.deleteAttempts).toBe(1);
+    expect(harness.pipeline.updated).toHaveLength(writes);
   });
 
   it("persists and freezes a deletion tombstone when remote identity competes", async () => {
     const harness = makeHarness(true);
     await harness.service.synchronizeProject(input());
-    harness.pipeline.tasks.set("remote-2", { ...harness.pipeline.tasks.get("remote-2")!, parentId: "foreign" });
+    const parent = harness.pipeline.tasks.get("remote-1")!;
+    harness.pipeline.tasks.set("remote-1", {
+      ...parent,
+      items: parent.items?.map((item) => ({ ...item, title: "远端竞争标题" })),
+    });
     harness.markdown.set("Stage.md", stage("用户保留"));
     const summary = await harness.service.synchronizeProject(input());
     expect(summary.frozen[0]).toMatchObject({ uuid: "uuid-1", reason: "conflict" });
@@ -401,7 +588,8 @@ describe("DidaProjectProjectionService with fake remote", () => {
     await harness.service.synchronizeProject(input());
     expect(harness.pipeline.created).toHaveLength(createCount);
     expect((await harness.state.read()).ledger.find((item) => item.uuid === "uuid-2")?.frozen).toBe("unknown-outcome");
-    expect((await harness.state.read()).ledger.find((item) => item.uuid === "uuid-2")?.operationId).toBe("op-action-unknown");
+    expect((await harness.state.read()).ledger.find((item) => item.uuid === "uuid-2")?.operationId)
+      .toMatch(/^op-projection-item-create-/);
     await harness.service.synchronizeProject(input());
     expect(harness.pipeline.created).toHaveLength(createCount);
   });
@@ -411,8 +599,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
     harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), { uuid: "uuid-1", state: "completed" }));
     const result = await harness.service.synchronizeProject(input());
     expect(result).toMatchObject({ createdActions: 1, completedActions: 1 });
-    expect(harness.pipeline.created[1]?.status).toBe(0);
-    expect(harness.pipeline.tasks.get("remote-2")?.status).toBe(2);
+    expect(harness.pipeline.tasks.get("remote-1")?.items?.[0]?.status).toBe(2);
   });
 
   it("freezes a verified parent when Markdown CAS loses and does not create it twice", async () => {
@@ -427,18 +614,21 @@ describe("DidaProjectProjectionService with fake remote", () => {
   it("does not touch real APIs or infer a task by title when a remote task disappears", async () => {
     const harness = makeHarness(true);
     await harness.service.synchronizeProject(input());
-    harness.pipeline.tasks.delete("remote-2");
+    const parent = harness.pipeline.tasks.get("remote-1")!;
+    harness.pipeline.tasks.set("remote-1", { ...parent, items: [] });
     harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), { uuid: "uuid-1", title: "changed" }));
     const result = await harness.service.synchronizeProject(input());
     expect(result.frozen[0]).toMatchObject({ uuid: "uuid-1", reason: "identity-mismatch" });
-    expect(result.frozen[0]?.message).toMatch(/不存在.*拒绝按标题/);
+    expect(result.frozen[0]?.message).toMatch(/不存在/);
   });
 
   it("merges the latest state by project key when another project changes during a write", async () => {
     const harness = makeHarness(true);
     const other = ledger({ uuid: "other", projectId: "project-2", stageId: "stage-2", remoteId: "other-task" });
-    harness.pipeline.onCreate = async (task) => {
-      if (task.parentId) harness.state.value.ledger.push(other);
+    const originalUpdate = harness.pipeline.updateTask.bind(harness.pipeline);
+    harness.pipeline.updateTask = async (task) => {
+      harness.state.value.ledger.push(other);
+      return originalUpdate(task);
     };
     await harness.service.synchronizeProject(input());
     expect(harness.state.value.ledger.find((entry) => entry.uuid === "other")).toEqual(other);
@@ -460,6 +650,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
       enqueueProjectionCreate: async () => { calls.push("queue-create"); return { operationId: "op-create", outcome: "verified", task }; },
       recoverProjectionCreate: async () => { calls.push("queue-recover"); return null; },
       enqueueProjectionUpdate: async () => { calls.push("queue-update"); return { operationId: "op-update", outcome: "unknown", message: "timeout" }; },
+      stageProjectionItemsConflict: async () => { calls.push("queue-conflict"); return { operationId: "op-conflict", outcome: "conflict", message: "conflict" }; },
       enqueueProjectionComplete: async () => { calls.push("queue-complete"); return { operationId: "op-complete", outcome: "verified", task: { ...task, status: 2 } }; },
       enqueueProjectionReopen: async () => { calls.push("queue-reopen"); return { operationId: "op-reopen", outcome: "verified", task: { ...task, status: 0 } }; },
       enqueueProjectionDelete: async () => { calls.push("queue-delete"); return { operationId: "op-delete", outcome: "verified-absent" }; },
@@ -469,12 +660,13 @@ describe("DidaProjectProjectionService with fake remote", () => {
     await expect(adapter.createTask(task, "client-1")).resolves.toMatchObject({ outcome: "verified", operationId: "op-create" });
     await expect(adapter.recoverCreate("client-1", "list-1")).resolves.toBeNull();
     await expect(adapter.updateTask(task, ["title"])).resolves.toMatchObject({ outcome: "unknown", operationId: "op-update" });
+    await expect(adapter.stageItemsConflict(task, task, task, "op-conflict")).resolves.toMatchObject({ outcome: "conflict" });
     await expect(adapter.completeTask(task)).resolves.toMatchObject({ outcome: "verified" });
     await expect(adapter.reopenTask({ ...task, status: 2 })).resolves.toMatchObject({ outcome: "verified", operationId: "op-reopen" });
     await expect(adapter.deleteTask({ taskId: "task", parentTaskId: "parent", targetProjectId: "list-1", targetColumnId: "column-1", marker: "m" }))
       .resolves.toEqual({ operationId: "op-delete", outcome: "verified-absent" });
     await expect(adapter.rereadTask("list-1", "task")).resolves.toEqual(task);
-    expect(calls).toEqual(["queue-create", "queue-recover", "queue-update", "queue-complete", "queue-reopen", "queue-delete", "lease-reread"]);
+    expect(calls).toEqual(["queue-create", "queue-recover", "queue-update", "queue-conflict", "queue-complete", "queue-reopen", "queue-delete", "lease-reread"]);
   });
 
   it("persists non-authoritative projection state with compare-and-swap", async () => {
@@ -580,7 +772,10 @@ describe("DidaProjectProjectionService with fake remote", () => {
   });
 
   it("reconciles unknown create only after the queue clears and exact desired state is verified", async () => {
-    const entry = ledger({ remoteId: undefined, frozen: "unknown-outcome", operationId: "op-create" });
+    const entry = ledger({
+      remoteId: undefined, frozen: "unknown-outcome", operationId: "op-create", createBaselineItemIds: [],
+      createBaselineItemsHash: stableHash([]), createBaselineItemHashes: {},
+    });
     const state = new MemoryState({
       enabled: true,
       target: { targetProjectId: "list-1", targetColumnId: "column-1" },
@@ -590,8 +785,9 @@ describe("DidaProjectProjectionService with fake remote", () => {
     });
     const pipeline = new FakePipeline();
     const remote = {
-      id: "remote-created", projectId: "list-1", parentId: "parent-1", columnId: "column-1",
-      title: entry.title, content: projectionMarker(entry.uuid), status: 0,
+      id: entry.parentTaskId, projectId: "list-1", columnId: "column-1",
+      title: "Alpha", content: "helix-project-projection:project-1", status: 0,
+      items: [{ id: "item-created", title: entry.title, status: 0 }],
     } satisfies DidaTask;
     pipeline.tasks.set(remote.id, remote);
     const diagnostics = new MemoryDiagnostics({
@@ -602,9 +798,9 @@ describe("DidaProjectProjectionService with fake remote", () => {
       .rejects.toThrow(/队列或逐字段冲突/);
     diagnostics.blocked = false;
     await service.reconcileFrozen(reconcileAction(entry));
-    expect(state.value.ledger[0]).toMatchObject({ remoteId: remote.id });
+    expect(state.value.ledger[0]).toMatchObject({ remoteId: "item-created" });
     expect(state.value.ledger[0]?.frozen).toBeUndefined();
-    expect(markdown.content("Stage.md")).toContain(`remoteId=${remote.id}`);
+    expect(markdown.content("Stage.md")).toContain("remoteId=item-created");
     expect(diagnostics.removed).toEqual(["op-create"]);
     const parent: DidaTask = {
       id: entry.parentTaskId,
@@ -620,8 +816,146 @@ describe("DidaProjectProjectionService with fake remote", () => {
     expect(pipeline.created).toEqual([]);
   });
 
+  it("resumes a checkpointed but unqueued item append with the same operation ID", async () => {
+    const entry = ledger({
+      remoteId: undefined,
+      frozen: "unknown-outcome",
+      operationId: "op-resume-create",
+      createBaselineItemIds: [],
+      createBaselineItemsHash: stableHash([]),
+      createBaselineItemHashes: {},
+    });
+    const state = new MemoryState({
+      enabled: true,
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
+    });
+    const pipeline = new FakePipeline();
+    pipeline.tasks.set(entry.parentTaskId, parentTaskWithItem(entry, undefined, []));
+    const diagnostics = new MemoryDiagnostics({
+      operationId: entry.operationId!, blocked: false, receiptPresent: false,
+    });
+    const { service, markdown } = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
+    await service.reconcileFrozen(reconcileAction(entry));
+    expect(pipeline.updateOperationIds).toEqual([entry.operationId]);
+    expect(state.value.ledger[0]).toMatchObject({ remoteId: expect.stringMatching(/^item-/), frozen: undefined });
+    expect(markdown.content("Stage.md")).toMatch(/remoteId=item-/);
+  });
+
+  it("keeps the full create checkpoint after an exception and resumes it without a duplicate append", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    const withAction = harness.markdown.content("Stage.md")
+      .replace("# 行动结果", "- [ ] 异常恢复\n# 行动结果");
+    const unmanaged = parseManagedPlanActions(withAction).unmanagedChecklistLines[0]!;
+    harness.markdown.set("Stage.md", adoptPlanAction(
+      withAction,
+      unmanaged,
+      "uuid-exception",
+    ));
+    harness.pipeline.nextUpdateError = new Error("transport interrupted");
+
+    const failed = await harness.service.synchronizeProject(input());
+    const checkpoint = harness.state.value.ledger.find((item) => item.uuid === "uuid-exception")!;
+    expect(failed.frozen).toContainEqual(expect.objectContaining({ uuid: "uuid-exception", reason: "unknown-outcome" }));
+    expect(checkpoint).toMatchObject({
+      operationId: expect.stringMatching(/^op-projection-item-create-/),
+      createBaselineItemIds: expect.any(Array),
+      createBaselineItemsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      createBaselineItemHashes: expect.any(Object),
+    });
+    const before = harness.pipeline.tasks.get(checkpoint.parentTaskId)?.items?.length;
+    const diagnostics = new MemoryDiagnostics({
+      operationId: checkpoint.operationId!, blocked: false, receiptPresent: false,
+    });
+    const resumed = new DidaProjectProjectionService(
+      harness.markdown,
+      harness.pipeline,
+      harness.state,
+      { read: async () => ({ projects: [project], columns: [column], readiness: ready }) },
+      () => "2026-08-05T00:00:00.000Z",
+      diagnostics,
+    );
+    await resumed.reconcileFrozen(reconcileAction(checkpoint));
+    expect(harness.pipeline.updateOperationIds.at(-1)).toBe(checkpoint.operationId);
+    expect(harness.pipeline.tasks.get(checkpoint.parentTaskId)?.items).toHaveLength((before ?? 0) + 1);
+  });
+
+  it("resumes a prepared owned update with the same operation ID only after an exact baseline reread", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", title: "崩溃后续发" },
+    ));
+    harness.pipeline.nextUpdateError = new Error("crash before enqueue");
+    await harness.service.synchronizeProject(input());
+    const checkpoint = harness.state.value.ledger[0]!;
+    expect(checkpoint).toMatchObject({
+      mutationKind: "update",
+      mutationBaselineItemIds: expect.any(Array),
+      mutationBaselineItemsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      operationId: expect.stringMatching(/^op-projection-item-update-/),
+    });
+    const diagnostics = new MemoryDiagnostics({
+      operationId: checkpoint.operationId!, blocked: false, receiptPresent: false,
+    });
+    const resumed = new DidaProjectProjectionService(
+      harness.markdown, harness.pipeline, harness.state,
+      { read: async () => ({ projects: [project], columns: [column], readiness: ready }) },
+      () => "2026-08-05T00:00:00.000Z", diagnostics,
+    );
+    await resumed.reconcileFrozen(reconcileAction(checkpoint));
+    expect(harness.pipeline.updateOperationIds.at(-1)).toBe(checkpoint.operationId);
+    expect(harness.pipeline.tasks.get(checkpoint.parentTaskId)?.items?.[0]?.title).toBe("崩溃后续发");
+  });
+
+  it("resumes a prepared owned delete with the same operation ID and never removes changed ordinary items", async () => {
+    const harness = makeHarness(true);
+    harness.pipeline.onCreate = async (task) => {
+      if (task.content?.startsWith("helix-project-projection:")) {
+        task.items = [{ id: "ordinary", title: "普通项", status: 0 }];
+      }
+    };
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", stage("行动已删"));
+    harness.pipeline.nextUpdateError = new Error("crash before delete enqueue");
+    await harness.service.synchronizeProject(input());
+    const checkpoint = harness.state.value.ledger[0]!;
+    expect(checkpoint).toMatchObject({
+      tombstone: true,
+      mutationKind: "delete",
+      operationId: expect.stringMatching(/^op-projection-item-delete-/),
+    });
+    const diagnostics = new MemoryDiagnostics({
+      operationId: checkpoint.operationId!, blocked: false, receiptPresent: false,
+    });
+    const resumed = new DidaProjectProjectionService(
+      harness.markdown, harness.pipeline, harness.state,
+      { read: async () => ({ projects: [project], columns: [column], readiness: ready }) },
+      () => "2026-08-05T00:00:00.000Z", diagnostics,
+    );
+    const exactParent = structuredClone(harness.pipeline.tasks.get(checkpoint.parentTaskId)!);
+    harness.pipeline.tasks.set(checkpoint.parentTaskId, {
+      ...exactParent,
+      items: exactParent.items?.map((item) => item.id === "ordinary" ? { ...item, title: "并发改动" } : item),
+    });
+    const sendsBeforeCompetition = harness.pipeline.updated.length;
+    await expect(resumed.reconcileFrozen(reconcileAction(checkpoint))).rejects.toThrow(/items 字段或顺序已变化/);
+    expect(harness.pipeline.updated).toHaveLength(sendsBeforeCompetition);
+    harness.pipeline.tasks.set(checkpoint.parentTaskId, exactParent);
+    await resumed.reconcileFrozen(reconcileAction(checkpoint));
+    expect(harness.pipeline.updateOperationIds.at(-1)).toBe(checkpoint.operationId);
+    expect(harness.pipeline.tasks.get(checkpoint.parentTaskId)?.items).toEqual([
+      { id: "ordinary", title: "普通项", status: 0 },
+    ]);
+    expect(harness.state.value.ledger).toEqual([]);
+  });
+
   it("keeps the receipt and frozen state when reconciliation state CAS loses a race", async () => {
-    const entry = ledger({ remoteId: undefined, frozen: "unknown-outcome", operationId: "op-race" });
+    const entry = ledger({
+      remoteId: undefined, frozen: "unknown-outcome", operationId: "op-race", createBaselineItemIds: [],
+      createBaselineItemsHash: stableHash([]), createBaselineItemHashes: {},
+    });
     const state = new MemoryState({
       enabled: true,
       target: { targetProjectId: "list-1", targetColumnId: "column-1" },
@@ -629,8 +963,9 @@ describe("DidaProjectProjectionService with fake remote", () => {
     });
     const pipeline = new FakePipeline();
     const remote: DidaTask = {
-      id: "remote-race", projectId: entry.targetProjectId, parentId: entry.parentTaskId,
-      columnId: entry.targetColumnId, title: entry.title, content: projectionMarker(entry.uuid), status: 0,
+      id: entry.parentTaskId, projectId: entry.targetProjectId,
+      columnId: entry.targetColumnId, title: "Alpha", content: "helix-project-projection:project-1", status: 0,
+      items: [{ id: "item-race", title: entry.title, status: 0 }],
     };
     pipeline.tasks.set(remote.id, remote);
     const diagnostics = new MemoryDiagnostics({ operationId: "op-race", blocked: false, resolvedTask: remote });
@@ -639,7 +974,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
     await expect(service.reconcileFrozen(reconcileAction(entry))).rejects.toThrow(/state CAS/);
     expect(state.value.ledger[0]?.frozen).toBe("unknown-outcome");
     expect(diagnostics.removed).toEqual([]);
-    expect(markdown.content("Stage.md")).toContain(`remoteId=${remote.id}`);
+    expect(markdown.content("Stage.md")).toContain("remoteId=item-race");
     await service.reconcileFrozen(reconcileAction(entry));
     expect(state.value.ledger[0]?.frozen).toBeUndefined();
     expect(diagnostics.removed).toEqual(["op-race"]);
@@ -664,7 +999,10 @@ describe("DidaProjectProjectionService with fake remote", () => {
   });
 
   it("persists cleanup proof and retries orphan receipt cleanup after restart", async () => {
-    const entry = ledger({ remoteId: undefined, frozen: "unknown-outcome", operationId: "op-cleanup" });
+    const entry = ledger({
+      remoteId: undefined, frozen: "unknown-outcome", operationId: "op-cleanup", createBaselineItemIds: [],
+      createBaselineItemsHash: stableHash([]), createBaselineItemHashes: {},
+    });
     const state = new MemoryState({
       enabled: true,
       target: { targetProjectId: "list-1", targetColumnId: "column-1" },
@@ -672,8 +1010,9 @@ describe("DidaProjectProjectionService with fake remote", () => {
     });
     const pipeline = new FakePipeline();
     const remote: DidaTask = {
-      id: "remote-cleanup", projectId: entry.targetProjectId, parentId: entry.parentTaskId,
-      columnId: entry.targetColumnId, title: entry.title, content: projectionMarker(entry.uuid), status: 0,
+      id: entry.parentTaskId, projectId: entry.targetProjectId,
+      columnId: entry.targetColumnId, title: "Alpha", content: "helix-project-projection:project-1", status: 0,
+      items: [{ id: "item-cleanup", title: entry.title, status: 0 }],
     };
     pipeline.tasks.set(remote.id, remote);
     const diagnostics = new MemoryDiagnostics({
@@ -683,7 +1022,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
     await service.reconcileFrozen(reconcileAction(entry));
     expect(state.value.ledger[0]?.frozen).toBeUndefined();
     expect(state.value.receiptCleanupPending).toEqual([
-      expect.objectContaining({ operationId: "op-cleanup", remoteTaskId: remote.id }),
+      expect.objectContaining({ operationId: "op-cleanup", remoteTaskId: entry.parentTaskId }),
     ]);
     expect(diagnostics.removed).toEqual([]);
     const model = await service.readProject(input());
@@ -766,27 +1105,28 @@ describe("DidaProjectProjectionService with fake remote", () => {
   });
 
   it("keeps an adopted unknown update frozen until remote title and state match Markdown", async () => {
-    const entry = ledger({ frozen: "unknown-outcome", operationId: "op-update" });
+    const entry = ledger({
+      frozen: "unknown-outcome", operationId: "op-update",
+      updateExpectedTitle: "行动", updateExpectedStatus: 0,
+      updateStageRevisionHash: "0".repeat(64),
+    });
     const state = new MemoryState({
       enabled: true,
       target: { targetProjectId: "list-1", targetColumnId: "column-1" },
       confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
     });
     const pipeline = new FakePipeline();
-    pipeline.tasks.set(entry.remoteId!, {
-      id: entry.remoteId!, projectId: entry.targetProjectId, parentId: entry.parentTaskId,
-      columnId: entry.targetColumnId, title: "Remote choice", content: projectionMarker(entry.uuid), status: 0,
-    });
+    pipeline.tasks.set(entry.parentTaskId, parentTaskWithItem(entry, "Remote choice"));
     const diagnostics = new MemoryDiagnostics({ operationId: "op-update", blocked: false });
-    const service = projectionServiceWithDiagnostics(state, pipeline, diagnostics);
-    await expect(service.reconcileFrozen(reconcileAction(entry)))
-      .rejects.toThrow(/标题/);
+    const harness = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
+    state.value.ledger[0]!.updateStageRevisionHash = stableHash(harness.markdown.content("Stage.md"));
+    await expect(harness.service.reconcileFrozen(reconcileAction(state.value.ledger[0]!)))
+      .rejects.toThrow(/持久期望/);
     expect(state.value.ledger[0]?.frozen).toBe("unknown-outcome");
-    pipeline.tasks.set(entry.remoteId!, {
-      ...pipeline.tasks.get(entry.remoteId!)!, title: entry.title,
-    });
-    await service.reconcileFrozen(reconcileAction(entry));
+    pipeline.tasks.set(entry.parentTaskId, parentTaskWithItem(entry));
+    await harness.service.reconcileFrozen(reconcileAction(state.value.ledger[0]!));
     expect(state.value.ledger[0]?.frozen).toBeUndefined();
+    expect(pipeline.updated).toEqual([]);
   });
 
   it("does not clear a blocked conflict until the existing conflict lifecycle is resolved", async () => {
@@ -797,12 +1137,11 @@ describe("DidaProjectProjectionService with fake remote", () => {
       confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
     });
     const pipeline = new FakePipeline();
-    pipeline.tasks.set(entry.remoteId!, {
-      id: entry.remoteId!, projectId: entry.targetProjectId, parentId: entry.parentTaskId,
-      columnId: entry.targetColumnId, title: entry.title, content: projectionMarker(entry.uuid), status: 0,
-    });
+    pipeline.tasks.set(entry.parentTaskId, parentTaskWithItem(entry));
     const diagnostics = new MemoryDiagnostics({
-      operationId: "op-blocked", blocked: true, receiptOverride: { conflictId: "conflict-1" },
+      operationId: "op-blocked", blocked: true,
+      resolvedTask: pipeline.tasks.get(entry.parentTaskId),
+      receiptOverride: { conflictId: "conflict-1" },
     });
     const service = projectionServiceWithDiagnostics(state, pipeline, diagnostics);
     await expect(service.reconcileFrozen(reconcileAction(entry)))
@@ -810,6 +1149,94 @@ describe("DidaProjectProjectionService with fake remote", () => {
     diagnostics.blocked = false;
     await service.reconcileFrozen(reconcileAction(entry));
     expect(state.value.ledger[0]?.frozen).toBeUndefined();
+  });
+
+  it.each([
+    ["Local", "本地选择", 2],
+    ["Remote", "远端选择", 0],
+    ["Custom", "人工自定义", 2],
+  ] as const)("reconciles an items conflict from the exact %s remote result into Markdown and ledger", async (_choice, title, status) => {
+    const entry = ledger({
+      title: "本地选择",
+      state: "completed",
+      frozen: "conflict",
+      operationId: "op-items-resolution",
+      conflictId: "conflict-items-resolution",
+      updateExpectedTitle: "本地选择",
+      updateExpectedStatus: 2,
+      updateStageRevisionHash: "0".repeat(64),
+      mutationBaselineOwnedStatus: 0,
+      mutationBaselineOwnedCompletedTimeHash: stableHash(undefined),
+    });
+    const state = new MemoryState({
+      enabled: true,
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
+    });
+    const pipeline = new FakePipeline();
+    const remote = parentTaskWithItem(entry, title, [{
+      id: entry.remoteId!, title, status,
+      ...(status === 2 ? { completedTime: "2026-08-05T00:00:00.000Z" } : {}),
+    }]);
+    pipeline.tasks.set(entry.parentTaskId, remote);
+    const diagnostics = new MemoryDiagnostics({
+      operationId: entry.operationId!, blocked: false, resolvedTask: remote,
+      receiptOverride: { conflictId: entry.conflictId },
+    });
+    const harness = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
+    state.value.ledger[0]!.updateStageRevisionHash = stableHash(harness.markdown.content("Stage.md"));
+
+    await harness.service.reconcileFrozen(reconcileAction(state.value.ledger[0]!));
+
+    expect(state.value.ledger[0]).toMatchObject({
+      title,
+      state: status === 2 ? "completed" : "active",
+      frozen: undefined,
+      operationId: undefined,
+      conflictId: undefined,
+      updateExpectedTitle: undefined,
+    });
+    expect(parseManagedPlanActions(harness.markdown.content("Stage.md")).actions[0]).toMatchObject({
+      title,
+      state: status === 2 ? "completed" : "active",
+    });
+    expect(diagnostics.removed).toEqual([entry.operationId]);
+  });
+
+  it("cancels a resolved delete when the audited Remote result keeps the owned item", async () => {
+    const owned = { id: "task-1", title: "远端保留", status: 0 };
+    const ordinary = { id: "ordinary", title: "普通项", status: 0 };
+    const baseline = [ordinary, owned];
+    const entry = ledger({
+      title: "原行动", tombstone: true, frozen: "conflict",
+      operationId: "op-delete-remote", conflictId: "conflict-delete-remote",
+      mutationKind: "delete",
+      mutationBaselineItemIds: baseline.map((item) => item.id),
+      mutationBaselineItemsHash: stableHash(baseline),
+      mutationBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
+      mutationOwnedInvariantHash: stableHash({ id: owned.id }),
+      mutationBaselineOwnedStatus: 0,
+      mutationBaselineOwnedCompletedTimeHash: stableHash(undefined),
+    });
+    const state = new MemoryState({
+      enabled: true, target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
+    });
+    const pipeline = new FakePipeline();
+    const remote = parentTaskWithItem(entry, undefined, baseline);
+    pipeline.tasks.set(entry.parentTaskId, remote);
+    const diagnostics = new MemoryDiagnostics({
+      operationId: entry.operationId!, blocked: false, resolvedTask: remote,
+      receiptOverride: { conflictId: entry.conflictId },
+    });
+    const harness = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
+
+    await harness.service.reconcileFrozen(reconcileAction(entry));
+
+    expect(state.value.ledger[0]).toMatchObject({ title: "远端保留", tombstone: undefined, frozen: undefined });
+    expect(parseManagedPlanActions(harness.markdown.content("Stage.md")).actions[0]).toMatchObject({
+      uuid: entry.uuid, title: "远端保留", remoteId: entry.remoteId,
+    });
   });
 
   it("removes a tombstone only after its queue clears and exact reread proves absence", async () => {
@@ -820,6 +1247,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
       confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
     });
     const pipeline = new FakePipeline();
+    pipeline.tasks.set(entry.parentTaskId, parentTaskWithItem(entry, undefined, []));
     const diagnostics = new MemoryDiagnostics({ operationId: "op-delete", blocked: true });
     const service = projectionServiceWithDiagnostics(state, pipeline, diagnostics);
     await expect(service.reconcileFrozen(reconcileAction(entry)))
@@ -838,6 +1266,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
       confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
     });
     const pipeline = new FakePipeline();
+    pipeline.tasks.set(entry.parentTaskId, parentTaskWithItem(entry, undefined, []));
     const diagnostics = new MemoryDiagnostics({ operationId: "op-orphan", blocked: false });
     const first = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
     const restarted = new DidaProjectProjectionService(
@@ -966,6 +1395,22 @@ function ledger(overrides: Partial<ProjectionLedgerEntry> = {}): ProjectionLedge
   };
 }
 
+function parentTaskWithItem(
+  entry: ProjectionLedgerEntry,
+  itemTitle = entry.title,
+  items: DidaTask["items"] = [{ id: entry.remoteId!, title: itemTitle, status: entry.state === "completed" ? 2 : 0 }],
+): DidaTask {
+  return {
+    id: entry.parentTaskId,
+    projectId: entry.targetProjectId,
+    columnId: entry.targetColumnId,
+    title: "Alpha",
+    content: `helix-project-projection:${entry.projectId}`,
+    status: 0,
+    items,
+  };
+}
+
 function reconcileAction(entry: ProjectionLedgerEntry) {
   return {
     kind: "action" as const,
@@ -1058,6 +1503,8 @@ class MemoryDiagnostics implements ProjectionDiagnosticsPort {
   }
   async inspect(operationId: string) {
     expect(operationId).toBe(this.value.operationId);
+    const resolvedIsParent = this.value.resolvedTask?.content?.startsWith("helix-project-projection:") === true;
+    const conflictId = this.value.receiptOverride?.conflictId;
     return {
       blocked: this.blocked,
       resolvedTask: this.value.resolvedTask,
@@ -1065,11 +1512,24 @@ class MemoryDiagnostics implements ProjectionDiagnosticsPort {
         clientIdentity: "test-client",
         projectId: this.value.resolvedTask?.projectId ?? "list-1",
         operationId,
-        marker: this.value.resolvedTask?.content ?? projectionMarker("uuid-1"),
+        marker: resolvedIsParent
+          ? this.value.resolvedTask!.content!
+          : "helix-project-projection:project-1",
         outcome: "unknown" as const,
-        remoteTaskId: this.value.resolvedTask?.id,
+        remoteTaskId: resolvedIsParent ? this.value.resolvedTask?.id : "parent-1",
         ...this.value.receiptOverride,
       },
+      resolutionAudit: conflictId && this.value.resolvedTask ? {
+        id: `audit-${conflictId}`,
+        conflictId,
+        entityId: this.value.resolvedTask.id,
+        kind: "task" as const,
+        resolvedAt: "2026-08-05T00:00:00.000Z",
+        sourceDeviceId: "test-device",
+        choices: {},
+        remoteBeforeHash: stableHash(this.value.resolvedTask),
+        remoteAfterHash: stableHash(this.value.resolvedTask),
+      } : undefined,
     };
   }
   async removeResolved(operationId: string) { this.removed.push(operationId); }
@@ -1079,6 +1539,7 @@ class MemoryDiagnostics implements ProjectionDiagnosticsPort {
       throw new Error("cleanup failed");
     }
     this.removed.push(operationId);
+    this.value.receiptPresent = false;
   }
 }
 
@@ -1115,7 +1576,11 @@ class FakePipeline implements ProjectionTaskPipeline {
   created: DidaTask[] = [];
   deleted: string[] = [];
   updated: DidaTask[] = [];
+  updateOperationIds: Array<string | undefined> = [];
+  updateBases: Array<DidaTask | undefined> = [];
   nextResult?: ProjectionWriteReceipt;
+  nextResults: ProjectionWriteReceipt[] = [];
+  nextUpdateError?: Error;
   nextDeleteResult?: {
     operationId: string;
     outcome: "unknown" | "conflict" | "retryable" | "authorization" | "capability";
@@ -1125,11 +1590,14 @@ class FakePipeline implements ProjectionTaskPipeline {
   deleteAttempts = 0;
   beforeDelete?: () => void;
   onCreate?: (task: DidaTask) => Promise<void>;
+  afterCreate?: (task: DidaTask) => void;
   onReread?: (taskId: string, count: number) => void;
   rereads = new Map<string, number>();
   receipts = new Map<string, ProjectionWriteReceipt>();
   operationSequence = 0;
   reopened = 0;
+  stagedConflicts = 0;
+  stagedBases: DidaTask[] = [];
   async createTask(task: DidaTask, clientIdentity: string): Promise<ProjectionWriteReceipt> {
     this.created.push(structuredClone(task));
     await this.onCreate?.(task);
@@ -1147,16 +1615,56 @@ class FakePipeline implements ProjectionTaskPipeline {
       task: structuredClone(remote),
     };
     this.receipts.set(clientIdentity, receipt);
+    this.afterCreate?.(structuredClone(remote));
     return receipt;
   }
   async recoverCreate(clientIdentity: string) {
     return structuredClone(this.receipts.get(clientIdentity) ?? null);
   }
-  async updateTask(task: DidaTask): Promise<ProjectionWriteReceipt> {
+  async updateTask(task: DidaTask, _writeFields?: string[], operationId?: string, freshBase?: DidaTask): Promise<ProjectionWriteReceipt> {
+    this.updateOperationIds.push(operationId);
+    this.updateBases.push(structuredClone(freshBase));
+    if (this.nextUpdateError) {
+      const error = this.nextUpdateError;
+      this.nextUpdateError = undefined;
+      throw error;
+    }
+    const queuedResult = this.nextResults.shift() ?? this.nextResult;
+    if (queuedResult?.outcome === "preflight-changed") {
+      const result = queuedResult;
+      if (queuedResult === this.nextResult) this.nextResult = undefined;
+      this.tasks.set(result.task.id, structuredClone(result.task));
+      return operationId ? { ...result, operationId } : result;
+    }
+    const previous = this.tasks.get(task.id);
+    task = {
+      ...task,
+      items: task.items?.map((candidate) => {
+        const item = candidate.id ? { ...candidate } : { ...candidate, id: `item-${++this.operationSequence}` };
+        const before = previous?.items?.find((old) => old.id === item.id);
+        if (before?.status !== 2 && item.status === 2) item.completedTime = "2026-08-05T00:00:00.000Z";
+        if (before?.status === 2 && item.status !== 2) delete item.completedTime;
+        return item;
+      }),
+    };
     this.updated.push(structuredClone(task));
-    if (this.nextResult) { const result = this.nextResult; this.nextResult = undefined; return result; }
+    if (this.nextResult) {
+      const result = this.nextResult;
+      this.nextResult = undefined;
+      return operationId ? { ...result, operationId } : result;
+    }
     this.tasks.set(task.id, structuredClone(task));
-    return { operationId: `op-${++this.operationSequence}`, outcome: "verified", task: structuredClone(task) };
+    return { operationId: operationId ?? `op-${++this.operationSequence}`, outcome: "verified", task: structuredClone(task) };
+  }
+  async stageItemsConflict(_local: DidaTask, _remote: DidaTask, base: DidaTask, _operationId: string): Promise<ProjectionWriteReceipt> {
+    this.stagedConflicts += 1;
+    this.stagedBases.push(structuredClone(base));
+    return {
+      operationId: `op-items-conflict-${this.stagedConflicts}`,
+      outcome: "conflict",
+      message: "owned item 进入逐子字段冲突",
+      conflictId: `conflict-items-${this.stagedConflicts}`,
+    };
   }
   async completeTask(task: DidaTask): Promise<ProjectionWriteReceipt> { return this.updateTask(task); }
   async reopenTask(task: DidaTask): Promise<ProjectionWriteReceipt> {

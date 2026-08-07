@@ -65,7 +65,8 @@ export interface DidaWriteContractReport {
   taskCrudVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
-  parentTaskVerified: boolean;
+  itemsRoundTripVerified: boolean;
+  itemIdStableVerified: boolean;
   taskReopenVerified: boolean;
   manualCleanupRequired?: {
     taskId: string;
@@ -109,7 +110,8 @@ export class DidaWriteContractRunner {
   private taskCrudVerified = false;
   private reminderWriteVerified = false;
   private repeatWriteVerified = false;
-  private parentTaskVerified = false;
+  private itemsRoundTripVerified = false;
+  private itemIdStableVerified = false;
   private taskReopenVerified = false;
   private manualCleanupRequired: DidaWriteContractReport["manualCleanupRequired"];
   private currentStage = "准备合同测试";
@@ -141,7 +143,8 @@ export class DidaWriteContractRunner {
     this.taskCrudVerified = false;
     this.reminderWriteVerified = false;
     this.repeatWriteVerified = false;
-    this.parentTaskVerified = false;
+    this.itemsRoundTripVerified = false;
+    this.itemIdStableVerified = false;
     this.taskReopenVerified = false;
     this.manualCleanupRequired = undefined;
     this.currentStage = "准备合同测试";
@@ -406,95 +409,100 @@ export class DidaWriteContractRunner {
         ? "独立写入并清空每日重复规则"
         : "当前账号未通过重复规则写入合同，保持生产只读");
 
-      this.beginStage("创建并验证父子任务关系");
+      this.beginStage("验证父任务检查项往返与 ID 稳定性");
       const parentTask = await this.createCapabilityTask(
         projectA.id,
         marker,
-        "父子能力父任务",
+        "检查项能力父任务",
         optionalTasks,
       );
-      let createdChild: DidaTask | null = null;
       try {
-        try {
-          createdChild = normalizeTask(await this.api.createTask(taskCreatePayload({
-          id: "pending-contract-child",
-          projectId: projectA.id,
-          parentId: parentTask.id,
-          title: `${marker} 子任务`,
-          content: `${marker} parent-contract`,
-          priority: 0,
-          status: 0,
-          }, { parentTaskVerified: true })));
-        } catch (error) {
-          if (isUnknownRemoteOutcome(error)) {
-            this.untrackedCreateOutcome = true;
-            await this.cleanupCheckpoint();
-          }
-          throw error;
-        }
-        childTask = {
-        id: createdChild.id,
-        projectId: projectA.id,
-        candidateProjectIds: [projectA.id],
-        state: "open",
-      };
-        await this.cleanupCheckpoint();
-        this.assertTaskIdentity(createdChild, createdChild.id, projectA.id, marker);
-        const rereadChild = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
-        this.assertTaskIdentity(rereadChild, createdChild.id, projectA.id, marker);
-        if (rereadChild.parentId !== parentTask.id) throw new Error("子任务 parentId 未指向测试父任务");
-        await this.updateAndVerifyTaskProperties(createdChild.id, projectA.id, marker,
-        taskUpdatePayload({ ...rereadChild, parentId: null }, { parentTaskVerified: true }, ["parentId"]),
-        (reread) => {
-        if (reread.parentId !== null ||
-          !sameDidaTaskExcept(rereadChild, reread, ["parentId"])) {
-          throw new Error(
-            "子任务解除父级后 parentId 未清空或其他字段发生变化：" +
-            didaTaskDifferenceFields(rereadChild, reread, ["parentId"]).join("、"),
-          );
-        }
-      });
-        const detachedChild = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
-        await this.updateAndVerifyTaskProperties(createdChild.id, projectA.id, marker,
-        taskUpdatePayload({ ...detachedChild, parentId: parentTask.id }, { parentTaskVerified: true }, ["parentId"]),
-        (reread) => {
-        if (reread.parentId !== parentTask.id ||
-          !sameDidaTaskExcept(detachedChild, reread, ["parentId"])) {
-          throw new Error("子任务重新挂接后 parentId 不一致或其他字段发生变化");
-        }
-      });
-        this.parentTaskVerified = true;
-        steps.push("创建子任务并验证挂接→解除→重新挂接");
-        this.beginStage("删除并核对子任务");
-        await this.deleteVerifiedTask(childTask, marker);
-        childTask = null;
+        const emptyParent = normalizeTask(await this.api.getTask(projectA.id, parentTask.id));
+        const sentinelTitle = `${marker} sentinel`;
+        const sentinelDraft = { id: "", title: sentinelTitle, status: 0, sortOrder: 321 };
+        const withSentinel = await this.updateAndVerifyTaskProperties(
+          parentTask.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({
+            ...emptyParent,
+            items: [sentinelDraft],
+          }, { itemsRoundTripVerified: true }, ["items"]),
+          (reread) => {
+            if (!sameDidaTaskExcept(emptyParent, reread, ["items"])) throw new Error("新增 sentinel 时父任务其他字段发生变化");
+            if (reread.items?.length !== 1 || !reread.items[0]?.id || reread.items[0].title !== sentinelTitle) {
+              throw new Error("sentinel 检查项未获得唯一服务端 ID");
+            }
+            if (!deepEqual({ ...reread.items[0], id: "" }, sentinelDraft)) {
+              throw new Error("sentinel 检查项字段或排序值未完整往返");
+            }
+          },
+        );
+        const sentinel = withSentinel.items![0]!;
+        const ownedTitle = `${marker} owned item`;
+        const withOwned = await this.updateAndVerifyTaskProperties(
+          parentTask.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({
+            ...withSentinel,
+            items: [...withSentinel.items!, { id: "", title: ownedTitle, status: 0 }],
+          }, { itemsRoundTripVerified: true }, ["items"]),
+          (reread) => {
+            if (!sameDidaTaskExcept(withSentinel, reread, ["items"])) throw new Error("新增 owned item 时父任务其他字段发生变化");
+            const added = (reread.items ?? []).filter((item) => item.id !== sentinel.id);
+            if (added.length !== 1 || !added[0]?.id || added[0].title !== ownedTitle || added[0].status !== 0) {
+              throw new Error("owned item 写后无法唯一领养服务端 ID");
+            }
+            if (!deepEqual(reread.items?.[0], sentinel) || reread.items?.[1]?.id !== added[0].id) {
+              throw new Error("新增 owned item 时 sentinel 未完整保留");
+            }
+          },
+        );
+        const owned = withOwned.items!.find((item) => item.id !== sentinel.id)!;
+        const renamed = { ...owned, title: `${ownedTitle} renamed`, status: 2 };
+        const afterRename = await this.updateAndVerifyTaskProperties(
+          parentTask.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...withOwned, items: [sentinel, renamed] }, { itemsRoundTripVerified: true }, ["items"]),
+          (reread) => assertChecklistContractState(withOwned, reread, sentinel, renamed),
+        );
+        const reopened = { ...renamed, status: 0 };
+        const afterReopen = await this.updateAndVerifyTaskProperties(
+          parentTask.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...afterRename, items: [sentinel, reopened] }, { itemsRoundTripVerified: true }, ["items"]),
+          (reread) => assertChecklistContractState(afterRename, reread, sentinel, reopened),
+        );
+        await this.updateAndVerifyTaskProperties(
+          parentTask.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...afterReopen, items: [sentinel] }, { itemsRoundTripVerified: true }, ["items"]),
+          (reread) => {
+            if (!sameDidaTaskExcept(afterReopen, reread, ["items"]) || reread.items?.length !== 1 ||
+              !deepEqual(reread.items[0], sentinel)) throw new Error("删除 owned item 时 sentinel 或父任务其他字段发生变化");
+          },
+        );
+        this.itemsRoundTripVerified = true;
+        this.itemIdStableVerified = true;
+        steps.push("验证 sentinel 保留、单项 ID 领养、ID 稳定、改名、完成/重开与 owned 删除");
         await this.cleanupCheckpoint();
         await this.deleteVerifiedTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
         await this.cleanupCheckpoint();
-        steps.push("先删除测试子任务并验证不存在");
       } catch (error) {
         if (this.untrackedCreateOutcome) throw error;
         if (isUnprovenRemoteOutcome(error)) throw error;
-        if (childTask) {
-          const current = normalizeTask(await this.api.getTask(projectA.id, childTask.id));
-          this.assertTaskIdentity(current, childTask.id, projectA.id, marker);
-          if (createdChild && !sameDidaTaskExcept(createdChild, current, ["parentId"])) {
-            throw new Error(
-              `parentId 合同失败且子任务出现非目标变更：${messageOf(error)}；` +
-              `当前差异字段 ${differenceFieldsLabel(didaTaskDifferenceFields(createdChild, current, ["parentId"]))}`,
-            );
-          }
-          await this.cleanupTask(childTask, marker);
-          childTask = null;
-          await this.cleanupCheckpoint();
-        }
         await this.cleanupTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
         await this.cleanupCheckpoint();
-        this.parentTaskVerified = false;
-        capabilityFailures.push(capabilityFailureSummary("parentTask"));
-        steps.push("当前账号未通过父子任务合同，保持生产只读");
+        this.itemsRoundTripVerified = false;
+        this.itemIdStableVerified = false;
+        capabilityFailures.push(capabilityFailureSummary("items"));
+        steps.push("当前账号未通过检查项往返与 ID 稳定合同，保持项目投影只读");
       }
 
       this.beginStage("以最小载荷验证测试任务看板归栏");
@@ -569,7 +577,10 @@ export class DidaWriteContractRunner {
       await this.api.completeTask(projectB.id, created.id);
       const rereadCompleted = normalizeTask(await this.api.getTask(projectB.id, created.id));
       this.assertTaskIdentity(rereadCompleted, created.id, projectB.id, marker);
-      if (rereadCompleted.status !== 2) throw new Error("任务完成后 status 未变为 2");
+      if (rereadCompleted.status !== 2 ||
+        !sameDidaTaskExcept(beforeMove, rereadCompleted, ["projectId", "status", "completedTime"])) {
+        throw new Error("任务完成后状态未完成或除 completedTime 外其他字段发生变化");
+      }
       task.state = "completed";
       await this.cleanupCheckpoint();
       steps.push("完成任务并复读状态");
@@ -714,7 +725,8 @@ export class DidaWriteContractRunner {
       taskCrudVerified: this.taskCrudVerified,
       reminderWriteVerified: this.reminderWriteVerified,
       repeatWriteVerified: this.repeatWriteVerified,
-      parentTaskVerified: this.parentTaskVerified,
+      itemsRoundTripVerified: this.itemsRoundTripVerified,
+      itemIdStableVerified: this.itemIdStableVerified,
       taskReopenVerified: this.taskReopenVerified,
       manualCleanupRequired: this.manualCleanupRequired,
       capabilityFailures,
@@ -728,7 +740,7 @@ export class DidaWriteContractRunner {
     marker: string,
     payload: DidaTaskUpdateWirePayload,
     verify: (reread: DidaTask) => void,
-  ): Promise<boolean> {
+  ): Promise<DidaTask> {
     let unknownOutcome: unknown;
     try {
       await this.api.updateTask(taskId, payload);
@@ -745,7 +757,7 @@ export class DidaWriteContractRunner {
       if (!unknownOutcome) throw error;
       throw new UnprovenRemoteOutcomeError("属性写入", unknownOutcome, error);
     }
-    return unknownOutcome !== undefined;
+    return reread;
   }
 
   private async probeTaskField<K extends "reminders" | "repeatFlag">(
@@ -1542,12 +1554,12 @@ function isUnprovenRemoteOutcome(error: unknown): boolean {
 }
 
 function capabilityFailureSummary(
-  capability: "reminders" | "repeatFlag" | "parentTask" | "boardPlacement" | "taskReopen",
+  capability: "reminders" | "repeatFlag" | "items" | "boardPlacement" | "taskReopen",
 ): string {
   const name = {
     reminders: "提醒",
     repeatFlag: "重复规则",
-    parentTask: "父子任务",
+    items: "检查项",
     boardPlacement: "看板归栏",
     taskReopen: "任务重开",
   }[capability];
@@ -1561,6 +1573,46 @@ function messageOf(error: unknown): string {
 /** 诊断只披露字段名，避免把临时合同任务内容写入日志或界面。 */
 function differenceFieldsLabel(fields: string[]): string {
   return fields.length > 0 ? fields.join("、") : "无可枚举字段";
+}
+
+function assertChecklistContractState(
+  before: DidaTask,
+  reread: DidaTask,
+  sentinel: NonNullable<DidaTask["items"]>[number],
+  expectedOwned: NonNullable<DidaTask["items"]>[number],
+): void {
+  if (!sameDidaTaskExcept(before, reread, ["items"])) throw new Error("检查项写入改变了父任务其他字段");
+  const actualOwned = reread.items?.[1];
+  const beforeOwned = before.items?.find((item) => item.id === expectedOwned.id);
+  if (reread.items?.length !== 2 || !deepEqual(reread.items[0], sentinel) ||
+    !actualOwned || !beforeOwned || !sameChecklistOwnedExceptDerivedTime(beforeOwned, expectedOwned, actualOwned)) {
+    throw new Error("检查项 ID、字段、未知属性或顺序未稳定往返");
+  }
+}
+
+function sameChecklistOwnedExceptDerivedTime(
+  before: NonNullable<DidaTask["items"]>[number],
+  expected: NonNullable<DidaTask["items"]>[number],
+  actual: NonNullable<DidaTask["items"]>[number],
+): boolean {
+  const expectedCopy = { ...expected };
+  const actualCopy = { ...actual };
+  const statusChanged = before.status !== expected.status;
+  if (!statusChanged) return deepEqual(actualCopy, expectedCopy);
+  if (before.status === 0 && expected.status === 2) {
+    if (actual.completedTime === undefined ||
+      !Number.isFinite(new Date(actual.completedTime).getTime())) return false;
+    delete expectedCopy.completedTime;
+    delete actualCopy.completedTime;
+    return deepEqual(actualCopy, expectedCopy);
+  }
+  if (before.status === 2 && expected.status !== 2) {
+    if (actual.completedTime !== undefined && actual.completedTime !== null) return false;
+    delete expectedCopy.completedTime;
+    delete actualCopy.completedTime;
+    return deepEqual(actualCopy, expectedCopy);
+  }
+  return false;
 }
 
 function scheduleMismatch(task: DidaTask, expectedStart: string, expectedDue: string): Error {

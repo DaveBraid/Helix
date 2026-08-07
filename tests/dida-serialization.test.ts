@@ -19,7 +19,7 @@ describe("Dida write serialization", () => {
       .toThrow("Dida 任务开始日期格式无效");
   });
 
-  it("serializes checklist dates without mutating the input", () => {
+  it("preserves checklist wire values without mutating the input", () => {
     const items = [{
       id: "item-1",
       title: "检查项",
@@ -30,8 +30,8 @@ describe("Dida write serialization", () => {
     const serialized = serializeDidaChecklistItems(items);
 
     expect(serialized?.[0]).toMatchObject({
-      startDate: "2026-08-01T14:37:34+0000",
-      completedTime: "2026-08-01T15:37:34+0000",
+      startDate: "2026-08-01T14:37:34.230Z",
+      completedTime: "2026-08-01T15:37:34.230Z",
     });
     expect(items[0]?.startDate).toBe("2026-08-01T14:37:34.230Z");
   });

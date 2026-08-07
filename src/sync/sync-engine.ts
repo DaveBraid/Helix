@@ -7,6 +7,7 @@ import {
   buildConflictFields,
   setFieldResolution,
   unresolvedFields,
+  validateChecklistTitleResolutions,
 } from "./three-way-merge";
 import type {
   ConflictRepository,
@@ -35,6 +36,13 @@ export interface SyncEngineDependencies<T extends RemoteEntity> {
   now?: () => Date;
   deferConflictFinalization?: boolean;
   validateWrite?: (value: T, remoteBeforeWrite: T | null) => void;
+  /** 仅供能证明尚未发送的专用写入在预检竞争时重建基线。 */
+  allowUnsentRebaseline?: (
+    operation: SyncQueueOperation<T>,
+    base: EntitySnapshot<T>,
+    desired: EntitySnapshot<T>,
+    remote: EntitySnapshot<T>,
+  ) => boolean;
 }
 
 export class SyncEngine<T extends RemoteEntity> {
@@ -47,6 +55,7 @@ export class SyncEngine<T extends RemoteEntity> {
   async process(operation: SyncQueueOperation<T>): Promise<
     | { outcome: "pushed"; snapshot: EntitySnapshot<T> }
     | { outcome: "pulled"; snapshot: EntitySnapshot<T> }
+    | { outcome: "preflight-changed"; snapshot: EntitySnapshot<T> }
     | { outcome: "conflict"; conflict: SyncConflict<T> }
     | { outcome: "deleted" }
     | { outcome: "noop" }
@@ -114,6 +123,11 @@ export class SyncEngine<T extends RemoteEntity> {
     const localChanged = snapshotChanged(local, base);
     const remoteChanged = snapshotChanged(remoteSnapshot, base);
     if (localChanged && remoteChanged && local.stamp.hash !== remoteSnapshot.stamp.hash) {
+      if (this.dependencies.allowUnsentRebaseline?.(operation, base, local, remoteSnapshot)) {
+        await this.dependencies.snapshots.saveBase(remoteSnapshot);
+        await this.dependencies.snapshots.saveLocal(remoteSnapshot);
+        return { outcome: "preflight-changed", snapshot: remoteSnapshot };
+      }
       const conflict = await this.openConflict(
         operation,
         base,
@@ -126,6 +140,9 @@ export class SyncEngine<T extends RemoteEntity> {
 
     if (localChanged) {
       const written = await this.safeWrite(operation, base, remoteSnapshot, local);
+      if ("preflightChanged" in written) {
+        return { outcome: "preflight-changed", snapshot: written.preflightChanged };
+      }
       if ("conflict" in written) return { outcome: "conflict", conflict: written.conflict };
       return { outcome: "pushed", snapshot: written.snapshot };
     }
@@ -168,6 +185,10 @@ export class SyncEngine<T extends RemoteEntity> {
       | null;
     if (!conflict) throw new Error("冲突不存在或已经解决");
     if (unresolvedFields(conflict).length > 0) throw new Error("仍有字段尚未选择");
+    if (conflict.scope === "helix-projection-owned-items") {
+      if (!conflict.ownedItemIds?.length) throw new Error("投影 owned 冲突缺少检查项身份范围");
+      validateChecklistTitleResolutions(conflict, conflict.ownedItemIds);
+    }
 
     const freshRemote = await this.dependencies.adapter.get(conflict.entityId, context);
     const freshRemoteSnapshot = freshRemote
@@ -298,6 +319,7 @@ export class SyncEngine<T extends RemoteEntity> {
   ): Promise<
     | { snapshot: EntitySnapshot<T> }
     | { conflict: SyncConflict<T> }
+    | { preflightChanged: EntitySnapshot<T> }
   > {
     const preflight = await this.dependencies.adapter.get(operation.entityId, {
       projectId: operation.projectId,
@@ -315,6 +337,11 @@ export class SyncEngine<T extends RemoteEntity> {
     }
     const preflightSnapshot = this.snapshot(preflight, operation.entityId);
     if (preflightSnapshot.stamp.hash !== expectedRemote.stamp.hash) {
+      if (this.dependencies.allowUnsentRebaseline?.(operation, base, desired, preflightSnapshot)) {
+        await this.dependencies.snapshots.saveBase(preflightSnapshot);
+        await this.dependencies.snapshots.saveLocal(preflightSnapshot);
+        return { preflightChanged: preflightSnapshot };
+      }
       return {
         conflict: await this.openConflict(
           operation,
@@ -442,6 +469,8 @@ export class SyncEngine<T extends RemoteEntity> {
       fields: buildConflictFields(base.value, local.value, remote.value),
       remoteRecheckCount: 0,
       sourceDeviceId: this.dependencies.deviceId,
+      scope: operation.conflictScope,
+      ownedItemIds: operation.conflictOwnedItemIds,
     };
     await this.dependencies.conflicts.save(conflict);
     return conflict;
@@ -562,9 +591,29 @@ function equivalentForVerification(
     Object.fromEntries(
       Object.entries(value as Record<string, unknown>).filter(([key]) => !ignored.has(key)),
     );
+  const expectedRecord = withoutServerMetadata(expected);
+  const actualRecord = withoutServerMetadata(actual);
+  if (Array.isArray(expectedRecord.items) && Array.isArray(actualRecord.items) &&
+    expectedRecord.items.length === actualRecord.items.length) {
+    const expectedItems = expectedRecord.items as unknown[];
+    actualRecord.items = (actualRecord.items as unknown[]).map((candidate, index) => {
+      const expectedItem = expectedItems[index];
+      if (!candidate || !expectedItem || typeof candidate !== "object" || typeof expectedItem !== "object") {
+        return candidate;
+      }
+      const actualItem = { ...(candidate as Record<string, unknown>) };
+      const desiredItem = expectedItem as Record<string, unknown>;
+      if (desiredItem.status === 2 && desiredItem.completedTime === undefined &&
+        actualItem.completedTime !== undefined &&
+        Number.isFinite(new Date(actualItem.completedTime as string | number).getTime())) {
+        delete actualItem.completedTime;
+      }
+      return actualItem;
+    });
+  }
   return deepEqual(
-    withoutServerMetadata(expected),
-    withoutServerMetadata(actual),
+    expectedRecord,
+    actualRecord,
   );
 }
 

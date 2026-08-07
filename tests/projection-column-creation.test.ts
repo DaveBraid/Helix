@@ -170,7 +170,7 @@ async function createHarness(
     taskCrudVerified: true,
     reminderWriteVerified: true,
     repeatWriteVerified: true,
-    parentTaskVerified: true,
+    itemsRoundTripVerified: true,
     taskReopenVerified: true,
     verifiedAt: "2026-08-05T00:00:00.000Z",
   };

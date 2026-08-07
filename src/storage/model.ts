@@ -79,7 +79,7 @@ export interface HelixPersistedData {
     projectId: string;
     operationId: string;
     marker: string;
-    outcome: "verified" | "verified-absent" | "unknown" | "conflict" | "retryable" | "authorization" | "capability";
+    outcome: "verified" | "verified-absent" | "preflight-changed" | "unknown" | "conflict" | "retryable" | "authorization" | "capability";
     remoteTaskId?: string;
     message?: string;
     conflictId?: string;
@@ -127,7 +127,8 @@ export interface HelixPersistedData {
     taskCrudVerified?: boolean;
     reminderWriteVerified?: boolean;
     repeatWriteVerified?: boolean;
-    parentTaskVerified?: boolean;
+    itemsRoundTripVerified?: boolean;
+    itemIdStableVerified?: boolean;
     taskReopenVerified?: boolean;
     verifiedAt: string;
   };
@@ -374,7 +375,8 @@ function validateDidaContractCapabilities(
       "taskCrudVerified",
       "reminderWriteVerified",
       "repeatWriteVerified",
-      "parentTaskVerified",
+      "itemsRoundTripVerified",
+      "itemIdStableVerified",
       "taskReopenVerified",
     ].some((key) => record[key] !== undefined && typeof record[key] !== "boolean")
   ) {
@@ -390,7 +392,8 @@ function validateDidaContractCapabilities(
     taskCrudVerified: record.taskCrudVerified === true,
     reminderWriteVerified: record.reminderWriteVerified === true,
     repeatWriteVerified: record.repeatWriteVerified === true,
-    parentTaskVerified: record.parentTaskVerified === true,
+    itemsRoundTripVerified: record.itemsRoundTripVerified === true,
+    itemIdStableVerified: record.itemIdStableVerified === true,
     taskReopenVerified: record.taskReopenVerified === true,
     verifiedAt: record.verifiedAt,
   };
@@ -533,7 +536,7 @@ function isProjectionCreateReceipt(
   if (Object.keys(record).some((key) => !allowed.has(key))) return false;
   const id = (candidate: unknown) => typeof candidate === "string" && candidate.length > 0 &&
     candidate === candidate.trim() && candidate.length <= 512 && !/[\r\n]/u.test(candidate);
-  const outcomes = ["verified", "verified-absent", "unknown", "conflict", "retryable", "authorization", "capability"];
+  const outcomes = ["verified", "verified-absent", "preflight-changed", "unknown", "conflict", "retryable", "authorization", "capability"];
   return id(record.clientIdentity) && id(record.projectId) && id(record.operationId) && id(record.marker) &&
     outcomes.includes(String(record.outcome)) &&
     (record.message === undefined || typeof record.message === "string") &&
@@ -582,6 +585,11 @@ function validateDidaProjectionState(
     if (!onlyKeys(row, [
       "uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId",
       "remoteId", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
+      "createBaselineItemIds", "createBaselineItemsHash", "createBaselineItemHashes",
+      "updateExpectedTitle", "updateExpectedStatus", "updateStageRevisionHash",
+      "mutationKind", "mutationBaselineItemIds", "mutationBaselineItemsHash",
+      "mutationBaselineItemHashes", "mutationOwnedInvariantHash",
+      "mutationBaselineOwnedStatus", "mutationBaselineOwnedCompletedTimeHash",
     ])) return false;
     return ["uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId", "title", "sourceHash"]
       .every((key) => stableId(row[key])) &&
@@ -590,6 +598,40 @@ function validateDidaProjectionState(
       (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
       (row.operationId === undefined || stableId(row.operationId)) &&
       (row.conflictId === undefined || stableId(row.conflictId)) &&
+      (row.createBaselineItemIds === undefined || (Array.isArray(row.createBaselineItemIds) &&
+        row.createBaselineItemIds.every(stableId) &&
+        new Set(row.createBaselineItemIds).size === row.createBaselineItemIds.length)) &&
+      (row.createBaselineItemsHash === undefined || /^[a-f0-9]{64}$/u.test(String(row.createBaselineItemsHash))) &&
+      (row.createBaselineItemHashes === undefined || (!!row.createBaselineItemHashes &&
+        typeof row.createBaselineItemHashes === "object" && !Array.isArray(row.createBaselineItemHashes) &&
+        Object.entries(row.createBaselineItemHashes as Record<string, unknown>).every(([key, value]) =>
+          stableId(key) && /^[a-f0-9]{64}$/u.test(String(value))))) &&
+      ((row.createBaselineItemIds === undefined && row.createBaselineItemsHash === undefined &&
+        row.createBaselineItemHashes === undefined) ||
+        (Array.isArray(row.createBaselineItemIds) && row.createBaselineItemsHash !== undefined &&
+          row.createBaselineItemHashes !== undefined &&
+          Object.keys(row.createBaselineItemHashes as Record<string, unknown>).length === row.createBaselineItemIds.length &&
+          row.createBaselineItemIds.every((id) => Object.hasOwn(row.createBaselineItemHashes as object, id)))) &&
+      ((row.updateExpectedTitle === undefined && row.updateExpectedStatus === undefined &&
+        row.updateStageRevisionHash === undefined) ||
+        (typeof row.updateExpectedTitle === "string" && row.updateExpectedTitle.length > 0 &&
+          typeof row.updateExpectedStatus === "number" && Number.isFinite(row.updateExpectedStatus) &&
+          /^[a-f0-9]{64}$/u.test(String(row.updateStageRevisionHash)))) &&
+      ((row.mutationKind === undefined && row.mutationBaselineItemIds === undefined &&
+        row.mutationBaselineItemsHash === undefined && row.mutationBaselineItemHashes === undefined &&
+        row.mutationOwnedInvariantHash === undefined && row.mutationBaselineOwnedStatus === undefined &&
+        row.mutationBaselineOwnedCompletedTimeHash === undefined) ||
+        ((row.mutationKind === "update" || row.mutationKind === "delete") &&
+          Array.isArray(row.mutationBaselineItemIds) && row.mutationBaselineItemIds.every(stableId) &&
+          new Set(row.mutationBaselineItemIds).size === row.mutationBaselineItemIds.length &&
+          /^[a-f0-9]{64}$/u.test(String(row.mutationBaselineItemsHash)) &&
+          /^[a-f0-9]{64}$/u.test(String(row.mutationOwnedInvariantHash)) &&
+          typeof row.mutationBaselineOwnedStatus === "number" &&
+          /^[a-f0-9]{64}$/u.test(String(row.mutationBaselineOwnedCompletedTimeHash)) &&
+          !!row.mutationBaselineItemHashes && typeof row.mutationBaselineItemHashes === "object" &&
+          !Array.isArray(row.mutationBaselineItemHashes) &&
+          row.mutationBaselineItemIds.every((id) =>
+            /^[a-f0-9]{64}$/u.test(String((row.mutationBaselineItemHashes as Record<string, unknown>)[id]))))) &&
       (row.tombstone === undefined || typeof row.tombstone === "boolean");
   });
   const validCheckpoints = Array.isArray(checkpoints) && checkpoints.every((item) => {
@@ -620,7 +662,7 @@ function validateDidaProjectionState(
       if (!["operationId", "targetProjectId", "marker", "remoteTaskId", "projectId"].every((key) => stableId(row[key])) ||
         (row.conflictId !== undefined && !stableId(row.conflictId))) return false;
       if (row.kind === "parent") return row.marker === `helix-project-projection:${row.projectId}`;
-      return stableId(row.stageId) && stableId(row.uuid) && row.marker === `helix-projection:${row.uuid}`;
+      return stableId(row.stageId) && stableId(row.uuid) && row.marker === `helix-project-projection:${row.projectId}`;
     }));
   const validColumnCreation = columnCreation === undefined || (() => {
     if (!columnCreation || typeof columnCreation !== "object" || Array.isArray(columnCreation)) return false;
@@ -846,7 +888,9 @@ function validArray<T>(
     return [];
   }
   const valid = value.filter(validator);
-  if (valid.length !== value.length) issues.push(`${label}含损坏条目，已忽略 ${value.length - valid.length} 项`);
+  if (valid.length !== value.length) {
+    issues.push(`${label}含损坏条目，已忽略 ${value.length - valid.length} 项并进入只读恢复模式`);
+  }
   return valid;
 }
 
@@ -863,7 +907,7 @@ function validRecord<T>(
   }
   const entries = Object.entries(value).filter(([key, entry]) => validator(entry, key));
   if (entries.length !== Object.keys(value).length) {
-    issues.push(`${label}含损坏条目，已忽略 ${Object.keys(value).length - entries.length} 项`);
+    issues.push(`${label}含损坏条目，已忽略 ${Object.keys(value).length - entries.length} 项并进入只读恢复模式`);
   }
   return Object.fromEntries(entries);
 }
@@ -943,6 +987,10 @@ function isQueueOperation(value: unknown): value is SyncQueueOperation {
     !Number.isFinite(Date.parse(value.updatedAt)) ||
     !optionalString(value.projectId) || !optionalString(value.conflictId) ||
     !optionalString(value.lastError) || !optionalString(value.idempotencyFingerprint) ||
+    (value.conflictScope !== undefined && value.conflictScope !== "helix-projection-owned-items") ||
+    (value.conflictOwnedItemIds !== undefined && !isUniqueStableIdArray(value.conflictOwnedItemIds)) ||
+    ((value.conflictScope === "helix-projection-owned-items") !==
+      (value.conflictOwnedItemIds !== undefined && isUniqueStableIdArray(value.conflictOwnedItemIds))) ||
     !optionalDate(value.nextAttemptAt) ||
     (value.writeFields !== undefined && (
       !Array.isArray(value.writeFields) ||
@@ -1120,6 +1168,10 @@ function isConflict(value: unknown): value is SyncConflict {
     (value.kind === "task" || value.kind === "project") &&
     typeof value.entityId === "string" &&
     typeof value.title === "string" && typeof value.sourceDeviceId === "string" &&
+    (value.scope === undefined || value.scope === "helix-projection-owned-items") &&
+    (value.ownedItemIds === undefined || isUniqueStableIdArray(value.ownedItemIds)) &&
+    ((value.scope === "helix-projection-owned-items") ===
+      (value.ownedItemIds !== undefined && isUniqueStableIdArray(value.ownedItemIds))) &&
     typeof value.createdAt === "string" && Number.isFinite(Date.parse(value.createdAt)) &&
     typeof value.updatedAt === "string" && Number.isFinite(Date.parse(value.updatedAt)) &&
     ["open", "staged", "applying", "resolved", "superseded"].includes(String(value.status)) &&
@@ -1460,6 +1512,13 @@ function isConflictField(value: unknown): boolean {
 
 function optionalString(value: unknown): boolean {
   return value === undefined || typeof value === "string";
+}
+
+function isUniqueStableIdArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 &&
+    value.every((item) => typeof item === "string" && item === item.trim() && item.length > 0 &&
+      item.length <= 512 && !/[\r\n]/u.test(item)) &&
+    new Set(value).size === value.length;
 }
 
 function optionalDate(value: unknown): boolean {

@@ -30,7 +30,7 @@ function grantTaskCrud(
     taskCrudVerified: true,
     reminderWriteVerified: true,
     repeatWriteVerified: true,
-    parentTaskVerified: true,
+    itemsRoundTripVerified: true, itemIdStableVerified: true,
     verifiedAt: "2026-08-03T00:00:00.000Z",
   };
 }
@@ -40,7 +40,7 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
     connected: true,
     authorizationConfigured: true,
     taskCrudVerified: true,
-    parentTaskVerified: true,
+    itemsRoundTripVerified: true, itemIdStableVerified: true,
     boardPlacementVerified: true,
     taskReopenVerified: false,
   };
@@ -377,7 +377,7 @@ describe("HelixService runtime recovery", () => {
       taskCrudVerified: true,
       reminderWriteVerified: true,
       repeatWriteVerified: true,
-      parentTaskVerified: true,
+      itemsRoundTripVerified: true, itemIdStableVerified: true,
       verifiedAt: "2026-08-04T00:00:00.000Z",
     };
     const service = new HelixService(
@@ -397,9 +397,9 @@ describe("HelixService runtime recovery", () => {
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
     });
-    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 6.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 7.*本次插件运行尚未执行合同测试/);
     expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
   });
 
@@ -413,7 +413,7 @@ describe("HelixService runtime recovery", () => {
       taskCrudVerified: true,
       reminderWriteVerified: true,
       repeatWriteVerified: true,
-      parentTaskVerified: true,
+      itemsRoundTripVerified: true, itemIdStableVerified: true,
       verifiedAt: "2026-08-03T00:00:00.000Z",
     };
     const service = new HelixService(
@@ -432,7 +432,7 @@ describe("HelixService runtime recovery", () => {
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
     });
   });
 
@@ -481,7 +481,7 @@ describe("HelixService runtime recovery", () => {
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
       verifiedAt: "2026-08-04T00:00:00.000Z",
     };
     const taskBase = createSnapshot("task", "task-conflict", {
@@ -1265,7 +1265,7 @@ describe("HelixService runtime recovery", () => {
         writable: true,
         queueEmpty: true,
         authorizationCurrent: true,
-        parentTaskVerified: true,
+        itemsRoundTripVerified: true, itemIdStableVerified: true,
         boardPlacementVerified: true,
         boardFresh: true,
         taskReopenVerified: true,
@@ -2527,6 +2527,39 @@ describe("HelixService runtime recovery", () => {
       "helix-action:project-a:stage-a:uuid-c",
       "target-list",
     )).resolves.toMatchObject({ outcome: "conflict" });
+  });
+
+  it("stages item conflicts from the projection ledger Base even when ordinary sync Base already absorbed remote edits", async () => {
+    const data = createDefaultData("device-projection-owned-base");
+    grantTaskCrud(data);
+    const remote: DidaTask = {
+      id: "parent-owned-base", projectId: "target-list", title: "Parent", status: 0,
+      content: "helix-project-projection:project-a",
+      items: [{ id: "owned", title: "远端改名", status: 0 }],
+    };
+    data.baseSnapshots[`task:${remote.id}`] = createSnapshot("task", remote.id, remote);
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    const projectionBase: DidaTask = {
+      ...remote,
+      items: [{ id: "owned", title: "投影账本旧标题", status: 0 }],
+    };
+    const local: DidaTask = {
+      ...remote,
+      items: [{ id: "owned", title: "本地改名", status: 0 }],
+    };
+
+    const receipt = await service.stageProjectionItemsConflict(local, remote, projectionBase, "op-owned-base");
+
+    expect(receipt.outcome).toBe("conflict");
+    expect(persisted.conflicts[0]?.base.value).toEqual(projectionBase);
+    expect(persisted.conflicts[0]?.fields).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "items[owned].title", sameResult: false }),
+    ]));
   });
 
   it("blocks projection reopen before queue or network when reopen was not verified", async () => {

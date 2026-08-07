@@ -88,6 +88,20 @@ export class OfflineQueue {
     return operation.id;
   }
 
+  /** 投影 prepared 操作必须保持精确 ID，禁止与同实体的普通队列操作合并。 */
+  enqueueExact<T>(operation: SyncQueueOperation<T>): string {
+    const sameId = this.operations.find((candidate) => candidate.id === operation.id);
+    if (sameId) {
+      if (!deepEqual(sameId, operation)) throw new Error("同一稳定 operation ID 已绑定其他队列内容");
+      return sameId.id;
+    }
+    const competing = this.operations.find((candidate) =>
+      candidate.kind === operation.kind && candidate.entityId === operation.entityId);
+    if (competing) throw new Error("同一远端对象已有未完成操作，本次预备写入保持阻塞");
+    this.operations.push(cloneValue(operation) as SyncQueueOperation);
+    return operation.id;
+  }
+
   nextRunnable(): SyncQueueOperation | null {
     const next = this.operations.find(
       (operation) =>

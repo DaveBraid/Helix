@@ -13,16 +13,12 @@ export function serializeDidaDate(
 export function serializeDidaChecklistItems(
   items: DidaChecklistItem[] | undefined,
 ): DidaChecklistItem[] | undefined {
+  // 与普通任务日期不同，items 采用完整数组替换合同，必须保留远端原始字面量与未知字段。
   return items?.map((item) => {
-    const { sortOrderUnsafe: _sortOrderUnsafe, ...value } = item;
-    return {
-      ...value,
-      sortOrder: item.sortOrderUnsafe ? undefined : item.sortOrder,
-      startDate: serializeDidaDate(item.startDate, "检查项开始日期") ?? undefined,
-      completedTime:
-        typeof item.completedTime === "string"
-          ? serializeDidaDate(item.completedTime, "检查项完成日期") ?? undefined
-          : item.completedTime,
-    };
+    if (item.sortOrderUnsafe) {
+      throw new Error("检查项排序原值已丢失，禁止执行无法无损的整组回写");
+    }
+    const { sortOrderUnsafe: _legacyUnsafeMarker, ...raw } = item;
+    return { ...raw };
   });
 }

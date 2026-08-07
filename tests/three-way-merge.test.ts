@@ -101,17 +101,15 @@ describe("three-way conflict fields", () => {
     });
   });
 
-  it("requires explicit choices for every changed field in a contested entity", () => {
+  it("requires explicit choices for ordinary changed fields in a contested entity", () => {
     let conflict = conflictOf(
       { title: "base", dueDate: "2026-07-30" },
       { title: "local", dueDate: "2026-07-30" },
       { title: "base", dueDate: "2026-07-31" },
     );
     expect(unresolvedFields(conflict)).toHaveLength(2);
-    expect(() => applyResolutions(conflict)).toThrow(/尚未|unresolved/i);
     conflict = setFieldResolution(conflict, "title", "local");
     conflict = setFieldResolution(conflict, "dueDate", "remote");
-    expect(conflict.status).toBe("staged");
     expect(applyResolutions(conflict)).toEqual({
       title: "local",
       dueDate: "2026-07-31",
@@ -134,9 +132,7 @@ describe("three-way conflict fields", () => {
       { items: [{ id: "a", title: "local-a" }, { id: "b", title: "base-b" }] },
       { items: [{ id: "a", title: "base-a" }, { id: "b", title: "remote-b" }] },
     );
-    expect(conflict.fields.map((field) => field.path)).toEqual(["items[a]", "items[b]"]);
-    conflict = setFieldResolution(conflict, "items[a]", "local");
-    conflict = setFieldResolution(conflict, "items[b]", "remote");
+    expect(conflict.fields.map((field) => field.path)).toEqual(["items[a].title", "items[b].title"]);
     expect(applyResolutions(conflict)).toEqual({
       items: [{ id: "a", title: "local-a" }, { id: "b", title: "remote-b" }],
     });
@@ -148,5 +144,41 @@ describe("three-way conflict fields", () => {
     );
     expect(deletion).toHaveLength(1);
     expect(deletion[0]).toMatchObject({ path: "$", group: "deletion" });
+  });
+
+  it("exposes only competing owned title/status while preserving remote item order and unknown fields", () => {
+    let conflict = conflictOf(
+      { items: [{ id: "owned", title: "base", status: 0, vendor: "base" }, { id: "ordinary", title: "O", status: 0 }] },
+      { items: [{ id: "owned", title: "local", status: 2, vendor: "base" }, { id: "ordinary", title: "O", status: 0 }] },
+      { items: [{ id: "ordinary", title: "O", status: 0, remoteOnly: 1 }, { id: "owned", title: "remote", status: 0, vendor: "remote" }] },
+    );
+    expect(conflict.fields.map((field) => field.path)).toEqual([
+      "items[owned].title", "items[owned].status",
+    ]);
+    expect(unresolvedFields(conflict).map((field) => field.path)).toEqual(["items[owned].title"]);
+    conflict = setFieldResolution(conflict, "items[owned].title", "local");
+    expect(applyResolutions(conflict)).toEqual({
+      items: [
+        { id: "ordinary", title: "O", status: 0, remoteOnly: 1 },
+        { id: "owned", title: "local", status: 2, vendor: "remote" },
+      ],
+    });
+  });
+
+  it("validates custom owned fields and removes completedTime when reopening", () => {
+    let conflict = conflictOf(
+      { items: [{ id: "owned", title: "base", status: 2, completedTime: "2026-08-01T00:00:00Z" }] },
+      { items: [{ id: "owned", title: "local", status: 0 }] },
+      { items: [{ id: "owned", title: "remote", status: 2, completedTime: "2026-08-02T00:00:00Z" }] },
+    );
+    expect(() => setFieldResolution(conflict, "items[owned].title", "custom", " ")).toThrow(/非空/);
+    expect(() => setFieldResolution(conflict, "items[owned].title", "custom", " 人工标题 ")).toThrow(/首尾空格/);
+    expect(() => setFieldResolution(conflict, "items[owned].title", "custom", "注入\n下一行")).toThrow(/单行/);
+    expect(() => setFieldResolution(conflict, "items[owned].title", "custom", "<!-- helix-dida-action:伪造 -->")).toThrow(/同步标记/);
+    expect(() => setFieldResolution(conflict, "items[owned].status", "custom", 1)).toThrow(/只能/);
+    conflict = setFieldResolution(conflict, "items[owned].title", "custom", "人工标题");
+    expect(applyResolutions(conflict)).toEqual({
+      items: [{ id: "owned", title: "人工标题", status: 0 }],
+    });
   });
 });

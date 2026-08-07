@@ -284,6 +284,46 @@ describe("HelixDataStore serialization", () => {
     expect(data.recoveryIssues).toContainEqual(expect.stringMatching(/队列操作/));
   });
 
+  it("rejects projection owned scope and item IDs unless both are persisted together", () => {
+    const baseValue = { id: "task-owned", projectId: "project-1", title: "Base", status: 0,
+      items: [{ id: "owned", title: "Base item", status: 0 }] };
+    const localValue = { ...baseValue, items: [{ id: "owned", title: "Local item", status: 0 }] };
+    const remoteValue = { ...baseValue, items: [{ id: "owned", title: "Remote item", status: 0 }] };
+    const base = createSnapshot("task", baseValue.id, baseValue);
+    const local = createSnapshot("task", baseValue.id, localValue);
+    const remote = createSnapshot("task", baseValue.id, remoteValue);
+    const queue = {
+      id: "op-owned", kind: "task", entityId: baseValue.id, projectId: "project-1",
+      operation: "update", status: "pending", createdAt: "2026-08-07T00:00:00.000Z",
+      updatedAt: "2026-08-07T00:00:00.000Z", attempts: 0, base, local,
+    } as const;
+    const conflict = {
+      id: "conflict-owned", kind: "task", entityId: baseValue.id, title: "Owned",
+      createdAt: "2026-08-07T00:00:00.000Z", updatedAt: "2026-08-07T00:00:00.000Z",
+      status: "open", base, local, remote,
+      fields: buildConflictFields(baseValue, localValue, remoteValue),
+      remoteRecheckCount: 0, sourceDeviceId: "device-1",
+    } as const;
+    const queueVariants = [
+      { ...queue, conflictScope: "helix-projection-owned-items" as const },
+      { ...queue, conflictOwnedItemIds: ["owned"] },
+    ];
+    for (const invalid of queueVariants) {
+      const hydrated = hydrateData({ schemaVersion: createDefaultData().schemaVersion, queue: [invalid] });
+      expect(hydrated.queue).toEqual([]);
+      expect(hydrated.recoveryIssues.join(" ")).toMatch(/队列操作.*只读恢复模式/);
+    }
+    const conflictVariants = [
+      { ...conflict, scope: "helix-projection-owned-items" as const },
+      { ...conflict, ownedItemIds: ["owned"] },
+    ];
+    for (const invalid of conflictVariants) {
+      const hydrated = hydrateData({ schemaVersion: createDefaultData().schemaVersion, conflicts: [invalid] });
+      expect(hydrated.conflicts).toEqual([]);
+      expect(hydrated.recoveryIssues.join(" ")).toMatch(/冲突记录.*只读恢复模式/);
+    }
+  });
+
   it("enters recovery mode for malformed events and kind-mismatched snapshot values", () => {
     const data = hydrateData({
       schemaVersion: 1,
@@ -629,7 +669,8 @@ describe("HelixDataStore serialization", () => {
       taskCrudVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
-      parentTaskVerified: false,
+      itemsRoundTripVerified: false,
+      itemIdStableVerified: false,
       taskReopenVerified: false,
       verifiedAt: "2026-07-31T00:00:00.000Z",
     });
@@ -737,8 +778,8 @@ describe("HelixDataStore serialization", () => {
         kind: "action" as const,
         operationId: "op-cleanup-a",
         targetProjectId: "target-list",
-        marker: "helix-projection:uuid-a",
-        remoteTaskId: "remote-a",
+        marker: "helix-project-projection:project-a",
+        remoteTaskId: "parent-a",
         projectId: "project-a",
         stageId: "stage-a",
         uuid: "uuid-a",

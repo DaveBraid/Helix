@@ -14,6 +14,10 @@ describe("workbench layout and navigation structure", () => {
     resolve(process.cwd(), "src/integrations/dida/request-governor.ts"),
     "utf8",
   );
+  const helixService = readFileSync(
+    resolve(process.cwd(), "src/services/helix-service.ts"),
+    "utf8",
+  );
   const didaProjectSync = [
     readFileSync(resolve(process.cwd(), "src/services/dida-project-projection.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/domain/dida-project-projection.ts"), "utf8"),
@@ -40,6 +44,11 @@ describe("workbench layout and navigation structure", () => {
 
   it("keeps rate-limit observation on the single governed request path", () => {
     expect(didaRequestGovernor).not.toContain("observeRateLimit");
+  });
+
+  it("reserves independent production budgets for contract work and cleanup", () => {
+    expect(helixService).toContain("maxAttempts: 1, maxCalls: 120");
+    expect(helixService).toMatch(/maxAttempts: 1,\s*maxCalls: 40,\s*cooldownProbe: true,/);
   });
 
   it("places analytics below review cards inside the shared review section", () => {

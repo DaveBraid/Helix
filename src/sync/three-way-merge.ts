@@ -126,6 +126,27 @@ export function unresolvedFields(conflict: SyncConflict): ConflictField[] {
   return conflict.fields.filter((field) => !field.sameResult && !field.choice);
 }
 
+/** 校验最终实际选择值，而不只校验 custom 输入。 */
+export function validateChecklistTitleResolutions(conflict: SyncConflict, ownedItemIds: readonly string[]): void {
+  const owned = new Set(ownedItemIds);
+  for (const field of conflict.fields) {
+    const match = /^items\[([^\]]+)\](?:\.title)?$/u.exec(field.path);
+    if (!match || !owned.has(decodeURIComponent(match[1]!))) continue;
+    const choice = field.choice ?? field.suggestedChoice ?? "local";
+    const selected = choice === "custom"
+      ? field.customValue
+      : choice === "remote" ? field.remoteValue : field.localValue;
+    const title = field.path.endsWith(".title")
+      ? selected
+      : selected && typeof selected === "object" ? (selected as Record<string, unknown>).title : undefined;
+    if (selected === undefined || selected === null || (title === undefined && !field.path.endsWith(".title"))) continue;
+    if (typeof title !== "string" || !title.trim() || title !== title.trim() || /[\r\n]/u.test(title) ||
+      title.includes("<!-- helix-dida-action:")) {
+      throw new Error("所选检查项标题必须非空、不能有首尾空格、必须是单行文本且不能包含同步标记");
+    }
+  }
+}
+
 export function setFieldResolution(
   conflict: SyncConflict,
   path: string,
@@ -135,6 +156,16 @@ export function setFieldResolution(
   const next = cloneValue(conflict);
   const field = next.fields.find((candidate) => candidate.path === path);
   if (!field) throw new Error(`Unknown conflict field: ${path}`);
+  if (choice === "custom" && /^items\[[^\]]+\]\.title$/u.test(path) &&
+    (typeof customValue !== "string" || !customValue.trim() || customValue !== customValue.trim() ||
+      /[\r\n]/u.test(customValue) ||
+      customValue.includes("<!-- helix-dida-action:"))) {
+    throw new Error("检查项自定义标题必须非空、不能有首尾空格、必须是单行文本且不能包含同步标记");
+  }
+  if (choice === "custom" && /^items\[[^\]]+\]\.status$/u.test(path) &&
+    customValue !== 0 && customValue !== 2) {
+    throw new Error("检查项自定义状态只能是未完成或已完成");
+  }
   field.choice = choice;
   field.customValue = choice === "custom" ? cloneValue(customValue) : undefined;
   next.status = unresolvedFields(next).length === 0 ? "staged" : "open";
@@ -147,7 +178,8 @@ export function applyResolutions<T>(conflict: SyncConflict<T>): T {
   if (missing.length > 0) {
     throw new Error(`Conflict still has ${missing.length} unresolved field(s)`);
   }
-  const output = cloneValue(conflict.base.value) as Record<string, unknown>;
+  // 远端是未知字段与集合顺序的权威底板；只把明确选择的本地业务字段覆盖上去。
+  const output = cloneValue(conflict.remote.value) as Record<string, unknown>;
   for (const field of conflict.fields) {
     const choice = field.choice ?? field.suggestedChoice ?? "local";
     const value =
@@ -174,7 +206,29 @@ function buildKeyedArrayFields(
   const ids = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
   return [...ids]
     .sort()
-    .map((id) => {
+    .flatMap((id) => {
+      if (key === "items" && base.has(id) && local.has(id) && remote.has(id)) {
+        const baseItem = base.get(id) as Record<string, unknown>;
+        const localItem = local.get(id) as Record<string, unknown>;
+        const remoteItem = remote.get(id) as Record<string, unknown>;
+        return ["title", "status"]
+          .map((property) => {
+            const field = createField(
+              `${key}[${encodeURIComponent(id)}].${property}`,
+              baseItem[property],
+              localItem[property],
+              remoteItem[property],
+            );
+            if (field) {
+              field.label = `${FIELD_LABELS[property] ?? property} · ${itemTitle(localItem)}`;
+              field.group = "checklist";
+              // owned item 的正交单边变化可直接合并；只有同一子字段双改竞争需要人工选择。
+              if (!field.sameResult && field.suggestedChoice) field.choice = field.suggestedChoice;
+            }
+            return field;
+          })
+          .filter((field): field is ConflictField => field !== null);
+      }
       const field = createField(
         `${key}[${encodeURIComponent(id)}]`,
         base.get(id),
@@ -185,7 +239,7 @@ function buildKeyedArrayFields(
         field.label = `${FIELD_LABELS[key] ?? key} · ${itemTitle(local.get(id) ?? remote.get(id) ?? base.get(id))}`;
         field.group = "checklist";
       }
-      return field;
+      return field ? [field] : [];
     })
     .filter((field): field is ConflictField => field !== null);
 }
@@ -208,7 +262,7 @@ function itemTitle(value: unknown): string {
 }
 
 function applyFieldValue(output: Record<string, unknown>, path: string, value: unknown): void {
-  const match = /^(items|checkins)\[(.+)]$/.exec(path);
+  const match = /^(items|checkins)\[(.+?)](?:\.(title|status))?$/.exec(path);
   if (!match) {
     output[path] = cloneValue(value);
     return;
@@ -224,7 +278,22 @@ function applyFieldValue(output: Record<string, unknown>, path: string, value: u
   if (value === undefined) {
     if (index >= 0) items.splice(index, 1);
   } else if (index >= 0) {
-    items[index] = cloneValue(value);
+    if (match[3]) {
+      const current = items[index] && typeof items[index] === "object"
+        ? cloneValue(items[index]) as Record<string, unknown>
+        : {};
+      current[match[3]] = cloneValue(value);
+      if (match[3] === "status") {
+        if (value === 0) delete current.completedTime;
+        else if (value === 2 && current.completedTime !== undefined &&
+          !Number.isFinite(new Date(current.completedTime as string | number).getTime())) {
+          delete current.completedTime;
+        }
+      }
+      items[index] = current;
+    } else {
+      items[index] = cloneValue(value);
+    }
   } else {
     items.push(cloneValue(value));
   }

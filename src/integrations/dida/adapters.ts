@@ -89,7 +89,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     const changedCapabilities: DidaTaskWriteCapabilities = {
       reminderWriteVerified: verified.reminderWriteVerified === true && writeFields.has("reminders"),
       repeatWriteVerified: verified.repeatWriteVerified === true && writeFields.has("repeatFlag"),
-      parentTaskVerified: verified.parentTaskVerified === true && writeFields.has("parentId"),
+      itemsRoundTripVerified: verified.itemsRoundTripVerified === true && writeFields.has("items"),
       taskReopenVerified: verified.taskReopenVerified === true && writeFields.has("status"),
     };
     // 纯跨清单迁移已由 moveTask 表达；不得再发送只有身份字段的空业务更新。
@@ -207,7 +207,7 @@ export interface DidaTaskWriteCapabilities {
   taskCrudVerified?: boolean;
   reminderWriteVerified?: boolean;
   repeatWriteVerified?: boolean;
-  parentTaskVerified?: boolean;
+  itemsRoundTripVerified?: boolean;
   boardPlacementVerified?: boolean;
   taskReopenVerified?: boolean;
 }
@@ -227,16 +227,15 @@ export function taskCreatePayload(
     timeZone: value.timeZone,
     priority: value.priority,
     sortOrder: value.sortOrderUnsafe ? undefined : value.sortOrder,
-    items: serializeDidaChecklistItems(value.items),
+    ...(capabilities.itemsRoundTripVerified && Object.hasOwn(value, "items")
+      ? { items: serializeDidaChecklistItems(value.items) }
+      : {}),
     tags: value.tags,
     ...(capabilities.reminderWriteVerified && Object.hasOwn(value, "reminders")
       ? { reminders: value.reminders }
       : {}),
     ...(capabilities.repeatWriteVerified && Object.hasOwn(value, "repeatFlag")
       ? { repeatFlag: value.repeatFlag }
-      : {}),
-    ...(capabilities.parentTaskVerified && Object.hasOwn(value, "parentId")
-      ? { parentId: value.parentId }
       : {}),
     ...(capabilities.boardPlacementVerified && Object.hasOwn(value, "columnId")
       ? { columnId: value.columnId }
@@ -269,7 +268,7 @@ export function taskUpdatePayload(
     ...(writeFields.has("sortOrder") && !value.sortOrderUnsafe && value.sortOrder !== undefined
       ? { sortOrder: value.sortOrder }
       : {}),
-    ...(writeFields.has("items")
+    ...(writeFields.has("items") && capabilities.itemsRoundTripVerified
       ? { items: serializeDidaChecklistItems(clearedAs(value, "items", [])) }
       : {}),
     ...(writeFields.has("tags") ? { tags: clearedAs(value, "tags", []) } : {}),
@@ -282,9 +281,6 @@ export function taskUpdatePayload(
       : {}),
     ...(writeFields.has("repeatFlag") && capabilities.repeatWriteVerified && Object.hasOwn(value, "repeatFlag")
       ? { repeatFlag: clearedAs(value, "repeatFlag", null) }
-      : {}),
-    ...(writeFields.has("parentId") && capabilities.parentTaskVerified && Object.hasOwn(value, "parentId")
-      ? { parentId: clearedAs(value, "parentId", null) }
       : {}),
     ...(writeFields.has("status") && capabilities.taskReopenVerified && value.status === 0
       ? { status: 0 }

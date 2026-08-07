@@ -28,7 +28,8 @@ export interface ProjectionReadiness {
   writable: boolean;
   queueEmpty: boolean;
   authorizationCurrent: boolean;
-  parentTaskVerified: boolean;
+  itemsRoundTripVerified: boolean;
+  itemIdStableVerified: boolean;
   boardPlacementVerified: boolean;
   boardFresh: boolean;
   taskReopenVerified: boolean;
@@ -105,6 +106,21 @@ export interface ProjectionLedgerEntry {
   frozen?: ProjectionFreezeReason;
   operationId?: string;
   conflictId?: string;
+  /** 新建检查项写前持久化的完整稳定 ID 集合；仅用于崩溃后唯一差集领养。 */
+  createBaselineItemIds?: string[];
+  createBaselineItemsHash?: string;
+  createBaselineItemHashes?: Record<string, string>;
+  /** owned item 更新发送前检查点；用于崩溃/结果未知后的只读收口，禁止重发。 */
+  updateExpectedTitle?: string;
+  updateExpectedStatus?: number;
+  updateStageRevisionHash?: string;
+  mutationKind?: "update" | "delete";
+  mutationBaselineItemIds?: string[];
+  mutationBaselineItemsHash?: string;
+  mutationBaselineItemHashes?: Record<string, string>;
+  mutationOwnedInvariantHash?: string;
+  mutationBaselineOwnedStatus?: number;
+  mutationBaselineOwnedCompletedTimeHash?: string;
 }
 
 export type ProjectionReceiptCleanupProof = {
@@ -260,8 +276,8 @@ export function patchManagedPlanAction(markdown: string, input: {
   const parsed = parseManagedPlanActions(markdown);
   const current = parsed.actions.find((action) => action.uuid === input.uuid);
   if (!current) throw new Error("找不到需要修改的已加入同步计划行动");
-  const title = input.title === undefined ? current.title : input.title.trim();
-  if (!title) throw new Error("计划行动标题不能为空");
+  const title = input.title === undefined ? current.title : input.title;
+  assertManagedActionTitle(title);
   const state = input.state ?? current.state;
   const remoteId = input.remoteId === undefined ? current.remoteId : input.remoteId || undefined;
   if (remoteId) assertStableId(remoteId, "远端任务 ID");
@@ -271,6 +287,29 @@ export function patchManagedPlanAction(markdown: string, input: {
   if (!layout) throw new Error("已加入同步的计划行动行结构已变化");
   lines[current.line - 1] = `${layout[1]}${layout[2]} [${state === "completed" ? "x" : " "}] ${title} ${renderActionMarker(current.uuid, remoteId, state)}`;
   return lines.join(parsed.section.eol);
+}
+
+export function restoreManagedPlanAction(
+  markdown: string,
+  action: Pick<ManagedPlanAction, "uuid" | "title" | "state" | "remoteId">,
+): string {
+  assertManagedActionTitle(action.title);
+  const parsed = parseManagedPlanActions(markdown);
+  if (parsed.actions.some((candidate) => candidate.uuid === action.uuid ||
+    (action.remoteId && candidate.remoteId === action.remoteId))) {
+    throw new Error("待恢复行动与现有同步行动身份冲突");
+  }
+  const lines = markdown.split(/\r?\n/);
+  lines.splice(parsed.section.end, 0,
+    `- [${action.state === "completed" ? "x" : " "}] ${action.title} ${renderActionMarker(action.uuid, action.remoteId, action.state)}`);
+  return lines.join(parsed.section.eol);
+}
+
+function assertManagedActionTitle(title: string): void {
+  if (!title.trim()) throw new Error("计划行动标题不能为空");
+  if (title !== title.trim() || /[\r\n]/u.test(title) || title.includes("<!-- helix-dida-action:")) {
+    throw new Error("计划行动标题不能有首尾空格，必须是单行文本且不能包含同步标记");
+  }
 }
 
 export function readProjectProjectionIdentity(markdown: string): {
@@ -358,13 +397,14 @@ export function planProjectionChanges(
     const writeFields: Array<"title" | "status"> = [];
     if (old.title !== entry.title) writeFields.push("title");
     if (old.state === "completed" && entry.state !== "completed") {
-      intents.push(options.taskReopenVerified
-        ? { kind: "reopen-action", entry }
-        : { kind: "freeze-action", entry: { ...entry, frozen: "capability" }, reason: "capability" });
-      continue;
+      if (!options.taskReopenVerified) {
+        intents.push({ kind: "freeze-action", entry: { ...entry, frozen: "capability" }, reason: "capability" });
+        continue;
+      }
+      writeFields.push("status");
     }
+    if (old.state !== "completed" && entry.state === "completed") writeFields.push("status");
     if (writeFields.length > 0) intents.push({ kind: "update-action", entry, writeFields });
-    if (old.state !== "completed" && entry.state === "completed") intents.push({ kind: "complete-action", entry });
   }
   for (const [uuid, old] of before) {
     if (after.has(uuid) || old.frozen) continue;
@@ -401,7 +441,8 @@ function readinessBlockers(value: ProjectionReadiness, project: DidaProject): st
     !value.writable ? "当前处于只读或恢复模式" : undefined,
     !value.queueEmpty ? "现有任务队列非空" : undefined,
     !value.authorizationCurrent ? "滴答授权合同缺失或过期" : undefined,
-    !value.parentTaskVerified ? "父子任务能力尚未验证" : undefined,
+    !value.itemsRoundTripVerified ? "检查项往返能力尚未验证" : undefined,
+    !value.itemIdStableVerified ? "检查项 ID 稳定性尚未验证" : undefined,
     !value.boardPlacementVerified ? "看板归栏能力尚未验证" : undefined,
     !value.boardFresh ? "目标看板快照已过期" : undefined,
     value.unknownOutcomes > 0 ? "仍有远端结果未知对象" : undefined,

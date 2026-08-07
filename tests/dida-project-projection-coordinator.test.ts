@@ -11,7 +11,7 @@ const readiness = {
   writable: true,
   queueEmpty: true,
   authorizationCurrent: true,
-  parentTaskVerified: true,
+  itemsRoundTripVerified: true, itemIdStableVerified: true,
   boardPlacementVerified: true,
   boardFresh: true,
   taskReopenVerified: true,

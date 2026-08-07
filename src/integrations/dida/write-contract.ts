@@ -90,7 +90,6 @@ export type ItemsOwnedAppendFailureCode =
   | "ITEMS_OWNED_APPEND_ADDED_ZERO"
   | "ITEMS_OWNED_APPEND_ADDED_MULTIPLE"
   | "ITEMS_OWNED_APPEND_ID_UNSTABLE"
-  | "ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED"
   | "ITEMS_OWNED_APPEND_SEMANTICS"
   | "ITEMS_OWNED_APPEND_EXISTING_FIELDS"
   | "ITEMS_OWNED_APPEND_EXISTING_ORDER";
@@ -100,7 +99,6 @@ export type ItemsSentinelFailureCode =
   | "ITEMS_SENTINEL_KIND"
   | "ITEMS_SENTINEL_COUNT"
   | "ITEMS_SENTINEL_ID_UNSTABLE"
-  | "ITEMS_SENTINEL_ID_NOT_PRESERVED"
   | "ITEMS_SENTINEL_SEMANTICS";
 
 export class ItemsOwnedAppendContractError extends Error {
@@ -462,6 +460,7 @@ export class DidaWriteContractRunner {
         // 与生产投影一致：远端发送前从完整 Base 分配并持久化客户端 ID 与安全 sortOrder。
         const sentinelDraft = createDidaChecklistClientItem([], sentinelTitle, 0, this.now().toISOString());
         itemsFailureCode = "ITEMS_SENTINEL_CREATE";
+        let sentinelClientIdPreserved = true;
         const withSentinel = await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -470,7 +469,13 @@ export class DidaWriteContractRunner {
             ...emptyParent,
             items: [sentinelDraft],
           }, { itemsRoundTripVerified: true }, ["items"]),
-          (reread) => { assertSentinelChecklistCreate(emptyParent, reread, sentinelDraft); },
+          (reread, responseUnknown) => {
+            const result = assertSentinelChecklistCreate(emptyParent, reread, sentinelDraft);
+            if (responseUnknown && !result.clientIdPreserved) {
+              throw new Error("结果未知时禁止领养服务端替换的 sentinel ID");
+            }
+            sentinelClientIdPreserved = result.clientIdPreserved;
+          },
         );
         const sentinel = withSentinel.items![0]!;
         const ownedTitle = `${marker} owned item`;
@@ -478,6 +483,7 @@ export class DidaWriteContractRunner {
           withSentinel.items!, ownedTitle, 0, this.now().toISOString(),
         );
         itemsFailureCode = "ITEMS_OWNED_APPEND";
+        let ownedClientIdPreserved = true;
         const withOwned = await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -486,7 +492,13 @@ export class DidaWriteContractRunner {
             ...withSentinel,
             items: [...withSentinel.items!, ownedDraft],
           }, { itemsRoundTripVerified: true }, ["items"]),
-          (reread) => { assertOwnedChecklistAppend(withSentinel, reread, ownedDraft); },
+          (reread, responseUnknown) => {
+            const result = assertOwnedChecklistAppend(withSentinel, reread, ownedDraft);
+            if (responseUnknown && !result.clientIdPreserved) {
+              throw new Error("结果未知时禁止领养服务端替换的 owned ID");
+            }
+            ownedClientIdPreserved = result.clientIdPreserved;
+          },
         );
         const owned = withOwned.items!.find((item) => item.id !== sentinel.id)!;
         const renamed = { ...owned, title: `${ownedTitle} renamed`, status: 2 };
@@ -525,8 +537,8 @@ export class DidaWriteContractRunner {
           },
         );
         this.itemsRoundTripVerified = true;
-        this.itemIdStableVerified = true;
-        steps.push("验证写前客户端 ID 与 sortOrder 分配、服务端精确保留、改名、完成/重开与 owned 删除");
+        this.itemIdStableVerified = sentinelClientIdPreserved && ownedClientIdPreserved;
+        steps.push("验证客户端 ID／服务端正式 ID、sortOrder、改名、完成／重开与 owned 删除");
         await this.cleanupCheckpoint();
         await this.deleteVerifiedTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
@@ -780,7 +792,7 @@ export class DidaWriteContractRunner {
     projectId: string,
     marker: string,
     payload: DidaTaskUpdateWirePayload,
-    verify: (reread: DidaTask) => void,
+    verify: (reread: DidaTask, responseUnknown: boolean) => void,
   ): Promise<DidaTask> {
     let unknownOutcome: unknown;
     try {
@@ -793,7 +805,7 @@ export class DidaWriteContractRunner {
     try {
       reread = normalizeTask(await this.api.getTask(projectId, taskId));
       this.assertTaskIdentity(reread, taskId, projectId, marker);
-      verify(reread);
+      verify(reread, Boolean(unknownOutcome));
     } catch (error) {
       if (!unknownOutcome) throw error;
       throw new UnprovenRemoteOutcomeError("属性写入", unknownOutcome, error);
@@ -1637,7 +1649,7 @@ export function assertSentinelChecklistCreate(
   before: DidaTask,
   reread: DidaTask,
   expected: NonNullable<DidaTask["items"]>[number],
-): NonNullable<DidaTask["items"]>[number] {
+): { item: NonNullable<DidaTask["items"]>[number]; clientIdPreserved: boolean } {
   if (!sameDidaTaskExcept(before, reread, ["items", "kind"])) {
     throw new ItemsSentinelContractError("ITEMS_SENTINEL_PARENT_FIELDS");
   }
@@ -1653,19 +1665,16 @@ export function assertSentinelChecklistCreate(
   } catch {
     throw new ItemsSentinelContractError("ITEMS_SENTINEL_ID_UNSTABLE");
   }
-  if (actual.id !== expected.id) {
-    throw new ItemsSentinelContractError("ITEMS_SENTINEL_ID_NOT_PRESERVED");
-  }
   if (actual.title !== expected.title || actual.status !== expected.status ||
     actual.sortOrder !== expected.sortOrder) {
     throw new ItemsSentinelContractError("ITEMS_SENTINEL_SEMANTICS");
   }
-  return actual;
+  return { item: actual, clientIdPreserved: actual.id === expected.id };
 }
 
 /**
- * 服务端可以为新项补充未提交的默认字段并据已提交 sortOrder 移动它，
- * 但必须精确保留写前持久化的客户端 ID、sortOrder 与受管字段。
+ * 服务端可以为新项补充未提交的默认字段并替换客户端 ID，
+ * 但明确成功响应必须只增加一个语义正确、具有稳定正式 ID 的检查项。
  * 既有项（包括 sentinel）的 sortOrder/默认字段若被重算，当前仍视为能力不稳定，
  * 直到真实响应证据足以定义更窄且可证明安全的放宽规则。
  */
@@ -1673,7 +1682,7 @@ export function assertOwnedChecklistAppend(
   before: DidaTask,
   reread: DidaTask,
   expectedOwned: NonNullable<DidaTask["items"]>[number],
-): NonNullable<DidaTask["items"]>[number] {
+): { item: NonNullable<DidaTask["items"]>[number]; clientIdPreserved: boolean } {
   if (!sameDidaTaskExcept(before, reread, ["items", "kind"])) {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_PARENT_FIELDS");
   }
@@ -1701,9 +1710,6 @@ export function assertOwnedChecklistAppend(
   } catch {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_ID_UNSTABLE");
   }
-  if (added[0]!.id !== expectedOwned.id) {
-    throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED");
-  }
   if (added[0]!.title !== expectedOwned.title || added[0]!.status !== expectedOwned.status ||
     added[0]!.sortOrder !== expectedOwned.sortOrder) {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_SEMANTICS");
@@ -1716,7 +1722,7 @@ export function assertOwnedChecklistAppend(
   if (!deepEqual(preservedOrder, existing.map((item) => item.id))) {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_EXISTING_ORDER");
   }
-  return added[0]!;
+  return { item: added[0]!, clientIdPreserved: added[0]!.id === expectedOwned.id };
 }
 
 function sameChecklistItemExceptId(

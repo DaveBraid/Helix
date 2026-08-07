@@ -437,7 +437,7 @@ export function verifyProjectedTask(
 
 /**
  * 核验“在末尾提交一个已持久化客户端 ID 的检查项”后的服务端结果。
- * 服务端可以补默认值并按 sortOrder 重排，但必须保留客户端 ID，既有项逐项及相对顺序不变。
+ * 明确成功响应允许服务端把临时客户端 ID 替换为唯一正式 ID；既有项逐项及相对顺序不变。
  */
 export function verifyClientChecklistAppendResult(
   base: DidaTask,
@@ -476,9 +476,9 @@ export function verifyClientChecklistAppendResult(
     const preservedIds = actualItems.filter((item) => baselineById.has(item.id)).map((item) => item.id);
     if (stableHash(preservedIds) !== stableHash(baselineItems.map((item) => item.id))) return false;
     const added = actualItems.filter((item) => !baselineById.has(item.id));
-    if (added.length !== 1 || added[0]!.id !== desiredNew.id) return false;
+    if (added.length !== 1) return false;
     return Object.entries(desiredNew)
-      .filter(([, value]) => value !== undefined)
+      .filter(([key, value]) => key !== "id" && value !== undefined)
       .every(([key, value]) => stableHash(value) === stableHash((added[0] as unknown as Record<string, unknown>)[key]));
   } catch {
     return false;
@@ -496,7 +496,6 @@ function readinessBlockers(value: ProjectionReadiness, project: DidaProject): st
     !value.queueEmpty ? "现有任务队列非空" : undefined,
     !value.authorizationCurrent ? "滴答授权合同缺失或过期" : undefined,
     !value.itemsRoundTripVerified ? "检查项往返能力尚未验证" : undefined,
-    !value.itemIdStableVerified ? "检查项 ID 稳定性尚未验证" : undefined,
     !value.boardPlacementVerified ? "看板归栏能力尚未验证" : undefined,
     !value.boardFresh ? "目标看板快照已过期" : undefined,
     value.unknownOutcomes > 0 ? "仍有远端结果未知对象" : undefined,

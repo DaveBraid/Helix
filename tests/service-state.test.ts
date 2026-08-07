@@ -45,6 +45,8 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
     taskReopenVerified: false,
   };
   expect(projectProjectionGlobalCapabilitiesReady(state)).toBe(true);
+  const serverAssignedIds = { ...state, itemIdStableVerified: false };
+  expect(projectProjectionGlobalCapabilitiesReady(serverAssignedIds)).toBe(true);
 });
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 

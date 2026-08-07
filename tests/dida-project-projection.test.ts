@@ -86,6 +86,16 @@ describe("Dida project projection domain", () => {
     });
     expect(preview).toMatchObject({ projectName: "科研", columnName: "Helix项目", blockers: [], createsColumn: false });
     expect(() => assertProjectionActivation(preview, preview.previewHash)).not.toThrow();
+    const serverAssignedIds = buildProjectionActivationPreview({
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      projects: [project],
+      columns: [column],
+      readiness: { ...ready, itemIdStableVerified: false },
+      projectCount: 2,
+      actionCount: 5,
+    });
+    expect(serverAssignedIds.blockers).toEqual([]);
+    expect(() => assertProjectionActivation(serverAssignedIds, serverAssignedIds.previewHash)).not.toThrow();
     expect(() => assertProjectionActivation(preview, "stale")).toThrow(/预览已变化/);
   });
 
@@ -195,8 +205,13 @@ describe("Dida project projection domain", () => {
     const desired: DidaTask = { ...base, items: [...base.items!, { id: "1785772800000", title: "Helix 行动", status: 0, sortOrder: 21 }] };
     const created: DidaChecklistItem = { id: "1785772800000", title: "Helix 行动", status: 0, sortOrder: 21, timeZone: "Asia/Shanghai" };
     const reordered: DidaTask = { ...desired, items: [created, ordinaryA, ordinaryB] };
+    const serverAssigned: DidaTask = {
+      ...desired,
+      items: [{ ...created, id: "server-formal-id" }, ordinaryA, ordinaryB],
+    };
 
     expect(verifyClientChecklistAppendResult(base, desired, reordered)).toBe(true);
+    expect(verifyClientChecklistAppendResult(base, desired, serverAssigned)).toBe(true);
     expect(verifyClientChecklistAppendResult(base, desired, {
       ...reordered,
       items: [created, ordinaryB, ordinaryA],
@@ -237,6 +252,31 @@ describe("DidaProjectProjectionService with fake remote", () => {
     expect(harness.pipeline.updateBases[0]).toMatchObject({ id: "remote-1" });
     expect(harness.pipeline.updateBases[0]).not.toHaveProperty("items");
     expect(harness.state.value.ledger[0]?.operationId).toBeUndefined();
+  });
+
+  it("adopts the unique formal checklist ID returned by a verified write", async () => {
+    const harness = makeHarness(true);
+    harness.pipeline.afterCreate = (parent) => {
+      harness.pipeline.nextResult = {
+        operationId: "ignored-by-fake",
+        outcome: "verified",
+        task: {
+          ...parent,
+          kind: "CHECKLIST",
+          items: [{ id: "server-formal-item-1", title: "行动", status: 0, sortOrder: 0 }],
+        },
+      };
+    };
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ createdActions: 1, frozen: [] });
+    expect(harness.state.value.ledger[0]).toMatchObject({
+      remoteId: "server-formal-item-1",
+      operationId: undefined,
+    });
+    expect(harness.state.value.ledger[0]).not.toHaveProperty("frozen");
+    expect(harness.markdown.content("Stage.md")).toContain("remoteId=server-formal-item-1");
   });
 
   it("rebaselines an unidentified append that loses the unsent preflight race", async () => {
@@ -380,7 +420,7 @@ describe("DidaProjectProjectionService with fake remote", () => {
     };
     const result = await harness.service.synchronizeProject(input());
     expect(result.frozen).toContainEqual(expect.objectContaining({
-      uuid: "uuid-2", reason: "identity-mismatch", message: expect.stringMatching(/客户端检查项 ID/),
+      uuid: "uuid-2", reason: "identity-mismatch", message: expect.stringMatching(/唯一且语义正确的正式检查项/),
     }));
     expect(harness.markdown.content("Stage.md")).toContain("uuid=uuid-2 remoteId=-");
   });
@@ -893,6 +933,47 @@ describe("DidaProjectProjectionService with fake remote", () => {
 
     expect(pipeline.updateOperationIds).toEqual([]);
     expect(state.value.ledger[0]).toMatchObject({ remoteId: clientId, frozen: undefined });
+  });
+
+  it("keeps an unknown append frozen when the server replaced its client ID", async () => {
+    const clientId = "1785888000000";
+    const entry = ledger({
+      remoteId: undefined,
+      frozen: "unknown-outcome",
+      operationId: "op-client-id-replaced-unknown",
+      createBaselineItemIds: [],
+      createBaselineItemsHash: stableHash([]),
+      createBaselineItemHashes: {},
+      createItemId: clientId,
+      createItemSortOrder: 0,
+    });
+    const state = new MemoryState({
+      enabled: true,
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      confirmedPreviewHash: "a".repeat(64), ledger: [entry], parentCheckpoints: [],
+    });
+    const remote: DidaTask = {
+      id: entry.parentTaskId, projectId: entry.targetProjectId, columnId: entry.targetColumnId,
+      title: "Alpha", content: "helix-project-projection:project-1", status: 0,
+      items: [{ id: "server-formal-item-unknown", title: entry.title, status: 0, sortOrder: 0 }],
+    };
+    const pipeline = new FakePipeline();
+    pipeline.tasks.set(remote.id, remote);
+    const diagnostics = new MemoryDiagnostics({
+      operationId: entry.operationId!, blocked: false, resolvedTask: remote,
+    });
+    const { service, markdown } = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
+
+    await expect(service.reconcileFrozen(reconcileAction(entry))).rejects.toThrow(/保持冻结/);
+
+    expect(pipeline.updateOperationIds).toEqual([]);
+    expect(state.value.ledger[0]).toMatchObject({
+      remoteId: undefined,
+      frozen: "unknown-outcome",
+      operationId: entry.operationId,
+    });
+    expect(markdown.content("Stage.md")).toContain("remoteId=-");
+    expect(diagnostics.removed).toEqual([]);
   });
 
   it("keeps a legacy unqueued no-ID checkpoint read-only", async () => {

@@ -632,6 +632,7 @@ export class DidaProjectProjectionService {
         resumeEntry.createBaselineItemIds,
         recoveredParent.items ?? [],
         resumeEntry,
+        inspection?.receipt?.outcome === "verified",
       );
       const stageRevision = await this.requireRevision(input.stagePath);
       assertProjectionStageIdentity(stageRevision.content, input.stageId);
@@ -1745,12 +1746,12 @@ function verifyClientOwnedCreatedChecklistItem(
   }
   const expected = checkpointChecklistItem(entry);
   const added = [...rereadById.entries()].filter(([id]) => !baselineById.has(id));
-  const created = rereadById.get(expected.id);
+  const created = added[0]?.[1];
   if (added.length !== 1 || !created || created.title !== expected.title ||
     created.status !== expected.status || created.sortOrder !== expected.sortOrder) {
-    throw new Error("服务端未稳定保留客户端检查项 ID、排序或受管字段，已冻结同步");
+    throw new Error("服务端未返回唯一且语义正确的正式检查项，已冻结同步");
   }
-  return expected.id;
+  return added[0]![0];
 }
 
 function assertOnlyOwnedChecklistItemDeleted(
@@ -1946,6 +1947,7 @@ function adoptCreatedChecklistItemFromIds(
   baselineIds: string[] | undefined,
   reread: DidaChecklistItem[],
   entry: ProjectionLedgerEntry,
+  allowClientIdReplacement = false,
 ): string {
   if (!baselineIds) throw new Error("冻结的新建检查项缺少可证明的写前 items 基线，禁止自动领养或重发");
   if (new Set(baselineIds).size !== baselineIds.length) throw new Error("新建检查项写前 ID 基线损坏");
@@ -1962,12 +1964,15 @@ function adoptCreatedChecklistItemFromIds(
   const added = [...current.entries()].filter(([id]) => !baselineIds.includes(id));
   if (entry.createItemId !== undefined) {
     const expected = checkpointChecklistItem(entry);
-    const created = current.get(expected.id);
+    const created = allowClientIdReplacement ? added[0]?.[1] : current.get(expected.id);
     if (added.length !== 1 || !created || created.title !== expected.title ||
       created.status !== expected.status || created.sortOrder !== expected.sortOrder) {
       throw new Error("冻结复读未证明服务端稳定保留客户端检查项身份，保持冻结");
     }
-    return expected.id;
+    if (!allowClientIdReplacement && created.id !== expected.id) {
+      throw new Error("结果未知时服务端未保留临时客户端 ID，必须人工确认");
+    }
+    return created.id;
   }
   // 旧版无 ID checkpoint 永不续发；仅在现有远端结果可由原基线唯一证明时只读收口。
   const matches = added.filter(([, item]) =>

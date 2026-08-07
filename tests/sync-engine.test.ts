@@ -170,7 +170,7 @@ describe("SyncEngine safety gates", () => {
       ...baseTask,
       items: [...baseTask.items!, { id: "1785772800000", title: "Helix 行动", status: 0, sortOrder: 11 }],
     };
-    const serverCreated = { id: "1785772800000", title: "Helix 行动", status: 0, sortOrder: 11 };
+    const serverCreated = { id: "server-formal-id", title: "Helix 行动", status: 0, sortOrder: 11 };
     const serverTask: DidaTask = { ...desiredTask, items: [serverCreated, ordinary] };
     const base = createSnapshot("task", "task-1", baseTask);
     const repository = new MemoryRepository();
@@ -191,7 +191,7 @@ describe("SyncEngine safety gates", () => {
 
     expect(result.outcome).toBe("pushed");
     expect((repository.base?.value as DidaTask).items?.map((item) => item.id))
-      .toEqual(["1785772800000", "ordinary-1"]);
+      .toEqual(["server-formal-id", "ordinary-1"]);
     expect(repository.conflicts).toEqual([]);
   });
 

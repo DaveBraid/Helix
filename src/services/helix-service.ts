@@ -144,11 +144,11 @@ export interface ProjectProjectionWriteReadiness {
 export function projectProjectionGlobalCapabilitiesReady(
   state: Pick<HelixRuntimeState,
     "connected" | "authorizationConfigured" | "taskCrudVerified" |
-    "itemsRoundTripVerified" | "itemIdStableVerified" | "boardPlacementVerified">,
+    "itemsRoundTripVerified" | "boardPlacementVerified">,
 ): boolean {
   // 重开只在具体 reopen 操作门禁检查；不能阻止普通创建、更新或完成从队列阻塞中恢复。
   return state.connected && state.authorizationConfigured && state.taskCrudVerified &&
-    state.itemsRoundTripVerified && state.itemIdStableVerified && state.boardPlacementVerified;
+    state.itemsRoundTripVerified && state.boardPlacementVerified;
 }
 
 export type StateListener = (state: HelixRuntimeState) => void;
@@ -2105,8 +2105,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   private assertProjectionCapabilities(reopen: boolean): void {
     this.assertTaskCrudVerified();
-    if (!this.state.itemsRoundTripVerified || !this.state.itemIdStableVerified || !this.state.boardPlacementVerified) {
-      throw new Error("当前授权尚未验证滴答项目同步所需的检查项往返、ID 稳定与看板归栏能力");
+    if (!this.state.itemsRoundTripVerified || !this.state.boardPlacementVerified) {
+      throw new Error("当前授权尚未验证滴答项目同步所需的检查项往返与看板归栏能力");
     }
     if (reopen && !this.state.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");

@@ -804,7 +804,6 @@ describe("DidaWriteContractRunner", () => {
     ["added-zero", "ITEMS_OWNED_APPEND_ADDED_ZERO"],
     ["added-multiple", "ITEMS_OWNED_APPEND_ADDED_MULTIPLE"],
     ["id-unstable", "ITEMS_OWNED_APPEND_ID_UNSTABLE"],
-    ["client-id-changed", "ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED"],
     ["semantics", "ITEMS_OWNED_APPEND_SEMANTICS"],
     ["existing-fields", "ITEMS_OWNED_APPEND_EXISTING_FIELDS"],
   ] as const)("reports the redacted owned-append subcode for %s", async (mutation, code) => {
@@ -833,7 +832,6 @@ describe("DidaWriteContractRunner", () => {
     ["ITEMS_OWNED_APPEND_ADDED_ZERO", (task: DidaTask) => ({ ...task, items: task.items!.slice(1) })],
     ["ITEMS_OWNED_APPEND_ADDED_MULTIPLE", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { id: "extra", title: "extra", status: 0 }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_ID_UNSTABLE", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: " " }, ...task.items!.slice(1)] })],
-    ["ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: "1999999999999" }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_SEMANTICS", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, status: 2 }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_EXISTING_FIELDS", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { ...task.items![1]!, sortOrder: 999 }, task.items![2]!] })],
     ["ITEMS_OWNED_APPEND_EXISTING_ORDER", (task: DidaTask) => ({ ...task, items: [task.items![0]!, task.items![2]!, task.items![1]!] })],
@@ -896,7 +894,6 @@ describe("DidaWriteContractRunner", () => {
     ["parent-fields", "ITEMS_SENTINEL_PARENT_FIELDS"],
     ["kind", "ITEMS_SENTINEL_KIND"],
     ["count", "ITEMS_SENTINEL_COUNT"],
-    ["id-not-preserved", "ITEMS_SENTINEL_ID_NOT_PRESERVED"],
     ["semantics", "ITEMS_SENTINEL_SEMANTICS"],
   ] as const)("reports the redacted sentinel subcode for %s", async (mutation, code) => {
     const api = new ContractApiFake();
@@ -919,7 +916,6 @@ describe("DidaWriteContractRunner", () => {
     ["ITEMS_SENTINEL_KIND", (task: DidaTask) => ({ ...task, kind: "TASK" })],
     ["ITEMS_SENTINEL_COUNT", (task: DidaTask) => ({ ...task, items: [] })],
     ["ITEMS_SENTINEL_ID_UNSTABLE", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: " " }] })],
-    ["ITEMS_SENTINEL_ID_NOT_PRESERVED", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: "server-id" }] })],
     ["ITEMS_SENTINEL_SEMANTICS", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, sortOrder: 8 }] })],
   ] as const)("maps the sentinel invariant to fixed code %s", (code, mutate) => {
     const before: DidaTask = { id: "parent", projectId: "list", title: "parent", status: 0 };
@@ -927,6 +923,40 @@ describe("DidaWriteContractRunner", () => {
     const reread: DidaTask = { ...before, kind: "CHECKLIST", items: [expected] };
     expect(() => assertSentinelChecklistCreate(before, mutate(reread), expected))
       .toThrow(expect.objectContaining<Partial<ItemsSentinelContractError>>({ code }));
+  });
+
+  it.each([
+    ["sentinel", "id-not-preserved"],
+    ["owned", "client-id-changed"],
+  ] as const)("accepts a known successful %s ID replacement but records client-ID instability", async (stage, mutation) => {
+    const api = new ContractApiFake();
+    if (stage === "sentinel") api.sentinelMutation = mutation;
+    else api.ownedAppendMutation = mutation;
+    const report = await new DidaWriteContractRunner(
+      api, () => `run-known-${stage}-replacement`, fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: true,
+      itemIdStableVerified: false,
+      capabilityFailureCodes: [],
+      remoteArtifactsRemaining: false,
+    });
+  });
+
+  it("does not adopt a replacement ID after an unknown sentinel write outcome", async () => {
+    const api = new ContractApiFake();
+    api.sentinelMutation = "id-not-preserved";
+    api.parentUpdateOutcome = "applied-unknown";
+    const report = await new DidaWriteContractRunner(
+      api, () => "run-unknown-id-replacement", fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "failed",
+      itemsRoundTripVerified: false,
+      itemIdStableVerified: false,
+      remoteArtifactsRemaining: false,
+    });
   });
 
   it("checkpoints sent-unknown before every temporary task and project delete", async () => {

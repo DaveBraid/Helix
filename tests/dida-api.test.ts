@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { DidaApi } from "../src/integrations/dida/api";
+import {
+  DidaRequestGovernor,
+  EMPTY_DIDA_REQUEST_CONTROL,
+  type DidaRequestControlState,
+} from "../src/integrations/dida/request-governor";
 import { DidaHttpError, classifyStatus } from "../src/integrations/dida/http-contract";
 import { createSnapshot } from "../src/sync/snapshots";
 import { OfflineQueue } from "../src/sync/offline-queue";
@@ -89,7 +94,11 @@ describe("DidaApi non-idempotent safety", () => {
       '{"errorCode":"exceed_query_limit","errorId":"private-id"}',
     );
 
-    expect(error).toMatchObject({ category: "rate-limit", retryAfterMs: 60_000 });
+    expect(error).toMatchObject({
+      category: "rate-limit",
+      retryAfterMs: 15 * 60_000,
+      limitKind: "query-limit",
+    });
     expect(error.message).toBe("查询限流，稍后只读复核");
     expect(error.message).not.toContain("private-id");
   });
@@ -111,7 +120,31 @@ describe("DidaApi non-idempotent safety", () => {
     expect(classifyStatus(429, "rate", headers).retryAfterMs).toBe(expected);
   });
 
-  it("retries a rate-limited read after the conservative delay without exposing response text", async () => {
+  it("supports HTTP-date Retry-After and clamps unsafe durations without releasing early", () => {
+    const now = Date.parse("2026-08-07T00:00:00.000Z");
+    expect(classifyStatus(
+      429,
+      "rate",
+      { "Retry-After": "Fri, 07 Aug 2026 00:02:00 GMT" },
+      undefined,
+      now,
+    ).retryAfterMs).toBe(120_000);
+    expect(classifyStatus(429, "rate", { "Retry-After": "0.001" }, undefined, now).retryAfterMs)
+      .toBe(1_000);
+    expect(classifyStatus(429, "rate", { "Retry-After": "1e999" }, undefined, now).retryAfterMs)
+      .toBe(30_000);
+    expect(classifyStatus(429, "rate", { "Retry-After": "9".repeat(400) }, undefined, now).retryAfterMs)
+      .toBe(24 * 60 * 60_000);
+    expect(classifyStatus(
+      429,
+      "rate",
+      { "Retry-After": "Fri, 07 Aug 2036 00:00:00 GMT" },
+      undefined,
+      now,
+    ).retryAfterMs).toBe(Date.parse("2036-08-07T00:00:00.000Z") - now);
+  });
+
+  it("persists a rate-limited read and returns immediately without sleeping or retrying", async () => {
     const transport = new SequenceTransport([
       { status: 500, headers: {}, data: {}, text: "errorId=private-id errorCode=exceed_query_limit" },
       { status: 200, headers: {}, data: { id: "project-1", name: "Recovered" }, text: "" },
@@ -119,10 +152,12 @@ describe("DidaApi non-idempotent safety", () => {
     const sleep = vi.fn(async (_milliseconds: number) => undefined);
     const api = new DidaApi(transport, () => "test-token-long-enough", {}, sleep);
 
-    await expect(api.getProject("project-1")).resolves.toMatchObject({ id: "project-1" });
-    expect(transport.calls).toHaveLength(2);
-    expect(sleep).toHaveBeenCalledTimes(1);
-    expect(sleep).toHaveBeenCalledWith(60_000);
+    await expect(api.getProject("project-1")).rejects.toMatchObject({
+      category: "rate-limit",
+      retryAfterMs: 15 * 60_000,
+    });
+    expect(transport.calls).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it("does not retry a rate-limited non-idempotent write", async () => {
@@ -145,14 +180,17 @@ describe("DidaApi non-idempotent safety", () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
-  it("uses Retry-After when transport throws an already classified rate-limit read error", async () => {
+  it("returns a transport-classified rate limit without holding the caller during Retry-After", async () => {
     const transport = new ThrowingRateThenSuccessTransport();
     const sleep = vi.fn(async (_milliseconds: number) => undefined);
     const api = new DidaApi(transport, () => "test-token-long-enough", {}, sleep);
 
-    await expect(api.getProject("project-1")).resolves.toMatchObject({ id: "project-1" });
-    expect(transport.calls).toHaveLength(2);
-    expect(sleep).toHaveBeenCalledWith(60_000);
+    await expect(api.getProject("project-1")).rejects.toMatchObject({
+      category: "rate-limit",
+      retryAfterMs: 60_000,
+    });
+    expect(transport.calls).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it("turns a transport-thrown rate-limited write into non-runnable reconciliation", async () => {
@@ -333,5 +371,105 @@ describe("DidaApi non-idempotent safety", () => {
 
     await expect(api.getProjects()).rejects.toMatchObject({ category: "transient" });
     expect(transport.calls).toBe(3);
+  });
+
+  it("stops a derived contract client when its shared call budget is exhausted", async () => {
+    const transport = new CapturingTransport();
+    const api = new DidaApi(transport, () => "test-token-long-enough")
+      .withRequestPolicy({ maxCalls: 2, maxAttempts: 1 });
+    await api.getProjects();
+    await api.getProjects();
+    await expect(api.getProjects()).rejects.toThrow(/预算已耗尽.*安全终止/);
+    expect(transport.calls).toHaveLength(2);
+  });
+
+  it("keeps the cleanup request reserve independent from an exhausted main contract budget", async () => {
+    const transport = new CapturingTransport();
+    const base = new DidaApi(transport, () => "test-token-long-enough");
+    const main = base.withRequestPolicy({ maxCalls: 1, maxAttempts: 1 });
+    const cleanup = base.withRequestPolicy({ maxCalls: 1, maxAttempts: 1, cooldownProbe: true });
+    await main.getProjects();
+    await expect(main.getProjects()).rejects.toThrow(/预算已耗尽/);
+    await expect(cleanup.getProjects()).resolves.toBe("OK");
+    expect(transport.calls).toHaveLength(2);
+  });
+
+  it("rechecks the remote guard immediately before transport after queueing or retry", async () => {
+    const transport = new StatusTransport(503);
+    let checks = 0;
+    const api = new DidaApi(
+      transport,
+      () => "test-token-long-enough",
+      { maxAttempts: 3 },
+      async () => undefined,
+      undefined,
+      undefined,
+      () => {
+        checks += 1;
+        if (checks >= 3) throw new Error("recovery activated while queued");
+      },
+    );
+    await expect(api.getProjects()).rejects.toThrow(/recovery activated while queued/);
+    expect(transport.calls).toBe(1);
+    expect(checks).toBe(3);
+  });
+
+  it("keeps a sent write unknown while latching a failed rate-limit state save", async () => {
+    let state: DidaRequestControlState = {
+      ...structuredClone(EMPTY_DIDA_REQUEST_CONTROL),
+      authorizationBinding: "a".repeat(64),
+    };
+    let writes = 0;
+    let latchWritten = false;
+    const governor = new DidaRequestGovernor({
+      read: async () => structuredClone(state),
+      write: async (next) => {
+        writes += 1;
+        if (writes === 2) throw new Error("data save failed");
+        state = structuredClone(next);
+      },
+      readEmergencyLatch: async () => null,
+      writeEmergencyLatch: async () => { latchWritten = true; },
+    }, 0, () => 0, async () => undefined);
+    const transport = new SequenceTransport([{
+      status: 500,
+      headers: {},
+      data: {},
+      text: '{"errorCode":"exceed_query_limit"}',
+    }]);
+    const api = new DidaApi(
+      transport,
+      () => "test-token-long-enough",
+      { maxAttempts: 1 },
+      async () => undefined,
+      governor,
+    );
+
+    await expect(api.createTask({ title: "one", projectId: "project-1" }))
+      .rejects.toMatchObject({ category: "unknown-outcome", remoteOutcomeUnknown: true });
+    expect(transport.calls).toHaveLength(1);
+    expect(latchWritten).toBe(true);
+  });
+
+  it("does not mark a write unknown when request control fails before transport", async () => {
+    const governor = new DidaRequestGovernor({
+      read: async () => ({
+        ...structuredClone(EMPTY_DIDA_REQUEST_CONTROL),
+        authorizationBinding: "a".repeat(64),
+      }),
+      write: async () => { throw new Error("preflight save failed"); },
+    }, 0, () => 0, async () => undefined);
+    const transport = new CapturingTransport();
+    const api = new DidaApi(
+      transport,
+      () => "test-token-long-enough",
+      { maxAttempts: 1 },
+      async () => undefined,
+      governor,
+    );
+
+    await expect(api.createTask({ title: "one", projectId: "project-1" }))
+      .rejects.toMatchObject({ category: "permanent", requestNotSent: true });
+    expect(transport.calls).toHaveLength(0);
   });
 });

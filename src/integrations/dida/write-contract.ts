@@ -116,9 +116,10 @@ export class DidaWriteContractRunner {
   private cleanupCheckpoint: (() => Promise<void>) | undefined;
   private cleanupCheckpointFailed = false;
   private readonly timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  private api: ContractApi;
 
   constructor(
-    private readonly api: ContractApi,
+    api: ContractApi,
     private readonly createRunId: () => string = () => crypto.randomUUID(),
     private readonly now: () => Date = () => new Date(),
     private readonly sleep: (milliseconds: number) => Promise<void> = delay,
@@ -127,7 +128,10 @@ export class DidaWriteContractRunner {
     private readonly onCleanupPlanChange: (
       plan: DidaContractCleanupPlan | undefined,
     ) => Promise<void> = async () => undefined,
-  ) {}
+    private readonly cleanupApi: ContractApi = api,
+  ) {
+    this.api = api;
+  }
 
   async run(): Promise<DidaWriteContractReport> {
     this.untrackedCreateOutcome = false;
@@ -631,6 +635,8 @@ export class DidaWriteContractRunner {
       failureStage = this.currentStage;
       failure = `${failureStage}：${messageOf(error)}`;
     } finally {
+      // 主合同预算耗尽后也必须保留独立的安全清理额度。
+      this.api = this.cleanupApi;
       let taskCleanupFailed = false;
       if (this.cleanupCheckpointFailed) {
         taskCleanupFailed = true;
@@ -1405,16 +1411,12 @@ export class DidaWriteContractRunner {
         await check();
         return;
       } catch (error) {
-        const rateLimited = error instanceof DidaHttpError && error.category === "rate-limit";
-        if (!(error instanceof ConsistencyPendingError) && !rateLimited) throw error;
+        if (!(error instanceof ConsistencyPendingError)) throw error;
         lastError = error;
         if (attempt < ABSENCE_CHECK_ATTEMPTS - 1) {
           const remaining = deadline - this.monotonicNow();
           if (remaining <= 0) break;
-          await this.sleep(Math.min(
-            rateLimited ? error.retryAfterMs ?? 60_000 : ABSENCE_CHECK_DELAY_MS,
-            remaining,
-          ));
+          await this.sleep(Math.min(ABSENCE_CHECK_DELAY_MS, remaining));
         }
       }
     }
@@ -1437,7 +1439,7 @@ export class DidaWriteContractRunner {
       const matches: CreatedTask[] = [];
       for (const projectId of task.candidateProjectIds) {
         const candidate = { ...task, projectId };
-        const tasks = await this.readObservableTasksWithRateLimit(candidate, deadline);
+        const tasks = await this.readObservableTasks(candidate);
         if (tasks.some((current) => current.id === task.id)) matches.push(candidate);
       }
       if (matches.length === 1) {
@@ -1454,22 +1456,6 @@ export class DidaWriteContractRunner {
     }
     if (ambiguous) throw new Error("测试任务同时存在于多个候选清单集合，拒绝猜测归属");
     return null;
-  }
-
-  private async readObservableTasksWithRateLimit(
-    task: CreatedTask,
-    deadline: number,
-  ): Promise<DidaTask[]> {
-    while (true) {
-      try {
-        return await this.readObservableTasks(task);
-      } catch (error) {
-        if (!(error instanceof DidaHttpError) || error.category !== "rate-limit") throw error;
-        const remaining = deadline - this.monotonicNow();
-        if (remaining <= 0) throw error;
-        await this.sleep(Math.min(error.retryAfterMs ?? 60_000, remaining));
-      }
-    }
   }
 
   private async cleanupProject(project: CreatedProject, marker: string): Promise<void> {

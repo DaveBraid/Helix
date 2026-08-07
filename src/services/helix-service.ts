@@ -79,6 +79,11 @@ import { buildProjectUpdateOperation } from "./project-operations";
 import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
 import { RemoteWriteGate } from "./remote-write-gate";
+import {
+  DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE,
+  DidaRequestGovernor,
+  EMPTY_DIDA_REQUEST_CONTROL,
+} from "../integrations/dida/request-governor";
 import { DidaContractCleanupService } from "./dida-contract-cleanup";
 import type {
   ExistingHelixProjectionCatalogPort,
@@ -173,6 +178,7 @@ const EMPTY_STATE: HelixRuntimeState = {
 
 export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixProjectionCatalogPort {
   private readonly api: DidaApi;
+  private readonly didaRequestGovernor: DidaRequestGovernor;
   private readonly habitService: DidaHabitService;
   private readonly focusService: DidaFocusService;
   private taskEngine: SyncEngine<DidaTask> | null = null;
@@ -194,7 +200,47 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     private readonly store: HelixDataStore,
     private readonly secrets: HelixSecretStore,
   ) {
-    this.api = new DidaApi(new ObsidianHttpTransport(), () => secrets.getDidaToken());
+    this.didaRequestGovernor = new DidaRequestGovernor({
+      read: async () => {
+        const token = this.secrets.getDidaToken();
+        if (!token) return structuredClone(EMPTY_DIDA_REQUEST_CONTROL);
+        const authorizationBinding = await didaAuthorizationBinding(token);
+        const persisted = (await this.store.snapshot()).didaRequestControl;
+        return persisted?.authorizationBinding === authorizationBinding
+          ? structuredClone(persisted)
+          : { ...structuredClone(EMPTY_DIDA_REQUEST_CONTROL), authorizationBinding };
+      },
+      write: async (state) => {
+        const token = this.secrets.getDidaToken();
+        if (!token) throw new Error("滴答授权缺失，拒绝保存请求控制状态");
+        const authorizationBinding = await didaAuthorizationBinding(token);
+        await this.store.mutate((data) => {
+          data.didaRequestControl = { ...structuredClone(state), authorizationBinding };
+        });
+      },
+      onPersistenceFailure: (message) => this.reportRecoveryIssue(message),
+      readEmergencyLatch: async () =>
+        this.secrets.getDidaRequestEmergencyLatch?.() ?? null,
+      writeEmergencyLatch: async (latch) => {
+        if (!this.secrets.setDidaRequestEmergencyLatch) {
+          throw new Error("紧急闭锁端口不可用");
+        }
+        this.secrets.setDidaRequestEmergencyLatch(latch);
+      },
+    });
+    this.api = new DidaApi(
+      new ObsidianHttpTransport(),
+      () => secrets.getDidaToken(),
+      {},
+      undefined,
+      this.didaRequestGovernor,
+      undefined,
+      () => {
+        if (this.state.recoveryIssues.length > 0) {
+          throw new Error("Helix 当前处于只读恢复模式，已阻止远端访问；请先修复本地恢复问题");
+        }
+      },
+    );
     this.habitService = new DidaHabitService(this.api);
     this.focusService = new DidaFocusService(this.api);
     secrets.setMutationGuard?.(() =>
@@ -364,26 +410,82 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   async replaceDidaToken(token: string): Promise<void> {
     const normalized = token.trim();
     if (normalized.length < 10) throw new Error("API 口令长度异常");
-    await this.changeDidaAuthorization(() => this.secrets.setDidaToken(normalized));
+    await this.changeDidaAuthorization(normalized);
   }
 
   async clearDidaToken(): Promise<void> {
-    await this.changeDidaAuthorization(() => this.secrets.clearDidaToken());
+    await this.changeDidaAuthorization(null);
   }
 
-  private async changeDidaAuthorization(mutateSecret: () => void): Promise<void> {
+  private async changeDidaAuthorization(replacementToken: string | null): Promise<void> {
     this.assertActive();
     const releaseExclusive = this.remoteWriteGate.enterExclusive("API 口令切换");
     try {
-      await this.store.mutate((data) => {
-        delete data.didaContractCapabilities;
+      const previousToken = this.secrets.getDidaToken();
+      const showSampleDataWhenDisconnected = (await this.store.snapshot())
+        .settings.showSampleDataWhenDisconnected;
+      const previousBinding = await didaAuthorizationBinding(
+        previousToken ?? "helix-no-authorization",
+      );
+      const replacementBinding = await didaAuthorizationBinding(
+        replacementToken ?? "helix-no-authorization",
+      );
+      const existingLatch = this.secrets.getDidaRequestEmergencyLatch();
+      if (replacementBinding === previousBinding) return;
+      this.secrets.setDidaRequestEmergencyLatch({
+        version: 1,
+        authorizationBinding: previousBinding,
+        targetAuthorizationBinding: replacementBinding,
+        reason: "authorization-transition",
+        stage: "prepared",
+        createdAt: new Date().toISOString(),
       });
       this.secretMutationAuthorized = true;
       try {
-        mutateSecret();
+        if (replacementToken) this.secrets.setDidaToken(replacementToken);
+        else this.secrets.clearDidaToken();
       } finally {
         this.secretMutationAuthorized = false;
       }
+      try {
+        await this.store.mutate((data) => {
+          delete data.didaContractCapabilities;
+          if (replacementToken) {
+            data.didaRequestControl = {
+              ...structuredClone(EMPTY_DIDA_REQUEST_CONTROL),
+              authorizationBinding: replacementBinding,
+            };
+          } else {
+            delete data.didaRequestControl;
+          }
+        });
+      } catch (error) {
+        this.secretMutationAuthorized = true;
+        try {
+          if (previousToken) this.secrets.setDidaToken(previousToken);
+          else this.secrets.clearDidaToken();
+        } catch {
+          // transition latch 保持，后续所有远端请求继续 fail-closed。
+        } finally {
+          this.secretMutationAuthorized = false;
+        }
+        throw error;
+      }
+      const preserveRateLimitLatch = existingLatch?.reason === "rate-limit-persistence-failed" &&
+        (!replacementToken || existingLatch.authorizationBinding === replacementBinding);
+      if (preserveRateLimitLatch) {
+        this.secrets.setDidaRequestEmergencyLatch(existingLatch);
+      } else {
+        this.secrets.clearDidaRequestEmergencyLatch();
+        this.didaRequestGovernor.resetForAuthorization(
+          replacementToken ? replacementBinding : undefined,
+        );
+      }
+      const recoveryIssues = preserveRateLimitLatch
+        ? this.state.recoveryIssues
+        : this.state.recoveryIssues.filter((issue) =>
+            issue !== DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE);
+      const clearedRecoveryIssues = this.state.recoveryIssues.length - recoveryIssues.length;
       this.patch({
         connected: false,
         authorizationConfigured: Boolean(this.secrets.getDidaToken()),
@@ -396,6 +498,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         repeatWriteVerified: false,
         parentTaskVerified: false,
         taskReopenVerified: false,
+        recoveryIssues,
+        attentionCount: Math.max(0, this.state.attentionCount - clearedRecoveryIssues),
         demoMode:
           !this.secrets.getDidaToken() &&
           this.state.projects.length === 0 &&
@@ -403,7 +507,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           this.state.habits.length === 0 &&
           this.state.habitCheckins.length === 0 &&
           this.state.focus.length === 0 &&
-          (await this.store.snapshot()).settings.showSampleDataWhenDisconnected,
+          showSampleDataWhenDisconnected,
       });
     } finally {
       releaseExclusive();
@@ -685,6 +789,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     onProgress?: (progress: DidaWriteContractProgress) => void,
   ): Promise<DidaWriteContractReport> {
     this.assertWritable();
+    await this.didaRequestGovernor.assertContractAllowed();
     if (this.state.loading) throw new Error("同步正在进行，请完成后再运行写入合同测试");
     const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答写入合同测试");
     this.contractTestRunning = true;
@@ -721,7 +826,13 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           },
         };
       });
-      const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 });
+      const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1, maxCalls: 60 });
+      const cleanupApi = this.api.withRequestPolicy({
+        timeoutMs: 5_000,
+        maxAttempts: 1,
+        maxCalls: 40,
+        cooldownProbe: true,
+      });
       const report = await new DidaWriteContractRunner(
         contractApi,
         () => runId,
@@ -747,6 +858,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
             }
           });
         },
+        cleanupApi,
       ).run();
       this.lastDidaWriteContractReport = report;
       await this.store.mutate((data) => {
@@ -848,7 +960,11 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       if (!token) throw new Error("尚未配置滴答授权");
       const authorizationBinding = await didaAuthorizationBinding(token);
       await new DidaContractCleanupService(
-        this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 }),
+        this.api.withRequestPolicy({
+          timeoutMs: 5_000,
+          maxAttempts: 1,
+          cooldownProbe: true,
+        }),
         this.store,
       ).adoptStrictRemoteRun(authorizationBinding);
     } finally {
@@ -868,7 +984,11 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       if (!token) throw new Error("尚未配置滴答授权");
       const authorizationBinding = await didaAuthorizationBinding(token);
       await new DidaContractCleanupService(
-        this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1 }),
+        this.api.withRequestPolicy({
+          timeoutMs: 5_000,
+          maxAttempts: 1,
+          cooldownProbe: true,
+        }),
         this.store,
       ).recover(authorizationBinding);
     } finally {

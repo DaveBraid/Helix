@@ -985,6 +985,58 @@ describe("HelixDataStore serialization", () => {
     expect(hydrateData({ schemaVersion: 2, pendingDidaContractCleanup: spacedRun })
       .pendingDidaContractCleanup).toBeUndefined();
   });
+
+  it("persists only strict authorization-bound and redacted Dida request control state", () => {
+    const state = {
+      authorizationBinding: "b".repeat(64),
+      nextAllowedAt: "2026-08-07T00:00:01.000Z",
+      cooldownUntil: "2026-08-07T00:15:00.000Z",
+      queryLimitLevel: 1,
+      cooldownProbeUsed: false,
+      recoveryReadPending: false,
+      requestCounts: { project: 1, task: 2, habit: 3, focus: 4, other: 5 },
+      rateLimitCount: 1,
+      lastRateLimitedAt: "2026-08-07T00:00:00.000Z",
+      lastRateLimitKind: "query-limit",
+    };
+    const valid = hydrateData({ schemaVersion: 2, didaRequestControl: state });
+    expect(valid.didaRequestControl).toEqual(state);
+    expect(valid.recoveryIssues).toEqual([]);
+
+    const leaked = { ...state, taskId: "must-not-persist" };
+    const rejected = hydrateData({ schemaVersion: 2, didaRequestControl: leaked });
+    expect(rejected.didaRequestControl).toBeUndefined();
+    expect(rejected.recoveryIssues.join(" ")).toMatch(/请求冷却状态无效.*只读恢复模式/);
+
+    const foreign = { ...state, authorizationBinding: "not-a-binding" };
+    const rejectedBinding = hydrateData({ schemaVersion: 2, didaRequestControl: foreign });
+    expect(rejectedBinding.didaRequestControl).toBeUndefined();
+    expect(rejectedBinding.recoveryIssues).toHaveLength(1);
+
+    const farFuture = { ...state, nextAllowedAt: "2099-01-01T00:00:00.000Z" };
+    const rejectedDeadline = hydrateData({ schemaVersion: 2, didaRequestControl: farFuture });
+    expect(rejectedDeadline.didaRequestControl).toBeUndefined();
+    expect(rejectedDeadline.recoveryIssues).toHaveLength(1);
+
+    const unsafeCount = {
+      ...state,
+      requestCounts: { ...state.requestCounts, task: Number.MAX_SAFE_INTEGER + 1 },
+    };
+    const rejectedCount = hydrateData({ schemaVersion: 2, didaRequestControl: unsafeCount });
+    expect(rejectedCount.didaRequestControl).toBeUndefined();
+    expect(rejectedCount.recoveryIssues).toHaveLength(1);
+
+    const saturated = {
+      ...state,
+      requestCounts: { ...state.requestCounts, task: Number.MAX_SAFE_INTEGER },
+      rateLimitCount: Number.MAX_SAFE_INTEGER,
+    };
+    expect(hydrateData({ schemaVersion: 2, didaRequestControl: saturated }).didaRequestControl)
+      .toMatchObject({
+        requestCounts: { task: Number.MAX_SAFE_INTEGER },
+        rateLimitCount: Number.MAX_SAFE_INTEGER,
+      });
+  });
 });
 
 function pendingDidaContractCleanupFixture() {

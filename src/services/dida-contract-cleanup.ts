@@ -8,7 +8,6 @@ import {
   parseDidaContractProjectName,
 } from "../domain/dida-contract-cleanup";
 import type { DidaApi } from "../integrations/dida/api";
-import { DidaHttpError } from "../integrations/dida/http-contract";
 import {
   normalizeColumns,
   normalizeProject,
@@ -26,15 +25,12 @@ export interface ContractCleanupStore {
   mutate(mutator: (data: { pendingDidaContractCleanup?: PendingDidaContractCleanup }) => void): Promise<void>;
 }
 
-const READ_ATTEMPTS = 6;
-const READ_BUDGET_MS = 15_000;
-
 export class DidaContractCleanupService {
   constructor(
     private readonly api: CleanupApi,
     private readonly store: ContractCleanupStore,
-    private readonly sleep: (milliseconds: number) => Promise<void> = delay,
-    private readonly monotonicNow: () => number = () => Date.now(),
+    _sleep: (milliseconds: number) => Promise<void> = delay,
+    _monotonicNow: () => number = () => Date.now(),
     private readonly now: () => Date = () => new Date(),
   ) {}
 
@@ -300,20 +296,8 @@ export class DidaContractCleanupService {
   }
 
   private async readWithRateLimit<T>(read: () => Promise<T>): Promise<T> {
-    const deadline = this.monotonicNow() + READ_BUDGET_MS;
-    let last: unknown;
-    for (let attempt = 0; attempt < READ_ATTEMPTS; attempt += 1) {
-      try {
-        return await read();
-      } catch (error) {
-        last = error;
-        if (!(error instanceof DidaHttpError) || error.category !== "rate-limit") throw error;
-        const remaining = deadline - this.monotonicNow();
-        if (remaining <= 0 || attempt === READ_ATTEMPTS - 1) break;
-        await this.sleep(Math.min(error.retryAfterMs ?? 60_000, remaining));
-      }
-    }
-    throw last;
+    // 全局请求治理器负责冷却；持有 RemoteWriteGate 的清理流程不得等待或自动重试。
+    return read();
   }
 
   private async requireCurrent(runId: string): Promise<PendingDidaContractCleanup> {

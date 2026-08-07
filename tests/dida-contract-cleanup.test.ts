@@ -212,7 +212,7 @@ describe("DidaContractCleanupService", () => {
     expect(store.pending).toBeUndefined();
   });
 
-  it("honors bounded retryAfter for rate-limited reads", async () => {
+  it("returns a rate-limited cleanup read immediately and preserves the pending plan", async () => {
     const state = apiState();
     const store = new MemoryStore(pendingPlan());
     const sleep = vi.fn<(ms: number) => Promise<void>>(async () => undefined);
@@ -225,13 +225,16 @@ describe("DidaContractCleanupService", () => {
         tasks: [...(state.tasks.get(id) ?? [])],
         columns: [...(state.columns.get(id) ?? [])],
       }));
-    await new DidaContractCleanupService(
+    await expect(new DidaContractCleanupService(
       state.api as never,
       store,
       sleep,
       () => now,
-    ).recover(binding);
-    expect(sleep).toHaveBeenCalledWith(25);
+    ).recover(binding)).rejects.toMatchObject({ category: "rate-limit" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(store.pending).toEqual(pendingPlan());
+    expect(state.api.deleteTask).not.toHaveBeenCalled();
+    expect(state.api.deleteProject).not.toHaveBeenCalled();
   });
 
   it("never resends a delete whose remote outcome is unknown", async () => {

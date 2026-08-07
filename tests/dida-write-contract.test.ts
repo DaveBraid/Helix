@@ -1211,7 +1211,7 @@ describe("DidaWriteContractRunner", () => {
     expect(api.tasks.has("original-task")).toBe(true);
   });
 
-  it("recovers a rate-limited project-cleanup read without leaving test artifacts", async () => {
+  it("does not wait on a rate-limited contract read and uses the reserved cleanup path", async () => {
     const api = new ContractApiFake();
     api.rateLimitProjectCollectionAfterDeleteOnce = true;
     const sleep = vi.fn(async (_milliseconds: number) => undefined);
@@ -1224,11 +1224,10 @@ describe("DidaWriteContractRunner", () => {
       () => 0,
     ).run();
 
-    expect(report.status).toBe("passed");
+    expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(false);
     expect(report.cleanupErrors).toEqual([]);
-    expect(sleep).toHaveBeenCalledTimes(1);
-    expect(sleep.mock.calls[0]?.[0]).toBe(15_000);
+    expect(sleep).not.toHaveBeenCalled();
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });

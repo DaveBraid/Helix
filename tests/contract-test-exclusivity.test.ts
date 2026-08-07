@@ -10,6 +10,7 @@ import { HelixSecretStore } from "../src/storage/secrets";
 import { createSnapshot } from "../src/sync/snapshots";
 import type { SyncQueueOperation } from "../src/sync/types";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
+import { DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE } from "../src/integrations/dida/request-governor";
 
 describe("HelixService contract-test exclusivity", () => {
   it("preserves quick-entry task attributes through the normal create queue", async () => {
@@ -299,10 +300,11 @@ describe("HelixService contract-test exclusivity", () => {
     const snapshotEntered = deferred<void>();
     const releaseSnapshot = deferred<void>();
     const originalSnapshot = store.snapshot.bind(store);
-    let intercept = true;
+    let snapshotCount = 0;
     store.snapshot = async () => {
-      if (intercept) {
-        intercept = false;
+      snapshotCount += 1;
+      // 第一次读取是进入写门之前的全局冷却断言；拦截写门内的 cleanup 复查。
+      if (snapshotCount === 2) {
         snapshotEntered.resolve();
         await releaseSnapshot.promise;
       }
@@ -476,9 +478,200 @@ describe("HelixService contract-test exclusivity", () => {
 
     await expect(service.replaceDidaToken("replacement-token")).rejects.toThrow("persist failed");
     expect(secrets.getDidaToken()).toBe("initial-contract-token");
+    expect(secrets.getDidaRequestEmergencyLatch()).toMatchObject({
+      reason: "authorization-transition",
+      authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+      targetAuthorizationBinding: didaAuthorizationBinding("replacement-token"),
+      stage: "prepared",
+    });
+    const request = vi.fn(async () => { throw new Error("transport must not run"); });
+    Object.defineProperty(serviceApi(service), "transport", { value: { request } });
+    await expect(service.verifyRemoteTask("project", "task"))
+      .rejects.toMatchObject({ requestNotSent: true });
+    expect(request).not.toHaveBeenCalled();
     expect(persisted.didaContractCapabilities?.taskScheduleMode).toBe("duration");
     expect(service.snapshot().taskScheduleMode).toBe("duration");
     expect(service.snapshot().boardPlacementVerified).toBe(true);
+  });
+
+  it("keeps a transition latch and sends nothing when SecretStorage rejects the token write", async () => {
+    let persisted = createDefaultData("contract-secret-failure");
+    const values = new Map<string, string>();
+    let rejectTokenWrite = false;
+    const secrets = new HelixSecretStore({
+      secretStorage: {
+        getSecret: (key: string) => values.get(key) ?? null,
+        setSecret: (key: string, value: string) => {
+          if (rejectTokenWrite && key === "helix-productivity-dida-token") {
+            throw new Error("secret write failed");
+          }
+          values.set(key, value);
+        },
+      },
+    } as unknown as App);
+    secrets.setDidaToken("initial-contract-token");
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), secrets);
+    await service.initialize();
+    rejectTokenWrite = true;
+
+    await expect(service.replaceDidaToken("replacement-contract-token"))
+      .rejects.toThrow(/secret write failed/);
+    expect(secrets.getDidaRequestEmergencyLatch()).toMatchObject({
+      reason: "authorization-transition",
+      stage: "prepared",
+    });
+    const request = vi.fn(async () => { throw new Error("transport must not run"); });
+    Object.defineProperty(serviceApi(service), "transport", { value: { request } });
+    await expect(service.verifyRemoteTask("project", "task"))
+      .rejects.toMatchObject({ requestNotSent: true });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("clears an old emergency latch only after the replacement binding is persisted", async () => {
+    const { service, secrets, store } = await serviceFixture();
+    secrets.setDidaRequestEmergencyLatch({
+      version: 1,
+      authorizationBinding: didaAuthorizationBinding("initial-contract-token"),
+      reason: "rate-limit-persistence-failed",
+      createdAt: "2026-08-07T00:00:00.000Z",
+    });
+
+    await service.replaceDidaToken("replacement-contract-token");
+
+    expect(secrets.getDidaRequestEmergencyLatch()).toBeNull();
+    expect((await store.snapshot()).didaRequestControl?.authorizationBinding)
+      .toBe(didaAuthorizationBinding("replacement-contract-token"));
+  });
+
+  it("keeps the same-authorization cooldown and latch closed", async () => {
+    const { service, secrets, store } = await serviceFixture();
+    const binding = didaAuthorizationBinding("initial-contract-token");
+    await store.mutate((data) => {
+      data.didaRequestControl = {
+        authorizationBinding: binding,
+        cooldownUntil: "2099-01-01T00:00:00.000Z",
+        queryLimitLevel: 1,
+        cooldownProbeUsed: false,
+        recoveryReadPending: false,
+        requestCounts: { project: 1, task: 2, habit: 0, focus: 0, other: 0 },
+        rateLimitCount: 1,
+      };
+    });
+    secrets.setDidaRequestEmergencyLatch({
+      version: 1,
+      authorizationBinding: binding,
+      reason: "rate-limit-persistence-failed",
+      createdAt: "2026-08-07T00:00:00.000Z",
+    });
+    const before = (await store.snapshot()).didaRequestControl;
+
+    await service.replaceDidaToken("initial-contract-token");
+
+    expect((await store.snapshot()).didaRequestControl).toEqual(before);
+    expect(secrets.getDidaRequestEmergencyLatch()?.authorizationBinding).toBe(binding);
+    const request = vi.fn(async () => { throw new Error("transport must not run"); });
+    Object.defineProperty(serviceApi(service), "transport", { value: { request } });
+    await expect(service.verifyRemoteTask("project", "task"))
+      .rejects.toMatchObject({ requestNotSent: true });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("keeps a rate-limit latch across clear and restoring the same token after reload", async () => {
+    const fixture = await serviceFixture();
+    const binding = didaAuthorizationBinding("initial-contract-token");
+    fixture.secrets.setDidaRequestEmergencyLatch({
+      version: 1,
+      authorizationBinding: binding,
+      reason: "rate-limit-persistence-failed",
+      createdAt: "2026-08-07T00:00:00.000Z",
+    });
+    await fixture.service.clearDidaToken();
+    expect(fixture.secrets.getDidaRequestEmergencyLatch()?.authorizationBinding).toBe(binding);
+    await fixture.service.replaceDidaToken("initial-contract-token");
+    expect(fixture.secrets.getDidaRequestEmergencyLatch()?.authorizationBinding).toBe(binding);
+
+    const reloaded = await fixture.reload();
+    const request = vi.fn(async () => { throw new Error("transport must not run"); });
+    Object.defineProperty(serviceApi(reloaded), "transport", { value: { request } });
+    await expect(reloaded.verifyRemoteTask("project", "task"))
+      .rejects.toMatchObject({ requestNotSent: true });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("clears only the rate-limit runtime issue after a genuine authorization replacement", async () => {
+    const { service, secrets } = await serviceFixture();
+    const binding = didaAuthorizationBinding("initial-contract-token");
+    secrets.setDidaRequestEmergencyLatch({
+      version: 1,
+      authorizationBinding: binding,
+      reason: "rate-limit-persistence-failed",
+      createdAt: "2026-08-07T00:00:00.000Z",
+    });
+    const blockedRequest = vi.fn(async () => { throw new Error("transport must not run"); });
+    Object.defineProperty(serviceApi(service), "transport", { value: { request: blockedRequest }, configurable: true });
+    await expect(service.verifyRemoteTask("project", "task"))
+      .rejects.toMatchObject({ requestNotSent: true });
+    service.reportRecoveryIssue(DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE);
+
+    await service.replaceDidaToken("replacement-contract-token");
+    expect(service.snapshot().recoveryIssues).toEqual([]);
+    const request = vi.fn(async () => ({
+      status: 200,
+      headers: {},
+      data: { id: "task", projectId: "project", title: "ok", status: 0 },
+      text: "",
+    }));
+    Object.defineProperty(serviceApi(service), "transport", { value: { request }, configurable: true });
+    await expect(service.verifyRemoteTask("project", "task")).resolves.toMatchObject({ id: "task" });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves unrelated runtime recovery issues during authorization replacement", async () => {
+    const { service } = await serviceFixture();
+    service.reportRecoveryIssue(DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE);
+    service.reportRecoveryIssue("unrelated recovery issue");
+    await service.replaceDidaToken("replacement-contract-token");
+    expect(service.snapshot().recoveryIssues).toEqual(["unrelated recovery issue"]);
+  });
+
+  it("publishes the committed authorization without a fallible post-commit store snapshot", async () => {
+    let persisted = createDefaultData("contract-post-commit-snapshot");
+    let committed = false;
+    const store = new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) {
+        persisted = structuredClone(value) as typeof persisted;
+        committed = true;
+      },
+    });
+    const values = new Map<string, string>();
+    const secrets = new HelixSecretStore({
+      secretStorage: {
+        getSecret: (key: string) => values.get(key) ?? null,
+        setSecret: (key: string, value: string) => values.set(key, value),
+      },
+    } as unknown as App);
+    secrets.setDidaToken("initial-contract-token");
+    const service = new HelixService(store, secrets);
+    await service.initialize();
+    committed = false;
+    const originalSnapshot = store.snapshot.bind(store);
+    store.snapshot = async () => {
+      if (committed) throw new Error("post-commit snapshot must not run");
+      return originalSnapshot();
+    };
+
+    await expect(service.replaceDidaToken("replacement-contract-token")).resolves.toBeUndefined();
+    expect(secrets.getDidaToken()).toBe("replacement-contract-token");
+    expect(service.snapshot()).toMatchObject({
+      authorizationConfigured: true,
+      taskScheduleMode: "unknown",
+      connected: false,
+    });
+    expect(secrets.getDidaRequestEmergencyLatch()).toBeNull();
   });
 
   it("rejects credential switching while a synchronization read is in flight", async () => {

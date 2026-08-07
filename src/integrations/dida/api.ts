@@ -7,6 +7,12 @@ import type {
   DidaTask,
 } from "../../domain/entities";
 import { DidaHttpError, classifyStatus, type HttpTransport } from "./http-contract";
+import {
+  DidaRequestGovernor,
+  EMPTY_DIDA_REQUEST_CONTROL,
+  didaInterfaceCategory,
+  type DidaRequestControlState,
+} from "./request-governor";
 
 const BASE_URL = "https://api.dida365.com/open/v1";
 
@@ -34,22 +40,37 @@ export type DidaTaskUpdateWirePayload = Omit<DidaTaskWriteWirePayload, "reminder
 export interface DidaRequestPolicy {
   timeoutMs?: number;
   maxAttempts?: number;
+  maxCalls?: number;
+  cooldownProbe?: boolean;
 }
 
 export class DidaApi {
+  private readonly governor: DidaRequestGovernor;
+  private readonly budget?: { remaining: number };
+
   constructor(
     private readonly transport: HttpTransport,
     private readonly tokenProvider: TokenProvider,
     private readonly requestPolicy: DidaRequestPolicy = {},
     private readonly sleep: (milliseconds: number) => Promise<void> = delay,
-  ) {}
+    governor?: DidaRequestGovernor,
+    budget?: { remaining: number },
+    private readonly remoteAccessGuard: () => void | Promise<void> = () => undefined,
+  ) {
+    this.governor = governor ?? new DidaRequestGovernor(memoryControlPort(), 0, () => Date.now(), sleep);
+    this.budget = budget ?? budgetFromPolicy(requestPolicy);
+  }
 
   withRequestPolicy(policy: DidaRequestPolicy): DidaApi {
+    const merged = { ...this.requestPolicy, ...policy };
     return new DidaApi(
       this.transport,
       this.tokenProvider,
-      { ...this.requestPolicy, ...policy },
+      merged,
       this.sleep,
+      this.governor,
+      policy.maxCalls === undefined ? this.budget : budgetFromPolicy(merged),
+      this.remoteAccessGuard,
     );
   }
 
@@ -196,11 +217,11 @@ export class DidaApi {
   }
 
   filterTasks(filter: Record<string, unknown>): Promise<DidaTask[]> {
-    return this.request("/task/filter", "POST", filter);
+    return this.request("/task/filter", "POST", filter, { readOnly: true });
   }
 
   getCompletedTasks(filter: Record<string, unknown>): Promise<DidaTask[]> {
-    return this.request("/task/completed", "POST", filter);
+    return this.request("/task/completed", "POST", filter, { readOnly: true });
   }
 
   listHabits(): Promise<DidaHabit[]> {
@@ -270,8 +291,9 @@ export class DidaApi {
     path: string,
     method = "GET",
     body?: unknown,
-    options: { outcomeUnknownOnNetworkFailure?: boolean } = {},
+    options: { outcomeUnknownOnNetworkFailure?: boolean; readOnly?: boolean } = {},
   ): Promise<T> {
+    await this.remoteAccessGuard();
     const token = this.tokenProvider();
     if (!token) throw new DidaHttpError("authentication", "尚未配置滴答 API 口令", 401);
     const requestBody = body === undefined ? undefined : JSON.stringify(body);
@@ -284,40 +306,48 @@ export class DidaApi {
         : 3;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
-        const response = await this.transport.request<T>({
-          url: `${BASE_URL}${path}`,
-          method,
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
+        this.consumeBudget();
+        const response = await this.governor.schedule(
+          didaInterfaceCategory(path),
+          method === "GET" || options.readOnly === true,
+          this.requestPolicy.cooldownProbe === true,
+          async () => {
+            // 排队、节流等待和 transient 重试后再次检查，封住恢复状态竞态。
+            try {
+              await this.remoteAccessGuard();
+            } catch (error) {
+              throw new DidaHttpError(
+                "permanent",
+                messageOf(error),
+                undefined,
+                undefined,
+                false,
+                undefined,
+                true,
+              );
+            }
+            const response = await this.transport.request<T>({
+              url: `${BASE_URL}${path}`,
+              method,
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: requestBody,
+              timeoutMs: this.requestPolicy.timeoutMs,
+            });
+            if (response.status < 200 || response.status >= 300) {
+              throw classifyStatus(
+                response.status,
+                `Dida API ${response.status}: ${sanitize(response.text)}`,
+                response.headers,
+                response.text,
+              );
+            }
+            return response;
           },
-          body: requestBody,
-          timeoutMs: this.requestPolicy.timeoutMs,
-        });
-        if (response.status >= 200 && response.status < 300) return response.data;
-        const error = classifyStatus(
-          response.status,
-          `Dida API ${response.status}: ${sanitize(response.text)}`,
-          response.headers,
-          response.text,
         );
-        if (error.category !== "transient" && error.category !== "rate-limit") throw error;
-        if (options.outcomeUnknownOnNetworkFailure) {
-          throw new DidaHttpError(
-            "unknown-outcome",
-            error.category === "rate-limit"
-              ? "查询限流发生在写入请求之后，无法确认远端结果；已转入待核对状态"
-              : "服务器错误发生在写入请求之后，无法确认远端结果；已转入待核对状态",
-            response.status,
-            undefined,
-            true,
-          );
-        }
-        lastError = error;
-        if (attempt < maxAttempts - 1) {
-          await this.sleep(error.retryAfterMs ?? 1_000 * 2 ** attempt);
-        }
-        continue;
+        return response.data;
       } catch (error) {
         if (error instanceof DidaHttpError && error.category === "unknown-outcome") {
           throw error;
@@ -325,7 +355,8 @@ export class DidaApi {
         if (
           options.outcomeUnknownOnNetworkFailure &&
           error instanceof DidaHttpError &&
-          error.category === "rate-limit"
+          error.category === "rate-limit" &&
+          !error.requestNotSent
         ) {
           throw new DidaHttpError(
             "unknown-outcome",
@@ -336,7 +367,10 @@ export class DidaApi {
           );
         }
         if (error instanceof DidaHttpError) {
-          if (error.category !== "transient" && error.category !== "rate-limit") throw error;
+          // 全局 governor 已持久化冷却窗口。限流必须立即释放上层写门，
+          // 只能由显式只读探针恢复，禁止在本次调用内等待或自动重发。
+          if (error.category === "rate-limit") throw error;
+          if (error.category !== "transient") throw error;
           lastError = error;
         } else {
           if (options.outcomeUnknownOnNetworkFailure) {
@@ -351,11 +385,7 @@ export class DidaApi {
           lastError = error;
         }
         if (attempt < maxAttempts - 1) {
-          await this.sleep(
-            error instanceof DidaHttpError && error.category === "rate-limit"
-              ? error.retryAfterMs ?? 60_000
-              : 1_000 * 2 ** attempt,
-          );
+          await this.sleep(1_000 * 2 ** attempt);
         }
       }
     }
@@ -373,6 +403,32 @@ export class DidaApi {
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
+
+  private consumeBudget(): void {
+    if (!this.budget) return;
+    if (this.budget.remaining <= 0) {
+      throw new DidaHttpError("permanent", "滴答合同请求预算已耗尽，已主动安全终止");
+    }
+    this.budget.remaining -= 1;
+  }
+}
+
+function budgetFromPolicy(policy: DidaRequestPolicy): { remaining: number } | undefined {
+  return policy.maxCalls === undefined
+    ? undefined
+    : {
+        remaining: Number.isSafeInteger(policy.maxCalls) && policy.maxCalls >= 0
+          ? policy.maxCalls
+          : 0,
+      };
+}
+
+function memoryControlPort() {
+  let state: DidaRequestControlState = structuredClone(EMPTY_DIDA_REQUEST_CONTROL);
+  return {
+    read: async () => structuredClone(state),
+    write: async (next: DidaRequestControlState) => { state = structuredClone(next); },
+  };
 }
 
 function sanitize(value: string): string {

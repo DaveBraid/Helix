@@ -84,6 +84,18 @@ export interface HelixPersistedData {
     message?: string;
     conflictId?: string;
   }>;
+  didaRequestControl?: {
+    authorizationBinding: string;
+    nextAllowedAt?: string;
+    cooldownUntil?: string;
+    queryLimitLevel: 0 | 1 | 2 | 3;
+    cooldownProbeUsed: boolean;
+    recoveryReadPending: boolean;
+    requestCounts: Record<"project" | "task" | "habit" | "focus" | "other", number>;
+    rateLimitCount: number;
+    lastRateLimitedAt?: string;
+    lastRateLimitKind?: "retry-after" | "query-limit";
+  };
   didaProjectionState?: {
     enabled: boolean;
     target?: DidaProjectionTarget;
@@ -241,6 +253,7 @@ export function hydrateData(value: unknown): HelixPersistedData {
     raw.didaProjectionState,
     recoveryIssues,
   );
+  const didaRequestControl = validateDidaRequestControl(raw.didaRequestControl, recoveryIssues);
   const projectionReceiptsByOperation = uniqueArray(
     validArray(
     raw.projectionOperationReceipts,
@@ -274,9 +287,67 @@ export function hydrateData(value: unknown): HelixPersistedData {
     didaContractCapabilities,
     pendingDidaContractCleanup,
     didaProjectionState,
+    didaRequestControl,
     projectionOperationReceipts,
     lineageConflict,
     lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : undefined,
+  };
+}
+
+function validateDidaRequestControl(
+  value: unknown,
+  issues: string[],
+): HelixPersistedData["didaRequestControl"] {
+  if (value === undefined) return undefined;
+  const allowed = [
+    "authorizationBinding", "nextAllowedAt", "cooldownUntil", "queryLimitLevel", "cooldownProbeUsed",
+    "recoveryReadPending",
+    "requestCounts", "rateLimitCount", "lastRateLimitedAt", "lastRateLimitKind",
+  ] as const;
+  if (!isRecord(value) || !onlyKeys(value, allowed) || !isRecord(value.requestCounts) ||
+    !onlyKeys(value.requestCounts, ["project", "task", "habit", "focus", "other"])) {
+    issues.push("滴答请求冷却状态无效，已停止远端访问并进入只读恢复模式");
+    return undefined;
+  }
+  const counts = value.requestCounts;
+  if (
+    typeof value.authorizationBinding !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.authorizationBinding) ||
+    (value.nextAllowedAt !== undefined &&
+      (typeof value.nextAllowedAt !== "string" || !Number.isFinite(Date.parse(value.nextAllowedAt)) ||
+        Date.parse(value.nextAllowedAt) > Date.now() + 5_000)) ||
+    !Number.isSafeInteger(value.queryLimitLevel) || Number(value.queryLimitLevel) < 0 || Number(value.queryLimitLevel) > 3 ||
+    typeof value.cooldownProbeUsed !== "boolean" ||
+    typeof value.recoveryReadPending !== "boolean" ||
+    !Number.isSafeInteger(value.rateLimitCount) || Number(value.rateLimitCount) < 0 ||
+    ["project", "task", "habit", "focus", "other"].some((key) =>
+      !Number.isSafeInteger(counts[key]) || Number(counts[key]) < 0) ||
+    (value.cooldownUntil !== undefined &&
+      (typeof value.cooldownUntil !== "string" || !Number.isFinite(Date.parse(value.cooldownUntil)))) ||
+    (value.lastRateLimitedAt !== undefined &&
+      (typeof value.lastRateLimitedAt !== "string" || !Number.isFinite(Date.parse(value.lastRateLimitedAt)))) ||
+    (value.lastRateLimitKind !== undefined &&
+      value.lastRateLimitKind !== "retry-after" && value.lastRateLimitKind !== "query-limit")) {
+    issues.push("滴答请求冷却状态无效，已停止远端访问并进入只读恢复模式");
+    return undefined;
+  }
+  return {
+    authorizationBinding: value.authorizationBinding,
+    nextAllowedAt: value.nextAllowedAt as string | undefined,
+    cooldownUntil: value.cooldownUntil as string | undefined,
+    queryLimitLevel: value.queryLimitLevel as 0 | 1 | 2 | 3,
+    cooldownProbeUsed: value.cooldownProbeUsed,
+    recoveryReadPending: value.recoveryReadPending,
+    requestCounts: {
+      project: Number(counts.project),
+      task: Number(counts.task),
+      habit: Number(counts.habit),
+      focus: Number(counts.focus),
+      other: Number(counts.other),
+    },
+    rateLimitCount: Number(value.rateLimitCount),
+    lastRateLimitedAt: value.lastRateLimitedAt as string | undefined,
+    lastRateLimitKind: value.lastRateLimitKind as "retry-after" | "query-limit" | undefined,
   };
 }
 

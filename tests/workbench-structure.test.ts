@@ -10,6 +10,10 @@ describe("workbench layout and navigation structure", () => {
     resolve(process.cwd(), "src/services/project-workspace.ts"),
     "utf8",
   );
+  const didaRequestGovernor = readFileSync(
+    resolve(process.cwd(), "src/integrations/dida/request-governor.ts"),
+    "utf8",
+  );
   const didaProjectSync = [
     readFileSync(resolve(process.cwd(), "src/services/dida-project-projection.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/domain/dida-project-projection.ts"), "utf8"),
@@ -32,6 +36,10 @@ describe("workbench layout and navigation structure", () => {
     expect(WORKBENCH_NAVIGATION.map((item) => item.label))
       .toEqual(["今日", "项目", "任务", "复盘", "挑战", "冲突"]);
     expect(WORKBENCH_NAVIGATION.map((item) => item.id)).not.toContain("analytics");
+  });
+
+  it("keeps rate-limit observation on the single governed request path", () => {
+    expect(didaRequestGovernor).not.toContain("observeRateLimit");
   });
 
   it("places analytics below review cards inside the shared review section", () => {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DidaFocusRecord, DidaProject, DidaTask } from "../src/domain/entities";
 import {
   HelixService,
@@ -6,7 +6,7 @@ import {
 } from "../src/services/helix-service";
 import { HelixDataStore, type PluginDataPort } from "../src/storage/data-store";
 import { createDefaultData, hydrateData } from "../src/storage/model";
-import type { HelixSecretStore } from "../src/storage/secrets";
+import type { DidaRequestEmergencyLatch, HelixSecretStore } from "../src/storage/secrets";
 import { createSnapshot } from "../src/sync/snapshots";
 import type { SyncQueueOperation } from "../src/sync/types";
 import { buildConflictFields } from "../src/sync/three-way-merge";
@@ -160,6 +160,46 @@ async function createBoardMoveHarness(): Promise<{
 }
 
 describe("HelixService runtime recovery", () => {
+  it("blocks every ordinary remote request when persisted request control is invalid", async () => {
+    let persisted: unknown = {
+      ...createDefaultData("device-invalid-request-control"),
+      pendingDidaContractCleanup: {
+        authorizationBinding: didaAuthorizationBinding("token"),
+        plan: {
+          runId: "run-invalid-control",
+          marker: "[Helix 合同测试 run-invalid-control]",
+          projects: [],
+          tasks: [],
+        },
+      },
+      didaRequestControl: {
+        authorizationBinding: "invalid",
+        queryLimitLevel: 1,
+        cooldownProbeUsed: false,
+        requestCounts: { project: 0, task: 0, habit: 0, focus: 0, other: 0 },
+        rateLimitCount: 1,
+      },
+    };
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value); },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    const request = vi.fn(async () => {
+      throw new Error("transport must not run");
+    });
+    const api = (service as unknown as { api: object }).api;
+    Object.defineProperty(api, "transport", { value: { request } });
+
+    await expect(service.verifyRemoteTask("project", "task"))
+      .rejects.toThrow(/只读恢复模式.*阻止远端访问/);
+    expect(request).not.toHaveBeenCalled();
+    expect(service.snapshot().recoveryIssues.join(" ")).toMatch(/请求冷却状态无效/);
+    await expect(service.adoptPendingContractRunFromRemote())
+      .rejects.toThrow(/只读恢复模式/);
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("replaces a persisted erroneous focus event with corrected milliseconds on sync", async () => {
     const record: DidaFocusRecord = {
       id: "focus-corrected",
@@ -293,6 +333,7 @@ describe("HelixService runtime recovery", () => {
     };
     let persisted = structuredClone(data);
     let token: string | null = "token";
+    let latch: DidaRequestEmergencyLatch | null = null;
     const service = new HelixService(
       new HelixDataStore({
         async loadData() {
@@ -307,6 +348,9 @@ describe("HelixService runtime recovery", () => {
         clearDidaToken: () => {
           token = null;
         },
+        setDidaRequestEmergencyLatch: (value: DidaRequestEmergencyLatch) => { latch = value; },
+        clearDidaRequestEmergencyLatch: () => { latch = null; },
+        getDidaRequestEmergencyLatch: () => latch,
       } as unknown as HelixSecretStore,
     );
 
@@ -2523,6 +2567,7 @@ describe("HelixService runtime recovery", () => {
     data.didaContractCapabilities!.taskReopenVerified = true;
     let persisted = structuredClone(data);
     let token: string | null = "token";
+    let latch: DidaRequestEmergencyLatch | null = null;
     let blockNextSave = false;
     let releaseSave!: () => void;
     const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
@@ -2542,6 +2587,9 @@ describe("HelixService runtime recovery", () => {
       getDidaToken: () => token,
       setDidaToken(value: string) { token = value; },
       clearDidaToken() { token = null; },
+      setDidaRequestEmergencyLatch(value: DidaRequestEmergencyLatch) { latch = value; },
+      clearDidaRequestEmergencyLatch() { latch = null; },
+      getDidaRequestEmergencyLatch() { return latch; },
     } as unknown as HelixSecretStore);
     await service.initialize();
     let networkCalls = 0;

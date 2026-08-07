@@ -6,7 +6,7 @@ import { stableHash } from "../src/domain/stable";
 import { HelixService } from "../src/services/helix-service";
 import { HelixDataStore } from "../src/storage/data-store";
 import { createDefaultData } from "../src/storage/model";
-import type { HelixSecretStore } from "../src/storage/secrets";
+import type { DidaRequestEmergencyLatch, HelixSecretStore } from "../src/storage/secrets";
 
 describe("projection column creation", () => {
   it("requires a fresh double-confirmed preview and sends exactly one create", async () => {
@@ -201,6 +201,7 @@ async function createHarness(
     failSaveCall: undefined as number | undefined,
   };
   let token = "token";
+  let latch: DidaRequestEmergencyLatch | null = null;
   const port = {
     async loadData() { return structuredClone(persisted); },
     async saveData(value: unknown) {
@@ -228,6 +229,9 @@ async function createHarness(
       getDidaToken: () => token,
       setDidaToken: (value: string) => { token = value; },
       clearDidaToken: () => { token = ""; },
+      setDidaRequestEmergencyLatch: (value: DidaRequestEmergencyLatch) => { latch = value; },
+      clearDidaRequestEmergencyLatch: () => { latch = null; },
+      getDidaRequestEmergencyLatch: () => latch,
     } as unknown as HelixSecretStore);
     await service.initialize();
     Object.defineProperty(service, "api", { value: api });

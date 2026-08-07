@@ -100,6 +100,7 @@ import {
   type ProjectAutoSyncReport,
 } from "./services/project-auto-sync";
 import { helixMarkerVisibilityExtension } from "./editor/helix-marker-visibility";
+import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "./release-capabilities";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = {
@@ -234,7 +235,9 @@ export default class HelixPlugin extends Plugin {
     this.register(this.service.subscribe(() => {
       void projectionReadinessRunner.run(async () => {
         const readiness = await this.service.projectProjectionWriteReadiness();
-        this.projectAutoSync.updateReadiness(readiness.ready);
+        this.projectAutoSync.updateReadiness(
+          PROJECT_DIDA_PROJECTION_AVAILABLE && readiness.ready,
+        );
       }).catch((error) => console.warn("Helix 无法刷新滴答项目后台写入条件", error));
     }));
     await this.projectProjection.retryReceiptCleanup();
@@ -274,9 +277,6 @@ export default class HelixPlugin extends Plugin {
         getTaskMatrixRules: () => ({ ...this.settings.taskMatrixRules }),
         updateTaskMatrixRules: (rules) => this.updateTaskMatrixRules(rules),
         readProjectProjection: (projectId) => this.readProjectProjection(projectId),
-        previewProjectProjection: (target) => this.previewProjectProjection(target),
-        adoptProjectAction: (input) => this.adoptProjectAction(input),
-        editProjectAction: (input) => this.editProjectAction(input),
         reconcileProjectProjectionFrozen: (input) => this.reconcileProjectProjectionFrozen(input),
         recoverPendingProjectProjectionReceiptCleanup: () =>
           this.recoverPendingProjectProjectionReceiptCleanup(),
@@ -615,6 +615,7 @@ export default class HelixPlugin extends Plugin {
   }
 
   async previewProjectProjection(target: DidaProjectionTarget): Promise<ProjectionActivationPreview> {
+    this.assertProjectProjectionAvailable();
     return this.withProjectWorkspaceRead(async () => {
       const snapshot = await this.projectWorkspace.snapshot();
       const counts = await projectionCounts(snapshot, this.projectProjection);
@@ -626,6 +627,7 @@ export default class HelixPlugin extends Plugin {
     preview: ProjectionActivationPreview,
     confirmedHash: string,
   ): Promise<void> {
+    this.assertProjectProjectionAvailable();
     await this.withWritableProjectMutation(async () => {
       const snapshot = await this.projectWorkspace.snapshot();
       await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
@@ -638,6 +640,7 @@ export default class HelixPlugin extends Plugin {
   }
 
   previewProjectProjectionColumn(projectId: string): Promise<ProjectionColumnCreationPreview> {
+    this.assertProjectProjectionAvailable();
     return this.service.previewProjectionColumnCreation(projectId);
   }
 
@@ -645,6 +648,7 @@ export default class HelixPlugin extends Plugin {
     preview: ProjectionColumnCreationPreview,
     confirmedHash: string,
   ) {
+    this.assertProjectProjectionAvailable();
     return this.service.confirmProjectionColumnCreation(preview, confirmedHash);
   }
 
@@ -730,11 +734,13 @@ export default class HelixPlugin extends Plugin {
   }
 
   async syncProjectProjection(projectId: string): Promise<ProjectionSyncSummary> {
+    this.assertProjectProjectionAvailable();
     return this.withWritableProjectMutation(async () =>
       this.projectProjection.synchronizeProject(await this.projectionInput(projectId)));
   }
 
   private async projectAutoSyncScan() {
+    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) return { candidates: [], failures: [] };
     return this.withProjectWorkspaceRead(async () => {
       const configuration = await this.projectProjection.readConfiguration();
       if (!configuration.enabled || !configuration.target || !configuration.confirmedPreviewHash) {
@@ -790,6 +796,12 @@ export default class HelixPlugin extends Plugin {
   private async requireProjectionStage(projectId: string, stageId: string) {
     const snapshot = await this.projectWorkspace.snapshot();
     return projectionStageInProject(snapshot, projectId, stageId);
+  }
+
+  private assertProjectProjectionAvailable(): void {
+    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) {
+      throw new Error("0.1.0 个人预览版暂未开放项目与滴答联动");
+    }
   }
 
   async saveTemplateFolderAndEnsure(folder: string): Promise<string[]> {

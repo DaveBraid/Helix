@@ -83,11 +83,6 @@ import {
 import { homeGreeting } from "../domain/home-dashboard";
 import { requestStageBoardStatusChange } from "../domain/stage-board";
 import type {
-  DidaProjectionTarget,
-  ProjectionActionState,
-  ProjectionActivationPreview,
-} from "../domain/dida-project-projection";
-import type {
   ProjectionProjectReadModel,
 } from "../services/dida-project-projection";
 import type {
@@ -128,11 +123,9 @@ import {
   type ProjectLineageViewMode,
 } from "./project-lineage-workbench";
 import {
-  PROJECTION_STATE_OPTIONS,
   ProjectionUiActionCoordinator,
   conflictCenterIsEmpty,
   loadProjectionConflictModels,
-  projectionProjectSummary,
 } from "./project-projection-presenter";
 
 echarts.use([
@@ -268,9 +261,6 @@ export class HelixView extends ItemView {
       getTaskMatrixRules: () => TaskMatrixRules;
       updateTaskMatrixRules: (rules: TaskMatrixRules) => Promise<void>;
       readProjectProjection: (projectId: string) => Promise<ProjectionProjectReadModel>;
-      previewProjectProjection: (target: DidaProjectionTarget) => Promise<ProjectionActivationPreview>;
-      adoptProjectAction: (input: { projectId: string; stageId: string; expectedHash: string; line: number }) => Promise<void>;
-      editProjectAction: (input: { projectId: string; stageId: string; expectedHash: string; uuid: string; title?: string; state?: ProjectionActionState }) => Promise<void>;
       reconcileProjectProjectionFrozen: (input:
         | { kind: "action"; projectId: string; stageId: string; uuid: string }
         | { kind: "parent"; projectId: string }) => Promise<void>;
@@ -2204,8 +2194,6 @@ export class HelixView extends ItemView {
     ) {
       this.selectedProjectId = workspace.projects[0]!.id;
     }
-    await this.renderProjectProjectionPanel(content, workspace, token);
-    if (token !== this.renderToken) return;
     const lifecycleGeneration = this.viewGeneration;
     this.renderNativeRelationCandidates(
       content,
@@ -2401,110 +2389,6 @@ export class HelixView extends ItemView {
     if (this.closed) return;
     this.pendingKanbanArrivalCycleId = cycleId;
     await this.render();
-  }
-
-  private async renderProjectProjectionPanel(
-    content: HTMLElement,
-    workspace: ProjectWorkspaceSnapshot,
-    token: number,
-  ): Promise<void> {
-    if (!this.selectedProjectId) return;
-    const project = workspace.projects.find((candidate) =>
-      candidate.id === this.selectedProjectId);
-    if (!project) return;
-    const panel = content.createDiv({ cls: "helix-card helix-project-projection-panel" });
-    panel.createEl("h3", { text: "滴答项目同步" });
-    const loading = panel.createEl("p", { cls: "helix-project-projection-loading", text: "读取行动与同步状态…" });
-    let model: ProjectionProjectReadModel;
-    try {
-      model = await this.actions.readProjectProjection(project.id);
-    } catch (error) {
-      if (token !== this.renderToken) return;
-      loading.setText(`无法读取滴答项目同步：${error instanceof Error ? error.message : String(error)}`);
-      return;
-    }
-    if (token !== this.renderToken) return;
-    loading.remove();
-    const summary = projectionProjectSummary(model);
-    const target = panel.createDiv({ cls: "helix-project-projection-target" });
-    target.createEl("strong", {
-      text: model.enabled
-        ? "滴答项目同步已启用"
-        : "本地行动编辑可用 · 滴答项目同步未启用",
-    });
-    target.createEl("code", { text: model.target ? `${model.target.targetProjectId} / ${model.target.targetColumnId}` : "尚未配置目标" });
-    target.createSpan({
-      text: model.project.parentTaskId
-        ? `父任务 ${model.project.parentTaskId}`
-        : model.parentDiagnostic?.frozen ? "父任务已冻结" : "父任务尚未创建",
-    });
-    target.createSpan({
-      text: this.state?.connected
-        ? "滴答读取连接正常"
-        : this.state?.authorizationConfigured
-          ? "滴答读取连接待恢复"
-          : "未配置滴答 API 授权",
-    });
-    panel.createEl("p", {
-      cls: "helix-project-projection-local-note",
-      text: model.enabled
-        ? "Stage 或项目发生变化后会自动排队同步；阻塞与失败会通过通知和冲突中心提示。"
-        : "本地行动可继续编辑；启用滴答项目同步前不会请求远端写入。",
-    });
-    const metrics = panel.createDiv({ cls: "helix-project-projection-metrics" });
-    for (const [label, value] of [
-      ["已加入", summary.managed], ["未加入", summary.unmanaged], ["失联关联", summary.orphan],
-      ["冻结", summary.frozen], ["待清理", summary.cleanup],
-    ] as const) metrics.createSpan({ text: `${label} ${value}` });
-
-    let remoteBlockers: string[] = [];
-    if (model.enabled && model.target) {
-      try {
-        remoteBlockers = (await this.actions.previewProjectProjection(model.target)).blockers;
-      } catch (error) {
-        remoteBlockers = [error instanceof Error ? error.message : String(error)];
-      }
-      if (token !== this.renderToken) return;
-    }
-    if (remoteBlockers.length > 0) panel.createEl("p", {
-      cls: "helix-project-projection-blockers",
-      text: `远端同步暂不可用：${remoteBlockers.join("；")}。本地 Stage 编辑不受影响。`,
-    });
-    const stageGrid = panel.createDiv({ cls: "helix-project-projection-stages" });
-    for (const stage of model.stages) {
-      const stageCard = stageGrid.createDiv({ cls: "helix-project-projection-stage" });
-      const stageTitle = project.cycles.find((cycle) => cycle.id === stage.id);
-      stageCard.createEl("h4", { text: stageTitle ? `阶段 ${stageTitle.stageCode} · ${stageTitle.title}` : stage.id });
-      for (const action of stage.unmanaged) {
-        const row = stageCard.createDiv({ cls: "helix-project-projection-action is-unmanaged" });
-        row.createSpan({ text: action.title });
-        const adopt = row.createEl("button", {
-          text: "加入同步",
-          attr: { "aria-label": `将行动加入滴答项目同步：${action.title}` },
-        });
-        adopt.addEventListener("click", () => this.runProjectionUiAction(adopt, token, async () => {
-          await this.actions.adoptProjectAction({
-            projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash, line: action.line,
-          });
-          new Notice(model.enabled ? "行动已加入，后台同步已排队" : "行动已加入；启用滴答项目同步后将自动发送");
-        }));
-      }
-      for (const action of stage.managed) {
-        const row = stageCard.createDiv({ cls: `helix-project-projection-action${action.frozen ? " is-frozen" : ""}` });
-        const title = row.createEl("input", { type: "text", value: action.title, attr: { "aria-label": "已加入同步的行动标题" } });
-        const state = row.createEl("select", { attr: { "aria-label": "已加入同步的行动状态" } });
-        for (const option of PROJECTION_STATE_OPTIONS) state.createEl("option", { value: option.value, text: option.label });
-        state.value = action.state;
-        const save = row.createEl("button", { text: "保存" });
-        save.addEventListener("click", () => this.runProjectionUiAction(save, token, async () => {
-          await this.actions.editProjectAction({
-            projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash,
-            uuid: action.uuid, title: title.value, state: state.value as ProjectionActionState,
-          });
-          new Notice(model.enabled ? "行动已保存，后台同步已排队" : "行动已保存；滴答项目同步尚未启用");
-        }, "Markdown 已变化，已刷新最新内容"));
-      }
-    }
   }
 
   private runProjectionUiAction(

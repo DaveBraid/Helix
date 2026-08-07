@@ -183,18 +183,17 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
 
-  it("replaces the old project mapping bar with explicit projection actions", () => {
+  it("keeps project-to-Dida projection out of the 0.1.0 release UI", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     expect(view).not.toContain("renderProjectDidaMappingBar");
     expect(view).not.toContain("ProjectDidaMappingConfirmModal");
-    expect(view).toMatch(/renderProjectProjectionPanel[\s\S]*未加入[\s\S]*adoptProjectAction/);
-    expect(view).toMatch(/editProjectAction/);
-    expect(view).toContain("Stage 或项目发生变化后会自动排队同步");
+    expect(view).not.toContain("renderProjectProjectionPanel");
+    expect(view).not.toContain("adoptProjectAction");
+    expect(view).not.toContain("editProjectAction");
     expect(view).not.toContain("同步此项目到滴答");
     expect(view).not.toContain("当前只写 Stage，尚未发送滴答");
-    expect(settings).toMatch(/滴答项目同步[\s\S]*选择清单[\s\S]*选择已有分栏/);
-    expect(settings).toMatch(/再次点击确认启用/);
-    expect(settings).toContain("请选择清单以查看已有分栏或安全创建目标分栏");
+    expect(settings).not.toContain("滴答项目同步");
+    expect(settings).not.toContain("renderProjectProjectionSettings");
   });
 
   it("registers Live Preview marker hiding and routes project changes through one background coordinator", () => {
@@ -204,7 +203,8 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/new ProjectAutoSyncCoordinator[\s\S]*scan: \(\) => this\.projectAutoSyncScan\(\)[\s\S]*synchronize: \(projectId\) => this\.syncProjectProjection\(projectId\)/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);
-    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*updateReadiness\(readiness\.ready\)/);
+    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && readiness\.ready/);
+    expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE[\s\S]*candidates: \[\], failures: \[\]/);
     const readiness = service.slice(
       service.indexOf("async projectProjectionWriteReadiness"),
       service.indexOf("async replaceDidaToken"),
@@ -243,21 +243,21 @@ describe("workbench layout and navigation structure", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     const modal = main.slice(main.indexOf("class ProjectPromptModal"), main.indexOf("class CyclePromptModal"));
     expect(view).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
-    expect(settings).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
-    expect(settings).toMatch(/setButtonText\("重新预览"\)[\s\S]*removeClass\("mod-cta"\)[\s\S]*确认失败或状态已变化，必须重新预览/);
+    expect(settings).not.toContain("ProjectionUiActionCoordinator");
+    expect(settings).not.toContain("confirmProjectProjection");
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
     expect(modal).toMatch(/submit\(title, this\.color\)/);
   });
 
-  it("exposes column creation only as a double-confirmed preview and unknown reconciliation", () => {
+  it("hides projection column creation while retaining safe unknown reconciliation", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
     const confirm = service.slice(
       service.indexOf("async confirmProjectionColumnCreation"),
       service.indexOf("async reconcileProjectionColumnCreation"),
     );
-    expect(settings).toMatch(/创建“\$\{PROJECTION_COLUMN_NAME\}”分栏[\s\S]*预览创建/);
-    expect(settings).toMatch(/完整列基线[\s\S]*baselineHash[\s\S]*再次点击确认创建/);
+    expect(settings).not.toContain("PROJECTION_COLUMN_NAME");
+    expect(settings).not.toContain("previewProjectProjectionColumn");
     expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
     expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
     expect(confirm).toMatch(/enterExclusive\("滴答项目同步分栏创建"\)/);

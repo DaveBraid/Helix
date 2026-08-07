@@ -1,4 +1,5 @@
 import type { DidaColumn, DidaProject, DidaTask } from "../../domain/entities";
+import { assertStableId } from "../../domain/dida-project-projection";
 import {
   didaTaskDifferenceFields,
   didaTaskWithoutRemoteMetadata,
@@ -75,6 +76,8 @@ export interface DidaWriteContractReport {
     reason: string;
   };
   capabilityFailures: string[];
+  /** 固定、脱敏的能力探针失败阶段码；不得包含远端正文或 ID。 */
+  capabilityFailureCodes: string[];
   /** 仅供持久恢复使用；不得进入 Notice 或普通诊断。 */
   cleanupPlan?: DidaContractCleanupPlan;
 }
@@ -156,6 +159,7 @@ export class DidaWriteContractRunner {
     const steps: string[] = [];
     const cleanupErrors: string[] = [];
     const capabilityFailures: string[] = [];
+    const capabilityFailureCodes: string[] = [];
     const projects: CreatedProject[] = [];
     const forbiddenProjectIds = new Set<string>();
     let task: CreatedTask | null = null;
@@ -416,10 +420,12 @@ export class DidaWriteContractRunner {
         "检查项能力父任务",
         optionalTasks,
       );
+      let itemsFailureCode = "ITEMS_PARENT_CREATE";
       try {
         const emptyParent = normalizeTask(await this.api.getTask(projectA.id, parentTask.id));
         const sentinelTitle = `${marker} sentinel`;
         const sentinelDraft = { id: "", title: sentinelTitle, status: 0, sortOrder: 321 };
+        itemsFailureCode = "ITEMS_SENTINEL_CREATE";
         const withSentinel = await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -433,13 +439,14 @@ export class DidaWriteContractRunner {
             if (reread.items?.length !== 1 || !reread.items[0]?.id || reread.items[0].title !== sentinelTitle) {
               throw new Error("sentinel 检查项未获得唯一服务端 ID");
             }
-            if (!deepEqual({ ...reread.items[0], id: "" }, sentinelDraft)) {
-              throw new Error("sentinel 检查项字段或排序值未完整往返");
+            if (!sameInitialChecklistSemantics(sentinelDraft, reread.items[0])) {
+              throw new Error("sentinel 检查项受管字段未按语义往返");
             }
           },
         );
         const sentinel = withSentinel.items![0]!;
         const ownedTitle = `${marker} owned item`;
+        itemsFailureCode = "ITEMS_OWNED_APPEND";
         const withOwned = await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -461,6 +468,7 @@ export class DidaWriteContractRunner {
         );
         const owned = withOwned.items!.find((item) => item.id !== sentinel.id)!;
         const renamed = { ...owned, title: `${ownedTitle} renamed`, status: 2 };
+        itemsFailureCode = "ITEMS_OWNED_COMPLETE";
         const afterRename = await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -469,6 +477,7 @@ export class DidaWriteContractRunner {
           (reread) => assertChecklistContractState(withOwned, reread, sentinel, renamed),
         );
         const reopened = { ...renamed, status: 0 };
+        itemsFailureCode = "ITEMS_OWNED_REOPEN";
         const afterReopen = await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -476,6 +485,7 @@ export class DidaWriteContractRunner {
           taskUpdatePayload({ ...afterRename, items: [sentinel, reopened] }, { itemsRoundTripVerified: true }, ["items"]),
           (reread) => assertChecklistContractState(afterRename, reread, sentinel, reopened),
         );
+        itemsFailureCode = "ITEMS_OWNED_DELETE";
         await this.updateAndVerifyTaskProperties(
           parentTask.id,
           projectA.id,
@@ -502,6 +512,7 @@ export class DidaWriteContractRunner {
         this.itemsRoundTripVerified = false;
         this.itemIdStableVerified = false;
         capabilityFailures.push(capabilityFailureSummary("items"));
+        capabilityFailureCodes.push(itemsFailureCode);
         steps.push("当前账号未通过检查项往返与 ID 稳定合同，保持项目投影只读");
       }
 
@@ -730,6 +741,7 @@ export class DidaWriteContractRunner {
       taskReopenVerified: this.taskReopenVerified,
       manualCleanupRequired: this.manualCleanupRequired,
       capabilityFailures,
+      capabilityFailureCodes,
       cleanupPlan,
     };
   }
@@ -1588,6 +1600,17 @@ function assertChecklistContractState(
     !actualOwned || !beforeOwned || !sameChecklistOwnedExceptDerivedTime(beforeOwned, expectedOwned, actualOwned)) {
     throw new Error("检查项 ID、字段、未知属性或顺序未稳定往返");
   }
+}
+
+function sameInitialChecklistSemantics(
+  expected: NonNullable<DidaTask["items"]>[number],
+  actual: NonNullable<DidaTask["items"]>[number],
+): boolean {
+  // 新检查项的 ID 及未提交字段由服务端生成；合同只要求显式受管字段
+  // 精确往返。后续步骤以该完整复读值为基线，继续证明默认/未知字段不丢失。
+  assertStableId(actual.id, "服务端检查项 ID");
+  return actual.title === expected.title &&
+    actual.status === expected.status && actual.sortOrder === expected.sortOrder;
 }
 
 function sameChecklistOwnedExceptDerivedTime(

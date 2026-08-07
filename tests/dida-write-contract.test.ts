@@ -58,6 +58,9 @@ class ContractApiFake {
   rejectRepeatWrites: false | string = false;
   advanceEtimestampOnUpdate = false;
   rejectParentCreate: false | string = false;
+  addChecklistServerDefaults = false;
+  corruptSentinelSortOrder = false;
+  forcedNewChecklistItemId?: string;
   rejectPlacementWrites: false | string = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
@@ -402,7 +405,12 @@ class ContractApiFake {
     if (Object.hasOwn(value, "items")) {
       updated.items = (value.items ?? []).map((item) => ({
         ...item,
-        id: item.id || `test-item-${++this.itemSequence}`,
+        id: item.id || (this.forcedNewChecklistItemId !== undefined
+          ? this.forcedNewChecklistItemId
+          : `test-item-${++this.itemSequence}`),
+        ...(!item.id && this.addChecklistServerDefaults
+          ? { isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
+          : {}),
       })).map((item) => {
         const before = current.items?.find((candidate) => candidate.id === item.id);
         if (before?.status === 0 && item.status === 2) {
@@ -415,6 +423,9 @@ class ContractApiFake {
         }
         return item;
       });
+      if (this.corruptSentinelSortOrder && current.items === undefined && updated.items[0]) {
+        updated.items[0] = { ...updated.items[0], sortOrder: 999 };
+      }
     }
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
     if (this.corruptSchedule) updated.dueDate = "2030-01-01T00:00:00.000Z";
@@ -683,6 +694,64 @@ describe("DidaWriteContractRunner", () => {
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
   });
+
+  it("accepts server defaults on a newly created checklist item and preserves them afterward", async () => {
+    const api = new ContractApiFake();
+    api.addChecklistServerDefaults = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-items-server-defaults",
+      fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: true,
+      itemIdStableVerified: true,
+      capabilityFailureCodes: [],
+      remoteArtifactsRemaining: false,
+    });
+    const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
+    expect(itemWrites.slice(1).some((payload) => payload.items?.[0]?.timeZone === "Asia/Shanghai")).toBe(true);
+  });
+
+  it("reports a fixed redacted items stage code for semantic sentinel failure", async () => {
+    const api = new ContractApiFake();
+    api.corruptSentinelSortOrder = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-secret-items-stage",
+      fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: false,
+      itemIdStableVerified: false,
+      capabilityFailureCodes: ["ITEMS_SENTINEL_CREATE"],
+      remoteArtifactsRemaining: false,
+    });
+    expect(JSON.stringify(report.capabilityFailureCodes)).not.toMatch(/run-secret|test-item|test-task/iu);
+  });
+
+  it.each(["", "   ", " item-with-spaces ", "item-with\nnewline"])(
+    "rejects an unstable server checklist ID with a redacted sentinel-stage code: %j",
+    async (serverId) => {
+      const api = new ContractApiFake();
+      api.forcedNewChecklistItemId = serverId;
+      const report = await new DidaWriteContractRunner(
+        api,
+        () => "run-unstable-item-id",
+        fixedNow,
+      ).run();
+      expect(report).toMatchObject({
+        status: "passed",
+        itemsRoundTripVerified: false,
+        itemIdStableVerified: false,
+        capabilityFailureCodes: ["ITEMS_SENTINEL_CREATE"],
+        remoteArtifactsRemaining: false,
+      });
+      if (serverId) expect(JSON.stringify(report.capabilityFailureCodes)).not.toContain(serverId);
+    },
+  );
 
   it("checkpoints sent-unknown before every temporary task and project delete", async () => {
     const api = new ContractApiFake();

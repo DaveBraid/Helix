@@ -7,8 +7,11 @@ export const DIDA_WRITE_CONTRACT_VERSION_LABEL = `合同版本 ${DIDA_CONTRACT_P
 
 /** 设置页与命令面板共用：合同报告中的远端正文、标记和 ID 一律不可见。 */
 export function didaWriteContractSafeSummary(report: DidaWriteContractReport): string {
+  const codes = report.capabilityFailureCodes.length > 0
+    ? `（${report.capabilityFailureCodes.join("、")}）`
+    : "";
   const capabilities = report.capabilityFailures.length > 0
-    ? "；部分扩展能力保持只读"
+    ? `；部分扩展能力保持只读${codes}`
     : "";
   if (report.status === "passed" && !report.remoteArtifactsRemaining) {
     return `核心合同通过；测试对象已全部清理${capabilities}`;

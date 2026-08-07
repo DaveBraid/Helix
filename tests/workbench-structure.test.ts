@@ -47,8 +47,13 @@ describe("workbench layout and navigation structure", () => {
   });
 
   it("reserves independent production budgets for contract work and cleanup", () => {
-    expect(helixService).toContain("maxAttempts: 1, maxCalls: 120");
+    expect(helixService).toContain("const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 15_000;");
+    expect(helixService).toMatch(/timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,\s*maxAttempts: 1,\s*maxCalls: 120/);
     expect(helixService).toMatch(/maxAttempts: 1,\s*maxCalls: 40,\s*cooldownProbe: true,/);
+    expect(helixService.match(/timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS/g)).toHaveLength(4);
+    expect(helixService).not.toContain("timeoutMs: 5_000");
+    expect(readFileSync(resolve(process.cwd(), "src/integrations/dida/http.ts"), "utf8"))
+      .toContain("request.timeoutMs ?? 20_000");
   });
 
   it("places analytics below review cards inside the shared review section", () => {

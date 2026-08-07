@@ -101,6 +101,8 @@ import {
   releaseConflictApplication,
 } from "./conflict-claim";
 
+const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 15_000;
+
 export interface HelixRuntimeState {
   loading: boolean;
   connected: boolean;
@@ -837,9 +839,13 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           },
         };
       });
-      const contractApi = this.api.withRequestPolicy({ timeoutMs: 5_000, maxAttempts: 1, maxCalls: 120 });
+      const contractApi = this.api.withRequestPolicy({
+        timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
+        maxAttempts: 1,
+        maxCalls: 120,
+      });
       const cleanupApi = this.api.withRequestPolicy({
-        timeoutMs: 5_000,
+        timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
         maxAttempts: 1,
         maxCalls: 40,
         cooldownProbe: true,
@@ -975,7 +981,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       const authorizationBinding = await didaAuthorizationBinding(token);
       await new DidaContractCleanupService(
         this.api.withRequestPolicy({
-          timeoutMs: 5_000,
+          timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
           maxAttempts: 1,
           cooldownProbe: true,
         }),
@@ -999,7 +1005,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       const authorizationBinding = await didaAuthorizationBinding(token);
       await new DidaContractCleanupService(
         this.api.withRequestPolicy({
-          timeoutMs: 5_000,
+          timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
           maxAttempts: 1,
           cooldownProbe: true,
         }),

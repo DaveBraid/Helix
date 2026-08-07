@@ -67,6 +67,7 @@ class ContractApiFake {
   sentinelMutation?: "parent-fields" | "kind" | "count" | "id-not-preserved" | "semantics";
   forcedNewChecklistItemId?: string;
   reorderNewChecklistItem = false;
+  regenerateChecklistIdsEveryWrite = false;
   ownedAppendMutation?: "parent-fields" | "kind" | "baseline-missing" | "id-regenerated" |
     "added-zero" | "added-multiple" | "id-unstable" | "client-id-changed" | "semantics" | "existing-fields";
   rejectPlacementWrites: false | string = false;
@@ -442,6 +443,9 @@ class ContractApiFake {
         }
         return item;
       });
+      if (this.regenerateChecklistIdsEveryWrite) {
+        updated.items = updated.items.map((item) => ({ ...item, id: `server-item-${++this.itemSequence}` }));
+      }
       if (this.corruptSentinelStatus && current.items === undefined && updated.items[0]) {
         updated.items[0] = { ...updated.items[0], status: 2 };
       }
@@ -799,8 +803,7 @@ describe("DidaWriteContractRunner", () => {
   it.each([
     ["parent-fields", "ITEMS_OWNED_APPEND_PARENT_FIELDS"],
     ["kind", "ITEMS_OWNED_APPEND_KIND"],
-    ["baseline-missing", "ITEMS_OWNED_APPEND_BASELINE_MISSING"],
-    ["id-regenerated", "ITEMS_OWNED_APPEND_ID_REGENERATED"],
+    ["baseline-missing", "ITEMS_OWNED_APPEND_ADDED_ZERO"],
     ["added-zero", "ITEMS_OWNED_APPEND_ADDED_ZERO"],
     ["added-multiple", "ITEMS_OWNED_APPEND_ADDED_MULTIPLE"],
     ["id-unstable", "ITEMS_OWNED_APPEND_ID_UNSTABLE"],
@@ -827,8 +830,7 @@ describe("DidaWriteContractRunner", () => {
   it.each([
     ["ITEMS_OWNED_APPEND_PARENT_FIELDS", (task: DidaTask) => ({ ...task, desc: "changed" })],
     ["ITEMS_OWNED_APPEND_KIND", (task: DidaTask) => ({ ...task, kind: "TASK" })],
-    ["ITEMS_OWNED_APPEND_BASELINE_MISSING", (task: DidaTask) => ({ ...task, items: [task.items![0]!, task.items![2]!] })],
-    ["ITEMS_OWNED_APPEND_ID_REGENERATED", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { ...task.items![1]!, id: "regenerated" }, task.items![2]!] })],
+    ["ITEMS_OWNED_APPEND_ADDED_ZERO", (task: DidaTask) => ({ ...task, items: [task.items![0]!, task.items![2]!] })],
     ["ITEMS_OWNED_APPEND_ADDED_ZERO", (task: DidaTask) => ({ ...task, items: task.items!.slice(1) })],
     ["ITEMS_OWNED_APPEND_ADDED_MULTIPLE", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { id: "extra", title: "extra", status: 0 }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_ID_UNSTABLE", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: " " }, ...task.items!.slice(1)] })],
@@ -935,6 +937,23 @@ describe("DidaWriteContractRunner", () => {
     const report = await new DidaWriteContractRunner(
       api, () => `run-known-${stage}-replacement`, fixedNow,
     ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: true,
+      itemIdStableVerified: false,
+      capabilityFailureCodes: [],
+      remoteArtifactsRemaining: false,
+    });
+  });
+
+  it("accepts known-success full-chain ID regeneration while keeping the account unstable", async () => {
+    const api = new ContractApiFake();
+    api.regenerateChecklistIdsEveryWrite = true;
+
+    const report = await new DidaWriteContractRunner(
+      api, () => "run-known-full-id-regeneration", fixedNow,
+    ).run();
+
     expect(report).toMatchObject({
       status: "passed",
       itemsRoundTripVerified: true,

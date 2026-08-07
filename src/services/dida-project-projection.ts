@@ -495,9 +495,10 @@ export class DidaProjectProjectionService {
     let current = await this.state.read();
     if (!current.target) throw new Error("滴答项目同步尚无已确认目标");
     if (input.kind === "action") {
-      const entry = current.ledger.find((item) => item.uuid === input.uuid &&
+      const foundEntry = current.ledger.find((item) => item.uuid === input.uuid &&
         item.projectId === input.projectId && item.stageId === input.stageId);
-      if (!entry?.frozen) throw new Error("行动没有待复核的冻结状态");
+      if (!foundEntry?.frozen) throw new Error("行动没有待复核的冻结状态");
+      let entry: ProjectionLedgerEntry = foundEntry;
       const inspection = entry.operationId && this.diagnostics
         ? await this.diagnostics.inspect(entry.operationId, entry.conflictId)
         : undefined;
@@ -560,6 +561,7 @@ export class DidaProjectProjectionService {
           createBaselineItemIds: latestIds,
           createBaselineItemsHash: stableHash(latestItems),
           createBaselineItemHashes: Object.fromEntries(latestItems.map((item) => [item.id, stableHash(item)])),
+          createBaselineSemanticHashes: latestItems.map(checklistSemanticHash),
           createItemSortOrder: resumedDraft.sortOrder,
         };
         const rebasedState = {
@@ -594,6 +596,7 @@ export class DidaProjectProjectionService {
               createBaselineItemIds: rebasedIds,
               createBaselineItemsHash: stableHash(rebased),
               createBaselineItemHashes: Object.fromEntries(rebased.map((item) => [item.id, stableHash(item)])),
+              createBaselineSemanticHashes: rebased.map(checklistSemanticHash),
               createItemSortOrder: rebasedDraft.sortOrder,
             }),
           });
@@ -628,12 +631,37 @@ export class DidaProjectProjectionService {
         inspection?.receipt?.outcome === "preflight-changed") {
         throw new Error("旧版无 ID checkpoint 已证明从未发送；禁止按标题领养或续发，保持冻结");
       }
-      const recoveredItemId = entry.remoteId ?? adoptCreatedChecklistItemFromIds(
-        resumeEntry.createBaselineItemIds,
-        recoveredParent.items ?? [],
-        resumeEntry,
-        inspection?.receipt?.outcome === "verified",
-      );
+      const createProof = entry.remoteId ? undefined : adoptCreatedChecklistItemFromIds(
+        resumeEntry.createBaselineItemIds, recoveredParent.items ?? [], resumeEntry,
+        inspection?.receipt?.outcome === "verified");
+      let recoveredItemId = entry.remoteId ?? createProof!.ownedId;
+      let knownRemap = createProof?.remap;
+      let knownMutationRemapped = false;
+      if (entry.remoteId && entry.mutationKind && !entry.conflictId &&
+        inspection?.receipt?.outcome === "verified") {
+        const remapped = verifyKnownSuccessfulMutationFromSemanticHashes(entry, recoveredParent.items ?? []);
+        if (remapped.ownedId) recoveredItemId = remapped.ownedId;
+        knownRemap = remapped.remap;
+        knownMutationRemapped = true;
+      }
+      if (knownRemap && [...knownRemap].some(([before, after]) => before !== after)) {
+        const remappedCurrent = recoveredItemId !== entry.remoteId && !entry.tombstone
+          ? { ...entry, remoteId: recoveredItemId }
+          : undefined;
+        await this.commitChecklistIdRemap({
+          projectId: entry.projectId,
+          parentTaskId: entry.parentTaskId,
+          entries: current.ledger,
+          remap: knownRemap,
+          current: remappedCurrent,
+          stagePaths: entry.remapStagePaths ?? { [entry.uuid]: input.stagePath },
+        });
+        current = await this.state.read();
+        const remappedEntry = current.ledger.find((item) => item.uuid === input.uuid &&
+          item.projectId === input.projectId && item.stageId === input.stageId);
+        if (!remappedEntry) throw new Error("完整 ID 重映后同步账本行动丢失");
+        entry = remappedEntry;
+      }
       const stageRevision = await this.requireRevision(input.stagePath);
       assertProjectionStageIdentity(stageRevision.content, input.stageId);
       const remote = recoveredParent;
@@ -663,9 +691,11 @@ export class DidaProjectProjectionService {
           mutationBaselineItemIds: undefined,
           mutationBaselineItemsHash: undefined,
           mutationBaselineItemHashes: undefined,
+          mutationOrdinarySemanticHashes: undefined,
           mutationOwnedInvariantHash: undefined,
           mutationBaselineOwnedStatus: undefined,
           mutationBaselineOwnedCompletedTimeHash: undefined,
+          remapStagePaths: undefined,
         };
         await this.markdown.compareAndWrite(stageRevision, restoreManagedPlanAction(stageRevision.content, {
           uuid: entry.uuid,
@@ -680,7 +710,7 @@ export class DidaProjectProjectionService {
         }, cleanupProof);
         return;
       }
-      if (entry.mutationKind) {
+      if (entry.mutationKind && !knownMutationRemapped) {
         assertFrozenMutationOutcome(entry, remote.items ?? [], Boolean(entry.conflictId));
       }
       if (entry.tombstone) {
@@ -696,7 +726,7 @@ export class DidaProjectProjectionService {
         entry.updateExpectedStatus !== undefined && entry.updateStageRevisionHash !== undefined;
       if (hasUpdateCheckpoint) {
         if (!remoteItem) throw new Error("更新冻结的 owned 检查项不存在，保持冻结");
-        if (stageRevision.hash !== entry.updateStageRevisionHash) {
+        if (!knownMutationRemapped && stageRevision.hash !== entry.updateStageRevisionHash) {
           throw new Error("阶段 Markdown 在更新冻结期间发生变化，保持冻结");
         }
         // 普通 unknown 只接受原期望结果；人工冲突解决则以已精确复读的最终远端值为准。
@@ -713,7 +743,7 @@ export class DidaProjectProjectionService {
         const markdownAction = parseManagedPlanActions(stageRevision.content).actions
           .find((action) => action.uuid === entry.uuid);
         if (!markdownAction || markdownAction.title !== entry.title || markdownAction.state !== entry.state ||
-          markdownAction.remoteId !== recoveredItemId) {
+          (markdownAction.remoteId !== recoveredItemId && markdownAction.remoteId !== entry.remoteId)) {
           throw new Error("阶段 Markdown 行动在更新冻结期间发生变化，保持冻结");
         }
         await this.markdown.compareAndWrite(stageRevision, patchManagedPlanAction(stageRevision.content, {
@@ -738,9 +768,11 @@ export class DidaProjectProjectionService {
                 mutationBaselineItemIds: undefined,
                 mutationBaselineItemsHash: undefined,
                 mutationBaselineItemHashes: undefined,
+                mutationOrdinarySemanticHashes: undefined,
                 mutationOwnedInvariantHash: undefined,
                 mutationBaselineOwnedStatus: undefined,
                 mutationBaselineOwnedCompletedTimeHash: undefined,
+                remapStagePaths: undefined,
               }
             : item),
         }, cleanupProof);
@@ -773,8 +805,10 @@ export class DidaProjectProjectionService {
               createBaselineItemIds: undefined,
               createBaselineItemsHash: undefined,
               createBaselineItemHashes: undefined,
+              createBaselineSemanticHashes: undefined,
               createItemId: undefined,
               createItemSortOrder: undefined,
+              remapStagePaths: undefined,
             }
           : item),
       }, cleanupProof);
@@ -1007,6 +1041,7 @@ export class DidaProjectProjectionService {
       currentEntries.push(...buildProjectionLedger({
         projectId: projectIdentity.projectId,
         stageId: stage.stageId,
+        stagePath: input.stages.find((candidate) => candidate.stageId === stage.stageId)!.path,
         parentTaskId,
         target: initialState.target,
         actions: stage.actions,
@@ -1030,6 +1065,7 @@ export class DidaProjectProjectionService {
             createBaselineItemIds: old.createBaselineItemIds,
             createBaselineItemsHash: old.createBaselineItemsHash,
             createBaselineItemHashes: old.createBaselineItemHashes,
+            createBaselineSemanticHashes: old.createBaselineSemanticHashes,
             createItemId: old.createItemId,
             createItemSortOrder: old.createItemSortOrder,
             updateExpectedTitle: old.updateExpectedTitle,
@@ -1039,9 +1075,11 @@ export class DidaProjectProjectionService {
             mutationBaselineItemIds: old.mutationBaselineItemIds,
             mutationBaselineItemsHash: old.mutationBaselineItemsHash,
             mutationBaselineItemHashes: old.mutationBaselineItemHashes,
+            mutationOrdinarySemanticHashes: old.mutationOrdinarySemanticHashes,
             mutationOwnedInvariantHash: old.mutationOwnedInvariantHash,
             mutationBaselineOwnedStatus: old.mutationBaselineOwnedStatus,
             mutationBaselineOwnedCompletedTimeHash: old.mutationBaselineOwnedCompletedTimeHash,
+            remapStagePaths: old.remapStagePaths,
           }
         : entry;
     });
@@ -1109,6 +1147,9 @@ export class DidaProjectProjectionService {
           working = freezeEntry(working, entry, "capability", summary, message(error));
           continue;
         }
+        const remapStagePaths = await this.buildVerifiedRemapStagePaths(
+          [...working, entry], entry.parentTaskId, stageRevisions,
+        );
         let checkpointEntry: ProjectionLedgerEntry = {
           ...entry,
           frozen: "unknown-outcome",
@@ -1116,8 +1157,10 @@ export class DidaProjectProjectionService {
           createBaselineItemIds,
           createBaselineItemsHash: stableHash(baseline),
           createBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
+          createBaselineSemanticHashes: baseline.map(checklistSemanticHash),
           createItemId: draft.id,
           createItemSortOrder: draft.sortOrder,
+          remapStagePaths,
         };
         working = replaceEntry(working, checkpointEntry);
         await this.persistProjectLedger(projectIdentity.projectId, working);
@@ -1161,6 +1204,7 @@ export class DidaProjectProjectionService {
             createBaselineItemIds: rebasedIds,
             createBaselineItemsHash: stableHash(baseline),
             createBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
+            createBaselineSemanticHashes: baseline.map(checklistSemanticHash),
             createItemSortOrder: rebasedDraft.sortOrder,
           };
           working = replaceEntry(working, checkpointEntry);
@@ -1189,9 +1233,9 @@ export class DidaProjectProjectionService {
           );
           continue;
         }
-        let adoptedId: string;
+        let proof: { ownedId: string; remap: Map<string, string> };
         try {
-          adoptedId = verifyClientOwnedCreatedChecklistItem(
+          proof = verifyClientOwnedCreatedChecklistItem(
             baseline, created.task.items ?? [], checkpointEntry,
           );
         } catch (error) {
@@ -1200,24 +1244,31 @@ export class DidaProjectProjectionService {
         }
         const verifiedEntry = {
           ...entry,
-          remoteId: adoptedId,
+          remoteId: proof.ownedId,
           operationId: undefined,
           conflictId: undefined,
           createBaselineItemIds: undefined,
           createBaselineItemsHash: undefined,
           createBaselineItemHashes: undefined,
+          createBaselineSemanticHashes: undefined,
           createItemId: undefined,
           createItemSortOrder: undefined,
+          remapStagePaths: undefined,
         };
         try {
-          const next = patchManagedPlanAction(stageRevision!.content, { uuid: entry.uuid, remoteId: adoptedId });
-          const written = await this.markdown.compareAndWrite(stageRevision!, next);
-          stageRevisions.set(entry.stageId, written);
-          working = replaceEntry(working, verifiedEntry);
+          working = await this.commitChecklistIdRemap({
+            projectId: projectIdentity.projectId,
+            parentTaskId: entry.parentTaskId,
+            entries: working,
+            remap: proof.remap,
+            current: verifiedEntry,
+            stagePaths: checkpointEntry.remapStagePaths ?? {},
+            stageRevisions,
+          });
           summary.createdActions += 1;
           if (verifiedEntry.state === "completed") summary.completedActions += 1;
         } catch (error) {
-          working = freezeEntry(working, { ...checkpointEntry, remoteId: adoptedId }, "markdown-race", summary, message(error), created);
+          working = freezeEntry(working, checkpointEntry, "markdown-race", summary, message(error), created);
         }
         continue;
       }
@@ -1238,6 +1289,9 @@ export class DidaProjectProjectionService {
             ? mergedOwned.item
             : item);
           const operationId = entry.operationId ?? `op-projection-item-update-${crypto.randomUUID()}`;
+          const remapStagePaths = await this.buildVerifiedRemapStagePaths(
+            working, entry.parentTaskId, stageRevisions,
+          );
           updateCheckpoint = {
             ...entry,
             frozen: "unknown-outcome",
@@ -1246,6 +1300,7 @@ export class DidaProjectProjectionService {
             updateExpectedStatus: mergedOwned.item.status,
             updateStageRevisionHash: stageRevision!.hash,
             ...mutationBaselineCheckpoint(parent.items ?? [], entry.remoteId!, "update"),
+            remapStagePaths,
           };
           working = replaceEntry(working, updateCheckpoint);
           await this.persistProjectLedger(projectIdentity.projectId, working);
@@ -1279,7 +1334,7 @@ export class DidaProjectProjectionService {
               "检查项更新返回了其他 operation ID，保持冻结", result);
             continue;
           }
-          assertOnlyOwnedChecklistItemChanged(
+          const remapProof = assertOnlyOwnedChecklistItemChanged(
             parent.items ?? [],
             result.task.items ?? [],
             entry.remoteId!,
@@ -1288,6 +1343,7 @@ export class DidaProjectProjectionService {
           );
           const reconciledEntry: ProjectionLedgerEntry = {
             ...entry,
+            remoteId: remapProof.ownedId,
             title: mergedOwned.item.title,
             state: projectionStateForRemoteStatus(entry.state, mergedOwned.item.status),
             operationId: undefined,
@@ -1299,21 +1355,22 @@ export class DidaProjectProjectionService {
             mutationBaselineItemIds: undefined,
             mutationBaselineItemsHash: undefined,
             mutationBaselineItemHashes: undefined,
+            mutationOrdinarySemanticHashes: undefined,
             mutationOwnedInvariantHash: undefined,
             mutationBaselineOwnedStatus: undefined,
             mutationBaselineOwnedCompletedTimeHash: undefined,
+            remapStagePaths: undefined,
           };
           verifyOwnedChecklistItem(result.task, reconciledEntry);
-          if (reconciledEntry.title !== entry.title || reconciledEntry.state !== entry.state) {
-            const next = patchManagedPlanAction(stageRevision!.content, {
-              uuid: entry.uuid,
-              title: reconciledEntry.title,
-              state: reconciledEntry.state,
-            });
-            const written = await this.markdown.compareAndWrite(stageRevision!, next);
-            stageRevisions.set(entry.stageId, written);
-          }
-          working = replaceEntry(working, reconciledEntry);
+          working = await this.commitChecklistIdRemap({
+            projectId: projectIdentity.projectId,
+            parentTaskId: entry.parentTaskId,
+            entries: working,
+            remap: remapProof.remap,
+            current: reconciledEntry,
+            stagePaths: updateCheckpoint.remapStagePaths ?? {},
+            stageRevisions,
+          });
           if (intent.kind === "update-action") summary.updatedActions += 1;
           if (intent.kind === "complete-action" || (base.state !== "completed" && entry.state === "completed")) {
             summary.completedActions += 1;
@@ -1336,12 +1393,16 @@ export class DidaProjectProjectionService {
         }
         const baseline = structuredClone(parent.items ?? []);
         const operationId = entry.operationId ?? `op-projection-item-delete-${crypto.randomUUID()}`;
+        const remapStagePaths = await this.buildVerifiedRemapStagePaths(
+          [...working, entry], entry.parentTaskId, stageRevisions,
+        );
         const deleteCheckpoint: ProjectionLedgerEntry = {
           ...entry,
           tombstone: true,
           frozen: "unknown-outcome",
           operationId,
           ...mutationBaselineCheckpoint(baseline, entry.remoteId, "delete"),
+          remapStagePaths,
         };
         working = working.some((item) => item.uuid === entry.uuid)
           ? replaceEntry(working, deleteCheckpoint)
@@ -1370,8 +1431,16 @@ export class DidaProjectProjectionService {
             "检查项删除返回了其他 operation ID，保持冻结", deletion);
         } else {
           try {
-            assertOnlyOwnedChecklistItemDeleted(baseline, deletion.task.items ?? [], entry.remoteId);
-            working = working.filter((item) => item.uuid !== entry.uuid);
+            const remap = assertOnlyOwnedChecklistItemDeleted(baseline, deletion.task.items ?? [], entry.remoteId);
+            working = await this.commitChecklistIdRemap({
+              projectId: projectIdentity.projectId,
+              parentTaskId: entry.parentTaskId,
+              entries: working,
+              remap,
+              removeUuid: entry.uuid,
+              stagePaths: deleteCheckpoint.remapStagePaths ?? {},
+              stageRevisions,
+            });
             summary.deletedActions += 1;
           } catch (error) {
             working = freezeEntry(working, deleteCheckpoint, "identity-mismatch", summary, message(error), deletion);
@@ -1613,6 +1682,104 @@ export class DidaProjectProjectionService {
     });
   }
 
+  private async buildVerifiedRemapStagePaths(
+    entries: ProjectionLedgerEntry[],
+    parentTaskId: string,
+    stageRevisions?: Map<string, ProjectionMarkdownRevision>,
+  ): Promise<Record<string, string>> {
+    const relevant = [...new Map(entries
+      .filter((entry) => entry.parentTaskId === parentTaskId)
+      .map((entry) => [projectionLedgerIdentity(entry), entry])).values()];
+    const paths: Record<string, string> = {};
+    const revisions = new Map<string, ProjectionMarkdownRevision>();
+    for (const entry of relevant) {
+      if (!entry.stagePath?.trim()) {
+        throw new Error("同一父任务存在缺少 Stage 路径的账本项，已在远端写入前阻断完整 ID 重映");
+      }
+      paths[entry.uuid] = entry.stagePath;
+      if (entry.tombstone) continue;
+      let revision = revisions.get(entry.stagePath) ?? stageRevisions?.get(entry.stageId);
+      if (!revision || revision.path !== entry.stagePath) revision = await this.requireRevision(entry.stagePath);
+      revisions.set(entry.stagePath, revision);
+      assertProjectionStageIdentity(revision.content, entry.stageId);
+      const actions = parseManagedPlanActions(revision.content).actions.filter((action) => action.uuid === entry.uuid);
+      if (actions.length !== 1 || actions[0]!.remoteId !== entry.remoteId) {
+        throw new Error("同一父任务的 Stage 行动 UUID 或旧 remoteId 与账本不一致，已在远端写入前阻断");
+      }
+    }
+    return paths;
+  }
+
+  private async commitChecklistIdRemap(input: {
+    projectId: string;
+    parentTaskId: string;
+    entries: ProjectionLedgerEntry[];
+    remap: Map<string, string>;
+    current?: ProjectionLedgerEntry;
+    removeUuid?: string;
+    stagePaths: Record<string, string>;
+    stageRevisions?: Map<string, ProjectionMarkdownRevision>;
+  }): Promise<ProjectionLedgerEntry[]> {
+    let nextEntries = input.entries
+      .filter((entry) => entry.uuid !== input.removeUuid)
+      .map((entry) => entry.parentTaskId === input.parentTaskId && entry.remoteId && input.remap.has(entry.remoteId)
+        ? { ...entry, remoteId: input.remap.get(entry.remoteId)! }
+        : entry);
+    if (input.current) nextEntries = replaceEntry(nextEntries, input.current);
+    const beforeByUuid = new Map(input.entries.map((entry) => [entry.uuid, entry]));
+    const affected = nextEntries.filter((entry) => {
+      const before = beforeByUuid.get(entry.uuid);
+      return !entry.tombstone && entry.parentTaskId === input.parentTaskId && entry.remoteId !== before?.remoteId;
+    });
+    const plans = new Map<string, { before: ProjectionMarkdownRevision; content: string; stageId: string }>();
+    for (const entry of affected) {
+      const path = input.stagePaths[entry.uuid];
+      if (!path) throw new Error("完整 ID 重映检查点缺少受影响行动的 Stage 路径");
+      const beforeEntry = beforeByUuid.get(entry.uuid);
+      const existingPlan = plans.get(path);
+      const revision = existingPlan?.before ?? input.stageRevisions?.get(entry.stageId) ?? await this.requireRevision(path);
+      assertProjectionStageIdentity(revision.content, entry.stageId);
+      const content = existingPlan?.content ?? revision.content;
+      const action = parseManagedPlanActions(content).actions.find((candidate) => candidate.uuid === entry.uuid);
+      if (!action || (action.remoteId !== beforeEntry?.remoteId && action.remoteId !== entry.remoteId)) {
+        throw new Error("完整 ID 重映时 Stage Markdown 身份或旧 ID 已竞争");
+      }
+      plans.set(path, {
+        before: revision,
+        stageId: entry.stageId,
+        content: action.remoteId === entry.remoteId
+          ? content
+          : patchManagedPlanAction(content, { uuid: entry.uuid, remoteId: entry.remoteId }),
+      });
+    }
+    const written: Array<{ before: ProjectionMarkdownRevision; after: ProjectionMarkdownRevision }> = [];
+    try {
+      for (const plan of plans.values()) {
+        if (plan.content === plan.before.content) continue;
+        const after = await this.markdown.compareAndWrite(plan.before, plan.content);
+        written.push({ before: plan.before, after });
+        input.stageRevisions?.set(plan.stageId, after);
+      }
+      await this.persistProjectLedger(input.projectId, nextEntries);
+      return nextEntries;
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      for (const item of written.reverse()) {
+        try {
+          const restored = await this.markdown.compareAndWrite(item.after, item.before.content);
+          const stageId = [...plans.values()].find((plan) => plan.before.path === item.before.path)?.stageId;
+          if (stageId) input.stageRevisions?.set(stageId, restored);
+        } catch (rollbackError) {
+          rollbackErrors.push(message(rollbackError));
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new Error(`完整 ID 重映失败且部分 Markdown 回滚失败：${rollbackErrors.join("；")}`, { cause: error });
+      }
+      throw error;
+    }
+  }
+
   private async requireRevision(path: string): Promise<ProjectionMarkdownRevision> {
     const revision = await this.markdown.read(path);
     if (!revision) throw new Error(`找不到同步所需的 Markdown：${path}`);
@@ -1731,48 +1898,43 @@ function verifyClientOwnedCreatedChecklistItem(
   baseline: DidaChecklistItem[],
   reread: DidaChecklistItem[],
   entry: ProjectionLedgerEntry,
-): string {
-  const baselineById = strictChecklistMap(baseline, "写前基线");
-  const rereadById = strictChecklistMap(reread, "写后复读");
-  for (const [id, item] of baselineById) {
-    const current = rereadById.get(id);
-    if (!current || stableHash(current) !== stableHash(item)) {
-      throw new Error("创建检查项期间父任务既有 items 发生竞争，已冻结同步");
-    }
+): { ownedId: string; remap: Map<string, string> } {
+  strictChecklistMap(baseline, "写前基线");
+  strictChecklistMap(reread, "写后复读");
+  if (reread.length !== baseline.length + 1) {
+    throw new Error("服务端未返回唯一新增检查项，已冻结同步");
   }
-  const preservedInOrder = reread.filter((item) => baselineById.has(item.id));
-  if (stableHash(preservedInOrder) !== stableHash(baseline)) {
-    throw new Error("创建检查项期间父任务既有 items 顺序发生竞争，已冻结同步");
-  }
+  const ordinary = matchUniqueChecklistSubsequence(baseline, reread, "创建检查项既有 items");
+  const ordinaryIds = new Set(ordinary.map((item) => item.id));
   const expected = checkpointChecklistItem(entry);
-  const added = [...rereadById.entries()].filter(([id]) => !baselineById.has(id));
-  const created = added[0]?.[1];
+  const added = reread.filter((item) => !ordinaryIds.has(item.id));
+  const created = added[0];
   if (added.length !== 1 || !created || created.title !== expected.title ||
     created.status !== expected.status || created.sortOrder !== expected.sortOrder) {
     throw new Error("服务端未返回唯一且语义正确的正式检查项，已冻结同步");
   }
-  return added[0]![0];
+  return {
+    ownedId: created.id,
+    remap: new Map([
+      ...baseline.map((item, index) => [item.id, ordinary[index]!.id] as const),
+      [expected.id, created.id] as const,
+    ]),
+  };
 }
 
 function assertOnlyOwnedChecklistItemDeleted(
   baseline: DidaChecklistItem[],
   reread: DidaChecklistItem[],
   ownedId: string,
-): void {
-  const before = strictChecklistMap(baseline, "删除前基线");
-  const after = strictChecklistMap(reread, "删除后复读");
-  if (!before.has(ownedId) || after.has(ownedId)) throw new Error("owned 检查项删除结果无法证明");
-  before.delete(ownedId);
-  if (before.size !== after.size) throw new Error("删除 owned 检查项时其他 items 数量发生变化");
-  for (const [id, item] of before) {
-    const current = after.get(id);
-    if (!current || stableHash(current) !== stableHash(item)) {
-      throw new Error("删除 owned 检查项时其他 items 被修改");
-    }
+): Map<string, string> {
+  strictChecklistMap(baseline, "删除前基线");
+  strictChecklistMap(reread, "删除后复读");
+  const ordinary = baseline.filter((item) => item.id !== ownedId);
+  if (ordinary.length !== baseline.length - 1 || reread.length !== ordinary.length) {
+    throw new Error("owned 检查项删除结果无法证明");
   }
-  if (stableHash(reread) !== stableHash(baseline.filter((item) => item.id !== ownedId))) {
-    throw new Error("删除 owned 检查项时其他 items 顺序被修改");
-  }
+  const mapped = matchUniqueChecklistSubsequence(ordinary, reread, "删除后的普通 items");
+  return new Map(ordinary.map((item, index) => [item.id, mapped[index]!.id]));
 }
 
 function assertOnlyOwnedChecklistItemChanged(
@@ -1781,10 +1943,15 @@ function assertOnlyOwnedChecklistItemChanged(
   ownedId: string,
   expectedOwned: DidaChecklistItem,
   beforeOwned: DidaChecklistItem,
-): void {
-  const actualOwned = reread.find((candidate) => candidate.id === ownedId);
-  if (!actualOwned) throw new Error("更新 owned 检查项后无法精确复读");
+): { ownedId: string; remap: Map<string, string> } {
+  strictChecklistMap(baseline, "更新前基线");
+  strictChecklistMap(reread, "更新后复读");
+  if (reread.length !== baseline.length) throw new Error("更新 owned 检查项后数量变化");
   const expectedOwnedForCompare = { ...expectedOwned };
+  const ownedCandidates = reread.filter((candidate) =>
+    sameOwnedTargetExceptIdAndDerivedTime(beforeOwned, expectedOwnedForCompare, candidate));
+  if (ownedCandidates.length !== 1) throw new Error("更新 owned 检查项后无法唯一复读受管目标");
+  const actualOwned = ownedCandidates[0]!;
   if (beforeOwned.status !== expectedOwned.status) {
     if (beforeOwned.status === 0 && expectedOwned.status === 2) {
       if (actualOwned.completedTime === undefined || actualOwned.completedTime === null) {
@@ -1803,13 +1970,75 @@ function assertOnlyOwnedChecklistItemChanged(
       throw new Error("owned 检查项 status 发生不受支持的转换");
     }
   }
-  const expected = baseline.map((item) => item.id === ownedId
-    // status 完成／重开时 completedTime 由服务端合法生成或移除。
-    ? expectedOwnedForCompare
-    : item);
-  if (stableHash(reread) !== stableHash(expected)) {
-    throw new Error("更新 owned 检查项时其他 items 字段或顺序被修改");
+  const ordinary = baseline.filter((item) => item.id !== ownedId);
+  const actualOrdinary = reread.filter((item) => item.id !== actualOwned.id);
+  if (actualOrdinary.length !== ordinary.length) throw new Error("更新 owned 检查项时普通 items 数量变化");
+  const mapped = matchUniqueChecklistSubsequence(ordinary, actualOrdinary, "更新后的普通 items");
+  return {
+    ownedId: actualOwned.id,
+    remap: new Map([
+      ...ordinary.map((item, index) => [item.id, mapped[index]!.id] as const),
+      [ownedId, actualOwned.id] as const,
+    ]),
+  };
+}
+
+function sameOwnedTargetExceptIdAndDerivedTime(
+  before: DidaChecklistItem,
+  expected: DidaChecklistItem,
+  actual: DidaChecklistItem,
+): boolean {
+  const expectedCopy = { ...expected } as Record<string, unknown>;
+  const actualCopy = { ...actual } as Record<string, unknown>;
+  delete expectedCopy.id;
+  delete actualCopy.id;
+  if (before.status === expected.status) return stableHash(actualCopy) === stableHash(expectedCopy);
+  if (before.status === 0 && expected.status === 2) {
+    if (typeof actual.completedTime !== "string" || !Number.isFinite(new Date(actual.completedTime).getTime())) return false;
+    delete expectedCopy.completedTime;
+    delete actualCopy.completedTime;
+    return stableHash(actualCopy) === stableHash(expectedCopy);
   }
+  if (before.status === 2 && expected.status === 0) {
+    if (actual.completedTime !== undefined && actual.completedTime !== null) return false;
+    delete expectedCopy.completedTime;
+    delete actualCopy.completedTime;
+    return stableHash(actualCopy) === stableHash(expectedCopy);
+  }
+  return false;
+}
+
+function checklistSemanticHash(item: DidaChecklistItem): string {
+  const { id: _id, ...semantic } = item;
+  return stableHash(semantic);
+}
+
+function matchUniqueChecklistSubsequence(
+  expected: DidaChecklistItem[],
+  actual: DidaChecklistItem[],
+  label: string,
+): DidaChecklistItem[] {
+  return matchUniqueChecklistSemanticHashes(expected.map(checklistSemanticHash), actual, label);
+}
+
+function matchUniqueChecklistSemanticHashes(
+  expectedHashes: string[],
+  actual: DidaChecklistItem[],
+  label: string,
+): DidaChecklistItem[] {
+  const matched = expectedHashes.map((hash) => {
+    const candidates = actual.filter((candidate) => checklistSemanticHash(candidate) === hash);
+    if (candidates.length !== 1) throw new Error(`${label} 无法按除 ID 外完整语义唯一匹配`);
+    return candidates[0]!;
+  });
+  if (new Set(matched.map((item) => item.id)).size !== matched.length) {
+    throw new Error(`${label} 映射不是唯一双射`);
+  }
+  const indices = matched.map((item) => actual.findIndex((candidate) => candidate.id === item.id));
+  if (indices.some((index, offset) => offset > 0 && index <= indices[offset - 1]!)) {
+    throw new Error(`${label} 相对顺序发生变化`);
+  }
+  return matched;
 }
 
 function strictChecklistMap(items: DidaChecklistItem[], label: string): Map<string, DidaChecklistItem> {
@@ -1831,7 +2060,7 @@ function mutationBaselineCheckpoint(
   mutationKind: "update" | "delete",
 ): Pick<ProjectionLedgerEntry,
   "mutationKind" | "mutationBaselineItemIds" | "mutationBaselineItemsHash" |
-  "mutationBaselineItemHashes" | "mutationOwnedInvariantHash" |
+  "mutationBaselineItemHashes" | "mutationOrdinarySemanticHashes" | "mutationOwnedInvariantHash" |
   "mutationBaselineOwnedStatus" | "mutationBaselineOwnedCompletedTimeHash"> {
   const ids = strictChecklistIds(items, "投影写入基线");
   const owned = items.find((item) => item.id === ownedId);
@@ -1841,6 +2070,7 @@ function mutationBaselineCheckpoint(
     mutationBaselineItemIds: ids,
     mutationBaselineItemsHash: stableHash(items),
     mutationBaselineItemHashes: Object.fromEntries(items.map((item) => [item.id, stableHash(item)])),
+    mutationOrdinarySemanticHashes: items.filter((item) => item.id !== ownedId).map(checklistSemanticHash),
     mutationOwnedInvariantHash: stableHash(checklistOwnedInvariant(owned)),
     mutationBaselineOwnedStatus: owned.status,
     mutationBaselineOwnedCompletedTimeHash: stableHash(owned.completedTime),
@@ -1849,6 +2079,7 @@ function mutationBaselineCheckpoint(
 
 function checklistOwnedInvariant(item: DidaChecklistItem): Record<string, unknown> {
   const copy = { ...item } as Record<string, unknown>;
+  delete copy.id;
   delete copy.title;
   delete copy.status;
   delete copy.completedTime;
@@ -1913,6 +2144,44 @@ function assertFrozenMutationOutcome(
   }
 }
 
+function verifyKnownSuccessfulMutationFromSemanticHashes(
+  entry: ProjectionLedgerEntry,
+  items: DidaChecklistItem[],
+): { ownedId?: string; remap: Map<string, string> } {
+  const ordinaryHashes = entry.mutationOrdinarySemanticHashes;
+  if (!entry.mutationKind || !ordinaryHashes || !entry.mutationOwnedInvariantHash ||
+    !entry.mutationBaselineItemIds) {
+    throw new Error("明确成功的检查项写入缺少重启语义证明，保持冻结");
+  }
+  strictChecklistMap(items, "明确成功写后复读");
+  if (entry.mutationKind === "delete") {
+    if (items.length !== ordinaryHashes.length) throw new Error("明确成功删除后的普通 items 数量变化");
+    const mapped = matchUniqueChecklistSemanticHashes(ordinaryHashes, items, "明确成功删除后的普通 items");
+    const ordinaryIds = entry.mutationBaselineItemIds!.filter((id) => id !== entry.remoteId);
+    return { remap: new Map(ordinaryIds.map((id, index) => [id, mapped[index]!.id])) };
+  }
+  if (items.length !== ordinaryHashes.length + 1 || entry.updateExpectedTitle === undefined ||
+    entry.updateExpectedStatus === undefined) {
+    throw new Error("明确成功更新后的 items 数量或目标语义不完整");
+  }
+  const candidates = items.filter((item) =>
+    stableHash(checklistOwnedInvariant(item)) === entry.mutationOwnedInvariantHash &&
+    item.title === entry.updateExpectedTitle && item.status === entry.updateExpectedStatus);
+  if (candidates.length !== 1) throw new Error("明确成功更新后的 owned item 无法唯一重映");
+  const owned = candidates[0]!;
+  assertOwnedCompletedTimeTransition(entry, owned);
+  const ordinary = items.filter((item) => item.id !== owned.id);
+  const mapped = matchUniqueChecklistSemanticHashes(ordinaryHashes, ordinary, "明确成功更新后的普通 items");
+  const ordinaryIds = entry.mutationBaselineItemIds!.filter((id) => id !== entry.remoteId);
+  return {
+    ownedId: owned.id,
+    remap: new Map([
+      ...ordinaryIds.map((id, index) => [id, mapped[index]!.id] as const),
+      [entry.remoteId!, owned.id] as const,
+    ]),
+  };
+}
+
 function assertOwnedCompletedTimeTransition(
   entry: ProjectionLedgerEntry,
   item: DidaChecklistItem,
@@ -1948,10 +2217,31 @@ function adoptCreatedChecklistItemFromIds(
   reread: DidaChecklistItem[],
   entry: ProjectionLedgerEntry,
   allowClientIdReplacement = false,
-): string {
+): { ownedId: string; remap: Map<string, string> } {
   if (!baselineIds) throw new Error("冻结的新建检查项缺少可证明的写前 items 基线，禁止自动领养或重发");
   if (new Set(baselineIds).size !== baselineIds.length) throw new Error("新建检查项写前 ID 基线损坏");
   const current = strictChecklistMap(reread, "冻结复读");
+  if (allowClientIdReplacement) {
+    const hashes = entry.createBaselineSemanticHashes;
+    if (!hashes || hashes.length !== baselineIds.length || reread.length !== hashes.length + 1) {
+      throw new Error("明确成功的新建检查项缺少完整语义基线，保持冻结");
+    }
+    const ordinary = matchUniqueChecklistSemanticHashes(hashes, reread, "明确成功的新建普通 items");
+    const ordinaryIds = new Set(ordinary.map((item) => item.id));
+    const created = reread.filter((item) => !ordinaryIds.has(item.id));
+    const expected = checkpointChecklistItem(entry);
+    if (created.length !== 1 || created[0]!.title !== expected.title ||
+      created[0]!.status !== expected.status || created[0]!.sortOrder !== expected.sortOrder) {
+      throw new Error("明确成功的新建检查项无法唯一领养正式 ID，保持冻结");
+    }
+    return {
+      ownedId: created[0]!.id,
+      remap: new Map([
+        ...baselineIds.map((id, index) => [id, ordinary[index]!.id] as const),
+        [entry.createItemId!, created[0]!.id] as const,
+      ]),
+    };
+  }
   if (baselineIds.some((id) => !current.has(id))) throw new Error("新建检查项期间既有 item ID 发生竞争");
   if (!entry.createBaselineItemsHash || !entry.createBaselineItemHashes) {
     throw new Error("冻结的新建检查项缺少有序基线哈希，禁止自动领养");
@@ -1964,15 +2254,15 @@ function adoptCreatedChecklistItemFromIds(
   const added = [...current.entries()].filter(([id]) => !baselineIds.includes(id));
   if (entry.createItemId !== undefined) {
     const expected = checkpointChecklistItem(entry);
-    const created = allowClientIdReplacement ? added[0]?.[1] : current.get(expected.id);
+    const created = current.get(expected.id);
     if (added.length !== 1 || !created || created.title !== expected.title ||
       created.status !== expected.status || created.sortOrder !== expected.sortOrder) {
       throw new Error("冻结复读未证明服务端稳定保留客户端检查项身份，保持冻结");
     }
-    if (!allowClientIdReplacement && created.id !== expected.id) {
+    if (created.id !== expected.id) {
       throw new Error("结果未知时服务端未保留临时客户端 ID，必须人工确认");
     }
-    return created.id;
+    return { ownedId: created.id, remap: new Map([[expected.id, created.id]]) };
   }
   // 旧版无 ID checkpoint 永不续发；仅在现有远端结果可由原基线唯一证明时只读收口。
   const matches = added.filter(([, item]) =>
@@ -1980,7 +2270,7 @@ function adoptCreatedChecklistItemFromIds(
   if (added.length !== 1 || matches.length !== 1) {
     throw new Error("冻结复读无法唯一证明新建检查项身份，保持冻结");
   }
-  return matches[0]![0];
+  return { ownedId: matches[0]![0], remap: new Map() };
 }
 
 function assertExactCreateBaseline(entry: ProjectionLedgerEntry, items: DidaChecklistItem[]): void {

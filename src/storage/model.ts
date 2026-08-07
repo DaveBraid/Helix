@@ -584,26 +584,34 @@ function validateDidaProjectionState(
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const row = item as Record<string, unknown>;
     if (!onlyKeys(row, [
-      "uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId",
+      "uuid", "projectId", "stageId", "stagePath", "parentTaskId", "targetProjectId", "targetColumnId",
       "remoteId", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
-      "createBaselineItemIds", "createBaselineItemsHash", "createBaselineItemHashes",
+      "createBaselineItemIds", "createBaselineItemsHash", "createBaselineItemHashes", "createBaselineSemanticHashes",
       "createItemId", "createItemSortOrder",
       "updateExpectedTitle", "updateExpectedStatus", "updateStageRevisionHash",
       "mutationKind", "mutationBaselineItemIds", "mutationBaselineItemsHash",
-      "mutationBaselineItemHashes", "mutationOwnedInvariantHash",
+      "mutationBaselineItemHashes", "mutationOrdinarySemanticHashes", "mutationOwnedInvariantHash",
       "mutationBaselineOwnedStatus", "mutationBaselineOwnedCompletedTimeHash",
+      "remapStagePaths",
     ])) return false;
     return ["uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId", "title", "sourceHash"]
       .every((key) => stableId(row[key])) &&
+      (row.stagePath === undefined || stableId(row.stagePath)) &&
       /^[a-f0-9]{64}$/u.test(String(row.sourceHash)) &&
       ["idea", "active", "completed", "paused", "terminated"].includes(String(row.state)) &&
       (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
       (row.operationId === undefined || stableId(row.operationId)) &&
       (row.conflictId === undefined || stableId(row.conflictId)) &&
+      (row.remapStagePaths === undefined || (!!row.remapStagePaths &&
+        typeof row.remapStagePaths === "object" && !Array.isArray(row.remapStagePaths) &&
+        Object.entries(row.remapStagePaths as Record<string, unknown>).every(([uuid, path]) =>
+          stableId(uuid) && stableId(path)))) &&
       (row.createBaselineItemIds === undefined || (Array.isArray(row.createBaselineItemIds) &&
         row.createBaselineItemIds.every(stableId) &&
         new Set(row.createBaselineItemIds).size === row.createBaselineItemIds.length)) &&
       (row.createBaselineItemsHash === undefined || /^[a-f0-9]{64}$/u.test(String(row.createBaselineItemsHash))) &&
+      (row.createBaselineSemanticHashes === undefined || (Array.isArray(row.createBaselineSemanticHashes) &&
+        row.createBaselineSemanticHashes.every((hash) => /^[a-f0-9]{64}$/u.test(String(hash))))) &&
       (row.createBaselineItemHashes === undefined || (!!row.createBaselineItemHashes &&
         typeof row.createBaselineItemHashes === "object" && !Array.isArray(row.createBaselineItemHashes) &&
         Object.entries(row.createBaselineItemHashes as Record<string, unknown>).every(([key, value]) =>
@@ -624,6 +632,7 @@ function validateDidaProjectionState(
           /^[a-f0-9]{64}$/u.test(String(row.updateStageRevisionHash)))) &&
       ((row.mutationKind === undefined && row.mutationBaselineItemIds === undefined &&
         row.mutationBaselineItemsHash === undefined && row.mutationBaselineItemHashes === undefined &&
+        row.mutationOrdinarySemanticHashes === undefined &&
         row.mutationOwnedInvariantHash === undefined && row.mutationBaselineOwnedStatus === undefined &&
         row.mutationBaselineOwnedCompletedTimeHash === undefined) ||
         ((row.mutationKind === "update" || row.mutationKind === "delete") &&
@@ -635,6 +644,9 @@ function validateDidaProjectionState(
           /^[a-f0-9]{64}$/u.test(String(row.mutationBaselineOwnedCompletedTimeHash)) &&
           !!row.mutationBaselineItemHashes && typeof row.mutationBaselineItemHashes === "object" &&
           !Array.isArray(row.mutationBaselineItemHashes) &&
+          (row.mutationOrdinarySemanticHashes === undefined ||
+            (Array.isArray(row.mutationOrdinarySemanticHashes) &&
+              row.mutationOrdinarySemanticHashes.every((hash) => /^[a-f0-9]{64}$/u.test(String(hash))))) &&
           row.mutationBaselineItemIds.every((id) =>
             /^[a-f0-9]{64}$/u.test(String((row.mutationBaselineItemHashes as Record<string, unknown>)[id]))))) &&
       (row.tombstone === undefined || typeof row.tombstone === "boolean");

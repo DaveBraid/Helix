@@ -96,6 +96,8 @@ export interface ProjectionLedgerEntry {
   uuid: string;
   projectId: string;
   stageId: string;
+  /** Stage Markdown 的稳定 Vault 路径；整组 items ID 重映时不可缺失。 */
+  stagePath?: string;
   parentTaskId: string;
   targetProjectId: string;
   targetColumnId: string;
@@ -111,6 +113,8 @@ export interface ProjectionLedgerEntry {
   createBaselineItemIds?: string[];
   createBaselineItemsHash?: string;
   createBaselineItemHashes?: Record<string, string>;
+  /** 既有项按原顺序保存的除 ID 外完整语义哈希；用于明确成功响应后的正式 ID 重映。 */
+  createBaselineSemanticHashes?: string[];
   /** 写前持久化的客户端检查项身份；缺失表示旧版无 ID checkpoint，只允许只读复读。 */
   createItemId?: string;
   createItemSortOrder?: number;
@@ -122,9 +126,13 @@ export interface ProjectionLedgerEntry {
   mutationBaselineItemIds?: string[];
   mutationBaselineItemsHash?: string;
   mutationBaselineItemHashes?: Record<string, string>;
+  /** 排除 owned 项后，普通 items 按原顺序保存的除 ID 外完整语义哈希。 */
+  mutationOrdinarySemanticHashes?: string[];
   mutationOwnedInvariantHash?: string;
   mutationBaselineOwnedStatus?: number;
   mutationBaselineOwnedCompletedTimeHash?: string;
+  /** 整组 items 写入前冻结的行动 UUID→Stage 路径，用于全组 ID 重映的崩溃恢复。 */
+  remapStagePaths?: Record<string, string>;
 }
 
 export type ProjectionReceiptCleanupProof = {
@@ -350,6 +358,7 @@ export function patchProjectParentTaskId(markdown: string, remoteId: string): st
 export function buildProjectionLedger(input: {
   projectId: string;
   stageId: string;
+  stagePath: string;
   parentTaskId: string;
   target: DidaProjectionTarget;
   actions: ManagedPlanAction[];
@@ -362,6 +371,7 @@ export function buildProjectionLedger(input: {
       uuid: action.uuid,
       projectId: input.projectId,
       stageId: input.stageId,
+      stagePath: input.stagePath,
       parentTaskId: input.parentTaskId,
       targetProjectId: input.target.targetProjectId,
       targetColumnId: input.target.targetColumnId,
@@ -470,12 +480,16 @@ export function verifyClientChecklistAppendResult(
       if (actualById.has(item.id)) return false;
       actualById.set(item.id, item);
     }
-    for (const [id, item] of baselineById) {
-      if (stableHash(actualById.get(id)) !== stableHash(item)) return false;
-    }
-    const preservedIds = actualItems.filter((item) => baselineById.has(item.id)).map((item) => item.id);
-    if (stableHash(preservedIds) !== stableHash(baselineItems.map((item) => item.id))) return false;
-    const added = actualItems.filter((item) => !baselineById.has(item.id));
+    const matched = baselineItems.map((item) => {
+      const expected = checklistItemSemanticHash(item);
+      const candidates = actualItems.filter((candidate) => checklistItemSemanticHash(candidate) === expected);
+      return candidates.length === 1 ? candidates[0] : undefined;
+    });
+    if (matched.some((item) => !item) || new Set(matched.map((item) => item!.id)).size !== matched.length) return false;
+    const matchedIds = new Set(matched.map((item) => item!.id));
+    const preservedIds = actualItems.filter((item) => matchedIds.has(item.id)).map((item) => item.id);
+    if (stableHash(preservedIds) !== stableHash(matched.map((item) => item!.id))) return false;
+    const added = actualItems.filter((item) => !matchedIds.has(item.id));
     if (added.length !== 1) return false;
     return Object.entries(desiredNew)
       .filter(([key, value]) => key !== "id" && value !== undefined)
@@ -483,6 +497,11 @@ export function verifyClientChecklistAppendResult(
   } catch {
     return false;
   }
+}
+
+function checklistItemSemanticHash(item: DidaChecklistItem): string {
+  const { id: _id, ...semantic } = item;
+  return stableHash(semantic);
 }
 
 export function projectionMarker(uuid: string): string {

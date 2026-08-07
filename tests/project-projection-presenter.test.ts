@@ -26,16 +26,15 @@ describe("project projection presenter", () => {
     }]);
   });
 
-  it("blocks manual sync for frozen, orphaned, cleanup-pending, or disabled projects", () => {
+  it("summarizes frozen, orphaned and cleanup-pending project state", () => {
     const model = baseModel();
     expect(projectionProjectSummary(model)).toMatchObject({
-      managed: 1, unmanaged: 1, orphan: 0, frozen: 0, cleanup: 0, canSync: true,
+      managed: 1, unmanaged: 1, orphan: 0, frozen: 0, cleanup: 0,
     });
     expect(projectionProjectSummary({
       ...model,
       orphanDiagnostics: [{ uuid: "orphan", stageId: "stage-1", state: "active", tombstone: true, frozen: "unknown-outcome" }],
-    }).canSync).toBe(false);
-    expect(projectionProjectSummary({ ...model, enabled: false }).canSync).toBe(false);
+    }).frozen).toBe(1);
   });
 
   it("presents target, counts, and blockers in the activation confirmation", () => {

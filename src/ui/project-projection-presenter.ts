@@ -38,7 +38,6 @@ export function projectionProjectSummary(model: ProjectionProjectReadModel): {
   orphan: number;
   frozen: number;
   cleanup: number;
-  canSync: boolean;
 } {
   const managed = model.stages.reduce((sum, stage) => sum + stage.managed.length, 0);
   const unmanaged = model.stages.reduce((sum, stage) => sum + stage.unmanaged.length, 0);
@@ -52,7 +51,6 @@ export function projectionProjectSummary(model: ProjectionProjectReadModel): {
     orphan: model.orphanDiagnostics.length,
     frozen,
     cleanup: model.receiptCleanupPending.length,
-    canSync: model.enabled && frozen === 0 && model.receiptCleanupPending.length === 0,
   };
 }
 

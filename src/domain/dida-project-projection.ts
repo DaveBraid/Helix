@@ -217,6 +217,26 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
   return { actions, unmanagedChecklistLines, section: { ...section, eol } };
 }
 
+/** Live Preview 复用完整领域校验；任一损坏、编码或状态不一致均由调用方保持可见。 */
+export function managedActionMarkerSpans(markdown: string): Array<{ from: number; to: number }> {
+  const parsed = parseManagedPlanActions(markdown);
+  const lineStarts = [0];
+  for (let index = 0; index < markdown.length; index += 1) {
+    if (markdown[index] === "\n") lineStarts.push(index + 1);
+  }
+  const lines = markdown.split(/\r?\n/);
+  return parsed.actions.map((action) => {
+    const line = lines[action.line - 1] ?? "";
+    const markerFrom = line.indexOf("<!-- helix-dida-action:");
+    const markerText = markerFrom >= 0 ? line.slice(markerFrom).trim() : "";
+    if (markerFrom < 0 || !ACTION_MARKER.test(markerText)) {
+      throw new Error(`计划行动同步标记损坏：第 ${action.line} 行`);
+    }
+    const from = lineStarts[action.line - 1]! + markerFrom;
+    return { from, to: from + markerText.length };
+  });
+}
+
 export function adoptPlanAction(markdown: string, lineNumber: number, uuid: string): string {
   assertStableId(uuid, "行动 UUID");
   const parsed = parseManagedPlanActions(markdown);

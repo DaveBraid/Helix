@@ -94,6 +94,12 @@ import {
   projectionInputFromProject,
   projectionStageInProject,
 } from "./services/dida-project-projection-coordinator";
+import { stableHash } from "./domain/stable";
+import {
+  ProjectAutoSyncCoordinator,
+  type ProjectAutoSyncReport,
+} from "./services/project-auto-sync";
+import { helixMarkerVisibilityExtension } from "./editor/helix-marker-visibility";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = {
@@ -108,6 +114,7 @@ export default class HelixPlugin extends Plugin {
   projectWorkspace!: ProjectWorkspaceService;
   taskReferences!: TaskReferenceService;
   projectProjection!: DidaProjectProjectionService;
+  private projectAutoSync!: ProjectAutoSyncCoordinator;
   /** 设置页和命令面板使用同一确认规则，但绝不允许跨入口确认。 */
   readonly didaWriteContractSettingsConfirmation = new DidaWriteContractConfirmationGate();
   private readonly didaWriteContractCommandConfirmation = new DidaWriteContractConfirmationGate();
@@ -218,7 +225,20 @@ export default class HelixPlugin extends Plugin {
       () => new Date().toISOString(),
       new PersistedProjectionDiagnosticsPort(this.store),
     );
+    this.projectAutoSync = new ProjectAutoSyncCoordinator({
+      scan: () => this.projectAutoSyncScan(),
+      synchronize: (projectId) => this.syncProjectProjection(projectId),
+      report: (report) => this.reportProjectAutoSync(report),
+    });
+    const projectionReadinessRunner = new SerializedRunner();
+    this.register(this.service.subscribe(() => {
+      void projectionReadinessRunner.run(async () => {
+        const readiness = await this.service.projectProjectionWriteReadiness();
+        this.projectAutoSync.updateReadiness(readiness.ready);
+      }).catch((error) => console.warn("Helix 无法刷新滴答项目后台写入条件", error));
+    }));
     await this.projectProjection.retryReceiptCleanup();
+    this.registerEditorExtension(helixMarkerVisibilityExtension);
     if (templateStartupAction(this.recoveryMode, this.settings.templateSetupCompleted) === "prompt") {
       this.showInitialTemplateFolderPrompt();
     }
@@ -257,7 +277,6 @@ export default class HelixPlugin extends Plugin {
         previewProjectProjection: (target) => this.previewProjectProjection(target),
         adoptProjectAction: (input) => this.adoptProjectAction(input),
         editProjectAction: (input) => this.editProjectAction(input),
-        syncProjectProjection: (projectId) => this.syncProjectProjection(projectId),
         reconcileProjectProjectionFrozen: (input) => this.reconcileProjectProjectionFrozen(input),
         recoverPendingProjectProjectionReceiptCleanup: () =>
           this.recoverPendingProjectProjectionReceiptCleanup(),
@@ -460,6 +479,8 @@ export default class HelixPlugin extends Plugin {
     void this.refreshActiveHelixStatusControl();
 
     this.refreshAutoSync(this.settings.autoSync);
+    // 重启后从 Markdown/Canvas 权威源重扫；队列与写门仍由既有同步管线负责。
+    this.projectAutoSync.request();
   }
 
   private activeHelixStatusTarget(): ActiveHelixStatusTarget | null {
@@ -543,6 +564,7 @@ export default class HelixPlugin extends Plugin {
     this.didaWriteContractSettingsConfirmation.disarm();
     this.didaContractAdoptConfirmation.disarm();
     this.didaWriteContractCommands?.dispose();
+    this.projectAutoSync?.dispose();
     if (this.projectRefreshTimer !== null) {
       window.clearTimeout(this.projectRefreshTimer);
       this.projectRefreshTimer = null;
@@ -608,6 +630,7 @@ export default class HelixPlugin extends Plugin {
       const snapshot = await this.projectWorkspace.snapshot();
       await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
     });
+    this.projectAutoSync.request(true);
   }
 
   async disableProjectProjection(): Promise<void> {
@@ -644,6 +667,7 @@ export default class HelixPlugin extends Plugin {
         line: input.line,
       });
     });
+    this.projectAutoSync.request();
   }
 
   async editProjectAction(input: {
@@ -665,6 +689,7 @@ export default class HelixPlugin extends Plugin {
         state: input.state,
       });
     });
+    this.projectAutoSync.request();
   }
 
   async reconcileProjectProjectionFrozen(input:
@@ -691,6 +716,7 @@ export default class HelixPlugin extends Plugin {
         });
       }
     });
+    this.projectAutoSync.invalidate(input.projectId);
   }
 
   async removeResolvedProjectProjectionReceipt(operationId: string): Promise<void> {
@@ -700,11 +726,58 @@ export default class HelixPlugin extends Plugin {
 
   async recoverPendingProjectProjectionReceiptCleanup(): Promise<void> {
     await this.withWritableProjectMutation(() => this.projectProjection.retryReceiptCleanup());
+    this.projectAutoSync.invalidate();
   }
 
   async syncProjectProjection(projectId: string): Promise<ProjectionSyncSummary> {
     return this.withWritableProjectMutation(async () =>
       this.projectProjection.synchronizeProject(await this.projectionInput(projectId)));
+  }
+
+  private async projectAutoSyncScan() {
+    return this.withProjectWorkspaceRead(async () => {
+      const configuration = await this.projectProjection.readConfiguration();
+      if (!configuration.enabled || !configuration.target || !configuration.confirmedPreviewHash) {
+        return { candidates: [], failures: [] };
+      }
+      const snapshot = await this.projectWorkspace.snapshot();
+      const candidates = [];
+      const failures = [];
+      for (const project of snapshot.projects) {
+        const input = projectionInputFromProject(project);
+        const fallbackFingerprint = stableHash(input);
+        try {
+          const model = await this.projectProjection.readProject(input);
+          candidates.push({
+            projectId: project.id,
+            fingerprint: stableHash({
+              project: model.project,
+              stages: model.stages.map((stage) => ({
+                id: stage.id,
+                path: stage.path,
+                revisionHash: stage.revisionHash,
+              })),
+            }),
+          });
+        } catch {
+          failures.push({ projectId: project.id, fingerprint: fallbackFingerprint });
+        }
+      }
+      return { candidates, failures };
+    });
+  }
+
+  private reportProjectAutoSync(report: ProjectAutoSyncReport): void {
+    if (this.unloaded) return;
+    if (report.failed > 0) {
+      new Notice(`滴答项目后台同步：暂缓 ${report.blocked} 项，失败 ${report.failed} 项；请查看冲突中心`, 10_000);
+      return;
+    }
+    if (report.blocked > 0) {
+      const frozen = report.frozen > 0 ? `（冻结 ${report.frozen} 个对象）` : "";
+      new Notice(`滴答项目同步暂缓 ${report.blocked} 项${frozen}；请查看冲突中心或同步设置`, 10_000);
+      return;
+    }
   }
 
   private async projectionInput(projectId: string): Promise<ProjectionProjectInput> {
@@ -1165,6 +1238,7 @@ export default class HelixPlugin extends Plugin {
           await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
         }
         await this.service.refreshPersistedEvents();
+        this.projectAutoSync.request();
       }).catch(async (error) => {
         const recoveryIssue = this.projectWorkspace.recoveryIssueMessage();
         const message = error instanceof Error ? error.message : String(error);

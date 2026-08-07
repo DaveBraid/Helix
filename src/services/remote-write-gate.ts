@@ -2,6 +2,8 @@ export class RemoteWriteGate {
   private activeShared = 0;
   private exclusiveReason: string | null = null;
 
+  constructor(private readonly onIdle?: () => void) {}
+
   enterShared(): () => void {
     if (this.exclusiveReason) {
       throw new Error(`${this.exclusiveReason}正在进行，其他远端访问已冻结`);
@@ -9,6 +11,7 @@ export class RemoteWriteGate {
     this.activeShared += 1;
     return once(() => {
       this.activeShared -= 1;
+      if (this.isIdle()) this.onIdle?.();
     });
   }
 
@@ -20,11 +23,16 @@ export class RemoteWriteGate {
     this.exclusiveReason = reason;
     return once(() => {
       this.exclusiveReason = null;
+      this.onIdle?.();
     });
   }
 
   isExclusive(): boolean {
     return this.exclusiveReason !== null;
+  }
+
+  isIdle(): boolean {
+    return this.exclusiveReason === null && this.activeShared === 0;
   }
 }
 

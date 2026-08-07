@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { DidaFocusRecord, DidaProject, DidaTask } from "../src/domain/entities";
-import { HelixService } from "../src/services/helix-service";
+import {
+  HelixService,
+  projectProjectionGlobalCapabilitiesReady,
+} from "../src/services/helix-service";
 import { HelixDataStore, type PluginDataPort } from "../src/storage/data-store";
 import { createDefaultData, hydrateData } from "../src/storage/model";
 import type { HelixSecretStore } from "../src/storage/secrets";
@@ -31,6 +34,18 @@ function grantTaskCrud(
     verifiedAt: "2026-08-03T00:00:00.000Z",
   };
 }
+
+it("keeps ordinary project writes globally ready when only task reopen is unverified", () => {
+  const state = {
+    connected: true,
+    authorizationConfigured: true,
+    taskCrudVerified: true,
+    parentTaskVerified: true,
+    boardPlacementVerified: true,
+    taskReopenVerified: false,
+  };
+  expect(projectProjectionGlobalCapabilitiesReady(state)).toBe(true);
+});
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 
 async function createBoardMoveHarness(): Promise<{

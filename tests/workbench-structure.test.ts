@@ -166,14 +166,30 @@ describe("workbench layout and navigation structure", () => {
     expect(view).not.toContain("renderProjectDidaMappingBar");
     expect(view).not.toContain("ProjectDidaMappingConfirmModal");
     expect(view).toMatch(/renderProjectProjectionPanel[\s\S]*未加入[\s\S]*adoptProjectAction/);
-    expect(view).toMatch(/editProjectAction[\s\S]*syncProjectProjection/);
-    expect(view).toContain("加入同步、标题与状态编辑当前只写入 Stage Markdown");
-    expect(view).toContain("仅“同步此项目到滴答”会请求远端写入");
-    expect(view).toContain("当前只写 Stage，尚未发送滴答");
-    expect(view).toMatch(/再次确认 ·/);
+    expect(view).toMatch(/editProjectAction/);
+    expect(view).toContain("Stage 或项目发生变化后会自动排队同步");
+    expect(view).not.toContain("同步此项目到滴答");
+    expect(view).not.toContain("当前只写 Stage，尚未发送滴答");
     expect(settings).toMatch(/滴答项目同步[\s\S]*选择清单[\s\S]*选择已有分栏/);
     expect(settings).toMatch(/再次点击确认启用/);
     expect(settings).toContain("请选择清单以查看已有分栏或安全创建目标分栏");
+  });
+
+  it("registers Live Preview marker hiding and routes project changes through one background coordinator", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
+    expect(main).toContain("this.registerEditorExtension(helixMarkerVisibilityExtension)");
+    expect(main).toMatch(/new ProjectAutoSyncCoordinator[\s\S]*scan: \(\) => this\.projectAutoSyncScan\(\)[\s\S]*synchronize: \(projectId\) => this\.syncProjectProjection\(projectId\)/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);
+    expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);
+    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*updateReadiness\(readiness\.ready\)/);
+    const readiness = service.slice(
+      service.indexOf("async projectProjectionWriteReadiness"),
+      service.indexOf("async replaceDidaToken"),
+    );
+    expect(readiness).toMatch(/data\.queue\.length[\s\S]*data\.conflicts\.some[\s\S]*state\.loading[\s\S]*remoteWriteGate\.isIdle[\s\S]*recoveryIssues[\s\S]*remoteOutcomeUnknown[\s\S]*projectionOperationReceipts/);
+    expect(service).toContain("new RemoteWriteGate(() => this.emit())");
+    expect(view).not.toContain("syncProjectProjection:");
   });
 
   it("routes projection conflicts only through strict reconciliation and safe cleanup", () => {

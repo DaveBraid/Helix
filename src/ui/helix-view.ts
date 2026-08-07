@@ -89,7 +89,6 @@ import type {
 } from "../domain/dida-project-projection";
 import type {
   ProjectionProjectReadModel,
-  ProjectionSyncSummary,
 } from "../services/dida-project-projection";
 import type {
   DidaProjectViewModeSyncStatus,
@@ -134,7 +133,6 @@ import {
   conflictCenterIsEmpty,
   loadProjectionConflictModels,
   projectionProjectSummary,
-  projectionSyncSummaryText,
 } from "./project-projection-presenter";
 
 echarts.use([
@@ -273,7 +271,6 @@ export class HelixView extends ItemView {
       previewProjectProjection: (target: DidaProjectionTarget) => Promise<ProjectionActivationPreview>;
       adoptProjectAction: (input: { projectId: string; stageId: string; expectedHash: string; line: number }) => Promise<void>;
       editProjectAction: (input: { projectId: string; stageId: string; expectedHash: string; uuid: string; title?: string; state?: ProjectionActionState }) => Promise<void>;
-      syncProjectProjection: (projectId: string) => Promise<ProjectionSyncSummary>;
       reconcileProjectProjectionFrozen: (input:
         | { kind: "action"; projectId: string; stageId: string; uuid: string }
         | { kind: "parent"; projectId: string }) => Promise<void>;
@@ -2450,7 +2447,9 @@ export class HelixView extends ItemView {
     });
     panel.createEl("p", {
       cls: "helix-project-projection-local-note",
-      text: "加入同步、标题与状态编辑当前只写入 Stage Markdown，尚未发送滴答；仅“同步此项目到滴答”会请求远端写入。",
+      text: model.enabled
+        ? "Stage 或项目发生变化后会自动排队同步；阻塞与失败会通过通知和冲突中心提示。"
+        : "本地行动可继续编辑；启用滴答项目同步前不会请求远端写入。",
     });
     const metrics = panel.createDiv({ cls: "helix-project-projection-metrics" });
     for (const [label, value] of [
@@ -2481,13 +2480,13 @@ export class HelixView extends ItemView {
         row.createSpan({ text: action.title });
         const adopt = row.createEl("button", {
           text: "加入同步",
-          attr: { "aria-label": `将行动加入滴答项目同步：${action.title}；当前只写 Stage，尚未发送滴答` },
+          attr: { "aria-label": `将行动加入滴答项目同步：${action.title}` },
         });
         adopt.addEventListener("click", () => this.runProjectionUiAction(adopt, token, async () => {
           await this.actions.adoptProjectAction({
             projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash, line: action.line,
           });
-          new Notice("行动已加入同步；当前只写入 Stage Markdown，尚未发送滴答");
+          new Notice(model.enabled ? "行动已加入，后台同步已排队" : "行动已加入；启用滴答项目同步后将自动发送");
         }));
       }
       for (const action of stage.managed) {
@@ -2502,26 +2501,9 @@ export class HelixView extends ItemView {
             projectId: project.id, stageId: stage.id, expectedHash: stage.revisionHash,
             uuid: action.uuid, title: title.value, state: state.value as ProjectionActionState,
           });
-          new Notice("行动已保存；尚未同步到滴答");
+          new Notice(model.enabled ? "行动已保存，后台同步已排队" : "行动已保存；滴答项目同步尚未启用");
         }, "Markdown 已变化，已刷新最新内容"));
       }
-    }
-    if (summary.canSync && remoteBlockers.length === 0) {
-      let armed = false;
-      const sync = panel.createEl("button", { cls: "helix-primary-button", text: "同步此项目到滴答" });
-      const summaryText = `${summary.managed} 条已加入行动；失联关联 ${summary.orphan}；冻结 ${summary.frozen}`;
-      sync.addEventListener("click", () => {
-        if (!armed) {
-          armed = true;
-          sync.setText(`再次确认 · ${summaryText}`);
-          return;
-        }
-        this.runProjectionUiAction(sync, token, async () => {
-          const result = await this.actions.syncProjectProjection(project.id);
-          const presentation = projectionSyncSummaryText(result);
-          new Notice(presentation.text, presentation.warning ? 12_000 : 8_000);
-        });
-      });
     }
   }
 
@@ -3242,7 +3224,7 @@ export class HelixView extends ItemView {
     card.createEl("strong", { text: `${model.project.title} · ${label}` });
     card.createEl("code", { text: `${stageId} / ${uuid}` });
     if (!actionable) {
-      card.createEl("p", { text: "该行动尚未冻结；返回项目页手动同步可生成并处理删除 tombstone。" });
+      card.createEl("p", { text: "该行动尚未冻结；返回项目页保存变更后，后台同步会生成并处理删除记录。" });
       return;
     }
     const reconcile = card.createEl("button", { text: "精确复读并收口" });

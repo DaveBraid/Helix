@@ -124,6 +124,25 @@ export interface HelixRuntimeState {
 
 export type DidaProjectViewModeSyncStatus = "synced" | "pending" | "conflict" | "attention";
 
+export interface ProjectProjectionWriteReadiness {
+  ready: boolean;
+  queueBlocked: boolean;
+  conflictsBlocked: boolean;
+  inProgress: boolean;
+  recoveryBlocked: boolean;
+  unknownBlocked: boolean;
+}
+
+export function projectProjectionGlobalCapabilitiesReady(
+  state: Pick<HelixRuntimeState,
+    "connected" | "authorizationConfigured" | "taskCrudVerified" |
+    "parentTaskVerified" | "boardPlacementVerified">,
+): boolean {
+  // 重开只在具体 reopen 操作门禁检查；不能阻止普通创建、更新或完成从队列阻塞中恢复。
+  return state.connected && state.authorizationConfigured && state.taskCrudVerified &&
+    state.parentTaskVerified && state.boardPlacementVerified;
+}
+
 export type StateListener = (state: HelixRuntimeState) => void;
 
 const EMPTY_STATE: HelixRuntimeState = {
@@ -163,7 +182,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private readonly queueDrain = new SingleFlight();
   private syncPromise: Promise<void> | null = null;
   private readonly conflictApplications = new Map<string, Promise<void>>();
-  private readonly remoteWriteGate = new RemoteWriteGate();
+  // 最后一份远端租约释放后必须重新发布状态，使后台写入条件能观察到 ready 转换。
+  private readonly remoteWriteGate = new RemoteWriteGate(() => this.emit());
   private readonly boardPlacementWrites = new Map<string, Promise<void>>();
   private contractTestRunning = false;
   private lastDidaWriteContractReport: DidaWriteContractReport | null = null;
@@ -315,6 +335,30 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.listeners.add(listener);
     listener(this.snapshot());
     return () => this.listeners.delete(listener);
+  }
+
+  async projectProjectionWriteReadiness(): Promise<ProjectProjectionWriteReadiness> {
+    const data = await this.store.snapshot();
+    const queueBlocked = data.queue.length > 0;
+    const conflictsBlocked = data.conflicts.some((conflict) =>
+      conflict.status !== "resolved" && conflict.status !== "superseded");
+    const inProgress = this.state.loading || this.contractTestRunning ||
+      !this.remoteWriteGate.isIdle() || data.queue.some((operation) => operation.status === "running");
+    const recoveryBlocked = data.recoveryIssues.length > 0 || Boolean(data.pendingDidaContractCleanup) ||
+      (data.didaProjectionState?.receiptCleanupPending?.length ?? 0) > 0;
+    const unknownBlocked = data.queue.some((operation) =>
+      operation.remoteOutcomeUnknown || operation.status === "reconciliation") ||
+      data.projectionOperationReceipts.some((receipt) => receipt.outcome === "unknown");
+    const capabilitiesReady = projectProjectionGlobalCapabilitiesReady(this.state);
+    return {
+      ready: capabilitiesReady && !queueBlocked && !conflictsBlocked && !inProgress &&
+        !recoveryBlocked && !unknownBlocked,
+      queueBlocked,
+      conflictsBlocked,
+      inProgress,
+      recoveryBlocked,
+      unknownBlocked,
+    };
   }
 
   async replaceDidaToken(token: string): Promise<void> {

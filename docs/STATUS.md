@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-07
-当前基线提交：`536eca3 docs: record project workflow acceptance`
-工作树状态：有尚未提交的 Live Preview 标记展示与项目后台同步改动；Vault 测试数据和运行态 `data.json` 不纳入 Git。
-当前阶段：修复“加入同步”只写 Markdown、必须再手动同步的问题，并改善 Helix 内部标记的编辑体验。
+当前基线提交：`45f3fe4 feat: automate safe project synchronization`
+工作树状态：工作树干净；Vault 测试数据和运行态 `data.json` 不纳入 Git。
+当前阶段：Live Preview 内部标记与项目后台自动调度已完成；真实滴答写入因查询限流保持只读。
 
 ## 本轮目标
 
@@ -37,20 +37,19 @@
 
 - 已通过：全量 65 个测试文件、802 项；`typecheck`、`build`、`release:check`、`git diff --check`。
 - 已通过针对性测试：Live Preview 精确匹配、Source／选择边界；后台防抖批处理、自写重入、重启扫描、阻塞／失败和卸载取消。
-- 仅自动化覆盖：主插件注册、Vault 事件接线和 UI 手动按钮移除；后台协调器测试使用假同步端口。
+- 已通过实机：Obsidian CLI 重载；Live Preview 隐藏 focus/action 标记且保留正文与源文件；错误和 console error 均为 0。
 - 真实合同：本次未通过（查询限流）；1 task＋2 project 票据已 recover 精确清理，本地 pending=false、queue=0、conflict=0，能力全只读。
-- 尚未验证：当前改动的 Obsidian CLI 重载、Live Preview 实机显示、真实启用后的后台 Notice 与滴答结果。
-- 不得宣称：生产项目同步、真实合同写入、当前 UI 实机或 Release 已通过。
+- 尚未验证：真实启用后的后台 Notice 与滴答项目父子任务结果。
+- 不得宣称：生产项目同步、真实合同写入或 Release 已通过。
 
 ## 未关闭问题
 
 - 当前 API 读取连接正常；本次合同失败并完成安全清理后，生产写能力仍全只读，重新验证前后台同步只能安全暂缓。
-- 当前改动尚未经过看门狗独立审查和 Obsidian 实机验收。
+- 看门狗已通过本轮代码终审，无剩余 P0–P2。
 - 项目页与复盘体验仍是下一阶段核心，尚未达到最终产品质量。
 
 ## 下一步
 
-1. 由看门狗审查后台调度、重入、Notice 和 CM6 装饰边界，修复 P0–P2。
-2. 运行 `release:check` 与 `git diff --check`，再用 Obsidian CLI 重载验证 Live Preview；不启用真实远端项目写入。
-3. 在用户明确安排真实测试后，仅用专用测试清单验证“加入同步→后台排队→远端结果”，保持普通数据零触碰。
-4. 验收后更新本快照并形成阶段提交，再回到项目和复盘核心打磨。
+1. 等滴答查询限流窗口恢复后，只运行一次专用写入合同；若再次失败或结果未知立即冻结，不连续重试。
+2. 合同完整通过后，仅用专用测试清单验证“加入同步→后台排队→父任务／子任务结果→精确清理”。
+3. 真实项目同步验收后，继续打磨项目 Canvas／Markdown 体验与复盘核心功能。

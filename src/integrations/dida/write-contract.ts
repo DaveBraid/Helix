@@ -436,7 +436,8 @@ export class DidaWriteContractRunner {
             items: [sentinelDraft],
           }, { itemsRoundTripVerified: true }, ["items"]),
           (reread) => {
-            if (!sameDidaTaskExcept(emptyParent, reread, ["items"])) throw new Error("新增 sentinel 时父任务其他字段发生变化");
+            if (!sameDidaTaskExcept(emptyParent, reread, ["items", "kind"])) throw new Error("新增 sentinel 时父任务其他字段发生变化");
+            if (reread.kind !== "CHECKLIST") throw new Error("sentinel 写入后父任务未切换为 CHECKLIST");
             if (reread.items?.length !== 1 || !reread.items[0]?.id || reread.items[0].title !== sentinelTitle) {
               throw new Error("sentinel 检查项未获得唯一服务端 ID");
             }

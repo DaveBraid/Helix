@@ -62,7 +62,7 @@ import { OfflineQueue } from "../sync/offline-queue";
 import { ingestRemoteRecords } from "../sync/remote-ingest";
 import { createSnapshot } from "../sync/snapshots";
 import { SyncEngine, type ResolvedConflict } from "../sync/sync-engine";
-import { buildConflictFields } from "../sync/three-way-merge";
+import { applyConflictScopeDefaults, buildConflictFields } from "../sync/three-way-merge";
 import type {
   ResolutionChoice,
   SyncConflict,
@@ -1474,43 +1474,47 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       this.assertWritable();
       this.assertProjectionCapabilities(false);
       const data = await this.store.snapshot();
+      const checklistLocal = { ...local, kind: "CHECKLIST" };
       const base = createSnapshot("task", projectionBase.id, projectionBase);
       const now = new Date().toISOString();
-      const localSnapshot = createSnapshot("task", local.id, local, { capturedAt: now });
+      const localSnapshot = createSnapshot("task", checklistLocal.id, checklistLocal, { capturedAt: now });
       const remoteSnapshot = createSnapshot("task", remote.id, remote, { capturedAt: now });
-      const ownedItemIds = changedChecklistItemIds(projectionBase, local);
+      const ownedItemIds = changedChecklistItemIds(projectionBase, checklistLocal);
       if (ownedItemIds.length !== 1) throw new Error("owned item 冲突必须精确绑定一个检查项 ID");
       const conflictId = `conflict-${stableHash(["task", local.id, base.stamp.hash, remoteSnapshot.stamp.hash])}`;
       const conflict: SyncConflict<DidaTask> = {
         id: conflictId,
         kind: "task",
-        entityId: local.id,
-        title: local.title,
+        entityId: checklistLocal.id,
+        title: checklistLocal.title,
         createdAt: now,
         updatedAt: now,
         status: "open",
         base,
         local: localSnapshot,
         remote: remoteSnapshot,
-        fields: buildConflictFields(base.value, local, remote),
+        fields: applyConflictScopeDefaults(
+          buildConflictFields(base.value, checklistLocal, remote),
+          "helix-projection-owned-items",
+        ),
         remoteRecheckCount: 0,
         sourceDeviceId: data.deviceId,
         scope: "helix-projection-owned-items",
         ownedItemIds,
       };
-      const operation = buildTaskUpdateOperation(local, base, "update", now, operationId, ["items"]);
+      const operation = buildTaskUpdateOperation(checklistLocal, base, "update", now, operationId, ["items", "kind"]);
       operation.status = "blocked";
       operation.conflictId = conflictId;
       operation.idempotencyFingerprint = `helix-write:${operationId}`;
       await this.store.mutate((current) => {
         current.conflicts = [...current.conflicts.filter((item) => item.id !== conflictId), conflict];
         current.queue = [...current.queue.filter((item) => item.id !== operationId), operation];
-        current.localSnapshots[`task:${local.id}`] = localSnapshot as EntitySnapshot<unknown>;
+        current.localSnapshots[`task:${checklistLocal.id}`] = localSnapshot as EntitySnapshot<unknown>;
         upsertProjectionReceipt(current, {
           clientIdentity: operation.idempotencyFingerprint!,
-          projectId: local.projectId,
+          projectId: checklistLocal.projectId,
           operationId,
-          marker: local.content ?? "",
+          marker: checklistLocal.content ?? "",
           outcome: "conflict",
           remoteTaskId: local.id,
           conflictId,
@@ -2026,6 +2030,11 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     try {
       this.assertWritable();
       this.assertProjectionCapabilities(operationType === "update" && writeFields.includes("status"));
+      const writesItems = writeFields.includes("items");
+      const desiredTask = writesItems ? { ...task, kind: "CHECKLIST" } : task;
+      const effectiveWriteFields = writesItems
+        ? [...new Set([...writeFields, "kind"])]
+        : writeFields;
       const base = freshBase
         ? createSnapshot("task", freshBase.id, taskSyncValue(freshBase))
         : (await this.store.snapshot()).baseSnapshots[`task:${task.id}`] as
@@ -2038,17 +2047,17 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       };
       const now = new Date().toISOString();
       const operation = buildTaskUpdateOperation(
-        taskSyncValue(task),
+        taskSyncValue(desiredTask),
         base,
         operationType,
         now,
         requestedOperationId ?? `op-projection-${crypto.randomUUID()}`,
-        writeFields,
+        effectiveWriteFields,
       );
       operation.idempotencyFingerprint = `helix-write:${operation.id}`;
-      if (writeFields.length === 1 && writeFields[0] === "items" &&
+      if (writesItems &&
         requestedOperationId?.startsWith("op-projection-item-")) {
-        const ownedItemIds = changedChecklistItemIds(freshBase ?? task, task);
+        const ownedItemIds = changedChecklistItemIds(freshBase ?? task, desiredTask);
         if (ownedItemIds.length > 0) {
           operation.conflictScope = "helix-projection-owned-items";
           operation.conflictOwnedItemIds = ownedItemIds;
@@ -3204,8 +3213,9 @@ function isProjectionUnidentifiedItemAppend(
   base: EntitySnapshot<DidaTask>,
   desired: EntitySnapshot<DidaTask>,
 ): boolean {
+  const fields = new Set(operation.writeFields ?? []);
   if (operation.kind !== "task" || operation.operation !== "update" ||
-    operation.writeFields?.length !== 1 || operation.writeFields[0] !== "items" ||
+    !fields.has("items") || !fields.has("kind") || fields.size !== 2 ||
     !operation.idempotencyFingerprint?.startsWith("helix-write:")) return false;
   const before = base.value.items ?? [];
   const after = desired.value.items ?? [];

@@ -12,6 +12,7 @@ import {
 } from "../src/integrations/dida/adapters";
 import type { DidaApi, DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
+import { normalizeTask } from "../src/integrations/dida/normalization";
 import {
   buildTaskUpdateOperation,
   migrateInProgressTaskId,
@@ -614,7 +615,36 @@ describe("DidaTaskAdapter", () => {
       items: [{ id: "item-1", title: "merged", status: 0 }],
     });
     expect(Object.keys(api.lastUpdate ?? {})).not.toContain("items[item-1].title");
-    expect(Object.keys(api.lastUpdate ?? {})).toEqual(["id", "projectId", "items"]);
+    expect(Object.keys(api.lastUpdate ?? {})).toEqual(["id", "projectId", "kind", "items"]);
+    expect(api.lastUpdate?.kind).toBe("CHECKLIST");
+  });
+
+  it("keeps an empty items replacement in CHECKLIST kind instead of oscillating back to text", () => {
+    expect(taskUpdatePayload({
+      id: "task-1", projectId: "project-old", title: "Checklist", status: 0,
+      kind: "CHECKLIST", items: [],
+    }, { itemsRoundTripVerified: true }, ["items", "kind"])).toEqual({
+      id: "task-1", projectId: "project-old", kind: "CHECKLIST", items: [],
+    });
+  });
+
+  it("keeps an explicitly typed CHECKLIST create with an empty items array", () => {
+    expect(taskCreatePayload({
+      id: "local-task", projectId: "project-old", title: "Checklist", status: 0,
+      kind: "CHECKLIST", items: [],
+    }, { itemsRoundTripVerified: true })).toMatchObject({
+      projectId: "project-old", title: "Checklist", kind: "CHECKLIST", items: [],
+    });
+  });
+
+  it("does not turn a normalized TEXT task with implicit empty items into CHECKLIST on rebuild", () => {
+    const normalized = normalizeTask({
+      id: "text-task", projectId: "project-old", title: "Text", status: 0, kind: "TEXT",
+    });
+    expect(normalized.items).toEqual([]);
+    const payload = taskCreatePayload(normalized, { itemsRoundTripVerified: true });
+    expect(payload.kind).toBe("TEXT");
+    expect(payload).not.toHaveProperty("items");
   });
 
   it("preserves remote checklist order and unknown fields through an items update", async () => {

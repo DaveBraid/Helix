@@ -452,6 +452,62 @@ describe("SyncEngine safety gates", () => {
     expect((repository.base?.value as DidaTask).title).toBe("changed-after-first-read");
   });
 
+  it("treats the CHECKLIST kind transition as part of an items write and verifies without a false conflict", async () => {
+    const baseTask = { ...task("parent"), kind: "TEXT", items: [{ id: "owned", title: "old", status: 0 }] };
+    const desired = { ...baseTask, kind: "CHECKLIST", items: [{ id: "owned", title: "new", status: 0 }] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", desired);
+    const adapter = new TaskAdapter(baseTask);
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process({
+      ...operation(desired, base),
+      writeFields: ["items", "kind"],
+    });
+    expect(result.outcome).toBe("pushed");
+    expect(adapter.lastContext?.writeFields).toEqual(["items", "kind"]);
+    expect(adapter.value).toMatchObject({ kind: "CHECKLIST", items: [{ id: "owned", title: "new", status: 0 }] });
+    expect(repository.conflicts).toEqual([]);
+  });
+
+  it("carries the derived CHECKLIST kind through Base/Local/Remote conflict resolution", async () => {
+    const baseTask = { ...task("parent"), kind: "TEXT", items: [{ id: "owned", title: "base", status: 0 }] };
+    const localTask = { ...baseTask, kind: "CHECKLIST", items: [{ id: "owned", title: "local", status: 0 }] };
+    const remoteTask = { ...baseTask, items: [{ id: "owned", title: "remote", status: 0 }] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({ adapter, snapshots: repository, conflicts: repository, deviceId: "device-a" });
+    const result = await engine.process({
+      ...operation(localTask, base),
+      writeFields: ["items", "kind"],
+      conflictScope: "helix-projection-owned-items",
+      conflictOwnedItemIds: ["owned"],
+    });
+    expect(result.outcome).toBe("conflict");
+    if (result.outcome !== "conflict") throw new Error("expected conflict");
+    expect(result.conflict.fields.find((field) => field.path === "kind")?.choice).toBe("local");
+    await engine.choose(result.conflict.id, "items[owned].title", "local");
+    adapter.value = { ...remoteTask, kind: "NOTE" };
+    const refreshed = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(refreshed.outcome).toBe("remote-changed");
+    if (refreshed.outcome !== "remote-changed") throw new Error("expected refreshed conflict");
+    expect(refreshed.conflict.fields.find((field) => field.path === "kind")?.choice).toBe("local");
+    await expect(engine.choose(result.conflict.id, "kind", "remote")).rejects.toThrow(/固定为 Local/);
+    await expect(engine.choose(result.conflict.id, "kind", "custom", "NOTE")).rejects.toThrow(/固定为 Local/);
+    expect(repository.conflicts[0]?.fields.find((field) => field.path === "kind")?.choice).toBe("local");
+    // 模拟旧版本已持久化的非法选择；apply 必须再次强制回 Local。
+    repository.conflicts[0]!.fields = repository.conflicts[0]!.fields.map((field) =>
+      field.path === "kind" ? { ...field, choice: "remote", customValue: "NOTE" } : field);
+    const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
+    expect(applied.outcome).toBe("resolved");
+    expect(adapter.lastContext?.writeFields).toEqual(expect.arrayContaining(["items", "kind"]));
+    expect(adapter.value).toMatchObject({ kind: "CHECKLIST", items: [{ id: "owned", title: "local", status: 0 }] });
+  });
+
   it("requires an explicit whole-record choice for delete versus update", async () => {
     const base = createSnapshot("task", "task-1", task("base"));
     const repository = new MemoryRepository();

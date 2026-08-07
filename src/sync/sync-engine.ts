@@ -4,6 +4,8 @@ import { cloneValue, deepEqual, stableHash } from "../domain/stable";
 import { createSnapshot, snapshotChanged } from "./snapshots";
 import {
   applyResolutions,
+  applyConflictScopeDefaults,
+  enforceConflictScopeDefaults,
   buildConflictFields,
   setFieldResolution,
   unresolvedFields,
@@ -180,10 +182,15 @@ export class SyncEngine<T extends RemoteEntity> {
     | ResolvedConflict<T>
     | { outcome: "remote-changed"; conflict: SyncConflict<T> }
   > {
-    const conflict = (await this.dependencies.conflicts.get(conflictId)) as
+    let conflict = (await this.dependencies.conflicts.get(conflictId)) as
       | SyncConflict<T>
       | null;
     if (!conflict) throw new Error("冲突不存在或已经解决");
+    const enforced = enforceConflictScopeDefaults(conflict);
+    if (!deepEqual(enforced.fields, conflict.fields)) {
+      await this.dependencies.conflicts.save(enforced);
+      conflict = enforced;
+    }
     if (unresolvedFields(conflict).length > 0) throw new Error("仍有字段尚未选择");
     if (conflict.scope === "helix-projection-owned-items") {
       if (!conflict.ownedItemIds?.length) throw new Error("投影 owned 冲突缺少检查项身份范围");
@@ -237,11 +244,16 @@ export class SyncEngine<T extends RemoteEntity> {
     context?: { projectId?: string },
     remoteEntityId?: string,
   ): Promise<ResolvedConflict<T>> {
-    const conflict = (await this.dependencies.conflicts.get(conflictId)) as
+    let conflict = (await this.dependencies.conflicts.get(conflictId)) as
       | SyncConflict<T>
       | null;
     if (!conflict || conflict.status !== "applying") {
       throw new Error("冲突不在等待远端核对状态");
+    }
+    const enforced = enforceConflictScopeDefaults(conflict);
+    if (!deepEqual(enforced.fields, conflict.fields)) {
+      await this.dependencies.conflicts.save(enforced);
+      conflict = enforced;
     }
     if (unresolvedFields(conflict).length > 0) throw new Error("仍有字段尚未选择");
     const merged = applyResolutions<T | null>(
@@ -450,6 +462,10 @@ export class SyncEngine<T extends RemoteEntity> {
     reason: string,
   ): Promise<SyncConflict<T>> {
     const timestamp = this.now().toISOString();
+    const fields = applyConflictScopeDefaults(
+      buildConflictFields(base.value, local.value, remote.value),
+      operation.conflictScope,
+    );
     const conflict: SyncConflict<T> = {
       id: `conflict-${stableHash([
         operation.kind,
@@ -466,7 +482,7 @@ export class SyncEngine<T extends RemoteEntity> {
       base,
       local,
       remote,
-      fields: buildConflictFields(base.value, local.value, remote.value),
+      fields,
       remoteRecheckCount: 0,
       sourceDeviceId: this.dependencies.deviceId,
       scope: operation.conflictScope,
@@ -480,7 +496,7 @@ export class SyncEngine<T extends RemoteEntity> {
     conflict: SyncConflict<T>,
     remote: EntitySnapshot<T>,
   ): SyncConflict<T> {
-    const fields = buildConflictFields(conflict.base.value, conflict.local.value, remote.value);
+    let fields = buildConflictFields(conflict.base.value, conflict.local.value, remote.value);
     for (const field of fields) {
       const previous = conflict.fields.find((candidate) => candidate.path === field.path);
       if (!previous?.choice) continue;
@@ -489,6 +505,7 @@ export class SyncEngine<T extends RemoteEntity> {
         field.customValue = cloneValue(previous.customValue);
       }
     }
+    fields = applyConflictScopeDefaults(fields, conflict.scope);
     return {
       ...cloneValue(conflict),
       updatedAt: this.now().toISOString(),

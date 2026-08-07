@@ -545,6 +545,6 @@ function sameProjectionIdentity(left: ProjectionLedgerEntry, right: ProjectionLe
     (!left.remoteId || !right.remoteId || left.remoteId === right.remoteId);
 }
 
-function assertStableId(value: string, label: string): void {
+export function assertStableId(value: string, label: string): void {
   if (!value || value !== value.trim() || /[\r\n]/.test(value) || value.length > 512) throw new Error(`${label}无效`);
 }

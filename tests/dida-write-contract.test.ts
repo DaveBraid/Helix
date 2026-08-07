@@ -323,6 +323,7 @@ class ContractApiFake {
       title: value.title,
       projectId: value.projectId,
       status: 0,
+      kind: value.kind ?? "TEXT",
     };
     if (this.collapseScheduleToPoint && task.dueDate) task.startDate = task.dueDate;
     if (this.corruptSchedule) task.dueDate = "2030-01-01T00:00:00.000Z";
@@ -403,6 +404,10 @@ class ContractApiFake {
         : {}),
     };
     if (Object.hasOwn(value, "items")) {
+      if (value.kind !== "CHECKLIST") {
+        updated.items = current.items;
+        updated.kind = current.kind;
+      } else {
       updated.items = (value.items ?? []).map((item) => ({
         ...item,
         id: item.id || (this.forcedNewChecklistItemId !== undefined
@@ -425,6 +430,7 @@ class ContractApiFake {
       });
       if (this.corruptSentinelStatus && current.items === undefined && updated.items[0]) {
         updated.items[0] = { ...updated.items[0], status: 2 };
+      }
       }
     }
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
@@ -711,6 +717,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
+    expect(itemWrites.every((payload) => payload.kind === "CHECKLIST")).toBe(true);
     expect(itemWrites.slice(1).some((payload) => payload.items?.[0]?.timeZone === "Asia/Shanghai")).toBe(true);
     expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("sortOrder");
     expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 987)).toBe(true);

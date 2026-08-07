@@ -216,6 +216,8 @@ export function taskCreatePayload(
   value: DidaTask,
   capabilities: DidaTaskWriteCapabilities = {},
 ): DidaTaskWriteWirePayload & Pick<DidaTask, "title" | "projectId"> {
+  const writesChecklist = capabilities.itemsRoundTripVerified === true &&
+    (value.kind === "CHECKLIST" || (value.items?.length ?? 0) > 0);
   return {
     title: value.title,
     projectId: value.projectId,
@@ -227,9 +229,9 @@ export function taskCreatePayload(
     timeZone: value.timeZone,
     priority: value.priority,
     sortOrder: value.sortOrderUnsafe ? undefined : value.sortOrder,
-    ...(capabilities.itemsRoundTripVerified && Object.hasOwn(value, "items")
-      ? { items: serializeDidaChecklistItems(value.items) }
-      : {}),
+    ...(writesChecklist
+      ? { kind: "CHECKLIST", items: serializeDidaChecklistItems(clearedAs(value, "items", [])) }
+      : value.kind !== undefined ? { kind: value.kind } : {}),
     tags: value.tags,
     ...(capabilities.reminderWriteVerified && Object.hasOwn(value, "reminders")
       ? { reminders: value.reminders }
@@ -268,8 +270,9 @@ export function taskUpdatePayload(
     ...(writeFields.has("sortOrder") && !value.sortOrderUnsafe && value.sortOrder !== undefined
       ? { sortOrder: value.sortOrder }
       : {}),
+    ...(writeFields.has("kind") && !writeFields.has("items") ? { kind: value.kind } : {}),
     ...(writeFields.has("items") && capabilities.itemsRoundTripVerified
-      ? { items: serializeDidaChecklistItems(clearedAs(value, "items", [])) }
+      ? { kind: "CHECKLIST", items: serializeDidaChecklistItems(clearedAs(value, "items", [])) }
       : {}),
     ...(writeFields.has("tags") ? { tags: clearedAs(value, "tags", []) } : {}),
     ...(writeFields.has("reminders") && capabilities.reminderWriteVerified && Object.hasOwn(value, "reminders")

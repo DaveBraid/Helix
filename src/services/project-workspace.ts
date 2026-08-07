@@ -5301,7 +5301,14 @@ function frontmatterFromContent(
 ): Record<string, unknown> | undefined {
   const match = /^(?:\uFEFF)?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(content);
   if (!match) return undefined;
-  const parsed = parseYaml(match[1] ?? "");
+  const frontmatter = match[1] ?? "";
+  // Vault 扫描会经过所有 Markdown。先用 Helix 的顶层身份键筛选候选，避免把
+  // 以水平线开头、稍后又含水平线的普通正文或受管块整体交给 YAML 解析器。
+  // 一旦出现身份键，仍解析并严格校验完整 frontmatter，绝不吞掉 Helix 结构错误。
+  if (!/^(?:helix-kind|"helix-kind"|'helix-kind')[ \t]*:/m.test(frontmatter)) {
+    return undefined;
+  }
+  const parsed = parseYaml(frontmatter);
   return parsed && typeof parsed === "object"
     ? parsed as Record<string, unknown>
     : undefined;

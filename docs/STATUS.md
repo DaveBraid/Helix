@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-08
-当前基线提交：`9023f37 fix: quarantine disabled project projection writes`
-工作树状态：工作树干净（本快照提交后）。
-当前阶段：`0.1.0` 个人预览版代码收口完成；待 Obsidian 实机确认后，开发主线转向“项目”与“复盘”。
+当前基线提交：`9023f37 fix: quarantine disabled project projection writes`（v0.1.1 基于此提交）
+工作树状态：工作树干净（本热修提交后）。
+当前阶段：`0.1.1` 热修完成；开发主线转向“项目”与“复盘”。
 
 ## 本轮目标
 
@@ -18,7 +18,8 @@
 - 发送前必须核对同父任务全部 Stage 身份、路径、UUID 和 remoteId；缺失、歧义、重排、CAS／ledger 失败或结果未知一律零写入或冻结，禁止猜测与重发。
 - Base／Local／Remote 同字段竞争必须逐字段人工解决；凭证只存 SecretStorage，所有远端写入复用唯一队列和 `RemoteWriteGate`。
 - `0.1.0` 不展示项目投影入口；统一门禁覆盖后台扫描、分栏、队列、恢复、重试和冲突写回。历史投影操作原样保留且不阻塞同对象普通任务，UI 只显示诊断。
-- 版本兼容基线为 Obsidian 桌面端 `1.12.2`；`manifest.json`、`package.json`、`versions.json` 均为 `0.1.0`。
+- Project／Stage 扫描仅解析含顶层 `helix-kind` 的 frontmatter；普通正文与聚焦块不解析、不改写，Helix 元数据仍严格校验。
+- 版本兼容基线为 Obsidian 桌面端 `1.12.2`；`manifest.json`、`package.json`、`package-lock.json` 与 `versions.json` 均已登记 `0.1.1`。
 
 ## 本轮改动
 
@@ -26,6 +27,8 @@
 - `src/ui/helix-view.ts`、`src/ui/settings-tab.ts`：移除项目页同步面板及设置启用／分栏创建入口；普通滴答同步界面不变。
 - `tests/workbench-structure.test.ts`：把发布界面与后台门禁约束固化为结构测试。
 - `README.md`、本文件：记录个人预览定位、暂未开放能力与版本兼容策略。
+- `src/services/project-workspace.ts`：在 YAML 解析前按顶层 Helix 身份键筛选，避免普通 Markdown 被误判；未写入用户文件。
+- `tests/project-workspace.test.ts`：覆盖正文反斜杠与聚焦样式块保持原文，以及 Helix 身份字段继续严格拒绝。
 
 ## 相关约束
 
@@ -36,9 +39,7 @@
 
 ## 当前验证
 
-- 基线已通过：66 个测试文件、924 项测试；`typecheck`、`build`、`release:check`、`git diff --check`。
-- 本轮已通过针对性测试（5 个文件、110 项）、完整测试（66 个文件、924 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；均为本地自动化，未访问真实滴答。
-- 自动化覆盖不稳定 ID 全组重映、双行动增改删、跨／缺席 Stage、冻结 tombstone、CAS 中断与 verified 重启恢复。
+- v0.1.1 已通过针对性测试（2 个文件、170 项）、完整测试（66 个文件、926 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；未访问真实滴答。
 - 最终 30 秒真实合同仍在 items 写入时超时并进入结果未知；后续复读无法唯一证明写入结果。全程零重发，安全清理完成：`cleanup clean`、`remoteArtifacts=false`。
 - 当前 `pending=0`、离线队列 `queue=0`、冲突 `conflict=0`、恢复问题 `recovery=0`，且未观察到限流。
 - 上述结果是外部真实环境阻塞，不是 items 合同通过；不得宣称生产项目投影可用。当前干净状态也不等于 2026-08-05 孤儿任务已清理。

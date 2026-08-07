@@ -9,6 +9,43 @@ const DELETE_JOURNAL = "Helix/.transactions/stage-delete.json";
 const HISTORY_JOURNAL = "Helix/.transactions/workspace-history.json";
 
 describe("ProjectWorkspaceService", () => {
+  it("does not parse ordinary Markdown between thematic breaks as Helix YAML", async () => {
+    const repo = baseRepository();
+    const path = "Notes/Android.md";
+    const ordinary = [
+      "---",
+      "# 普通 Markdown 正文",
+      '{"path":"Android sdk\\platform-tools"}',
+      "<!-- helix-focus-bridge:start version=1 -->",
+      "用户受管块样式文本",
+      "<!-- helix-focus-bridge:end -->",
+      "---",
+      "正文继续",
+    ].join("\n");
+    repo.set(path, ordinary);
+
+    await expect(workspace(repo).snapshot()).resolves.toMatchObject({
+      projects: [expect.objectContaining({ id: "project-1" })],
+    });
+    expect((await repo.read(path))?.content).toBe(ordinary);
+  });
+
+  it("keeps Helix identity fields strict after the non-Helix prefilter", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Broken/Stage-02.md", [
+      "---",
+      "helix-kind: helix-stage",
+      "helix-id: broken-stage",
+      "helix-project-id: project-1",
+      "helix-sequence: broken",
+      "helix-status: idea",
+      "---",
+      "# 阶段 2",
+    ].join("\n"));
+
+    await expect(workspace(repo).snapshot()).rejects.toThrow(/阶段元数据不完整/);
+  });
+
   it("consumes template bodies for new project and initial stage while retaining Helix envelopes", async () => {
     const repo = baseRepository();
     const calls: string[] = [];

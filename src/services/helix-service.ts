@@ -101,7 +101,7 @@ import {
   releaseConflictApplication,
 } from "./conflict-claim";
 
-const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 15_000;
+const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface HelixRuntimeState {
   loading: boolean;

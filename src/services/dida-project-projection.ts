@@ -26,6 +26,7 @@ import {
   type ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
 import type { ResolutionAuditEntry } from "../sync/types";
+import { newDidaChecklistItemDraft } from "../integrations/dida/serialization";
 
 export interface ProjectionMarkdownRevision {
   path: string;
@@ -1610,11 +1611,7 @@ function projectionStateForRemoteStatus(
 
 /** 新检查项不携带用户可见 marker；ID 必须由写后精确复读的差集领养。 */
 function newChecklistItem(entry: ProjectionLedgerEntry): DidaChecklistItem {
-  return {
-    id: undefined as unknown as string,
-    title: entry.title,
-    status: checklistStatus(entry.state),
-  };
+  return newDidaChecklistItemDraft(entry.title, checklistStatus(entry.state));
 }
 
 function findChecklistItem(task: DidaTask, itemId: string): DidaChecklistItem | undefined {

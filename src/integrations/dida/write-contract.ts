@@ -21,7 +21,7 @@ import {
 } from "./adapters";
 import { DidaHttpError } from "./http-contract";
 import { normalizeColumns, normalizeProject, normalizeTask } from "./normalization";
-import { serializeDidaDate } from "./serialization";
+import { newDidaChecklistItemDraft, serializeDidaDate } from "./serialization";
 
 type ContractApi = Pick<
   DidaApi,
@@ -441,7 +441,7 @@ export class DidaWriteContractRunner {
         const emptyParent = normalizeTask(await this.api.getTask(projectA.id, parentTask.id));
         const sentinelTitle = `${marker} sentinel`;
         // 与生产投影一致：新检查项不臆造 sortOrder，由服务端决定排序元数据。
-        const sentinelDraft = { id: "", title: sentinelTitle, status: 0 };
+        const sentinelDraft = newDidaChecklistItemDraft(sentinelTitle, 0);
         itemsFailureCode = "ITEMS_SENTINEL_CREATE";
         const withSentinel = await this.updateAndVerifyTaskProperties(
           parentTask.id,
@@ -471,7 +471,7 @@ export class DidaWriteContractRunner {
           marker,
           taskUpdatePayload({
             ...withSentinel,
-            items: [...withSentinel.items!, { id: "", title: ownedTitle, status: 0 }],
+            items: [...withSentinel.items!, newDidaChecklistItemDraft(ownedTitle, 0)],
           }, { itemsRoundTripVerified: true }, ["items"]),
           (reread) => { assertOwnedChecklistAppend(withSentinel, reread, ownedTitle); },
         );

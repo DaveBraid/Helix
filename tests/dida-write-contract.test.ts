@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
 import type { DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
+import { newDidaChecklistItemDraft } from "../src/integrations/dida/serialization";
 import {
   assertOwnedChecklistAppend,
   DidaWriteContractRunner,
@@ -412,15 +413,21 @@ class ContractApiFake {
         updated.items = current.items;
         updated.kind = current.kind;
       } else {
-      updated.items = (value.items ?? []).map((item) => ({
-        ...item,
-        id: item.id || (this.forcedNewChecklistItemId !== undefined
-          ? this.forcedNewChecklistItemId
-          : `test-item-${++this.itemSequence}`),
-        ...(!item.id && this.addChecklistServerDefaults
-          ? { sortOrder: 987, isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
-          : {}),
-      })).map((item) => {
+      updated.items = (value.items ?? []).flatMap((item) => {
+        const hasId = Object.hasOwn(item, "id");
+        // 真实故障的保守模型：显式空串可能被服务端当作无效已有项并忽略；
+        // 只有完全省略 id 才表示创建并由服务端分配 ID。
+        if (hasId && item.id === "") return [];
+        return [{
+          ...item,
+          id: hasId ? item.id : (this.forcedNewChecklistItemId !== undefined
+            ? this.forcedNewChecklistItemId
+            : `test-item-${++this.itemSequence}`),
+          ...(!hasId && this.addChecklistServerDefaults
+            ? { sortOrder: 987, isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
+            : {}),
+        }];
+      }).map((item) => {
         const before = current.items?.find((candidate) => candidate.id === item.id);
         if (before?.status === 0 && item.status === 2) {
           return { ...item, completedTime: "2026-07-31T00:00:00.000Z" };
@@ -740,7 +747,28 @@ describe("DidaWriteContractRunner", () => {
     expect(itemWrites.every((payload) => payload.kind === "CHECKLIST")).toBe(true);
     expect(itemWrites.slice(1).some((payload) => payload.items?.[0]?.timeZone === "Asia/Shanghai")).toBe(true);
     expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("sortOrder");
+    expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("id");
     expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 987)).toBe(true);
+  });
+
+  it("models explicit empty item IDs as ignored while an omitted ID creates a server-owned item", async () => {
+    const api = new ContractApiFake();
+    await api.updateTask("original-task", {
+      id: "original-task",
+      projectId: "original-project",
+      kind: "CHECKLIST",
+      items: [{ id: "", title: "ignored", status: 0 }],
+    });
+    expect((await api.getTask("original-project", "original-task")).items).toEqual([]);
+
+    await api.updateTask("original-task", {
+      id: "original-task",
+      projectId: "original-project",
+      kind: "CHECKLIST",
+      items: [newDidaChecklistItemDraft("created", 0)],
+    });
+    expect((await api.getTask("original-project", "original-task")).items)
+      .toEqual([expect.objectContaining({ id: "test-item-1", title: "created", status: 0 })]);
   });
 
   it("adopts a new checklist ID after server sortOrder repositions it and preserves that order", async () => {

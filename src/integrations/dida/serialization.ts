@@ -1,5 +1,10 @@
 import type { DidaChecklistItem } from "../../domain/entities";
 
+/** 由服务端分配 ID 的新检查项；运行时对象必须完全省略 id 属性。 */
+export function newDidaChecklistItemDraft(title: string, status: number): DidaChecklistItem {
+  return { title, status } as DidaChecklistItem;
+}
+
 export function serializeDidaDate(
   value: string | null | undefined,
   label = "日期",
@@ -19,6 +24,8 @@ export function serializeDidaChecklistItems(
       throw new Error("检查项排序原值已丢失，禁止执行无法无损的整组回写");
     }
     const { sortOrderUnsafe: _legacyUnsafeMarker, ...raw } = item;
-    return { ...raw };
+    if (raw.id !== undefined) return { ...raw };
+    const { id: _undefinedId, ...withoutId } = raw;
+    return withoutId as DidaChecklistItem;
   });
 }

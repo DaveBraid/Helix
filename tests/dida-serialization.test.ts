@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  newDidaChecklistItemDraft,
   serializeDidaChecklistItems,
   serializeDidaDate,
 } from "../src/integrations/dida/serialization";
@@ -34,5 +35,14 @@ describe("Dida write serialization", () => {
       completedTime: "2026-08-01T15:37:34.230Z",
     });
     expect(items[0]?.startDate).toBe("2026-08-01T14:37:34.230Z");
+  });
+
+  it("omits the ID property entirely for a new checklist item draft", () => {
+    const draft = newDidaChecklistItemDraft("新检查项", 0);
+    const serialized = serializeDidaChecklistItems([draft]);
+
+    expect(draft).not.toHaveProperty("id");
+    expect(serialized?.[0]).not.toHaveProperty("id");
+    expect(JSON.stringify(serialized)).toBe('[{"title":"新检查项","status":0}]');
   });
 });

@@ -1,7 +1,7 @@
 # 当前开发状态
 
 最后更新：2026-08-08
-当前基线提交：`66c23f7 release: close 0.1.0 preview scope`
+当前基线提交：`9023f37 fix: quarantine disabled project projection writes`
 工作树状态：工作树干净（本快照提交后）。
 当前阶段：`0.1.0` 个人预览版代码收口完成；待 Obsidian 实机确认后，开发主线转向“项目”与“复盘”。
 
@@ -17,7 +17,7 @@
 - 项目投影底层采用“项目父任务 + 阶段行动 `items`”；该账号整组更新会重生成全部 item ID，只有成功响应后的完整语义唯一双射才能原子重映 ledger 与 Stage Markdown。
 - 发送前必须核对同父任务全部 Stage 身份、路径、UUID 和 remoteId；缺失、歧义、重排、CAS／ledger 失败或结果未知一律零写入或冻结，禁止猜测与重发。
 - Base／Local／Remote 同字段竞争必须逐字段人工解决；凭证只存 SecretStorage，所有远端写入复用唯一队列和 `RemoteWriteGate`。
-- `0.1.0` 的项目页与设置页不展示项目投影入口；发布门禁固定关闭后台扫描、激活、分栏创建和投影同步，底层实现与历史诊断仅为后续复核保留。
+- `0.1.0` 不展示项目投影入口；统一门禁覆盖后台扫描、分栏、队列、恢复、重试和冲突写回。历史投影操作原样保留且不阻塞同对象普通任务，UI 只显示诊断。
 - 版本兼容基线为 Obsidian 桌面端 `1.12.2`；`manifest.json`、`package.json`、`versions.json` 均为 `0.1.0`。
 
 ## 本轮改动
@@ -37,7 +37,7 @@
 ## 当前验证
 
 - 基线已通过：66 个测试文件、924 项测试；`typecheck`、`build`、`release:check`、`git diff --check`。
-- 本轮已通过针对性测试（3 个文件、39 项）、完整测试（66 个文件、924 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；均为本地自动化，未访问真实滴答。
+- 本轮已通过针对性测试（5 个文件、110 项）、完整测试（66 个文件、924 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；均为本地自动化，未访问真实滴答。
 - 自动化覆盖不稳定 ID 全组重映、双行动增改删、跨／缺席 Stage、冻结 tombstone、CAS 中断与 verified 重启恢复。
 - 最终 30 秒真实合同仍在 items 写入时超时并进入结果未知；后续复读无法唯一证明写入结果。全程零重发，安全清理完成：`cleanup clean`、`remoteArtifacts=false`。
 - 当前 `pending=0`、离线队列 `queue=0`、冲突 `conflict=0`、恢复问题 `recovery=0`，且未观察到限流。

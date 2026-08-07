@@ -21,7 +21,7 @@ import {
 } from "./adapters";
 import { DidaHttpError } from "./http-contract";
 import { normalizeColumns, normalizeProject, normalizeTask } from "./normalization";
-import { newDidaChecklistItemDraft, serializeDidaDate } from "./serialization";
+import { createDidaChecklistClientItem, serializeDidaDate } from "./serialization";
 
 type ContractApi = Pick<
   DidaApi,
@@ -85,8 +85,12 @@ export interface DidaWriteContractReport {
 export type ItemsOwnedAppendFailureCode =
   | "ITEMS_OWNED_APPEND_PARENT_FIELDS"
   | "ITEMS_OWNED_APPEND_KIND"
-  | "ITEMS_OWNED_APPEND_ADDED_COUNT"
+  | "ITEMS_OWNED_APPEND_BASELINE_MISSING"
+  | "ITEMS_OWNED_APPEND_ID_REGENERATED"
+  | "ITEMS_OWNED_APPEND_ADDED_ZERO"
+  | "ITEMS_OWNED_APPEND_ADDED_MULTIPLE"
   | "ITEMS_OWNED_APPEND_ID_UNSTABLE"
+  | "ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED"
   | "ITEMS_OWNED_APPEND_SEMANTICS"
   | "ITEMS_OWNED_APPEND_EXISTING_FIELDS"
   | "ITEMS_OWNED_APPEND_EXISTING_ORDER";
@@ -441,7 +445,7 @@ export class DidaWriteContractRunner {
         const emptyParent = normalizeTask(await this.api.getTask(projectA.id, parentTask.id));
         const sentinelTitle = `${marker} sentinel`;
         // 与生产投影一致：新检查项不臆造 sortOrder，由服务端决定排序元数据。
-        const sentinelDraft = newDidaChecklistItemDraft(sentinelTitle, 0);
+        const sentinelDraft = createDidaChecklistClientItem([], sentinelTitle, 0, this.now().toISOString());
         itemsFailureCode = "ITEMS_SENTINEL_CREATE";
         const withSentinel = await this.updateAndVerifyTaskProperties(
           parentTask.id,
@@ -454,8 +458,9 @@ export class DidaWriteContractRunner {
           (reread) => {
             if (!sameDidaTaskExcept(emptyParent, reread, ["items", "kind"])) throw new Error("新增 sentinel 时父任务其他字段发生变化");
             if (reread.kind !== "CHECKLIST") throw new Error("sentinel 写入后父任务未切换为 CHECKLIST");
-            if (reread.items?.length !== 1 || !reread.items[0]?.id || reread.items[0].title !== sentinelTitle) {
-              throw new Error("sentinel 检查项未获得唯一服务端 ID");
+            if (reread.items?.length !== 1 || reread.items[0]?.id !== sentinelDraft.id ||
+              reread.items[0].sortOrder !== sentinelDraft.sortOrder || reread.items[0].title !== sentinelTitle) {
+              throw new Error("sentinel 检查项客户端 ID 或排序未被服务端稳定保留");
             }
             if (!sameInitialChecklistSemantics(sentinelDraft, reread.items[0])) {
               throw new Error("sentinel 检查项受管字段未按语义往返");
@@ -464,6 +469,9 @@ export class DidaWriteContractRunner {
         );
         const sentinel = withSentinel.items![0]!;
         const ownedTitle = `${marker} owned item`;
+        const ownedDraft = createDidaChecklistClientItem(
+          withSentinel.items!, ownedTitle, 0, this.now().toISOString(),
+        );
         itemsFailureCode = "ITEMS_OWNED_APPEND";
         const withOwned = await this.updateAndVerifyTaskProperties(
           parentTask.id,
@@ -471,9 +479,9 @@ export class DidaWriteContractRunner {
           marker,
           taskUpdatePayload({
             ...withSentinel,
-            items: [...withSentinel.items!, newDidaChecklistItemDraft(ownedTitle, 0)],
+            items: [...withSentinel.items!, ownedDraft],
           }, { itemsRoundTripVerified: true }, ["items"]),
-          (reread) => { assertOwnedChecklistAppend(withSentinel, reread, ownedTitle); },
+          (reread) => { assertOwnedChecklistAppend(withSentinel, reread, ownedDraft); },
         );
         const owned = withOwned.items!.find((item) => item.id !== sentinel.id)!;
         const renamed = { ...owned, title: `${ownedTitle} renamed`, status: 2 };
@@ -1629,7 +1637,7 @@ function assertChecklistContractState(
 export function assertOwnedChecklistAppend(
   before: DidaTask,
   reread: DidaTask,
-  expectedOwnedTitle: string,
+  expectedOwned: NonNullable<DidaTask["items"]>[number],
 ): NonNullable<DidaTask["items"]>[number] {
   if (!sameDidaTaskExcept(before, reread, ["items", "kind"])) {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_PARENT_FIELDS");
@@ -1640,16 +1648,29 @@ export function assertOwnedChecklistAppend(
   const existing = before.items ?? [];
   const actual = reread.items ?? [];
   const existingIds = new Set(existing.map((item) => item.id));
-  const added = actual.filter((item) => !existingIds.has(item.id));
-  if (actual.length !== existing.length + 1 || added.length !== 1) {
-    throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_ADDED_COUNT");
+  const actualIds = new Set(actual.map((item) => item.id));
+  const missingExisting = existing.filter((item) => !actualIds.has(item.id));
+  if (missingExisting.length > 0) {
+    const unmatchedActual = actual.filter((item) => !existingIds.has(item.id));
+    const regenerated = missingExisting.every((item) =>
+      unmatchedActual.some((candidate) => sameChecklistItemExceptId(item, candidate)));
+    throw new ItemsOwnedAppendContractError(regenerated
+      ? "ITEMS_OWNED_APPEND_ID_REGENERATED"
+      : "ITEMS_OWNED_APPEND_BASELINE_MISSING");
   }
+  const added = actual.filter((item) => !existingIds.has(item.id));
+  if (added.length === 0) throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_ADDED_ZERO");
+  if (added.length > 1) throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_ADDED_MULTIPLE");
   try {
     assertStableId(added[0]!.id, "owned item ID");
   } catch {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_ID_UNSTABLE");
   }
-  if (added[0]!.title !== expectedOwnedTitle || added[0]!.status !== 0) {
+  if (added[0]!.id !== expectedOwned.id) {
+    throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED");
+  }
+  if (added[0]!.title !== expectedOwned.title || added[0]!.status !== expectedOwned.status ||
+    added[0]!.sortOrder !== expectedOwned.sortOrder) {
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_SEMANTICS");
   }
   const actualById = new Map(actual.map((item) => [item.id, item]));
@@ -1661,6 +1682,15 @@ export function assertOwnedChecklistAppend(
     throw new ItemsOwnedAppendContractError("ITEMS_OWNED_APPEND_EXISTING_ORDER");
   }
   return added[0]!;
+}
+
+function sameChecklistItemExceptId(
+  left: NonNullable<DidaTask["items"]>[number],
+  right: NonNullable<DidaTask["items"]>[number],
+): boolean {
+  const { id: _leftId, ...leftFields } = left;
+  const { id: _rightId, ...rightFields } = right;
+  return deepEqual(leftFields, rightFields);
 }
 
 function sameInitialChecklistSemantics(

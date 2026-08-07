@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
 import type { DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
-import { newDidaChecklistItemDraft } from "../src/integrations/dida/serialization";
 import {
   assertOwnedChecklistAppend,
   DidaWriteContractRunner,
@@ -65,7 +64,8 @@ class ContractApiFake {
   corruptSentinelStatus = false;
   forcedNewChecklistItemId?: string;
   reorderNewChecklistItem = false;
-  ownedAppendMutation?: "parent-fields" | "kind" | "added-count" | "id-unstable" | "semantics" | "existing-fields";
+  ownedAppendMutation?: "parent-fields" | "kind" | "baseline-missing" | "id-regenerated" |
+    "added-zero" | "added-multiple" | "id-unstable" | "client-id-changed" | "semantics" | "existing-fields";
   rejectPlacementWrites: false | string = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
@@ -415,16 +415,17 @@ class ContractApiFake {
       } else {
       updated.items = (value.items ?? []).flatMap((item) => {
         const hasId = Object.hasOwn(item, "id");
+        const isNew = !current.items?.some((candidate) => candidate.id === item.id);
         // 真实故障的保守模型：显式空串可能被服务端当作无效已有项并忽略；
         // 只有完全省略 id 才表示创建并由服务端分配 ID。
         if (hasId && item.id === "") return [];
         return [{
           ...item,
-          id: hasId ? item.id : (this.forcedNewChecklistItemId !== undefined
+          id: isNew && this.forcedNewChecklistItemId !== undefined
             ? this.forcedNewChecklistItemId
-            : `test-item-${++this.itemSequence}`),
-          ...(!hasId && this.addChecklistServerDefaults
-            ? { sortOrder: 987, isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
+            : hasId ? item.id : `test-item-${++this.itemSequence}`,
+          ...(isNew && this.addChecklistServerDefaults
+            ? { ...(item.sortOrder === undefined ? { sortOrder: 987 } : {}), isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
             : {}),
         }];
       }).map((item) => {
@@ -450,8 +451,17 @@ class ContractApiFake {
         const newIndex = updated.items.findIndex((item) => item.id !== existingId);
         if (this.ownedAppendMutation === "parent-fields") updated.desc = "server-recomputed-parent-field";
         if (this.ownedAppendMutation === "kind") updated.kind = "TASK";
-        if (this.ownedAppendMutation === "added-count") updated.items = [...current.items];
+        if (this.ownedAppendMutation === "baseline-missing") updated.items = updated.items.filter((item) => item.id !== existingId);
+        if (this.ownedAppendMutation === "id-regenerated") {
+          const existingIndex = updated.items.findIndex((item) => item.id === existingId);
+          if (existingIndex >= 0) updated.items[existingIndex] = { ...updated.items[existingIndex]!, id: "regenerated-existing-id" };
+        }
+        if (this.ownedAppendMutation === "added-zero") updated.items = [...current.items];
+        if (this.ownedAppendMutation === "added-multiple") {
+          updated.items.push({ id: "unexpected-second-new", title: "unexpected", status: 0 });
+        }
         if (this.ownedAppendMutation === "id-unstable" && newIndex >= 0) updated.items[newIndex] = { ...updated.items[newIndex]!, id: " " };
+        if (this.ownedAppendMutation === "client-id-changed" && newIndex >= 0) updated.items[newIndex] = { ...updated.items[newIndex]!, id: "1999999999999" };
         if (this.ownedAppendMutation === "semantics" && newIndex >= 0) updated.items[newIndex] = { ...updated.items[newIndex]!, status: 2 };
         if (this.ownedAppendMutation === "existing-fields") {
           const existingIndex = updated.items.findIndex((item) => item.id === existingId);
@@ -746,29 +756,11 @@ describe("DidaWriteContractRunner", () => {
     const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
     expect(itemWrites.every((payload) => payload.kind === "CHECKLIST")).toBe(true);
     expect(itemWrites.slice(1).some((payload) => payload.items?.[0]?.timeZone === "Asia/Shanghai")).toBe(true);
-    expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("sortOrder");
-    expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("id");
-    expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 987)).toBe(true);
-  });
-
-  it("models explicit empty item IDs as ignored while an omitted ID creates a server-owned item", async () => {
-    const api = new ContractApiFake();
-    await api.updateTask("original-task", {
-      id: "original-task",
-      projectId: "original-project",
-      kind: "CHECKLIST",
-      items: [{ id: "", title: "ignored", status: 0 }],
+    expect(itemWrites[0]?.items?.[0]).toMatchObject({
+      id: "1785456000000",
+      sortOrder: 0,
     });
-    expect((await api.getTask("original-project", "original-task")).items).toEqual([]);
-
-    await api.updateTask("original-task", {
-      id: "original-task",
-      projectId: "original-project",
-      kind: "CHECKLIST",
-      items: [newDidaChecklistItemDraft("created", 0)],
-    });
-    expect((await api.getTask("original-project", "original-task")).items)
-      .toEqual([expect.objectContaining({ id: "test-item-1", title: "created", status: 0 })]);
+    expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 0)).toBe(true);
   });
 
   it("adopts a new checklist ID after server sortOrder repositions it and preserves that order", async () => {
@@ -788,14 +780,18 @@ describe("DidaWriteContractRunner", () => {
     });
     const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
     const reorderedIds = itemWrites[2]?.items?.map((item) => item.id);
-    expect(reorderedIds).toEqual(["test-item-2", "test-item-1"]);
+    expect(reorderedIds).toEqual(["1785456000001", "1785456000000"]);
   });
 
   it.each([
     ["parent-fields", "ITEMS_OWNED_APPEND_PARENT_FIELDS"],
     ["kind", "ITEMS_OWNED_APPEND_KIND"],
-    ["added-count", "ITEMS_OWNED_APPEND_ADDED_COUNT"],
+    ["baseline-missing", "ITEMS_OWNED_APPEND_BASELINE_MISSING"],
+    ["id-regenerated", "ITEMS_OWNED_APPEND_ID_REGENERATED"],
+    ["added-zero", "ITEMS_OWNED_APPEND_ADDED_ZERO"],
+    ["added-multiple", "ITEMS_OWNED_APPEND_ADDED_MULTIPLE"],
     ["id-unstable", "ITEMS_OWNED_APPEND_ID_UNSTABLE"],
+    ["client-id-changed", "ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED"],
     ["semantics", "ITEMS_OWNED_APPEND_SEMANTICS"],
     ["existing-fields", "ITEMS_OWNED_APPEND_EXISTING_FIELDS"],
   ] as const)("reports the redacted owned-append subcode for %s", async (mutation, code) => {
@@ -819,8 +815,12 @@ describe("DidaWriteContractRunner", () => {
   it.each([
     ["ITEMS_OWNED_APPEND_PARENT_FIELDS", (task: DidaTask) => ({ ...task, desc: "changed" })],
     ["ITEMS_OWNED_APPEND_KIND", (task: DidaTask) => ({ ...task, kind: "TASK" })],
-    ["ITEMS_OWNED_APPEND_ADDED_COUNT", (task: DidaTask) => ({ ...task, items: task.items!.slice(1) })],
+    ["ITEMS_OWNED_APPEND_BASELINE_MISSING", (task: DidaTask) => ({ ...task, items: [task.items![0]!, task.items![2]!] })],
+    ["ITEMS_OWNED_APPEND_ID_REGENERATED", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { ...task.items![1]!, id: "regenerated" }, task.items![2]!] })],
+    ["ITEMS_OWNED_APPEND_ADDED_ZERO", (task: DidaTask) => ({ ...task, items: task.items!.slice(1) })],
+    ["ITEMS_OWNED_APPEND_ADDED_MULTIPLE", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { id: "extra", title: "extra", status: 0 }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_ID_UNSTABLE", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: " " }, ...task.items!.slice(1)] })],
+    ["ITEMS_OWNED_APPEND_CLIENT_ID_CHANGED", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: "1999999999999" }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_SEMANTICS", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, status: 2 }, ...task.items!.slice(1)] })],
     ["ITEMS_OWNED_APPEND_EXISTING_FIELDS", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { ...task.items![1]!, sortOrder: 999 }, task.items![2]!] })],
     ["ITEMS_OWNED_APPEND_EXISTING_ORDER", (task: DidaTask) => ({ ...task, items: [task.items![0]!, task.items![2]!, task.items![1]!] })],
@@ -836,7 +836,7 @@ describe("DidaWriteContractRunner", () => {
       ...before,
       items: [{ id: "owned", title: "owned title", status: 0, sortOrder: 3 }, ...before.items!],
     };
-    expect(() => assertOwnedChecklistAppend(before, mutate(reread), "owned title"))
+    expect(() => assertOwnedChecklistAppend(before, mutate(reread), reread.items![0]!))
       .toThrow(expect.objectContaining<Partial<ItemsOwnedAppendContractError>>({ code }));
   });
 

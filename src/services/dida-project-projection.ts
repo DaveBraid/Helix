@@ -1,5 +1,6 @@
 import type { DidaChecklistItem, DidaColumn, DidaProject, DidaTask } from "../domain/entities";
 import { stableHash } from "../domain/stable";
+import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import type { HelixDataStore } from "../storage/data-store";
 import type { HelixVaultRepository } from "../storage/vault-repository";
 import {
@@ -26,7 +27,7 @@ import {
   type ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
 import type { ResolutionAuditEntry } from "../sync/types";
-import { newDidaChecklistItemDraft } from "../integrations/dida/serialization";
+import { createDidaChecklistClientItem } from "../integrations/dida/serialization";
 
 export interface ProjectionMarkdownRevision {
   path: string;
@@ -505,10 +506,11 @@ export class DidaProjectProjectionService {
       }
       const resumableUnqueuedCreate = Boolean(entry.operationId && !entry.remoteId && inspection &&
         !inspection.receipt && entry.createBaselineItemIds && entry.createBaselineItemsHash &&
-        entry.createBaselineItemHashes);
+        entry.createBaselineItemHashes && entry.createItemId && entry.createItemSortOrder !== undefined);
       const resumableUnsentCreate = Boolean(entry.operationId && !entry.remoteId && inspection &&
         inspection.receipt?.outcome === "preflight-changed" &&
-        entry.createBaselineItemIds && entry.createBaselineItemsHash && entry.createBaselineItemHashes);
+        entry.createBaselineItemIds && entry.createBaselineItemsHash && entry.createBaselineItemHashes &&
+        entry.createItemId && entry.createItemSortOrder !== undefined);
       const resumablePreparedMutation = Boolean(entry.operationId && entry.remoteId && inspection &&
         !inspection.receipt && entry.mutationKind && entry.mutationBaselineItemIds &&
         entry.mutationBaselineItemsHash && entry.mutationBaselineItemHashes);
@@ -550,11 +552,15 @@ export class DidaProjectProjectionService {
         if (!latestEntry || latestEntry.operationId !== entry.operationId || latestEntry.remoteId) {
           throw new Error("未发送恢复前同步账本发生竞争");
         }
+        const resumedDraft = createClientOwnedChecklistItem(
+          latestItems, latestEntry, this.now(), latestEntry.createItemId,
+        );
         resumeEntry = {
           ...latestEntry,
           createBaselineItemIds: latestIds,
           createBaselineItemsHash: stableHash(latestItems),
           createBaselineItemHashes: Object.fromEntries(latestItems.map((item) => [item.id, stableHash(item)])),
+          createItemSortOrder: resumedDraft.sortOrder,
         };
         const rebasedState = {
           ...latest,
@@ -568,7 +574,7 @@ export class DidaProjectProjectionService {
         assertExactCreateBaseline(resumeEntry, recoveredParent.items ?? []);
         const resumed = await this.pipeline.updateTask({
           ...recoveredParent,
-          items: [...(recoveredParent.items ?? []), newChecklistItem(resumeEntry)],
+          items: [...(recoveredParent.items ?? []), checkpointChecklistItem(resumeEntry)],
         }, ["items"], entry.operationId, recoveredParent);
         if (resumed.outcome === "preflight-changed") {
           const rebased = resumed.task.items ?? [];
@@ -578,6 +584,9 @@ export class DidaProjectProjectionService {
           if (!latestEntry || latestEntry.operationId !== entry.operationId) {
             throw new Error("恢复时重基线账本发生竞争");
           }
+          const rebasedDraft = createClientOwnedChecklistItem(
+            rebased, latestEntry, this.now(), latestEntry.createItemId,
+          );
           await this.state.write(latest, {
             ...latest,
             ledger: replaceEntry(latest.ledger, {
@@ -585,6 +594,7 @@ export class DidaProjectProjectionService {
               createBaselineItemIds: rebasedIds,
               createBaselineItemsHash: stableHash(rebased),
               createBaselineItemHashes: Object.fromEntries(rebased.map((item) => [item.id, stableHash(item)])),
+              createItemSortOrder: rebasedDraft.sortOrder,
             }),
           });
           throw new Error("恢复续发仍在请求发送前发生竞争；最新 Base 已持久化，可安全再次恢复");
@@ -613,6 +623,10 @@ export class DidaProjectProjectionService {
           throw new Error("prepared 写入续发未取得同 operation ID 的精确结果");
         }
         recoveredParent = resumed.task;
+      }
+      if (!entry.remoteId && !resumeEntry.createItemId &&
+        inspection?.receipt?.outcome === "preflight-changed") {
+        throw new Error("旧版无 ID checkpoint 已证明从未发送；禁止按标题领养或续发，保持冻结");
       }
       const recoveredItemId = entry.remoteId ?? adoptCreatedChecklistItemFromIds(
         resumeEntry.createBaselineItemIds,
@@ -758,6 +772,8 @@ export class DidaProjectProjectionService {
               createBaselineItemIds: undefined,
               createBaselineItemsHash: undefined,
               createBaselineItemHashes: undefined,
+              createItemId: undefined,
+              createItemSortOrder: undefined,
             }
           : item),
       }, cleanupProof);
@@ -1013,6 +1029,8 @@ export class DidaProjectProjectionService {
             createBaselineItemIds: old.createBaselineItemIds,
             createBaselineItemsHash: old.createBaselineItemsHash,
             createBaselineItemHashes: old.createBaselineItemHashes,
+            createItemId: old.createItemId,
+            createItemSortOrder: old.createItemSortOrder,
             updateExpectedTitle: old.updateExpectedTitle,
             updateExpectedStatus: old.updateExpectedStatus,
             updateStageRevisionHash: old.updateStageRevisionHash,
@@ -1083,6 +1101,13 @@ export class DidaProjectProjectionService {
         // 写前先落盘“结果未知”检查点；即使进程在远端接受写入后崩溃，下一轮也不会重复追加。
         const createBaselineItemIds = strictChecklistIds(baseline, "写前基线");
         const operationId = entry.operationId ?? `op-projection-item-create-${crypto.randomUUID()}`;
+        let draft: DidaChecklistItem;
+        try {
+          draft = createClientOwnedChecklistItem(baseline, entry, this.now());
+        } catch (error) {
+          working = freezeEntry(working, entry, "capability", summary, message(error));
+          continue;
+        }
         let checkpointEntry: ProjectionLedgerEntry = {
           ...entry,
           frozen: "unknown-outcome",
@@ -1090,6 +1115,8 @@ export class DidaProjectProjectionService {
           createBaselineItemIds,
           createBaselineItemsHash: stableHash(baseline),
           createBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
+          createItemId: draft.id,
+          createItemSortOrder: draft.sortOrder,
         };
         working = replaceEntry(working, checkpointEntry);
         await this.persistProjectLedger(projectIdentity.projectId, working);
@@ -1098,7 +1125,7 @@ export class DidaProjectProjectionService {
           try {
             created = await this.pipeline.updateTask({
               ...parent,
-              items: [...baseline, newChecklistItem(entry)],
+              items: [...baseline, checkpointChecklistItem(checkpointEntry)],
             }, ["items"], operationId, parent);
           } catch (error) {
             working = freezeEntry(working, checkpointEntry, "unknown-outcome", summary, message(error));
@@ -1118,11 +1145,22 @@ export class DidaProjectProjectionService {
           parent = nextParent;
           baseline = structuredClone(parent.items ?? []);
           const rebasedIds = strictChecklistIds(baseline, "未发送重基线");
+          let rebasedDraft: DidaChecklistItem;
+          try {
+            rebasedDraft = createClientOwnedChecklistItem(
+              baseline, checkpointEntry, this.now(), checkpointEntry.createItemId,
+            );
+          } catch (error) {
+            working = freezeEntry(working, checkpointEntry, "identity-mismatch", summary, message(error));
+            created = undefined;
+            break;
+          }
           checkpointEntry = {
             ...checkpointEntry,
             createBaselineItemIds: rebasedIds,
             createBaselineItemsHash: stableHash(baseline),
             createBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
+            createItemSortOrder: rebasedDraft.sortOrder,
           };
           working = replaceEntry(working, checkpointEntry);
           await this.persistProjectLedger(projectIdentity.projectId, working);
@@ -1152,7 +1190,9 @@ export class DidaProjectProjectionService {
         }
         let adoptedId: string;
         try {
-          adoptedId = adoptUniqueCreatedChecklistItem(baseline, created.task.items ?? [], entry);
+          adoptedId = verifyClientOwnedCreatedChecklistItem(
+            baseline, created.task.items ?? [], checkpointEntry,
+          );
         } catch (error) {
           working = freezeEntry(working, checkpointEntry, "identity-mismatch", summary, message(error), created);
           continue;
@@ -1165,6 +1205,8 @@ export class DidaProjectProjectionService {
           createBaselineItemIds: undefined,
           createBaselineItemsHash: undefined,
           createBaselineItemHashes: undefined,
+          createItemId: undefined,
+          createItemSortOrder: undefined,
         };
         try {
           const next = patchManagedPlanAction(stageRevision!.content, { uuid: entry.uuid, remoteId: adoptedId });
@@ -1609,9 +1651,34 @@ function projectionStateForRemoteStatus(
   return localState === "completed" ? "active" : localState;
 }
 
-/** 新检查项不携带用户可见 marker；ID 必须由写后精确复读的差集领养。 */
-function newChecklistItem(entry: ProjectionLedgerEntry): DidaChecklistItem {
-  return newDidaChecklistItemDraft(entry.title, checklistStatus(entry.state));
+/**
+ * 上游 DidaSync 以 13 位毫秒时间戳作为新 item ID。Helix 在发送前生成并持久化，
+ * 之后只允许复用；若 Base 无法给出无损 sortOrder，则宁可冻结。
+ */
+export function createClientOwnedChecklistItem(
+  baseline: DidaChecklistItem[],
+  entry: Pick<ProjectionLedgerEntry, "title" | "state">,
+  now: string,
+  persistedId?: string,
+): DidaChecklistItem {
+  return createDidaChecklistClientItem(
+    baseline, entry.title, checklistStatus(entry.state), now, persistedId,
+  );
+}
+
+function checkpointChecklistItem(entry: ProjectionLedgerEntry): DidaChecklistItem {
+  if (!entry.createItemId || entry.createItemSortOrder === undefined) {
+    throw new Error("旧版无 ID 新建 checkpoint 只允许复读，禁止续发");
+  }
+  if (!isDidaChecklistClientId(entry.createItemId) || !Number.isSafeInteger(entry.createItemSortOrder)) {
+    throw new Error("新建检查项 checkpoint 身份或排序损坏");
+  }
+  return {
+    id: entry.createItemId,
+    title: entry.title,
+    status: checklistStatus(entry.state),
+    sortOrder: entry.createItemSortOrder,
+  };
 }
 
 function findChecklistItem(task: DidaTask, itemId: string): DidaChecklistItem | undefined {
@@ -1659,7 +1726,7 @@ function mergeOwnedChecklistFields(
   };
 }
 
-function adoptUniqueCreatedChecklistItem(
+function verifyClientOwnedCreatedChecklistItem(
   baseline: DidaChecklistItem[],
   reread: DidaChecklistItem[],
   entry: ProjectionLedgerEntry,
@@ -1676,13 +1743,14 @@ function adoptUniqueCreatedChecklistItem(
   if (stableHash(preservedInOrder) !== stableHash(baseline)) {
     throw new Error("创建检查项期间父任务既有 items 顺序发生竞争，已冻结同步");
   }
+  const expected = checkpointChecklistItem(entry);
   const added = [...rereadById.entries()].filter(([id]) => !baselineById.has(id));
-  const matching = added.filter(([, item]) =>
-    item.title === entry.title && item.status === checklistStatus(entry.state));
-  if (added.length !== 1 || matching.length !== 1) {
-    throw new Error("写后无法唯一证明新建检查项身份，已冻结同步");
+  const created = rereadById.get(expected.id);
+  if (added.length !== 1 || !created || created.title !== expected.title ||
+    created.status !== expected.status || created.sortOrder !== expected.sortOrder) {
+    throw new Error("服务端未稳定保留客户端检查项 ID、排序或受管字段，已冻结同步");
   }
-  return matching[0]![0];
+  return expected.id;
 }
 
 function assertOnlyOwnedChecklistItemDeleted(
@@ -1892,6 +1960,16 @@ function adoptCreatedChecklistItemFromIds(
     throw new Error("新建检查项期间既有 items 字段或顺序发生竞争");
   }
   const added = [...current.entries()].filter(([id]) => !baselineIds.includes(id));
+  if (entry.createItemId !== undefined) {
+    const expected = checkpointChecklistItem(entry);
+    const created = current.get(expected.id);
+    if (added.length !== 1 || !created || created.title !== expected.title ||
+      created.status !== expected.status || created.sortOrder !== expected.sortOrder) {
+      throw new Error("冻结复读未证明服务端稳定保留客户端检查项身份，保持冻结");
+    }
+    return expected.id;
+  }
+  // 旧版无 ID checkpoint 永不续发；仅在现有远端结果可由原基线唯一证明时只读收口。
   const matches = added.filter(([, item]) =>
     item.title === entry.title && item.status === checklistStatus(entry.state));
   if (added.length !== 1 || matches.length !== 1) {

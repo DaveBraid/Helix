@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DidaTask, EntityKind, EntitySnapshot } from "../src/domain/entities";
 import { createSnapshot } from "../src/sync/snapshots";
 import { SyncEngine } from "../src/sync/sync-engine";
-import { verifyUnidentifiedChecklistAppendResult } from "../src/domain/dida-project-projection";
+import { verifyClientChecklistAppendResult } from "../src/domain/dida-project-projection";
 import type {
   ConflictRepository,
   RemoteEntityAdapter,
@@ -168,9 +168,9 @@ describe("SyncEngine safety gates", () => {
     const baseTask: DidaTask = { ...task("项目"), kind: "CHECKLIST", items: [ordinary] };
     const desiredTask: DidaTask = {
       ...baseTask,
-      items: [...baseTask.items!, { id: "", title: "Helix 行动", status: 0 }],
+      items: [...baseTask.items!, { id: "1785772800000", title: "Helix 行动", status: 0, sortOrder: 11 }],
     };
-    const serverCreated = { id: "server-new", title: "Helix 行动", status: 0, sortOrder: 20 };
+    const serverCreated = { id: "1785772800000", title: "Helix 行动", status: 0, sortOrder: 11 };
     const serverTask: DidaTask = { ...desiredTask, items: [serverCreated, ordinary] };
     const base = createSnapshot("task", "task-1", baseTask);
     const repository = new MemoryRepository();
@@ -184,14 +184,14 @@ describe("SyncEngine safety gates", () => {
       conflicts: repository,
       deviceId: "device-a",
       verifyWriteResult: (_queued, actualBase, desired, actual) =>
-        verifyUnidentifiedChecklistAppendResult(actualBase.value, desired.value, actual),
+        verifyClientChecklistAppendResult(actualBase.value, desired.value, actual),
     });
 
     const result = await engine.process(operation(desiredTask, base));
 
     expect(result.outcome).toBe("pushed");
     expect((repository.base?.value as DidaTask).items?.map((item) => item.id))
-      .toEqual(["server-new", "ordinary-1"]);
+      .toEqual(["1785772800000", "ordinary-1"]);
     expect(repository.conflicts).toEqual([]);
   });
 

@@ -30,6 +30,7 @@ import type {
   ProjectionLedgerEntry,
   ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
+import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import {
   didaContractMarker,
   isDidaContractRunId,
@@ -586,6 +587,7 @@ function validateDidaProjectionState(
       "uuid", "projectId", "stageId", "parentTaskId", "targetProjectId", "targetColumnId",
       "remoteId", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
       "createBaselineItemIds", "createBaselineItemsHash", "createBaselineItemHashes",
+      "createItemId", "createItemSortOrder",
       "updateExpectedTitle", "updateExpectedStatus", "updateStageRevisionHash",
       "mutationKind", "mutationBaselineItemIds", "mutationBaselineItemsHash",
       "mutationBaselineItemHashes", "mutationOwnedInvariantHash",
@@ -612,6 +614,9 @@ function validateDidaProjectionState(
           row.createBaselineItemHashes !== undefined &&
           Object.keys(row.createBaselineItemHashes as Record<string, unknown>).length === row.createBaselineItemIds.length &&
           row.createBaselineItemIds.every((id) => Object.hasOwn(row.createBaselineItemHashes as object, id)))) &&
+      ((row.createItemId === undefined && row.createItemSortOrder === undefined) ||
+        (isDidaChecklistClientId(row.createItemId) &&
+          typeof row.createItemSortOrder === "number" && Number.isSafeInteger(row.createItemSortOrder))) &&
       ((row.updateExpectedTitle === undefined && row.updateExpectedStatus === undefined &&
         row.updateStageRevisionHash === undefined) ||
         (typeof row.updateExpectedTitle === "string" && row.updateExpectedTitle.length > 0 &&

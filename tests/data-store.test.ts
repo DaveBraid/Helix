@@ -858,6 +858,32 @@ describe("HelixDataStore serialization", () => {
     expect(hydrateData(cleanupShadow).didaProjectionState).toBeUndefined();
   });
 
+  it("hydrates the persisted client checklist identity used by restart-safe append", () => {
+    const raw = createDefaultData("projection-client-item-checkpoint");
+    raw.didaProjectionState = {
+      enabled: true,
+      target: { targetProjectId: "target-list", targetColumnId: "target-column" },
+      confirmedPreviewHash: "a".repeat(64),
+      ledger: [{
+        uuid: "uuid-a", projectId: "project-a", stageId: "stage-a", parentTaskId: "parent-a",
+        targetProjectId: "target-list", targetColumnId: "target-column", title: "Action",
+        state: "active", sourceHash: "b".repeat(64), frozen: "unknown-outcome",
+        operationId: "op-create-a", createBaselineItemIds: [],
+        createBaselineItemsHash: stableHash([]), createBaselineItemHashes: {},
+        createItemId: "1785888000000", createItemSortOrder: 0,
+      }],
+      parentCheckpoints: [],
+    };
+
+    expect(hydrateData(raw).didaProjectionState?.ledger[0]).toMatchObject({
+      createItemId: "1785888000000",
+      createItemSortOrder: 0,
+    });
+    const corrupted = structuredClone(raw);
+    corrupted.didaProjectionState!.ledger[0]!.createItemId = "0000000000001";
+    expect(hydrateData(corrupted).didaProjectionState).toBeUndefined();
+  });
+
   it("strictly validates the projection column creation checkpoint without secret-shaped extras", () => {
     const baselineColumns = [{ id: "todo", projectId: "target-list", name: "待处理" }];
     const valid = createDefaultData("projection-column-checkpoint");

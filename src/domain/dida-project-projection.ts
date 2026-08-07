@@ -1,5 +1,6 @@
 import type { DidaChecklistItem, DidaColumn, DidaProject, DidaTask } from "./entities";
 import { stableHash } from "./stable";
+import { isDidaChecklistClientId } from "./dida-checklist-id";
 
 export const PROJECT_PARENT_TASK_FIELD = "helix-dida-parent-task-id";
 export const LEGACY_PROJECT_LIST_FIELD = "helix-dida-project-id";
@@ -110,6 +111,9 @@ export interface ProjectionLedgerEntry {
   createBaselineItemIds?: string[];
   createBaselineItemsHash?: string;
   createBaselineItemHashes?: Record<string, string>;
+  /** 写前持久化的客户端检查项身份；缺失表示旧版无 ID checkpoint，只允许只读复读。 */
+  createItemId?: string;
+  createItemSortOrder?: number;
   /** owned item 更新发送前检查点；用于崩溃/结果未知后的只读收口，禁止重发。 */
   updateExpectedTitle?: string;
   updateExpectedStatus?: number;
@@ -432,10 +436,10 @@ export function verifyProjectedTask(
 }
 
 /**
- * 核验“在末尾提交一个无 ID 检查项”后的服务端结果。
- * 服务端可以为新项补 ID/默认值并按 sortOrder 重排，但既有项必须逐项不变且相对顺序不变。
+ * 核验“在末尾提交一个已持久化客户端 ID 的检查项”后的服务端结果。
+ * 服务端可以补默认值并按 sortOrder 重排，但必须保留客户端 ID，既有项逐项及相对顺序不变。
  */
-export function verifyUnidentifiedChecklistAppendResult(
+export function verifyClientChecklistAppendResult(
   base: DidaTask,
   desired: DidaTask,
   actual: DidaTask,
@@ -445,7 +449,8 @@ export function verifyUnidentifiedChecklistAppendResult(
   const actualItems = actual.items ?? [];
   const desiredNew = desiredItems.at(-1);
   if (desired.kind !== "CHECKLIST" || actual.kind !== "CHECKLIST" ||
-    desiredItems.length !== baselineItems.length + 1 || !desiredNew || desiredNew.id ||
+    desiredItems.length !== baselineItems.length + 1 || !desiredNew || !isDidaChecklistClientId(desiredNew.id) ||
+    baselineItems.some((item) => item.id === desiredNew.id) ||
     actualItems.length !== baselineItems.length + 1) return false;
 
   const { items: _desiredItems, ...desiredParent } = desired;
@@ -471,9 +476,9 @@ export function verifyUnidentifiedChecklistAppendResult(
     const preservedIds = actualItems.filter((item) => baselineById.has(item.id)).map((item) => item.id);
     if (stableHash(preservedIds) !== stableHash(baselineItems.map((item) => item.id))) return false;
     const added = actualItems.filter((item) => !baselineById.has(item.id));
-    if (added.length !== 1) return false;
+    if (added.length !== 1 || added[0]!.id !== desiredNew.id) return false;
     return Object.entries(desiredNew)
-      .filter(([key, value]) => key !== "id" && value !== undefined)
+      .filter(([, value]) => value !== undefined)
       .every(([key, value]) => stableHash(value) === stableHash((added[0] as unknown as Record<string, unknown>)[key]));
   } catch {
     return false;

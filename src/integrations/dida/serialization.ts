@@ -1,8 +1,47 @@
 import type { DidaChecklistItem } from "../../domain/entities";
+import {
+  DIDA_CHECKLIST_CLIENT_ID_MAX,
+  DIDA_CHECKLIST_CLIENT_ID_MIN,
+  isDidaChecklistClientId,
+} from "../../domain/dida-checklist-id";
 
-/** 由服务端分配 ID 的新检查项；运行时对象必须完全省略 id 属性。 */
-export function newDidaChecklistItemDraft(title: string, status: number): DidaChecklistItem {
-  return { title, status } as DidaChecklistItem;
+export function createDidaChecklistClientItem(
+  baseline: DidaChecklistItem[],
+  title: string,
+  status: number,
+  now: string,
+  persistedId?: string,
+): DidaChecklistItem {
+  const ids = new Set<string>();
+  for (const item of baseline) {
+    if (!item.id || item.id !== item.id.trim() || /[\r\n]/u.test(item.id) || ids.has(item.id)) {
+      throw new Error("检查项客户端 ID 分配基线无效");
+    }
+    ids.add(item.id);
+  }
+  let id = persistedId;
+  if (id !== undefined) {
+    if (!isDidaChecklistClientId(id) || ids.has(id)) throw new Error("持久化检查项客户端 ID 无效或碰撞");
+  } else {
+    const nowMs = Date.parse(now);
+    const greatestExisting = [...ids].filter(isDidaChecklistClientId)
+      .reduce((greatest, candidate) => Math.max(greatest, Number(candidate)), 0);
+    const candidate = Math.max(nowMs, greatestExisting + 1);
+    if (!Number.isSafeInteger(candidate) || candidate < DIDA_CHECKLIST_CLIENT_ID_MIN ||
+      candidate > DIDA_CHECKLIST_CLIENT_ID_MAX) {
+      throw new Error("无法生成 13 位检查项客户端 ID");
+    }
+    id = String(candidate);
+  }
+  let sortOrder = 0;
+  if (baseline.length > 0) {
+    if (baseline.some((item) => item.sortOrderUnsafe || !Number.isSafeInteger(item.sortOrder))) {
+      throw new Error("远端检查项缺少可无损使用的 sortOrder，禁止追加");
+    }
+    sortOrder = Math.max(...baseline.map((item) => item.sortOrder!)) + 1;
+    if (!Number.isSafeInteger(sortOrder)) throw new Error("检查项 sortOrder 无法安全递增");
+  }
+  return { id, title, status, sortOrder };
 }
 
 export function serializeDidaDate(
@@ -24,8 +63,9 @@ export function serializeDidaChecklistItems(
       throw new Error("检查项排序原值已丢失，禁止执行无法无损的整组回写");
     }
     const { sortOrderUnsafe: _legacyUnsafeMarker, ...raw } = item;
-    if (raw.id !== undefined) return { ...raw };
-    const { id: _undefinedId, ...withoutId } = raw;
-    return withoutId as DidaChecklistItem;
+    if (raw.id === undefined || raw.id === "") {
+      throw new Error("检查项写载荷缺少稳定 ID；必须先持久化客户端 ID");
+    }
+    return { ...raw };
   });
 }

@@ -30,9 +30,10 @@ import {
 import { focusMinutes } from "../domain/focus-duration";
 import { challengeProgress, rotatingChallenges } from "../domain/gamification";
 import { stableHash } from "../domain/stable";
+import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import {
   PROJECTION_COLUMN_NAME,
-  verifyUnidentifiedChecklistAppendResult,
+  verifyClientChecklistAppendResult,
   type ProjectionColumnBaseline,
   type ProjectionColumnCreationCheckpoint,
   type ProjectionColumnCreationPreview,
@@ -302,10 +303,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           this.state.taskScheduleMode,
           remoteBeforeWrite,
         ),
-      allowUnsentRebaseline: isProjectionUnidentifiedItemAppend,
+      allowUnsentRebaseline: isProjectionClientItemAppend,
       verifyWriteResult: (operation, base, desired, actual) =>
-        isProjectionUnidentifiedItemAppend(operation, base, desired)
-          ? verifyUnidentifiedChecklistAppendResult(base.value, desired.value, actual)
+        isProjectionClientItemAppend(operation, base, desired)
+          ? verifyClientChecklistAppendResult(base.value, desired.value, actual)
           : undefined,
     });
     this.projectEngine = new SyncEngine({
@@ -3213,7 +3214,7 @@ function projectionWriteReceipt(
   };
 }
 
-function isProjectionUnidentifiedItemAppend(
+function isProjectionClientItemAppend(
   operation: SyncQueueOperation<DidaTask>,
   base: EntitySnapshot<DidaTask>,
   desired: EntitySnapshot<DidaTask>,
@@ -3224,7 +3225,9 @@ function isProjectionUnidentifiedItemAppend(
     !operation.idempotencyFingerprint?.startsWith("helix-write:")) return false;
   const before = base.value.items ?? [];
   const after = desired.value.items ?? [];
-  if (after.length !== before.length + 1 || after.at(-1)?.id) return false;
+  const newId = after.at(-1)?.id;
+  if (after.length !== before.length + 1 || !isDidaChecklistClientId(newId) ||
+    before.some((item) => item.id === newId)) return false;
   return stableHash(after.slice(0, -1)) === stableHash(before);
 }
 

@@ -3,7 +3,9 @@ import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
 import type { DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
 import {
+  assertOwnedChecklistAppend,
   DidaWriteContractRunner,
+  ItemsOwnedAppendContractError,
   verifiedBoardPlacementCapability,
 } from "../src/integrations/dida/write-contract";
 
@@ -62,6 +64,7 @@ class ContractApiFake {
   corruptSentinelStatus = false;
   forcedNewChecklistItemId?: string;
   reorderNewChecklistItem = false;
+  ownedAppendMutation?: "parent-fields" | "kind" | "added-count" | "id-unstable" | "semantics" | "existing-fields";
   rejectPlacementWrites: false | string = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
@@ -435,6 +438,19 @@ class ContractApiFake {
       if (this.reorderNewChecklistItem && current.items?.length === 1 && updated.items.length === 2) {
         updated.items = [...updated.items].reverse();
       }
+      if (current.items?.length === 1 && updated.items.length === 2 && this.ownedAppendMutation) {
+        const existingId = current.items[0]!.id;
+        const newIndex = updated.items.findIndex((item) => item.id !== existingId);
+        if (this.ownedAppendMutation === "parent-fields") updated.desc = "server-recomputed-parent-field";
+        if (this.ownedAppendMutation === "kind") updated.kind = "TASK";
+        if (this.ownedAppendMutation === "added-count") updated.items = [...current.items];
+        if (this.ownedAppendMutation === "id-unstable" && newIndex >= 0) updated.items[newIndex] = { ...updated.items[newIndex]!, id: " " };
+        if (this.ownedAppendMutation === "semantics" && newIndex >= 0) updated.items[newIndex] = { ...updated.items[newIndex]!, status: 2 };
+        if (this.ownedAppendMutation === "existing-fields") {
+          const existingIndex = updated.items.findIndex((item) => item.id === existingId);
+          if (existingIndex >= 0) updated.items[existingIndex] = { ...updated.items[existingIndex]!, sortOrder: 321 };
+        }
+      }
       }
     }
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
@@ -745,6 +761,55 @@ describe("DidaWriteContractRunner", () => {
     const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
     const reorderedIds = itemWrites[2]?.items?.map((item) => item.id);
     expect(reorderedIds).toEqual(["test-item-2", "test-item-1"]);
+  });
+
+  it.each([
+    ["parent-fields", "ITEMS_OWNED_APPEND_PARENT_FIELDS"],
+    ["kind", "ITEMS_OWNED_APPEND_KIND"],
+    ["added-count", "ITEMS_OWNED_APPEND_ADDED_COUNT"],
+    ["id-unstable", "ITEMS_OWNED_APPEND_ID_UNSTABLE"],
+    ["semantics", "ITEMS_OWNED_APPEND_SEMANTICS"],
+    ["existing-fields", "ITEMS_OWNED_APPEND_EXISTING_FIELDS"],
+  ] as const)("reports the redacted owned-append subcode for %s", async (mutation, code) => {
+    const api = new ContractApiFake();
+    api.ownedAppendMutation = mutation;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-secret-owned-append",
+      fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: false,
+      itemIdStableVerified: false,
+      capabilityFailureCodes: [code],
+      remoteArtifactsRemaining: false,
+    });
+    expect(JSON.stringify(report.capabilityFailureCodes)).not.toMatch(/run-secret|test-item|test-task/iu);
+  });
+
+  it.each([
+    ["ITEMS_OWNED_APPEND_PARENT_FIELDS", (task: DidaTask) => ({ ...task, desc: "changed" })],
+    ["ITEMS_OWNED_APPEND_KIND", (task: DidaTask) => ({ ...task, kind: "TASK" })],
+    ["ITEMS_OWNED_APPEND_ADDED_COUNT", (task: DidaTask) => ({ ...task, items: task.items!.slice(1) })],
+    ["ITEMS_OWNED_APPEND_ID_UNSTABLE", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: " " }, ...task.items!.slice(1)] })],
+    ["ITEMS_OWNED_APPEND_SEMANTICS", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, status: 2 }, ...task.items!.slice(1)] })],
+    ["ITEMS_OWNED_APPEND_EXISTING_FIELDS", (task: DidaTask) => ({ ...task, items: [task.items![0]!, { ...task.items![1]!, sortOrder: 999 }, task.items![2]!] })],
+    ["ITEMS_OWNED_APPEND_EXISTING_ORDER", (task: DidaTask) => ({ ...task, items: [task.items![0]!, task.items![2]!, task.items![1]!] })],
+  ] as const)("maps the append invariant to fixed code %s", (code, mutate) => {
+    const before: DidaTask = {
+      id: "parent", projectId: "list", title: "parent", status: 0, kind: "CHECKLIST",
+      items: [
+        { id: "sentinel-a", title: "A", status: 0, sortOrder: 2 },
+        { id: "sentinel-b", title: "B", status: 0, sortOrder: 1 },
+      ],
+    };
+    const reread: DidaTask = {
+      ...before,
+      items: [{ id: "owned", title: "owned title", status: 0, sortOrder: 3 }, ...before.items!],
+    };
+    expect(() => assertOwnedChecklistAppend(before, mutate(reread), "owned title"))
+      .toThrow(expect.objectContaining<Partial<ItemsOwnedAppendContractError>>({ code }));
   });
 
   it("reports a fixed redacted items stage code for semantic sentinel failure", async () => {

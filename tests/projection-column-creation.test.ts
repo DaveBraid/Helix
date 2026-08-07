@@ -232,7 +232,7 @@ async function createHarness(
       setDidaRequestEmergencyLatch: (value: DidaRequestEmergencyLatch) => { latch = value; },
       clearDidaRequestEmergencyLatch: () => { latch = null; },
       getDidaRequestEmergencyLatch: () => latch,
-    } as unknown as HelixSecretStore);
+    } as unknown as HelixSecretStore, { projectDidaProjectionAvailable: true });
     await service.initialize();
     Object.defineProperty(service, "api", { value: api });
     return service;

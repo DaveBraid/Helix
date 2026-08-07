@@ -102,13 +102,16 @@ export class OfflineQueue {
     return operation.id;
   }
 
-  nextRunnable(): SyncQueueOperation | null {
+  nextRunnable(
+    predicate: (operation: SyncQueueOperation) => boolean = () => true,
+  ): SyncQueueOperation | null {
     const next = this.operations.find(
       (operation) =>
+        predicate(operation) &&
         (operation.status === "pending" || operation.status === "failed") &&
         operation.attempts < MAX_ATTEMPTS &&
         (!operation.nextAttemptAt || operation.nextAttemptAt <= new Date().toISOString()) &&
-        !this.hasEarlierUnfinishedOperation(operation),
+        !this.hasEarlierUnfinishedOperation(operation, predicate),
     );
     if (!next) return null;
     return cloneValue(next);
@@ -255,11 +258,15 @@ export class OfflineQueue {
     Object.assign(operation, values, { updatedAt: new Date().toISOString() });
   }
 
-  private hasEarlierUnfinishedOperation(operation: SyncQueueOperation): boolean {
+  private hasEarlierUnfinishedOperation(
+    operation: SyncQueueOperation,
+    predicate: (operation: SyncQueueOperation) => boolean,
+  ): boolean {
     const position = this.operations.findIndex((candidate) => candidate.id === operation.id);
     if (position <= 0) return false;
     return this.operations.slice(0, position).some(
       (candidate) =>
+        predicate(candidate) &&
         candidate.kind === operation.kind &&
         candidate.entityId === operation.entityId,
     );

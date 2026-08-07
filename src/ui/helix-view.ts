@@ -89,7 +89,7 @@ import type {
   DidaProjectViewModeSyncStatus,
   HelixRuntimeState,
 } from "../services/helix-service";
-import { HelixService } from "../services/helix-service";
+import { HelixService, isProjectionQueueOperation } from "../services/helix-service";
 import type {
   ProjectConnectionPlan,
   ProjectWorkspaceCycleStatusUpdatePlan,
@@ -127,6 +127,7 @@ import {
   conflictCenterIsEmpty,
   loadProjectionConflictModels,
 } from "./project-projection-presenter";
+import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 echarts.use([
   LineChart,
@@ -2925,6 +2926,10 @@ export class HelixView extends ItemView {
       card.createEl("p", {
         text: operation.lastError ?? "应用在请求期间中断。Helix 不会自动重放非幂等写入。",
       });
+      if (!PROJECT_DIDA_PROJECTION_AVAILABLE && isProjectionQueueOperation(operation)) {
+        card.createEl("p", { text: "0.1.0 仅保留该项目联动记录供诊断，不提供复读、绑定或重试操作。" });
+        continue;
+      }
       if (operation.operation !== "create") {
         const actions = card.createDiv({ cls: "helix-reconciliation-actions" });
         actions.createEl("p", { text: "请在滴答 App 核对；Helix 不会重发结果未知的写入。" });
@@ -2968,6 +2973,10 @@ export class HelixView extends ItemView {
       card.createEl("p", {
         text: `${operation.lastError ?? "未知错误"} · 已尝试 ${operation.attempts} 次`,
       });
+      if (!PROJECT_DIDA_PROJECTION_AVAILABLE && isProjectionQueueOperation(operation)) {
+        card.createEl("p", { text: "0.1.0 仅保留该项目联动记录供诊断，不提供重试操作。" });
+        continue;
+      }
       const retry = card.createEl("button", {
         cls: "helix-secondary-button",
         text: "修复原因后手动重试",
@@ -3046,22 +3055,29 @@ export class HelixView extends ItemView {
     if (count === 0) return 0;
     const group = content.createDiv({ cls: "helix-projection-conflict-group" });
     group.createEl("h2", { text: "滴答项目同步" });
+    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) {
+      group.createEl("p", { text: "0.1.0 个人预览版仅显示历史诊断；所有复读、重试、清理和写回入口均已关闭。" });
+    }
     if (columnCreation) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
       card.createEl("strong", { text: `分栏创建结果未知 · ${columnCreation.desiredName}` });
       card.createEl("code", { text: `${columnCreation.targetProjectId} / ${columnCreation.operationId}` });
       card.createEl("p", { text: "只会双源复读并精确领养；不会重发创建、删除或改名任何分栏。" });
-      const reconcile = card.createEl("button", { text: "精确复读并收口" });
-      reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
-        () => this.actions.reconcileProjectProjectionColumn()));
+      if (PROJECT_DIDA_PROJECTION_AVAILABLE) {
+        const reconcile = card.createEl("button", { text: "精确复读并收口" });
+        reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
+          () => this.actions.reconcileProjectProjectionColumn()));
+      }
     }
     if (pending.length > 0) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
       card.createEl("strong", { text: `${pending.length} 条收据清理等待重试` });
       card.createEl("p", { text: "冻结状态已经安全收口；这里只幂等清理持久收据，不触发远端写入。" });
-      const retry = card.createEl("button", { text: "重试安全清理" });
-      retry.addEventListener("click", () => this.runProjectionUiAction(retry, token,
-        () => this.actions.recoverPendingProjectProjectionReceiptCleanup()));
+      if (PROJECT_DIDA_PROJECTION_AVAILABLE) {
+        const retry = card.createEl("button", { text: "重试安全清理" });
+        retry.addEventListener("click", () => this.runProjectionUiAction(retry, token,
+          () => this.actions.recoverPendingProjectProjectionReceiptCleanup()));
+      }
     }
     for (const { model, stageId, action } of frozenActions) {
       this.renderProjectionReconcileCard(group, token, model, stageId, action.uuid,
@@ -3075,9 +3091,11 @@ export class HelixView extends ItemView {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
       card.createEl("strong", { text: `${model.project.title} · 父任务冻结` });
       card.createEl("code", { text: model.parentDiagnostic?.operationId ?? "无操作 ID" });
-      const reconcile = card.createEl("button", { text: "精确复读并收口" });
-      reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
-        () => this.actions.reconcileProjectProjectionFrozen({ kind: "parent", projectId: model.project.id })));
+      if (PROJECT_DIDA_PROJECTION_AVAILABLE) {
+        const reconcile = card.createEl("button", { text: "精确复读并收口" });
+        reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
+          () => this.actions.reconcileProjectProjectionFrozen({ kind: "parent", projectId: model.project.id })));
+      }
     }
     for (const receipt of receipts) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
@@ -3088,9 +3106,11 @@ export class HelixView extends ItemView {
         continue;
       }
       card.createEl("p", { text: "只有既有队列与逐字段冲突均已收口时，安全检查才允许移除此收据。" });
-      const cleanup = card.createEl("button", { text: "安全检查并清理" });
-      cleanup.addEventListener("click", () => this.runProjectionUiAction(cleanup, token,
-        () => this.actions.removeResolvedProjectProjectionReceipt(receipt.operationId)));
+      if (PROJECT_DIDA_PROJECTION_AVAILABLE) {
+        const cleanup = card.createEl("button", { text: "安全检查并清理" });
+        cleanup.addEventListener("click", () => this.runProjectionUiAction(cleanup, token,
+          () => this.actions.removeResolvedProjectProjectionReceipt(receipt.operationId)));
+      }
     }
     return count;
   }
@@ -3107,6 +3127,10 @@ export class HelixView extends ItemView {
     const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
     card.createEl("strong", { text: `${model.project.title} · ${label}` });
     card.createEl("code", { text: `${stageId} / ${uuid}` });
+    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) {
+      card.createEl("p", { text: "0.1.0 仅保留该项目联动记录供诊断，不提供复读或写回操作。" });
+      return;
+    }
     if (!actionable) {
       card.createEl("p", { text: "该行动尚未冻结；返回项目页保存变更后，后台同步会生成并处理删除记录。" });
       return;
@@ -3216,12 +3240,25 @@ export class HelixView extends ItemView {
 
   private renderConflict(content: HTMLElement, conflict: SyncConflict): void {
     const applying = conflict.status === "applying";
+    const projectionReadOnly =
+      !PROJECT_DIDA_PROJECTION_AVAILABLE && conflict.scope === "helix-projection-owned-items";
     const card = content.createDiv({ cls: "helix-card helix-conflict-card" });
     const head = card.createDiv({ cls: "helix-conflict-head" });
     const title = head.createDiv();
     title.createEl("span", { cls: "helix-chip is-danger", text: conflict.kind === "task" ? "任务冲突" : "项目冲突" });
     title.createEl("h3", { text: conflict.title });
     title.createEl("p", { text: `远端复检 ${conflict.remoteRecheckCount} 次 · ${conflict.fields.length} 个变化字段` });
+    if (projectionReadOnly) {
+      card.createEl("p", { text: "0.1.0 仅保留该项目联动冲突供诊断，不提供字段选择、写回或远端采纳。" });
+      for (const field of conflict.fields) {
+        const row = card.createDiv({ cls: "helix-conflict-field" });
+        row.createEl("strong", { text: `${field.label} · ${field.path}` });
+        row.createEl("code", { text: `Base ${displayValue(field.baseValue)}` });
+        row.createEl("code", { text: `本地 ${displayValue(field.localValue)}` });
+        row.createEl("code", { text: `远端 ${displayValue(field.remoteValue)}` });
+      }
+      return;
+    }
     for (const field of conflict.fields) {
       const row = card.createDiv({ cls: "helix-conflict-field" });
       const label = row.createDiv({ cls: "helix-conflict-label" });

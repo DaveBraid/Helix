@@ -3,9 +3,10 @@ import type { SyncQueueOperation } from "../sync/types";
 
 export function claimNextQueueOperation(
   operations: SyncQueueOperation[],
+  canClaim: (operation: SyncQueueOperation) => boolean = () => true,
 ): { operations: SyncQueueOperation[]; claimed: SyncQueueOperation | null } {
   const queue = new OfflineQueue(operations);
-  const next = queue.nextRunnable();
+  const next = queue.nextRunnable(canClaim);
   if (!next) return { operations: queue.list(), claimed: null };
   queue.markRunning(next.id);
   const claimed = queue.list().find((operation) => operation.id === next.id) ?? null;

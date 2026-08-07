@@ -100,7 +100,10 @@ import {
   type ProjectAutoSyncReport,
 } from "./services/project-auto-sync";
 import { helixMarkerVisibilityExtension } from "./editor/helix-marker-visibility";
-import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "./release-capabilities";
+import {
+  PROJECT_DIDA_PROJECTION_AVAILABLE,
+  assertProjectDidaProjectionAvailable,
+} from "./release-capabilities";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = {
@@ -653,6 +656,7 @@ export default class HelixPlugin extends Plugin {
   }
 
   reconcileProjectProjectionColumn() {
+    this.assertProjectProjectionAvailable();
     return this.service.reconcileProjectionColumnCreation();
   }
 
@@ -699,6 +703,7 @@ export default class HelixPlugin extends Plugin {
   async reconcileProjectProjectionFrozen(input:
     | { kind: "action"; projectId: string; stageId: string; uuid: string }
     | { kind: "parent"; projectId: string }): Promise<void> {
+    this.assertProjectProjectionAvailable();
     await this.withWritableProjectMutation(async () => {
       const projectionInput = await this.projectionInput(input.projectId);
       if (input.kind === "action") {
@@ -799,9 +804,7 @@ export default class HelixPlugin extends Plugin {
   }
 
   private assertProjectProjectionAvailable(): void {
-    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) {
-      throw new Error("0.1.0 个人预览版暂未开放项目与滴答联动");
-    }
+    assertProjectDidaProjectionAvailable();
   }
 
   async saveTemplateFolderAndEnsure(folder: string): Promise<string[]> {

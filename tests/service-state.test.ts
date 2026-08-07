@@ -2377,9 +2377,8 @@ describe("HelixService runtime recovery", () => {
       value: { async process() { sends += 1; throw new Error("must not resend"); } },
     });
 
-    const receipt = await service.enqueueProjectionCreate(local, clientIdentity);
-
-    expect(receipt).toMatchObject({ operationId: "op-projection-restart", outcome: "unknown" });
+    await expect(service.enqueueProjectionCreate(local, clientIdentity))
+      .rejects.toThrow(/个人预览版暂未开放/);
     expect(sends).toBe(0);
     expect(persisted.queue).toMatchObject([{
       id: "op-projection-restart",
@@ -2388,7 +2387,7 @@ describe("HelixService runtime recovery", () => {
     }]);
   });
 
-  it("keeps ordinary and projection drains behind one queue single-flight consumer", async () => {
+  it("keeps disabled projection operations untouched while draining ordinary tasks", async () => {
     const data = createDefaultData("device-projection-single-flight");
     grantTaskCrud(data);
     data.didaContractCapabilities!.taskReopenVerified = true;
@@ -2401,7 +2400,28 @@ describe("HelixService runtime recovery", () => {
     const ordinarySnapshot = createSnapshot("task", ordinary.id, ordinary);
     data.baseSnapshots[`task:${ordinary.id}`] = ordinarySnapshot;
     data.localSnapshots[`task:${ordinary.id}`] = ordinarySnapshot;
+    const projection: DidaTask = {
+      id: ordinary.id,
+      projectId: "target-list",
+      title: "Projection",
+      content: "helix-action-projection:uuid-b",
+      status: 0,
+    };
+    const projectionSnapshot = createSnapshot("task", projection.id, projection);
     data.queue = [{
+      id: "op-projection-disabled",
+      kind: "task",
+      entityId: ordinary.id,
+      projectId: projection.projectId,
+      operation: "update",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      updatedAt: "2026-08-04T00:00:00.000Z",
+      attempts: 0,
+      status: "pending",
+      idempotencyFingerprint: "helix-action:project-a:stage-a:uuid-b",
+      base: ordinarySnapshot,
+      local: projectionSnapshot,
+    }, {
       id: "op-ordinary",
       kind: "task",
       entityId: ordinary.id,
@@ -2422,57 +2442,37 @@ describe("HelixService runtime recovery", () => {
     });
     const service = new HelixService(store, { getDidaToken: () => "token" } as HelixSecretStore);
     await service.initialize();
-    let active = 0;
-    let maxActive = 0;
-    let calls = 0;
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    let firstStarted!: () => void;
-    const firstDidStart = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const processed: string[] = [];
     Object.defineProperty(service, "taskEngine", {
       value: {
         async process(operation: SyncQueueOperation<DidaTask>) {
-          calls += 1;
-          active += 1;
-          maxActive = Math.max(maxActive, active);
-          if (calls === 1) {
-            firstStarted();
-            await firstGate;
-          }
-          const local = operation.local.value;
-          const remote = operation.operation === "create"
-            ? { ...local, id: "remote-projection" }
-            : local;
-          const snapshot = createSnapshot("task", remote.id, remote);
-          await store.mutate((draft) => {
-            draft.baseSnapshots[`task:${remote.id}`] = snapshot;
-            draft.localSnapshots[`task:${remote.id}`] = snapshot;
-          });
-          active -= 1;
-          return { outcome: "pushed" as const, snapshot };
+          processed.push(operation.id);
+          return { outcome: "pushed" as const, snapshot: operation.local };
         },
       },
     });
 
-    const ordinaryDrain = (service as unknown as { drainQueue(): Promise<void> }).drainQueue();
-    await firstDidStart;
-    const marker = "helix-action-projection:uuid-b";
-    const projectionDrain = service.enqueueProjectionCreate({
-      id: "pending-projection",
-      projectId: "target-list",
-      title: "Projection",
-      content: marker,
-      parentId: "parent-a",
-      columnId: "column-a",
-      status: 0,
-    }, "helix-action:project-a:stage-a:uuid-b");
-    releaseFirst();
-    const [, receipt] = await Promise.all([ordinaryDrain, projectionDrain]);
+    await (service as unknown as { drainQueue(): Promise<void> }).drainQueue();
 
-    expect(maxActive).toBe(1);
-    expect(calls).toBe(2);
-    expect(receipt).toMatchObject({ outcome: "verified", task: { id: "remote-projection", content: marker } });
-    expect(persisted.queue).toEqual([]);
+    expect(processed).toEqual(["op-ordinary"]);
+    expect(persisted.queue).toEqual([expect.objectContaining({
+      id: "op-projection-disabled",
+      status: "pending",
+      attempts: 0,
+    })]);
+    await store.mutate((draft) => {
+      draft.queue[0]!.status = "failed";
+      draft.queue[0]!.lastError = "historic projection failure";
+    });
+    await expect(service.retryFailedOperation("op-projection-disabled"))
+      .rejects.toThrow(/个人预览版暂未开放/);
+    expect(persisted.queue[0]).toMatchObject({
+      id: "op-projection-disabled",
+      status: "failed",
+      attempts: 0,
+      lastError: "historic projection failure",
+    });
+    expect(processed).toEqual(["op-ordinary"]);
   });
 
   it("recovers a verified projection receipt only from a matching Base snapshot", async () => {
@@ -2544,7 +2544,9 @@ describe("HelixService runtime recovery", () => {
     const service = new HelixService(new HelixDataStore({
       async loadData() { return structuredClone(persisted); },
       async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
-    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    }), { getDidaToken: () => "token" } as HelixSecretStore, {
+      projectDidaProjectionAvailable: true,
+    });
     await service.initialize();
     const projectionBase: DidaTask = {
       ...remote,
@@ -2562,6 +2564,23 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.conflicts[0]?.fields).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "items[owned].title", sameResult: false }),
     ]));
+
+    const disabled = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await disabled.initialize();
+    let remoteCalls = 0;
+    Object.defineProperty(disabled, "taskEngine", {
+      value: { async process() { remoteCalls += 1; throw new Error("must not run"); } },
+    });
+    const conflictId = persisted.conflicts[0]!.id;
+    await expect(disabled.chooseConflict(conflictId, "items[owned].title", "local"))
+      .rejects.toThrow(/个人预览版暂未开放/);
+    await expect(disabled.applyConflict(conflictId))
+      .rejects.toThrow(/个人预览版暂未开放/);
+    expect(remoteCalls).toBe(0);
+    expect(persisted.conflicts[0]).toMatchObject({ id: conflictId, status: "open" });
   });
 
   it("blocks projection reopen before queue or network when reopen was not verified", async () => {
@@ -2583,7 +2602,9 @@ describe("HelixService runtime recovery", () => {
     const service = new HelixService(new HelixDataStore({
       async loadData() { return structuredClone(persisted); },
       async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
-    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    }), { getDidaToken: () => "token" } as HelixSecretStore, {
+      projectDidaProjectionAvailable: true,
+    });
     await service.initialize();
     let networkCalls = 0;
     Object.defineProperty(service, "taskEngine", {

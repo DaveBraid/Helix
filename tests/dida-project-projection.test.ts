@@ -13,6 +13,7 @@ import {
   projectionMarker,
   readProjectProjectionIdentity,
   verifyProjectedTask,
+  verifyUnidentifiedChecklistAppendResult,
   PROJECTION_ACTION_EDITABLE_STATES,
   type ProjectionLedgerEntry,
   type ProjectionReadiness,
@@ -185,6 +186,25 @@ describe("Dida project projection domain", () => {
     const task: DidaTask = { id: "task-1", projectId: "list-1", parentId: "parent-1", columnId: "column-1", title: "行动", content: projectionMarker("uuid-1"), status: 0 };
     expect(() => verifyProjectedTask(task, entry, projectionMarker("uuid-1"))).not.toThrow();
     expect(() => verifyProjectedTask({ ...task, parentId: "foreign" }, entry, projectionMarker("uuid-1"))).toThrow(/复读不一致/);
+  });
+
+  it("accepts a uniquely identified server-reordered checklist append without relaxing existing items", () => {
+    const ordinaryA: DidaChecklistItem = { id: "ordinary-a", title: "用户 A", status: 0, sortOrder: 20 };
+    const ordinaryB: DidaChecklistItem = { id: "ordinary-b", title: "用户 B", status: 2, sortOrder: 10 };
+    const base: DidaTask = { id: "task-1", projectId: "list-1", title: "项目", status: 0, kind: "CHECKLIST", items: [ordinaryA, ordinaryB] };
+    const desired: DidaTask = { ...base, items: [...base.items!, { id: "", title: "Helix 行动", status: 0 }] };
+    const created: DidaChecklistItem = { id: "server-new", title: "Helix 行动", status: 0, sortOrder: 30, timeZone: "Asia/Shanghai" };
+    const reordered: DidaTask = { ...desired, items: [created, ordinaryA, ordinaryB] };
+
+    expect(verifyUnidentifiedChecklistAppendResult(base, desired, reordered)).toBe(true);
+    expect(verifyUnidentifiedChecklistAppendResult(base, desired, {
+      ...reordered,
+      items: [created, ordinaryB, ordinaryA],
+    })).toBe(false);
+    expect(verifyUnidentifiedChecklistAppendResult(base, desired, {
+      ...reordered,
+      items: [created, ordinaryA, { ...ordinaryB, title: "被改动" }],
+    })).toBe(false);
   });
 });
 

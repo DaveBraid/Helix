@@ -463,7 +463,9 @@ export class DidaWriteContractRunner {
             if (added.length !== 1 || !added[0]?.id || added[0].title !== ownedTitle || added[0].status !== 0) {
               throw new Error("owned item 写后无法唯一领养服务端 ID");
             }
-            if (!deepEqual(reread.items?.[0], sentinel) || reread.items?.[1]?.id !== added[0].id) {
+            assertStableId(added[0].id, "owned item ID");
+            const preservedSentinel = (reread.items ?? []).find((item) => item.id === sentinel.id);
+            if (!preservedSentinel || !deepEqual(preservedSentinel, sentinel)) {
               throw new Error("新增 owned item 时 sentinel 未完整保留");
             }
           },
@@ -475,7 +477,10 @@ export class DidaWriteContractRunner {
           parentTask.id,
           projectA.id,
           marker,
-          taskUpdatePayload({ ...withOwned, items: [sentinel, renamed] }, { itemsRoundTripVerified: true }, ["items"]),
+          taskUpdatePayload({
+            ...withOwned,
+            items: withOwned.items!.map((item) => item.id === owned.id ? renamed : item),
+          }, { itemsRoundTripVerified: true }, ["items"]),
           (reread) => assertChecklistContractState(withOwned, reread, sentinel, renamed),
         );
         const reopened = { ...renamed, status: 0 };
@@ -484,7 +489,10 @@ export class DidaWriteContractRunner {
           parentTask.id,
           projectA.id,
           marker,
-          taskUpdatePayload({ ...afterRename, items: [sentinel, reopened] }, { itemsRoundTripVerified: true }, ["items"]),
+          taskUpdatePayload({
+            ...afterRename,
+            items: afterRename.items!.map((item) => item.id === owned.id ? reopened : item),
+          }, { itemsRoundTripVerified: true }, ["items"]),
           (reread) => assertChecklistContractState(afterRename, reread, sentinel, reopened),
         );
         itemsFailureCode = "ITEMS_OWNED_DELETE";
@@ -1596,9 +1604,11 @@ function assertChecklistContractState(
   expectedOwned: NonNullable<DidaTask["items"]>[number],
 ): void {
   if (!sameDidaTaskExcept(before, reread, ["items"])) throw new Error("检查项写入改变了父任务其他字段");
-  const actualOwned = reread.items?.[1];
+  const actualOwned = reread.items?.find((item) => item.id === expectedOwned.id);
   const beforeOwned = before.items?.find((item) => item.id === expectedOwned.id);
-  if (reread.items?.length !== 2 || !deepEqual(reread.items[0], sentinel) ||
+  const actualSentinel = reread.items?.find((item) => item.id === sentinel.id);
+  if (reread.items?.length !== 2 || !actualSentinel || !deepEqual(actualSentinel, sentinel) ||
+    !deepEqual(reread.items.map((item) => item.id), before.items?.map((item) => item.id)) ||
     !actualOwned || !beforeOwned || !sameChecklistOwnedExceptDerivedTime(beforeOwned, expectedOwned, actualOwned)) {
     throw new Error("检查项 ID、字段、未知属性或顺序未稳定往返");
   }

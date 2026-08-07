@@ -61,6 +61,7 @@ class ContractApiFake {
   addChecklistServerDefaults = false;
   corruptSentinelStatus = false;
   forcedNewChecklistItemId?: string;
+  reorderNewChecklistItem = false;
   rejectPlacementWrites: false | string = false;
   throwAfterFirstProjectCreate = false;
   reuseOriginalProjectId = false;
@@ -431,6 +432,9 @@ class ContractApiFake {
       if (this.corruptSentinelStatus && current.items === undefined && updated.items[0]) {
         updated.items[0] = { ...updated.items[0], status: 2 };
       }
+      if (this.reorderNewChecklistItem && current.items?.length === 1 && updated.items.length === 2) {
+        updated.items = [...updated.items].reverse();
+      }
       }
     }
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
@@ -721,6 +725,26 @@ describe("DidaWriteContractRunner", () => {
     expect(itemWrites.slice(1).some((payload) => payload.items?.[0]?.timeZone === "Asia/Shanghai")).toBe(true);
     expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("sortOrder");
     expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 987)).toBe(true);
+  });
+
+  it("adopts a new checklist ID after server sortOrder repositions it and preserves that order", async () => {
+    const api = new ContractApiFake();
+    api.reorderNewChecklistItem = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-items-server-reorder",
+      fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: true,
+      itemIdStableVerified: true,
+      capabilityFailureCodes: [],
+      remoteArtifactsRemaining: false,
+    });
+    const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
+    const reorderedIds = itemWrites[2]?.items?.map((item) => item.id);
+    expect(reorderedIds).toEqual(["test-item-2", "test-item-1"]);
   });
 
   it("reports a fixed redacted items stage code for semantic sentinel failure", async () => {

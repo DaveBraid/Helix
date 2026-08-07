@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DidaTask, EntityKind, EntitySnapshot } from "../src/domain/entities";
 import { createSnapshot } from "../src/sync/snapshots";
 import { SyncEngine } from "../src/sync/sync-engine";
+import { verifyUnidentifiedChecklistAppendResult } from "../src/domain/dida-project-projection";
 import type {
   ConflictRepository,
   RemoteEntityAdapter,
@@ -62,6 +63,7 @@ class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
   updateCount = 0;
   lastContext: RemoteWriteContext | undefined;
   advanceEtimestampOnUpdate = false;
+  checklistAppendResult: DidaTask | null = null;
 
   constructor(value: DidaTask | null) {
     this.value = value;
@@ -81,7 +83,7 @@ class TaskAdapter implements RemoteEntityAdapter<DidaTask> {
   ): Promise<DidaTask> {
     this.updateCount += 1;
     this.lastContext = structuredClone(context);
-    this.value = {
+    this.value = this.checklistAppendResult ? structuredClone(this.checklistAppendResult) : {
       ...structuredClone(value),
       ...(this.advanceEtimestampOnUpdate
         ? { etimestamp: Number(value.etimestamp ?? 0) + 1 }
@@ -159,6 +161,38 @@ describe("SyncEngine safety gates", () => {
       projectId: "project-1",
       writeFields: ["reminders"],
     });
+  });
+
+  it("adopts a server-generated checklist ID and server order through a scoped verifier", async () => {
+    const ordinary = { id: "ordinary-1", title: "用户原项", status: 0, sortOrder: 10 };
+    const baseTask: DidaTask = { ...task("项目"), kind: "CHECKLIST", items: [ordinary] };
+    const desiredTask: DidaTask = {
+      ...baseTask,
+      items: [...baseTask.items!, { id: "", title: "Helix 行动", status: 0 }],
+    };
+    const serverCreated = { id: "server-new", title: "Helix 行动", status: 0, sortOrder: 20 };
+    const serverTask: DidaTask = { ...desiredTask, items: [serverCreated, ordinary] };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = base;
+    const adapter = new TaskAdapter(baseTask);
+    adapter.checklistAppendResult = serverTask;
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+      verifyWriteResult: (_queued, actualBase, desired, actual) =>
+        verifyUnidentifiedChecklistAppendResult(actualBase.value, desired.value, actual),
+    });
+
+    const result = await engine.process(operation(desiredTask, base));
+
+    expect(result.outcome).toBe("pushed");
+    expect((repository.base?.value as DidaTask).items?.map((item) => item.id))
+      .toEqual(["server-new", "ordinary-1"]);
+    expect(repository.conflicts).toEqual([]);
   });
 
   it("passes local and custom empty reminder resolutions through conflict apply with explicit intent", async () => {

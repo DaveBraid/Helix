@@ -32,6 +32,7 @@ import { challengeProgress, rotatingChallenges } from "../domain/gamification";
 import { stableHash } from "../domain/stable";
 import {
   PROJECTION_COLUMN_NAME,
+  verifyUnidentifiedChecklistAppendResult,
   type ProjectionColumnBaseline,
   type ProjectionColumnCreationCheckpoint,
   type ProjectionColumnCreationPreview,
@@ -302,6 +303,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           remoteBeforeWrite,
         ),
       allowUnsentRebaseline: isProjectionUnidentifiedItemAppend,
+      verifyWriteResult: (operation, base, desired, actual) =>
+        isProjectionUnidentifiedItemAppend(operation, base, desired)
+          ? verifyUnidentifiedChecklistAppendResult(base.value, desired.value, actual)
+          : undefined,
     });
     this.projectEngine = new SyncEngine({
       adapter: new DidaProjectAdapter(this.api),

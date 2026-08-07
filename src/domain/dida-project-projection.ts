@@ -1,4 +1,4 @@
-import type { DidaColumn, DidaProject, DidaTask } from "./entities";
+import type { DidaChecklistItem, DidaColumn, DidaProject, DidaTask } from "./entities";
 import { stableHash } from "./stable";
 
 export const PROJECT_PARENT_TASK_FIELD = "helix-dida-parent-task-id";
@@ -428,6 +428,55 @@ export function verifyProjectedTask(
     task.content !== marker || (verifyTitle && task.title !== entry.title) ||
     (verifyState && (entry.state === "completed" ? task.status !== 2 : task.status === 2))) {
     throw new Error("远端任务身份、父级、清单、分栏、标题、状态或唯一标记复读不一致");
+  }
+}
+
+/**
+ * 核验“在末尾提交一个无 ID 检查项”后的服务端结果。
+ * 服务端可以为新项补 ID/默认值并按 sortOrder 重排，但既有项必须逐项不变且相对顺序不变。
+ */
+export function verifyUnidentifiedChecklistAppendResult(
+  base: DidaTask,
+  desired: DidaTask,
+  actual: DidaTask,
+): boolean {
+  const baselineItems = base.items ?? [];
+  const desiredItems = desired.items ?? [];
+  const actualItems = actual.items ?? [];
+  const desiredNew = desiredItems.at(-1);
+  if (desired.kind !== "CHECKLIST" || actual.kind !== "CHECKLIST" ||
+    desiredItems.length !== baselineItems.length + 1 || !desiredNew || desiredNew.id ||
+    actualItems.length !== baselineItems.length + 1) return false;
+
+  const { items: _desiredItems, ...desiredParent } = desired;
+  const { items: _actualItems, ...actualParent } = actual;
+  if (stableHash(desiredParent) !== stableHash(actualParent)) return false;
+
+  try {
+    const baselineById = new Map<string, DidaChecklistItem>();
+    for (const item of baselineItems) {
+      assertStableId(item.id, "既有检查项 ID");
+      if (baselineById.has(item.id)) return false;
+      baselineById.set(item.id, item);
+    }
+    const actualById = new Map<string, NonNullable<DidaTask["items"]>[number]>();
+    for (const item of actualItems) {
+      assertStableId(item.id, "服务端检查项 ID");
+      if (actualById.has(item.id)) return false;
+      actualById.set(item.id, item);
+    }
+    for (const [id, item] of baselineById) {
+      if (stableHash(actualById.get(id)) !== stableHash(item)) return false;
+    }
+    const preservedIds = actualItems.filter((item) => baselineById.has(item.id)).map((item) => item.id);
+    if (stableHash(preservedIds) !== stableHash(baselineItems.map((item) => item.id))) return false;
+    const added = actualItems.filter((item) => !baselineById.has(item.id));
+    if (added.length !== 1) return false;
+    return Object.entries(desiredNew)
+      .filter(([key, value]) => key !== "id" && value !== undefined)
+      .every(([key, value]) => stableHash(value) === stableHash((added[0] as unknown as Record<string, unknown>)[key]));
+  } catch {
+    return false;
   }
 }
 

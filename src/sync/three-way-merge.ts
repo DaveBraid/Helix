@@ -126,6 +126,25 @@ export function unresolvedFields(conflict: SyncConflict): ConflictField[] {
   return conflict.fields.filter((field) => !field.sameResult && !field.choice);
 }
 
+export function applyConflictScopeDefaults(
+  fields: ConflictField[],
+  scope: SyncConflict["scope"],
+): ConflictField[] {
+  if (scope !== "helix-projection-owned-items") return fields;
+  return fields.map((field) => field.path === "kind"
+    ? { ...field, choice: "local" as const, customValue: undefined }
+    : field);
+}
+
+export function enforceConflictScopeDefaults<T>(conflict: SyncConflict<T>): SyncConflict<T> {
+  if (conflict.scope !== "helix-projection-owned-items") return conflict;
+  const kind = conflict.fields.find((field) => field.path === "kind");
+  if (kind && kind.localValue !== "CHECKLIST") {
+    throw new Error("投影 owned 冲突的 Local kind 必须是 CHECKLIST");
+  }
+  return { ...conflict, fields: applyConflictScopeDefaults(conflict.fields, conflict.scope) };
+}
+
 /** 校验最终实际选择值，而不只校验 custom 输入。 */
 export function validateChecklistTitleResolutions(conflict: SyncConflict, ownedItemIds: readonly string[]): void {
   const owned = new Set(ownedItemIds);
@@ -156,6 +175,9 @@ export function setFieldResolution(
   const next = cloneValue(conflict);
   const field = next.fields.find((candidate) => candidate.path === path);
   if (!field) throw new Error(`Unknown conflict field: ${path}`);
+  if (next.scope === "helix-projection-owned-items" && path === "kind" && choice !== "local") {
+    throw new Error("投影 owned 冲突的 kind 由系统固定为 Local CHECKLIST");
+  }
   if (choice === "custom" && /^items\[[^\]]+\]\.title$/u.test(path) &&
     (typeof customValue !== "string" || !customValue.trim() || customValue !== customValue.trim() ||
       /[\r\n]/u.test(customValue) ||

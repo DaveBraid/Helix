@@ -45,6 +45,13 @@ export interface SyncEngineDependencies<T extends RemoteEntity> {
     desired: EntitySnapshot<T>,
     remote: EntitySnapshot<T>,
   ) => boolean;
+  /** 仅供可证明安全的专用写入核验服务端派生结果；undefined 表示使用通用严格核验。 */
+  verifyWriteResult?: (
+    operation: SyncQueueOperation<T>,
+    base: EntitySnapshot<T>,
+    desired: EntitySnapshot<T>,
+    actual: T,
+  ) => boolean | undefined;
 }
 
 export class SyncEngine<T extends RemoteEntity> {
@@ -374,7 +381,13 @@ export class SyncEngine<T extends RemoteEntity> {
       projectId: verificationProjectId,
     });
     if (!verified) throw new Error("写入后验证失败：远端记录不可读");
-    if (!equivalentForVerification(desired.value, verified)) {
+    const specializedVerification = this.dependencies.verifyWriteResult?.(
+      operation,
+      base,
+      desired,
+      verified,
+    );
+    if (!(specializedVerification ?? equivalentForVerification(desired.value, verified))) {
       return {
         conflict: await this.openConflict(
           operation,

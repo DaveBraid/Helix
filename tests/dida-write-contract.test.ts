@@ -59,7 +59,7 @@ class ContractApiFake {
   advanceEtimestampOnUpdate = false;
   rejectParentCreate: false | string = false;
   addChecklistServerDefaults = false;
-  corruptSentinelSortOrder = false;
+  corruptSentinelStatus = false;
   forcedNewChecklistItemId?: string;
   rejectPlacementWrites: false | string = false;
   throwAfterFirstProjectCreate = false;
@@ -409,7 +409,7 @@ class ContractApiFake {
           ? this.forcedNewChecklistItemId
           : `test-item-${++this.itemSequence}`),
         ...(!item.id && this.addChecklistServerDefaults
-          ? { isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
+          ? { sortOrder: 987, isAllDay: false, timeZone: "Asia/Shanghai", completedTime: undefined }
           : {}),
       })).map((item) => {
         const before = current.items?.find((candidate) => candidate.id === item.id);
@@ -423,8 +423,8 @@ class ContractApiFake {
         }
         return item;
       });
-      if (this.corruptSentinelSortOrder && current.items === undefined && updated.items[0]) {
-        updated.items[0] = { ...updated.items[0], sortOrder: 999 };
+      if (this.corruptSentinelStatus && current.items === undefined && updated.items[0]) {
+        updated.items[0] = { ...updated.items[0], status: 2 };
       }
     }
     if (this.collapseScheduleToPoint && updated.dueDate) updated.startDate = updated.dueDate;
@@ -712,11 +712,13 @@ describe("DidaWriteContractRunner", () => {
     });
     const itemWrites = api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"));
     expect(itemWrites.slice(1).some((payload) => payload.items?.[0]?.timeZone === "Asia/Shanghai")).toBe(true);
+    expect(itemWrites[0]?.items?.[0]).not.toHaveProperty("sortOrder");
+    expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 987)).toBe(true);
   });
 
   it("reports a fixed redacted items stage code for semantic sentinel failure", async () => {
     const api = new ContractApiFake();
-    api.corruptSentinelSortOrder = true;
+    api.corruptSentinelStatus = true;
     const report = await new DidaWriteContractRunner(
       api,
       () => "run-secret-items-stage",

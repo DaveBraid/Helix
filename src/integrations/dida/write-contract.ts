@@ -424,7 +424,8 @@ export class DidaWriteContractRunner {
       try {
         const emptyParent = normalizeTask(await this.api.getTask(projectA.id, parentTask.id));
         const sentinelTitle = `${marker} sentinel`;
-        const sentinelDraft = { id: "", title: sentinelTitle, status: 0, sortOrder: 321 };
+        // 与生产投影一致：新检查项不臆造 sortOrder，由服务端决定排序元数据。
+        const sentinelDraft = { id: "", title: sentinelTitle, status: 0 };
         itemsFailureCode = "ITEMS_SENTINEL_CREATE";
         const withSentinel = await this.updateAndVerifyTaskProperties(
           parentTask.id,
@@ -1606,11 +1607,10 @@ function sameInitialChecklistSemantics(
   expected: NonNullable<DidaTask["items"]>[number],
   actual: NonNullable<DidaTask["items"]>[number],
 ): boolean {
-  // 新检查项的 ID 及未提交字段由服务端生成；合同只要求显式受管字段
+  // 新检查项的 ID、sortOrder 及其他未提交字段由服务端生成；合同只要求显式受管字段
   // 精确往返。后续步骤以该完整复读值为基线，继续证明默认/未知字段不丢失。
   assertStableId(actual.id, "服务端检查项 ID");
-  return actual.title === expected.title &&
-    actual.status === expected.status && actual.sortOrder === expected.sortOrder;
+  return actual.title === expected.title && actual.status === expected.status;
 }
 
 function sameChecklistOwnedExceptDerivedTime(

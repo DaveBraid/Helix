@@ -95,10 +95,25 @@ export type ItemsOwnedAppendFailureCode =
   | "ITEMS_OWNED_APPEND_EXISTING_FIELDS"
   | "ITEMS_OWNED_APPEND_EXISTING_ORDER";
 
+export type ItemsSentinelFailureCode =
+  | "ITEMS_SENTINEL_PARENT_FIELDS"
+  | "ITEMS_SENTINEL_KIND"
+  | "ITEMS_SENTINEL_COUNT"
+  | "ITEMS_SENTINEL_ID_UNSTABLE"
+  | "ITEMS_SENTINEL_ID_NOT_PRESERVED"
+  | "ITEMS_SENTINEL_SEMANTICS";
+
 export class ItemsOwnedAppendContractError extends Error {
   constructor(readonly code: ItemsOwnedAppendFailureCode) {
     super(code);
     this.name = "ItemsOwnedAppendContractError";
+  }
+}
+
+export class ItemsSentinelContractError extends Error {
+  constructor(readonly code: ItemsSentinelFailureCode) {
+    super(code);
+    this.name = "ItemsSentinelContractError";
   }
 }
 
@@ -444,7 +459,7 @@ export class DidaWriteContractRunner {
       try {
         const emptyParent = normalizeTask(await this.api.getTask(projectA.id, parentTask.id));
         const sentinelTitle = `${marker} sentinel`;
-        // 与生产投影一致：新检查项不臆造 sortOrder，由服务端决定排序元数据。
+        // 与生产投影一致：远端发送前从完整 Base 分配并持久化客户端 ID 与安全 sortOrder。
         const sentinelDraft = createDidaChecklistClientItem([], sentinelTitle, 0, this.now().toISOString());
         itemsFailureCode = "ITEMS_SENTINEL_CREATE";
         const withSentinel = await this.updateAndVerifyTaskProperties(
@@ -455,17 +470,7 @@ export class DidaWriteContractRunner {
             ...emptyParent,
             items: [sentinelDraft],
           }, { itemsRoundTripVerified: true }, ["items"]),
-          (reread) => {
-            if (!sameDidaTaskExcept(emptyParent, reread, ["items", "kind"])) throw new Error("新增 sentinel 时父任务其他字段发生变化");
-            if (reread.kind !== "CHECKLIST") throw new Error("sentinel 写入后父任务未切换为 CHECKLIST");
-            if (reread.items?.length !== 1 || reread.items[0]?.id !== sentinelDraft.id ||
-              reread.items[0].sortOrder !== sentinelDraft.sortOrder || reread.items[0].title !== sentinelTitle) {
-              throw new Error("sentinel 检查项客户端 ID 或排序未被服务端稳定保留");
-            }
-            if (!sameInitialChecklistSemantics(sentinelDraft, reread.items[0])) {
-              throw new Error("sentinel 检查项受管字段未按语义往返");
-            }
-          },
+          (reread) => { assertSentinelChecklistCreate(emptyParent, reread, sentinelDraft); },
         );
         const sentinel = withSentinel.items![0]!;
         const ownedTitle = `${marker} owned item`;
@@ -521,7 +526,7 @@ export class DidaWriteContractRunner {
         );
         this.itemsRoundTripVerified = true;
         this.itemIdStableVerified = true;
-        steps.push("验证 sentinel 保留、单项 ID 领养、ID 稳定、改名、完成/重开与 owned 删除");
+        steps.push("验证写前客户端 ID 与 sortOrder 分配、服务端精确保留、改名、完成/重开与 owned 删除");
         await this.cleanupCheckpoint();
         await this.deleteVerifiedTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
@@ -535,9 +540,8 @@ export class DidaWriteContractRunner {
         this.itemsRoundTripVerified = false;
         this.itemIdStableVerified = false;
         capabilityFailures.push(capabilityFailureSummary("items"));
-        capabilityFailureCodes.push(
-          error instanceof ItemsOwnedAppendContractError ? error.code : itemsFailureCode,
-        );
+        capabilityFailureCodes.push(error instanceof ItemsOwnedAppendContractError ||
+          error instanceof ItemsSentinelContractError ? error.code : itemsFailureCode);
         steps.push("当前账号未通过检查项往返与 ID 稳定合同，保持项目投影只读");
       }
 
@@ -1629,8 +1633,39 @@ function assertChecklistContractState(
   }
 }
 
+export function assertSentinelChecklistCreate(
+  before: DidaTask,
+  reread: DidaTask,
+  expected: NonNullable<DidaTask["items"]>[number],
+): NonNullable<DidaTask["items"]>[number] {
+  if (!sameDidaTaskExcept(before, reread, ["items", "kind"])) {
+    throw new ItemsSentinelContractError("ITEMS_SENTINEL_PARENT_FIELDS");
+  }
+  if (reread.kind !== "CHECKLIST") {
+    throw new ItemsSentinelContractError("ITEMS_SENTINEL_KIND");
+  }
+  if (reread.items?.length !== 1) {
+    throw new ItemsSentinelContractError("ITEMS_SENTINEL_COUNT");
+  }
+  const actual = reread.items[0]!;
+  try {
+    assertStableId(actual.id, "sentinel ID");
+  } catch {
+    throw new ItemsSentinelContractError("ITEMS_SENTINEL_ID_UNSTABLE");
+  }
+  if (actual.id !== expected.id) {
+    throw new ItemsSentinelContractError("ITEMS_SENTINEL_ID_NOT_PRESERVED");
+  }
+  if (actual.title !== expected.title || actual.status !== expected.status ||
+    actual.sortOrder !== expected.sortOrder) {
+    throw new ItemsSentinelContractError("ITEMS_SENTINEL_SEMANTICS");
+  }
+  return actual;
+}
+
 /**
- * 服务端可能为新项补默认字段并据 sortOrder 移动它；这两者均允许。
+ * 服务端可以为新项补充未提交的默认字段并据已提交 sortOrder 移动它，
+ * 但必须精确保留写前持久化的客户端 ID、sortOrder 与受管字段。
  * 既有项（包括 sentinel）的 sortOrder/默认字段若被重算，当前仍视为能力不稳定，
  * 直到真实响应证据足以定义更窄且可证明安全的放宽规则。
  */
@@ -1691,16 +1726,6 @@ function sameChecklistItemExceptId(
   const { id: _leftId, ...leftFields } = left;
   const { id: _rightId, ...rightFields } = right;
   return deepEqual(leftFields, rightFields);
-}
-
-function sameInitialChecklistSemantics(
-  expected: NonNullable<DidaTask["items"]>[number],
-  actual: NonNullable<DidaTask["items"]>[number],
-): boolean {
-  // 新检查项的 ID、sortOrder 及其他未提交字段由服务端生成；合同只要求显式受管字段
-  // 精确往返。后续步骤以该完整复读值为基线，继续证明默认/未知字段不丢失。
-  assertStableId(actual.id, "服务端检查项 ID");
-  return actual.title === expected.title && actual.status === expected.status;
 }
 
 function sameChecklistOwnedExceptDerivedTime(

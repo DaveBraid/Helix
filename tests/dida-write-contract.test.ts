@@ -4,8 +4,10 @@ import type { DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
 import {
   assertOwnedChecklistAppend,
+  assertSentinelChecklistCreate,
   DidaWriteContractRunner,
   ItemsOwnedAppendContractError,
+  ItemsSentinelContractError,
   verifiedBoardPlacementCapability,
 } from "../src/integrations/dida/write-contract";
 
@@ -62,6 +64,7 @@ class ContractApiFake {
   rejectParentCreate: false | string = false;
   addChecklistServerDefaults = false;
   corruptSentinelStatus = false;
+  sentinelMutation?: "parent-fields" | "kind" | "count" | "id-not-preserved" | "semantics";
   forcedNewChecklistItemId?: string;
   reorderNewChecklistItem = false;
   ownedAppendMutation?: "parent-fields" | "kind" | "baseline-missing" | "id-regenerated" |
@@ -416,8 +419,7 @@ class ContractApiFake {
       updated.items = (value.items ?? []).flatMap((item) => {
         const hasId = Object.hasOwn(item, "id");
         const isNew = !current.items?.some((candidate) => candidate.id === item.id);
-        // 真实故障的保守模型：显式空串可能被服务端当作无效已有项并忽略；
-        // 只有完全省略 id 才表示创建并由服务端分配 ID。
+        // 保留历史故障模型以防回归：空串 ID 会被忽略；当前生产与合同均不会走此路径。
         if (hasId && item.id === "") return [];
         return [{
           ...item,
@@ -442,6 +444,17 @@ class ContractApiFake {
       });
       if (this.corruptSentinelStatus && current.items === undefined && updated.items[0]) {
         updated.items[0] = { ...updated.items[0], status: 2 };
+      }
+      if (current.items === undefined && this.sentinelMutation) {
+        if (this.sentinelMutation === "parent-fields") updated.desc = "server-mutated-parent";
+        if (this.sentinelMutation === "kind") updated.kind = "TASK";
+        if (this.sentinelMutation === "count") updated.items = [];
+        if (this.sentinelMutation === "id-not-preserved" && updated.items[0]) {
+          updated.items[0] = { ...updated.items[0], id: "server-regenerated-id" };
+        }
+        if (this.sentinelMutation === "semantics" && updated.items[0]) {
+          updated.items[0] = { ...updated.items[0], status: 2 };
+        }
       }
       if (this.reorderNewChecklistItem && current.items?.length === 1 && updated.items.length === 2) {
         updated.items = [...updated.items].reverse();
@@ -763,7 +776,7 @@ describe("DidaWriteContractRunner", () => {
     expect(itemWrites.slice(1).every((payload) => payload.items?.[0]?.sortOrder === 0)).toBe(true);
   });
 
-  it("adopts a new checklist ID after server sortOrder repositions it and preserves that order", async () => {
+  it("preserves the persisted client ID when the server repositions the new item by sortOrder", async () => {
     const api = new ContractApiFake();
     api.reorderNewChecklistItem = true;
     const report = await new DidaWriteContractRunner(
@@ -852,7 +865,7 @@ describe("DidaWriteContractRunner", () => {
       status: "passed",
       itemsRoundTripVerified: false,
       itemIdStableVerified: false,
-      capabilityFailureCodes: ["ITEMS_SENTINEL_CREATE"],
+      capabilityFailureCodes: ["ITEMS_SENTINEL_SEMANTICS"],
       remoteArtifactsRemaining: false,
     });
     expect(JSON.stringify(report.capabilityFailureCodes)).not.toMatch(/run-secret|test-item|test-task/iu);
@@ -872,12 +885,49 @@ describe("DidaWriteContractRunner", () => {
         status: "passed",
         itemsRoundTripVerified: false,
         itemIdStableVerified: false,
-        capabilityFailureCodes: ["ITEMS_SENTINEL_CREATE"],
+        capabilityFailureCodes: ["ITEMS_SENTINEL_ID_UNSTABLE"],
         remoteArtifactsRemaining: false,
       });
       if (serverId) expect(JSON.stringify(report.capabilityFailureCodes)).not.toContain(serverId);
     },
   );
+
+  it.each([
+    ["parent-fields", "ITEMS_SENTINEL_PARENT_FIELDS"],
+    ["kind", "ITEMS_SENTINEL_KIND"],
+    ["count", "ITEMS_SENTINEL_COUNT"],
+    ["id-not-preserved", "ITEMS_SENTINEL_ID_NOT_PRESERVED"],
+    ["semantics", "ITEMS_SENTINEL_SEMANTICS"],
+  ] as const)("reports the redacted sentinel subcode for %s", async (mutation, code) => {
+    const api = new ContractApiFake();
+    api.sentinelMutation = mutation;
+    const report = await new DidaWriteContractRunner(
+      api, () => "run-secret-sentinel", fixedNow,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: false,
+      itemIdStableVerified: false,
+      capabilityFailureCodes: [code],
+      remoteArtifactsRemaining: false,
+    });
+    expect(JSON.stringify(report.capabilityFailureCodes)).not.toMatch(/run-secret|test-item|test-task/iu);
+  });
+
+  it.each([
+    ["ITEMS_SENTINEL_PARENT_FIELDS", (task: DidaTask) => ({ ...task, desc: "changed" })],
+    ["ITEMS_SENTINEL_KIND", (task: DidaTask) => ({ ...task, kind: "TASK" })],
+    ["ITEMS_SENTINEL_COUNT", (task: DidaTask) => ({ ...task, items: [] })],
+    ["ITEMS_SENTINEL_ID_UNSTABLE", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: " " }] })],
+    ["ITEMS_SENTINEL_ID_NOT_PRESERVED", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, id: "server-id" }] })],
+    ["ITEMS_SENTINEL_SEMANTICS", (task: DidaTask) => ({ ...task, items: [{ ...task.items![0]!, sortOrder: 8 }] })],
+  ] as const)("maps the sentinel invariant to fixed code %s", (code, mutate) => {
+    const before: DidaTask = { id: "parent", projectId: "list", title: "parent", status: 0 };
+    const expected = { id: "1785456000000", title: "sentinel", status: 0, sortOrder: 0 };
+    const reread: DidaTask = { ...before, kind: "CHECKLIST", items: [expected] };
+    expect(() => assertSentinelChecklistCreate(before, mutate(reread), expected))
+      .toThrow(expect.objectContaining<Partial<ItemsSentinelContractError>>({ code }));
+  });
 
   it("checkpoints sent-unknown before every temporary task and project delete", async () => {
     const api = new ContractApiFake();

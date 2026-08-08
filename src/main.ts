@@ -100,6 +100,7 @@ import {
   type ProjectAutoSyncReport,
 } from "./services/project-auto-sync";
 import { helixMarkerVisibilityExtension } from "./editor/helix-marker-visibility";
+import { ProjectRefreshBatch } from "./services/project-refresh-batch";
 import {
   PROJECT_DIDA_PROJECTION_AVAILABLE,
   assertProjectDidaProjectionAvailable,
@@ -131,7 +132,7 @@ export default class HelixPlugin extends Plugin {
   private dataGeneration!: DataGeneration;
   private projectRefreshTimer: number | null = null;
   private projectMutationDepth = 0;
-  private projectRefreshPending = false;
+  private projectRefreshBatch!: ProjectRefreshBatch;
   private projectCanvasRefreshPending = false;
   private readonly projectMarkdownRefreshPaths = new Set<string>();
   private readonly projectIdentityProbeTimers = new Map<string, number>();
@@ -142,6 +143,7 @@ export default class HelixPlugin extends Plugin {
 
   async onload(): Promise<void> {
     this.unloaded = false;
+    this.projectRefreshBatch = new ProjectRefreshBatch(() => this.scheduleProjectRefresh());
     this.dataGeneration = beginDataGeneration();
     this.store = new HelixDataStore(this, this.dataGeneration);
     this.secrets = new HelixSecretStore(this.app);
@@ -568,6 +570,7 @@ export default class HelixPlugin extends Plugin {
     this.didaContractAdoptConfirmation.disarm();
     this.didaWriteContractCommands?.dispose();
     this.projectAutoSync?.dispose();
+    this.projectRefreshBatch?.dispose();
     if (this.projectRefreshTimer !== null) {
       window.clearTimeout(this.projectRefreshTimer);
       this.projectRefreshTimer = null;
@@ -1233,10 +1236,7 @@ export default class HelixPlugin extends Plugin {
     ) {
       this.projectCanvasRefreshPending = true;
     }
-    if (this.projectMutationDepth > 0) {
-      this.projectRefreshPending = true;
-      return;
-    }
+    if (this.projectRefreshBatch.recordEvent()) return;
     if (this.projectRefreshTimer !== null) {
       window.clearTimeout(this.projectRefreshTimer);
     }
@@ -1294,17 +1294,14 @@ export default class HelixPlugin extends Plugin {
       if (this.projectMutationDepth === 0 && this.projectRefreshTimer !== null) {
         window.clearTimeout(this.projectRefreshTimer);
         this.projectRefreshTimer = null;
-        this.projectRefreshPending = true;
       }
+      this.projectRefreshBatch.begin();
       this.projectMutationDepth += 1;
       try {
         return await operation();
       } finally {
         this.projectMutationDepth -= 1;
-        if (this.projectMutationDepth === 0 && this.projectRefreshPending) {
-          this.projectRefreshPending = false;
-          this.scheduleProjectRefresh();
-        }
+        this.projectRefreshBatch.end();
       }
     });
   }

@@ -113,6 +113,16 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/workspace = await this\.actions\.readProjectWorkspace\([\s\S]*loadStableWorkspace\(\)/);
   });
 
+  it("coalesces self-written Vault events until one stable project refresh", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(main).toMatch(/new ProjectRefreshBatch\(\(\) => this\.scheduleProjectRefresh\(\)\)/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*projectRefreshBatch\.recordEvent\(\)[\s\S]*return/);
+    expect(main).toMatch(
+      /withProjectMutation<T>[\s\S]*projectRefreshBatch\.begin\(\)[\s\S]*try[\s\S]*finally[\s\S]*projectRefreshBatch\.end\(\)/,
+    );
+    expect(main).toMatch(/onunload[\s\S]*projectRefreshBatch\?\.dispose\(\)/);
+  });
+
   it("persists focus startup failures into the generic recovery center", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(main).toMatch(

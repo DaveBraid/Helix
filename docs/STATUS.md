@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-08
-当前基线提交：`9023f37 fix: quarantine disabled project projection writes`（v0.1.1 基于此提交）
+当前基线提交：`f9a0ac7 fix: tolerate backslashes in non-Helix Markdown`
 工作树状态：工作树干净（本热修提交后）。
-当前阶段：`0.1.1` 热修完成；开发主线转向“项目”与“复盘”。
+当前阶段：`0.1.2` 主题合成兼容热修待提交与发布。
 
 ## 本轮目标
 
@@ -19,7 +19,7 @@
 - Base／Local／Remote 同字段竞争必须逐字段人工解决；凭证只存 SecretStorage，所有远端写入复用唯一队列和 `RemoteWriteGate`。
 - `0.1.0` 不展示项目投影入口；统一门禁覆盖后台扫描、分栏、队列、恢复、重试和冲突写回。历史投影操作原样保留且不阻塞同对象普通任务，UI 只显示诊断。
 - Project／Stage 扫描仅解析含顶层 `helix-kind` 的 frontmatter；普通正文与聚焦块不解析、不改写，Helix 元数据仍严格校验。
-- 版本兼容基线为 Obsidian 桌面端 `1.12.2`；`manifest.json`、`package.json`、`package-lock.json` 与 `versions.json` 均已登记 `0.1.1`。
+- 版本兼容基线为 Obsidian 桌面端 `1.12.2`；版本文件均已登记 `0.1.2`。
 
 ## 本轮改动
 
@@ -29,6 +29,7 @@
 - `README.md`、本文件：记录个人预览定位、暂未开放能力与版本兼容策略。
 - `src/services/project-workspace.ts`：在 YAML 解析前按顶层 Helix 身份键筛选，避免普通 Markdown 被误判；未写入用户文件。
 - `tests/project-workspace.test.ts`：覆盖正文反斜杠与聚焦样式块保持原文，以及 Helix 身份字段继续严格拒绝。
+- `styles.css`：移除 Helix 毛玻璃滤镜并隔离根合成层，避免 Cupertino／Electron 下整窗残影。
 
 ## 相关约束
 
@@ -39,7 +40,7 @@
 
 ## 当前验证
 
-- v0.1.1 已通过针对性测试（2 个文件、170 项）、完整测试（66 个文件、926 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；未访问真实滴答。
+- v0.1.2 已通过完整测试（66 个文件、926 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；未访问真实滴答。
 - 最终 30 秒真实合同仍在 items 写入时超时并进入结果未知；后续复读无法唯一证明写入结果。全程零重发，安全清理完成：`cleanup clean`、`remoteArtifacts=false`。
 - 当前 `pending=0`、离线队列 `queue=0`、冲突 `conflict=0`、恢复问题 `recovery=0`，且未观察到限流。
 - 上述结果是外部真实环境阻塞，不是 items 合同通过；不得宣称生产项目投影可用。当前干净状态也不等于 2026-08-05 孤儿任务已清理。

@@ -1,4 +1,7 @@
 .helix-root {
+  /* 避免主题的合成层与 Helix 内容互相污染；Cupertino + Electron 下
+     backdrop-filter 曾导致整个工作区出现残影。 */
+  isolation: isolate;
   --helix-ink: #202534;
   --helix-muted: #768094;
   --helix-line: #e7e9ef;
@@ -310,7 +313,6 @@
   padding: 0 28px;
   border-bottom: 1px solid var(--helix-line);
   background: color-mix(in srgb, var(--helix-surface-control) 92%, transparent);
-  backdrop-filter: blur(16px);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1799,7 +1801,6 @@
   border-radius: 12px;
   background: color-mix(in srgb, var(--background-primary) 94%, transparent);
   box-shadow: var(--shadow-s);
-  backdrop-filter: blur(14px);
 }
 
 .helix-task-quick-suggestion {
@@ -3761,7 +3762,6 @@
   box-shadow:
     inset 0 0 0 1px color-mix(in srgb, white 4%, transparent),
     0 2px 7px rgba(0, 0, 0, .08);
-  backdrop-filter: blur(10px);
   color: var(--text-muted);
   font-size: 0;
   line-height: 0;

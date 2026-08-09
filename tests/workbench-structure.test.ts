@@ -343,16 +343,23 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)/);
   });
 
-  it("uses a compact searchable conflict master list with one field-resolution detail pane", () => {
-    expect(view).toMatch(/renderConflictMasterDetail\([\s\S]*helix-conflict-master[\s\S]*helix-conflict-detail/);
-    expect(view).toMatch(/helix-conflict-search[\s\S]*搜索冲突标题或类型/);
-    expect(view).toContain("[\"all\", \"project\", \"task\", \"focus\"]");
-    expect(view).toContain("helix-conflict-filters");
+  it("uses a prioritized conflict table with inline three-step field resolution", () => {
+    expect(view).toMatch(/renderConflictMasterDetail\([\s\S]*helix-conflict-workspace[\s\S]*helix-conflict-board/);
+    expect(view).toMatch(/待你选择[\s\S]*已阻止写入[\s\S]*不影响其他同步/);
+    expect(view).toMatch(/搜索冲突内容或路径[\s\S]*全部类型[\s\S]*项目[\s\S]*任务[\s\S]*聚焦/);
+    expect(view).toMatch(/需要你选择[\s\S]*等待远端核对[\s\S]*仅需检查/);
+    expect(view).toMatch(/helix-conflict-table-head[\s\S]*来源[\s\S]*对象[\s\S]*诊断[\s\S]*严重性[\s\S]*操作/);
+    expect(view).toMatch(/预览差异[\s\S]*选择方案[\s\S]*完成处理/);
+    expect(view).toMatch(/并排视图[\s\S]*统一视图/);
+    expect(view).toMatch(/保留本地[\s\S]*采用远端[\s\S]*手动编辑/);
+    expect(view).toMatch(/helix-focus-custom[\s\S]*is-collapsed[\s\S]*helix-focus-custom-toggle/);
+    expect(view).toMatch(/批量采用建议[\s\S]*清除选择[\s\S]*最近处理/);
     expect(view).toMatch(/event\.key !== "ArrowDown"[\s\S]*event\.key !== "ArrowUp"[\s\S]*event\.key !== "Enter"/);
     expect(view).toMatch(/item\.type === "focus"[\s\S]*renderFocusBridgeConflict[\s\S]*renderConflict\(detail/);
     expect(view).toMatch(/helix-conflict-custom-toggle[\s\S]*aria-expanded[\s\S]*removeClass\("is-collapsed"\)/);
     const conflictStyles = css.slice(css.indexOf(".helix-conflict-diagnostics"), css.indexOf(".helix-reconciliation-card"));
-    expect(conflictStyles).toMatch(/\.helix-conflict-center[\s\S]*grid-template-columns: minmax\(220px, 29%\) minmax\(0, 1fr\)/);
+    expect(conflictStyles).toMatch(/\.helix-conflict-workspace[\s\S]*grid-template-columns: minmax\(720px, 1fr\) 190px/);
+    expect(conflictStyles).toMatch(/\.helix-conflict-expanded[\s\S]*grid-template-columns: 168px minmax\(0, 1fr\)/);
     expect(conflictStyles).not.toContain("backdrop-filter");
   });
 });

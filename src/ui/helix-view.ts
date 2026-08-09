@@ -121,7 +121,7 @@ import {
   type TaskReferenceService,
 } from "../services/task-references";
 import { HelixDataStore } from "../storage/data-store";
-import type { ResolutionChoice, SyncConflict } from "../sync/types";
+import type { ResolutionAuditEntry, ResolutionChoice, SyncConflict } from "../sync/types";
 import { analyticsChartSeries } from "./chart-series";
 import { inProgressPresentation } from "./in-progress-presentation";
 import {
@@ -234,6 +234,11 @@ export class HelixView extends ItemView {
   private chartObservers: ResizeObserver[] = [];
   private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
   private focusBridgeConflictCount = 0;
+  private conflictSearch = "";
+  private conflictTypeFilter: "all" | "project" | "task" | "focus" = "all";
+  private selectedConflictCenterItemId: string | null = null;
+  private readonly selectedConflictCenterItemIds = new Set<string>();
+  private conflictDiffMode: "split" | "unified" = "split";
   private readonly projectionUiActions = new ProjectionUiActionCoordinator();
 
   constructor(
@@ -3129,7 +3134,6 @@ export class HelixView extends ItemView {
   }
 
   private async renderConflicts(content: HTMLElement, token: number): Promise<void> {
-    this.renderPageTitle(content, "冲突中心");
     const [conflicts, persisted, queue, focusConflicts] = await Promise.all([
       this.store.list(),
       this.store.snapshot(),
@@ -3337,103 +3341,335 @@ export class HelixView extends ItemView {
       empty.createEl("p", { text: "Helix 会在发生竞争修改时暂停单条记录，不阻塞其他对象同步。" });
       return;
     }
-    this.renderConflictMasterDetail(masterDetail, conflicts, focusConflicts);
+    this.renderConflictMasterDetail(
+      masterDetail,
+      conflicts,
+      focusConflicts,
+      persisted.resolutionAudit,
+    );
   }
 
-  /** 冲突选择是逐字段操作；左栏只负责定位，右栏始终只呈现一个真实冲突。 */
+  /** 冲突选择仍是逐字段操作；表格只负责分流，展开区复用唯一合并入口。 */
   private renderConflictMasterDetail(
     content: HTMLElement,
     conflicts: SyncConflict[],
     focusConflicts: ProjectWorkspaceFocusConflict[],
+    audits: ResolutionAuditEntry[],
   ): void {
     type CenterItem = {
       id: string;
       type: "task" | "project" | "focus";
+      category: "decision" | "blocked" | "inspect";
       title: string;
-      subtitle: string;
+      diagnosis: string;
+      scope: string;
+      updatedAt: string;
+      severity: "high" | "medium" | "low";
       conflict: SyncConflict | ProjectWorkspaceFocusConflict;
     };
     const items: CenterItem[] = [
       ...conflicts.map<CenterItem>((conflict) => ({
         id: `sync:${conflict.id}`,
         type: conflict.kind === "task" ? "task" : "project",
+        category: conflict.status === "applying" ? "blocked" : "decision",
         title: conflict.title,
-        subtitle: `${conflict.fields.length} 个字段 · 已复检 ${conflict.remoteRecheckCount} 次`,
+        diagnosis: conflict.status === "applying"
+          ? "远端结果未知，已冻结写入"
+          : `${conflict.fields.length} 个竞争字段，需要逐项选择`,
+        scope: conflict.kind === "task" ? "滴答任务" : "滴答清单",
+        updatedAt: conflict.updatedAt,
+        severity: conflict.status === "applying" || conflict.status === "open" ? "high" : "medium",
         conflict,
       })),
       ...focusConflicts.map<CenterItem>((conflict) => ({
         id: `focus:${conflict.id}`,
         type: "focus" as const,
+        category: conflict.reason === "simultaneous-edit" ? "decision" : "inspect",
         title: `${conflict.sourceId} → ${conflict.targetId}`,
-        subtitle: conflict.reason === "simultaneous-edit" ? "来源与派生同时修改" : "需要只读诊断或手工修复",
+        diagnosis: conflict.reason === "simultaneous-edit"
+          ? "来源与派生同时修改"
+          : conflict.reason === "derived-structure-changed"
+            ? "自动引用结构发生变化"
+            : "缺少可验证的共同基线",
+        scope: `${conflict.sourcePath} → ${conflict.targetPath}`,
+        updatedAt: conflict.createdAt,
+        severity: conflict.reason === "simultaneous-edit" ? "high" : "low",
         conflict,
       })),
     ];
     if (items.length === 0) return;
-    const shell = content.createDiv({ cls: "helix-conflict-center" });
-    const master = shell.createDiv({ cls: "helix-conflict-master" });
-    const detail = shell.createDiv({ cls: "helix-conflict-detail", attr: { tabindex: "-1" } });
-    const search = master.createEl("input", {
+
+    const shell = content.createDiv({ cls: "helix-conflict-workspace" });
+    const main = shell.createDiv({ cls: "helix-conflict-workspace-main" });
+    const history = shell.createDiv({ cls: "helix-conflict-history" });
+    const top = main.createDiv({ cls: "helix-conflict-topline" });
+    const introduction = top.createDiv({ cls: "helix-conflict-introduction" });
+    introduction.createEl("h1", { text: "冲突中心" });
+    introduction.createEl("p", { text: "按处理优先级整理，快速完成三方合并与安全核对" });
+    const toolbar = top.createDiv({ cls: "helix-conflict-toolbar" });
+    const summary = toolbar.createDiv({ cls: "helix-conflict-summary" });
+    const summaryMetric = (value: string, label: string, iconName?: IconName) => {
+      const metric = summary.createDiv({ cls: "helix-conflict-summary-metric" });
+      if (iconName) {
+        const icon = metric.createSpan({ cls: "helix-conflict-summary-icon" });
+        setIcon(icon, iconName);
+      } else {
+        metric.createEl("strong", { text: value });
+      }
+      metric.createSpan({ text: label });
+    };
+    summaryMetric(String(items.filter((item) => item.category === "decision").length), "待你选择");
+    summaryMetric(String(items.filter((item) => item.category === "blocked").length), "已阻止写入");
+    summaryMetric("", "不影响其他同步", "circle-check");
+    const controls = toolbar.createDiv({ cls: "helix-conflict-toolbar-controls" });
+    const searchWrap = controls.createDiv({ cls: "helix-conflict-search-wrap" });
+    const searchIcon = searchWrap.createSpan();
+    setIcon(searchIcon, "search");
+    const search = searchWrap.createEl("input", {
       cls: "helix-conflict-search",
       type: "search",
-      placeholder: "搜索冲突标题或类型",
+      placeholder: "搜索冲突内容或路径",
       attr: { "aria-label": "搜索冲突" },
     });
-    const filters = master.createDiv({ cls: "helix-conflict-filters" });
-    const list = master.createDiv({ cls: "helix-conflict-list", attr: { role: "listbox", "aria-label": "冲突列表" } });
-    let type: "all" | CenterItem["type"] = "all";
-    let selected = items[0]!.id;
+    search.value = this.conflictSearch;
+    const filterWrap = controls.createDiv({ cls: "helix-conflict-filter-wrap" });
+    const filterIcon = filterWrap.createSpan();
+    setIcon(filterIcon, "list-filter");
+    const filter = filterWrap.createEl("select", { attr: { "aria-label": "冲突类型筛选" } });
+    for (const [value, label] of [["all", "全部类型"], ["task", "任务"], ["project", "项目"], ["focus", "聚焦"]] as const) {
+      filter.createEl("option", { value, text: label });
+    }
+    filter.value = this.conflictTypeFilter;
+
+    const board = main.createDiv({ cls: "helix-conflict-board", attr: { tabindex: "0" } });
     const filtered = () => items.filter((item) =>
-      (type === "all" || item.type === type) &&
-      `${item.title} ${item.subtitle} ${item.type}`.toLocaleLowerCase("zh-CN")
-        .includes(search.value.trim().toLocaleLowerCase("zh-CN")));
-    const showDetail = (item: CenterItem) => {
-      detail.empty();
-      if (item.type === "focus") this.renderFocusBridgeConflict(detail, item.conflict as ProjectWorkspaceFocusConflict);
-      else this.renderConflict(detail, item.conflict as SyncConflict);
-      detail.focus();
+      (this.conflictTypeFilter === "all" || item.type === this.conflictTypeFilter) &&
+      `${item.title} ${item.diagnosis} ${item.scope} ${item.type}`.toLocaleLowerCase("zh-CN")
+        .includes(this.conflictSearch.trim().toLocaleLowerCase("zh-CN")));
+    const itemById = (id: string) => items.find((item) => item.id === id);
+    const renderExpanded = (parent: HTMLElement, item: CenterItem) => {
+      const expanded = parent.createDiv({
+        cls: `helix-conflict-expanded is-${this.conflictDiffMode}`,
+        attr: { tabindex: "-1" },
+      });
+      const steps = expanded.createDiv({ cls: "helix-conflict-steps" });
+      for (const [index, title, copy] of [
+        ["1", "预览差异", "查看共同基线与两侧变化。"],
+        ["2", "选择方案", "保留本地、采用远端或手动编辑。"],
+        ["3", "完成处理", "复检远端并标记处理结果。"],
+      ] as const) {
+        const step = steps.createDiv({ cls: "helix-conflict-step" });
+        step.createSpan({ text: index });
+        const copyEl = step.createDiv();
+        copyEl.createEl("strong", { text: title });
+        copyEl.createEl("small", { text: copy });
+      }
+      const resolution = expanded.createDiv({ cls: "helix-conflict-resolution" });
+      const resolutionToolbar = resolution.createDiv({ cls: "helix-conflict-resolution-toolbar" });
+      resolutionToolbar.createEl("strong", { text: item.type === "focus" ? "三方内容预览" : "字段差异预览" });
+      const viewModes = resolutionToolbar.createDiv({ cls: "helix-conflict-view-modes" });
+      for (const [mode, label] of [["split", "并排视图"], ["unified", "统一视图"]] as const) {
+        const button = viewModes.createEl("button", {
+          cls: this.conflictDiffMode === mode ? "is-selected" : "",
+          text: label,
+        });
+        button.addEventListener("click", () => {
+          this.conflictDiffMode = mode;
+          renderBoard();
+        });
+      }
+      const detail = resolution.createDiv({ cls: "helix-conflict-detail" });
+      if (item.type === "focus") {
+        this.renderFocusBridgeConflict(detail, item.conflict as ProjectWorkspaceFocusConflict, true);
+      } else {
+        this.renderConflict(detail, item.conflict as SyncConflict, true);
+        const conflict = item.conflict as SyncConflict;
+        if (conflict.status !== "applying") {
+          const actions = resolution.createDiv({ cls: "helix-conflict-resolution-shortcuts" });
+          const chooseAll = (choice: "local" | "remote") => {
+            void this.chooseAllConflictFields(conflict, choice)
+              .catch((error) => new Notice(messageOf(error), 8_000));
+          };
+          actions.createEl("button", { cls: "is-local", text: "保留本地" })
+            .addEventListener("click", () => chooseAll("local"));
+          actions.createEl("button", { cls: "is-remote", text: "采用远端" })
+            .addEventListener("click", () => chooseAll("remote"));
+          const manual = actions.createEl("button", { text: "手动编辑" });
+          manual.addEventListener("click", () => {
+            const toggle = detail.querySelector<HTMLButtonElement>(".helix-conflict-custom-toggle");
+            toggle?.click();
+            toggle?.scrollIntoView({ block: "center", behavior: "smooth" });
+          });
+        }
+      }
     };
-    const renderList = () => {
+    const renderBoard = () => {
       const visible = filtered();
-      if (!visible.some((item) => item.id === selected)) selected = visible[0]?.id ?? "";
-      list.empty();
+      if (!visible.some((item) => item.id === this.selectedConflictCenterItemId)) {
+        this.selectedConflictCenterItemId = visible[0]?.id ?? null;
+      }
+      for (const selected of [...this.selectedConflictCenterItemIds]) {
+        if (!items.some((item) => item.id === selected)) this.selectedConflictCenterItemIds.delete(selected);
+      }
+      board.empty();
       if (visible.length === 0) {
-        list.createDiv({ cls: "helix-conflict-list-empty", text: "没有匹配的冲突" });
-        detail.empty();
-        detail.createDiv({ cls: "helix-empty-state", text: "调整搜索或类型筛选后继续。" });
+        board.createDiv({ cls: "helix-empty-state", text: "没有匹配的冲突，调整搜索或类型筛选后继续。" });
         return;
       }
-      for (const item of visible) {
-        const button = list.createEl("button", {
-          cls: `helix-conflict-list-item${item.id === selected ? " is-selected" : ""}`,
-          attr: { role: "option", "aria-selected": String(item.id === selected) },
-        });
-        button.createSpan({ cls: "helix-conflict-list-type", text: item.type === "focus" ? "聚焦" : item.type === "task" ? "任务" : "项目" });
-        button.createEl("strong", { text: item.title });
-        button.createEl("small", { text: item.subtitle });
-        button.addEventListener("click", () => { selected = item.id; renderList(); });
+      const groupDefinitions = [
+        { category: "decision", title: "需要你选择", description: "存在内容分歧，需要决定采用本地、远端或自定义版本。", icon: "circle-alert", tone: "danger" },
+        { category: "blocked", title: "等待远端核对", description: "结果未知或正在收口，保持冻结且禁止重发。", icon: "clock-3", tone: "warning" },
+        { category: "inspect", title: "仅需检查", description: "自动处理未继续执行，需要确认结构或共同基线。", icon: "info", tone: "info" },
+      ] as const;
+      for (const definition of groupDefinitions) {
+        const groupItems = visible.filter((item) => item.category === definition.category);
+        if (groupItems.length === 0) continue;
+        const group = board.createDiv({ cls: `helix-conflict-group is-${definition.tone}` });
+        const groupHead = group.createDiv({ cls: "helix-conflict-group-head" });
+        const groupIcon = groupHead.createSpan();
+        setIcon(groupIcon, definition.icon);
+        groupHead.createEl("strong", { text: `${definition.title} ${groupItems.length}` });
+        groupHead.createSpan({ text: definition.description });
+        const tableHead = group.createDiv({ cls: "helix-conflict-table-head" });
+        tableHead.createSpan({ text: "" });
+        tableHead.createSpan({ text: "来源" });
+        tableHead.createSpan({ text: "对象" });
+        tableHead.createSpan({ text: "诊断" });
+        tableHead.createSpan({ text: "影响范围／路径" });
+        tableHead.createSpan({ text: "时间" });
+        tableHead.createSpan({ text: "严重性" });
+        tableHead.createSpan({ text: "操作" });
+        for (const item of groupItems) {
+          const entry = group.createDiv({ cls: `helix-conflict-entry${item.id === this.selectedConflictCenterItemId ? " is-selected" : ""}` });
+          const row = entry.createDiv({ cls: "helix-conflict-table-row" });
+          const checkbox = row.createEl("input", { type: "checkbox", attr: { "aria-label": `选择 ${item.title}` } });
+          checkbox.checked = this.selectedConflictCenterItemIds.has(item.id);
+          checkbox.disabled = item.type === "focus" || item.category === "blocked";
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) this.selectedConflictCenterItemIds.add(item.id);
+            else this.selectedConflictCenterItemIds.delete(item.id);
+            renderBulkBar();
+          });
+          const source = row.createDiv({ cls: `helix-conflict-source is-${item.type}` });
+          const sourceIcon = source.createSpan();
+          setIcon(sourceIcon, item.type === "task" ? "square-check-big" : item.type === "project" ? "folder" : "git-merge");
+          source.createSpan({ text: item.type === "task" ? "任务" : item.type === "project" ? "项目" : "聚焦" });
+          row.createEl("strong", { cls: "helix-conflict-object", text: item.title });
+          row.createSpan({ cls: "helix-conflict-diagnosis", text: item.diagnosis });
+          row.createSpan({ cls: "helix-conflict-scope", text: item.scope });
+          row.createSpan({ cls: "helix-conflict-time", text: relativeConflictTime(item.updatedAt) });
+          row.createSpan({ cls: `helix-conflict-severity is-${item.severity}`, text: item.severity === "high" ? "高" : item.severity === "medium" ? "中" : "低" });
+          const open = row.createEl("button", {
+            cls: "helix-conflict-open",
+            text: item.id === this.selectedConflictCenterItemId
+              ? "收起"
+              : item.type === "focus" ? "查看详情" : "对比字段",
+          });
+          open.addEventListener("click", () => {
+            this.selectedConflictCenterItemId = item.id === this.selectedConflictCenterItemId ? null : item.id;
+            renderBoard();
+          });
+          row.addEventListener("dblclick", () => {
+            this.selectedConflictCenterItemId = item.id;
+            renderBoard();
+          });
+          if (item.id === this.selectedConflictCenterItemId) renderExpanded(entry, item);
+        }
       }
-      showDetail(visible.find((item) => item.id === selected)!);
+      renderBulkBar();
     };
-    (["all", "project", "task", "focus"] as const).forEach((candidate) => {
-      const button = filters.createEl("button", {
-        cls: candidate === type ? "is-selected" : "",
-        text: candidate === "all" ? `全部 ${items.length}` : candidate === "project" ? "项目" : candidate === "task" ? "任务" : "聚焦",
+    const bulk = main.createDiv({ cls: "helix-conflict-bulk" });
+    const renderBulkBar = () => {
+      bulk.empty();
+      bulk.createSpan({ text: `已选择 ${this.selectedConflictCenterItemIds.size} 项` });
+      const actions = bulk.createDiv();
+      const suggested = actions.createEl("button", { cls: "helix-primary-button", text: "批量采用建议" });
+      suggested.disabled = this.selectedConflictCenterItemIds.size === 0;
+      suggested.addEventListener("click", () => {
+        const selected = [...this.selectedConflictCenterItemIds]
+          .map(itemById)
+          .filter((item): item is CenterItem => Boolean(item && item.type !== "focus" && item.category !== "blocked"));
+        void this.applySuggestedConflictChoices(selected.map((item) => item.conflict as SyncConflict))
+          .catch((error) => new Notice(messageOf(error), 8_000));
       });
-      button.addEventListener("click", () => { type = candidate; filters.querySelectorAll("button").forEach((el) => el.toggleClass("is-selected", el === button)); renderList(); });
+      const clear = actions.createEl("button", { text: "清除选择" });
+      clear.addEventListener("click", () => {
+        this.selectedConflictCenterItemIds.clear();
+        renderBoard();
+      });
+    };
+    search.addEventListener("input", () => {
+      this.conflictSearch = search.value;
+      renderBoard();
     });
-    search.addEventListener("input", renderList);
-    master.addEventListener("keydown", (event) => {
+    filter.addEventListener("change", () => {
+      this.conflictTypeFilter = filter.value as typeof this.conflictTypeFilter;
+      renderBoard();
+    });
+    board.addEventListener("keydown", (event) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter") return;
       const visible = filtered();
-      const index = Math.max(0, visible.findIndex((item) => item.id === selected));
-      if (event.key === "Enter") { event.preventDefault(); detail.focus(); return; }
+      const index = Math.max(0, visible.findIndex((item) => item.id === this.selectedConflictCenterItemId));
+      if (event.key === "Enter") {
+        event.preventDefault();
+        board.querySelector<HTMLElement>(".helix-conflict-expanded")?.focus();
+        return;
+      }
       const next = visible[index + (event.key === "ArrowDown" ? 1 : -1)];
       if (!next) return;
-      event.preventDefault(); selected = next.id; renderList();
-      list.querySelector<HTMLElement>(`.helix-conflict-list-item:nth-child(${visible.indexOf(next) + 1})`)?.focus();
+      event.preventDefault();
+      this.selectedConflictCenterItemId = next.id;
+      renderBoard();
+      board.querySelector<HTMLElement>(".helix-conflict-entry.is-selected")?.scrollIntoView({ block: "nearest" });
     });
-    renderList();
+
+    const historyHead = history.createDiv({ cls: "helix-conflict-history-head" });
+    historyHead.createEl("strong", { text: "最近处理" });
+    const historyIcon = historyHead.createSpan();
+    setIcon(historyIcon, "chevron-up");
+    const timeline = history.createDiv({ cls: "helix-conflict-history-list" });
+    const recent = [...audits].sort((left, right) => right.resolvedAt.localeCompare(left.resolvedAt)).slice(0, 6);
+    if (recent.length === 0) {
+      timeline.createDiv({ cls: "helix-conflict-history-empty", text: "还没有已完成的冲突处理。" });
+    } else {
+      for (const audit of recent) {
+        const event = timeline.createDiv({ cls: "helix-conflict-history-event" });
+        const icon = event.createSpan();
+        setIcon(icon, "circle-check");
+        const copy = event.createDiv();
+        copy.createSpan({ text: formatConflictClock(audit.resolvedAt) });
+        copy.createEl("strong", { text: "已完成逐字段合并" });
+        copy.createEl("small", { text: `${audit.kind === "task" ? "任务" : "项目"} · ${audit.entityId}` });
+      }
+    }
+    renderBoard();
+  }
+
+  private async chooseAllConflictFields(
+    conflict: SyncConflict,
+    choice: "local" | "remote",
+  ): Promise<void> {
+    if (conflict.status === "applying") throw new Error("该冲突正在等待远端核对，当前不能修改选择");
+    for (const field of conflict.fields) {
+      if (field.sameResult || field.choice === choice) continue;
+      await this.service.chooseConflict(conflict.id, field.path, choice);
+    }
+    await this.render();
+  }
+
+  private async applySuggestedConflictChoices(conflicts: SyncConflict[]): Promise<void> {
+    let applied = 0;
+    for (const conflict of conflicts) {
+      if (conflict.status === "applying") continue;
+      for (const field of conflict.fields) {
+        if (field.sameResult || field.choice || !field.suggestedChoice) continue;
+        await this.service.chooseConflict(conflict.id, field.path, field.suggestedChoice);
+        applied += 1;
+      }
+    }
+    if (applied === 0) new Notice("所选冲突没有可安全自动采用的单边建议");
+    else new Notice(`已采用 ${applied} 个无竞争字段建议；双边竞争仍需你选择`);
+    await this.render();
   }
 
   private renderProjectionConflicts(
@@ -3552,17 +3788,20 @@ export class HelixView extends ItemView {
   private renderFocusBridgeConflict(
     content: HTMLElement,
     conflict: ProjectWorkspaceFocusConflict,
+    embedded = false,
   ): void {
-    const card = content.createDiv({ cls: "helix-card helix-conflict-card" });
-    card.createEl("span", { cls: "helix-chip is-danger", text: "阶段聚焦冲突" });
-    card.createEl("h3", { text: `${conflict.sourceId} → ${conflict.targetId}` });
-    card.createEl("p", {
-      text: conflict.reason === "derived-structure-changed"
-        ? "派生引用的链接或结构发生变化，已冻结该引用。"
-        : conflict.reason === "checkpoint-missing"
-          ? "缺少可验证的同步基线，已停止自动写入。"
-          : "来源和派生正文均已变化，请选择保留内容。",
-    });
+    const card = content.createDiv({ cls: `helix-card helix-conflict-card${embedded ? " is-embedded" : ""}` });
+    if (!embedded) {
+      card.createEl("span", { cls: "helix-chip is-danger", text: "阶段聚焦冲突" });
+      card.createEl("h3", { text: `${conflict.sourceId} → ${conflict.targetId}` });
+      card.createEl("p", {
+        text: conflict.reason === "derived-structure-changed"
+          ? "派生引用的链接或结构发生变化，已冻结该引用。"
+          : conflict.reason === "checkpoint-missing"
+            ? "缺少可验证的同步基线，已停止自动写入。"
+            : "来源和派生正文均已变化，请选择保留内容。",
+      });
+    }
     const columns = card.createDiv({ cls: "helix-conflict-options" });
     const base = columns.createDiv({ cls: "helix-conflict-option is-base" });
     base.createEl("strong", { text: "Base" });
@@ -3620,8 +3859,21 @@ export class HelixView extends ItemView {
     };
     addChoice("来源", conflict.sourceContent, "source");
     addChoice("派生", conflict.derivedContent, "derived");
-    const custom = columns.createDiv({ cls: "helix-conflict-option" });
+    const custom = columns.createDiv({
+      cls: `helix-conflict-option helix-focus-custom${embedded ? " is-collapsed" : ""}`,
+    });
     custom.createEl("strong", { text: "自定义" });
+    if (embedded) {
+      const reveal = custom.createEl("button", {
+        cls: "helix-secondary-button helix-focus-custom-toggle",
+        text: "手动编辑",
+        attr: { "aria-expanded": "false" },
+      });
+      reveal.addEventListener("click", () => {
+        custom.removeClass("is-collapsed");
+        reveal.setAttribute("aria-expanded", "true");
+      });
+    }
     const editor = custom.createEl("textarea", {
       attr: { "aria-label": "自定义阶段聚焦内容" },
     });
@@ -3645,16 +3897,18 @@ export class HelixView extends ItemView {
     });
   }
 
-  private renderConflict(content: HTMLElement, conflict: SyncConflict): void {
+  private renderConflict(content: HTMLElement, conflict: SyncConflict, embedded = false): void {
     const applying = conflict.status === "applying";
     const projectionReadOnly =
       !PROJECT_DIDA_PROJECTION_AVAILABLE && conflict.scope === "helix-projection-owned-items";
-    const card = content.createDiv({ cls: "helix-card helix-conflict-card" });
-    const head = card.createDiv({ cls: "helix-conflict-head" });
-    const title = head.createDiv();
-    title.createEl("span", { cls: "helix-chip is-danger", text: conflict.kind === "task" ? "任务冲突" : "项目冲突" });
-    title.createEl("h3", { text: conflict.title });
-    title.createEl("p", { text: `远端复检 ${conflict.remoteRecheckCount} 次 · ${conflict.fields.length} 个变化字段` });
+    const card = content.createDiv({ cls: `helix-card helix-conflict-card${embedded ? " is-embedded" : ""}` });
+    if (!embedded) {
+      const head = card.createDiv({ cls: "helix-conflict-head" });
+      const title = head.createDiv();
+      title.createEl("span", { cls: "helix-chip is-danger", text: conflict.kind === "task" ? "任务冲突" : "项目冲突" });
+      title.createEl("h3", { text: conflict.title });
+      title.createEl("p", { text: `远端复检 ${conflict.remoteRecheckCount} 次 · ${conflict.fields.length} 个变化字段` });
+    }
     if (projectionReadOnly) {
       card.createEl("p", { text: "0.1.0 仅保留该项目联动冲突供诊断，不提供字段选择、写回或远端采纳。" });
       for (const field of conflict.fields) {
@@ -4154,6 +4408,27 @@ function formatShortTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(date);
+}
+
+function relativeConflictTime(value: string): string {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return "时间未知";
+  const minutes = Math.max(0, Math.round((Date.now() - time) / 60_000));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.round(hours / 24)} 天前`;
+}
+
+function formatConflictClock(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--:--";
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
 function formatHour(value: string, timeZone?: string): string {

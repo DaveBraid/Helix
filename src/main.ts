@@ -1,5 +1,6 @@
 import {
   Modal,
+  MarkdownView,
   Notice,
   Plugin,
   Setting,
@@ -1532,6 +1533,16 @@ export default class HelixPlugin extends Plugin {
     if (!(file instanceof TFile)) throw new Error(`无法打开文件：${path}`);
     const leaf: WorkspaceLeaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(file);
+    this.app.workspace.setActiveLeaf(leaf, { focus: true });
+    const ownerWindow = leaf.view.containerEl.ownerDocument.defaultView ?? window;
+    ownerWindow.requestAnimationFrame(() => {
+      if (
+        this.app.workspace.activeLeaf !== leaf ||
+        !(leaf.view instanceof MarkdownView) ||
+        leaf.view.file?.path !== file.path
+      ) return;
+      leaf.view.editor.focus();
+    });
   }
 }
 

@@ -176,6 +176,18 @@ describe("workbench layout and navigation structure", () => {
     );
   });
 
+  it("opens project Markdown in an active editable leaf after the card click settles", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const lineage = readFileSync(
+      resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"),
+      "utf8",
+    );
+    expect(main).toMatch(
+      /private async openFile\(path: string\)[\s\S]*leaf\.openFile\(file\)[\s\S]*setActiveLeaf\(leaf, \{ focus: true \}\)[\s\S]*requestAnimationFrame[\s\S]*leaf\.view\.editor\.focus\(\)/,
+    );
+    expect(lineage).toMatch(/helix-lineage-card-title[\s\S]*event\.preventDefault\(\)[\s\S]*onOpenNote/);
+  });
+
   it("routes all new status saves through a recovery-mode write gate", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(view).toMatch(/this\.actions\.updateProjectStatus\(plan, status\)/);

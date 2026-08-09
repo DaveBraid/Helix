@@ -1321,6 +1321,7 @@ export class ProjectLineageWorkbench {
       attr: { "aria-label": `打开 ${node.title}` },
     });
     open.addEventListener("click", (event) => {
+      event.preventDefault();
       event.stopPropagation();
       this.options.onOpenNote(node.notePath);
     });

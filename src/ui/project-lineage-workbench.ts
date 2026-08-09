@@ -5,6 +5,7 @@ import {
 } from "../domain/cycle-graph";
 import {
   collapsedClosedComponents,
+  planProjectGraphLayout,
   projectedGraphIsAcyclic,
   type ProjectGraphEdge,
 } from "../domain/project-graph";
@@ -19,7 +20,6 @@ import {
 import { PROJECT_STATUS_LABELS } from "../domain/project-status";
 import type {
   ProjectWorkspaceCanvasNode,
-  ProjectWorkspaceHistoryState,
   ProjectWorkspaceNodeMove,
   ProjectWorkspaceCycle,
   ProjectWorkspaceProject,
@@ -56,11 +56,24 @@ export interface LineageCamera {
   rawCenterY: number;
 }
 
+export interface LineageLayoutSnapshot {
+  [entityId: string]: LineagePoint;
+}
+
+export interface LineageLayoutDraft {
+  canvasRevisionHash: string;
+  positions: LineageLayoutSnapshot;
+  undo: LineageLayoutSnapshot[];
+  redo: LineageLayoutSnapshot[];
+  dirty: boolean;
+}
+
 interface WorkbenchOptions {
   snapshot: ProjectWorkspaceSnapshot;
   selectedProjectId: string | null;
   focusEntityId?: string;
   initialCamera?: LineageCamera;
+  initialLayoutDraft?: LineageLayoutDraft;
   onFocusApplied?: (entityId: string) => void;
   mode: ProjectLineageViewMode;
   arrivalCycleId?: string;
@@ -69,8 +82,9 @@ interface WorkbenchOptions {
   onCreateProject: () => void;
   onCreateCycle: (projectId: string, sourceCycleIds: string[]) => void;
   onDeleteCycle: (cycleId: string) => void;
+  onDeleteProject: (projectId: string) => void;
   onOpenNote: (path: string) => void;
-  onMoveNodes: (moves: ProjectWorkspaceNodeMove[]) => Promise<void>;
+  onSaveLayout: (moves: ProjectWorkspaceNodeMove[]) => Promise<void>;
   onManageRelation: (relationId: string) => void;
   onConnectCycles: (sourceCycleId: string, targetCycleId: string) => void;
   onChooseConnectionTarget: (
@@ -93,10 +107,6 @@ interface WorkbenchOptions {
   ) => Promise<void>;
   onToggleCompletedCollapse: (projectId: string, collapsed: boolean) => void;
   onExpandCompletedProjects: (projectIds: string[]) => void;
-  onAutoLayout: () => void;
-  history: ProjectWorkspaceHistoryState;
-  onUndo: () => void;
-  onRedo: () => void;
   onError: (error: unknown) => void;
 }
 
@@ -133,6 +143,42 @@ interface LineageStatusOption<T extends string> {
   icon: string;
 }
 export const LINEAGE_ALL_PROJECTS_FOCUS_ID = "helix:all-projects";
+
+export type LineageArrangeScope =
+  | { kind: "disabled"; reason: "empty" | "cross-project" }
+  | { kind: "project"; projectId: string; entityIds: string[] }
+  | { kind: "selection"; projectId: string; entityIds: string[] };
+
+export function lineageArrangeScope(
+  selectedEntityIds: readonly string[],
+  selectedProjectId: string | null,
+  nodes: readonly ProjectWorkspaceCanvasNode[],
+): LineageArrangeScope {
+  const stages = nodes.filter((node) => node.kind === "cycle");
+  if (selectedEntityIds.length > 0) {
+    const selected = selectedEntityIds.flatMap((id) => {
+      const node = stages.find((candidate) => candidate.entityId === id);
+      return node ? [node] : [];
+    });
+    const projects = new Set(selected.map((node) => node.projectId));
+    if (projects.size !== 1 || selected.length === 0) {
+      return { kind: "disabled", reason: "cross-project" };
+    }
+    return {
+      kind: "selection",
+      projectId: selected[0]!.projectId,
+      entityIds: selected.map((node) => node.entityId),
+    };
+  }
+  if (!selectedProjectId) return { kind: "disabled", reason: "empty" };
+  return {
+    kind: "project",
+    projectId: selectedProjectId,
+    entityIds: stages
+      .filter((node) => node.projectId === selectedProjectId)
+      .map((node) => node.entityId),
+  };
+}
 
 export function lineageGraphBox(
   _node: Pick<ProjectWorkspaceCanvasNode, "width" | "height">,
@@ -720,6 +766,15 @@ export class ProjectLineageWorkbench {
   private statusPopoverAnchor: HTMLButtonElement | null = null;
   private statusPopoverAbort: AbortController | null = null;
   private statusPopoverListenerTimer: number | null = null;
+  private readonly persistedLayout: LineageLayoutSnapshot;
+  private layoutUndo: LineageLayoutSnapshot[] = [];
+  private layoutRedo: LineageLayoutSnapshot[] = [];
+  private layoutDirty = false;
+  private undoButton: HTMLButtonElement | null = null;
+  private redoButton: HTMLButtonElement | null = null;
+  private arrangeButton: HTMLButtonElement | null = null;
+  private saveLayoutButton: HTMLButtonElement | null = null;
+  private layoutSavePending = false;
 
   constructor(private readonly options: WorkbenchOptions) {
     const minimumX = Math.min(0, ...options.snapshot.canvasNodes.map((node) => node.x));
@@ -734,6 +789,18 @@ export class ProjectLineageWorkbench {
         x: node.x + this.canvasOffset.x,
         y: node.y + this.canvasOffset.y,
       });
+    }
+    this.persistedLayout = this.captureRawLayout();
+    const draft = options.initialLayoutDraft;
+    if (
+      draft &&
+      draft.canvasRevisionHash === options.snapshot.canvasRevisionHash &&
+      this.sameLayoutEntities(draft.positions)
+    ) {
+      this.applyRawLayout(draft.positions);
+      this.layoutUndo = draft.undo.filter((item) => this.sameLayoutEntities(item));
+      this.layoutRedo = draft.redo.filter((item) => this.sameLayoutEntities(item));
+      this.layoutDirty = draft.dirty;
     }
     this.prepareCompletedProjection();
     for (const [projectId, entityIds] of lineageVisibleStageIdsByProject(
@@ -779,6 +846,27 @@ export class ProjectLineageWorkbench {
     };
   }
 
+  layoutDraft(): LineageLayoutDraft | undefined {
+    if (!this.options.snapshot.canvasRevisionHash ||
+      (!this.layoutDirty && this.layoutUndo.length === 0 && this.layoutRedo.length === 0)) {
+      return undefined;
+    }
+    return {
+      canvasRevisionHash: this.options.snapshot.canvasRevisionHash,
+      positions: this.captureRawLayout(),
+      undo: this.layoutUndo.map((item) => cloneLayoutSnapshot(item)),
+      redo: this.layoutRedo.map((item) => cloneLayoutSnapshot(item)),
+      dirty: this.layoutDirty,
+    };
+  }
+
+  markLayoutSaved(): void {
+    this.layoutDirty = false;
+    this.layoutUndo = [];
+    this.layoutRedo = [];
+    this.updateLayoutControls();
+  }
+
   render(parent: HTMLElement): void {
     this.closeStatusPopover();
     parent.empty();
@@ -818,63 +906,40 @@ export class ProjectLineageWorkbench {
       button.addEventListener("click", () => this.options.onModeChange(item.id));
     }
     const actions = toolbar.createDiv({ cls: "helix-lineage-toolbar-actions" });
-    const selectedProject = this.options.snapshot.projects.find((project) =>
-      project.id === this.options.selectedProjectId);
-    const selectedCollapsed = selectedProject
-      ? this.options.snapshot.collapsedCompletedProjectIds.includes(selectedProject.id)
-      : false;
-    if (
-      this.options.mode !== "graph" &&
-      selectedProject &&
-      (selectedCollapsed || this.hasCollapsibleCompleted(selectedProject))
-    ) {
-      const collapsed = selectedCollapsed;
-      const fold = actions.createEl("button", {
-        cls: "helix-secondary-button",
-        text: collapsed ? "展开已完成" : "折叠已完成",
-      });
-      fold.addEventListener("click", () =>
-        this.options.onToggleCompletedCollapse(selectedProject.id, !collapsed));
-    }
+    if (this.options.mode !== "graph") return;
     const undo = actions.createEl("button", {
       cls: "helix-secondary-button helix-lineage-history-button",
       text: "撤销",
-      attr: {
-        title: this.options.history.undoLabel
-          ? `撤销：${this.options.history.undoLabel}`
-          : "没有可撤销的项目图谱操作",
-        "aria-label": this.options.history.undoLabel
-          ? `撤销${this.options.history.undoLabel}`
-          : "没有可撤销的项目图谱操作",
-      },
+      attr: { title: "撤销尚未保存的布局变化" },
     });
-    undo.disabled = this.options.history.undoCount === 0;
-    undo.addEventListener("click", this.options.onUndo);
+    undo.addEventListener("click", () => this.undoLayout());
     const redo = actions.createEl("button", {
       cls: "helix-secondary-button helix-lineage-history-button",
       text: "重做",
-      attr: {
-        title: this.options.history.redoLabel
-          ? `重做：${this.options.history.redoLabel}`
-          : "没有可重做的项目图谱操作",
-        "aria-label": this.options.history.redoLabel
-          ? `重做${this.options.history.redoLabel}`
-          : "没有可重做的项目图谱操作",
-      },
+      attr: { title: "重做尚未保存的布局变化" },
     });
-    redo.disabled = this.options.history.redoCount === 0;
-    redo.addEventListener("click", this.options.onRedo);
+    redo.addEventListener("click", () => this.redoLayout());
     const arrange = actions.createEl("button", {
       cls: "helix-secondary-button",
-      text: "整理全部",
-      attr: { title: "按项目泳道整理全部 Helix 卡片" },
+      text: "整理",
     });
-    arrange.addEventListener("click", this.options.onAutoLayout);
+    arrange.addEventListener("click", () => this.arrangeCurrentScope());
+    const save = actions.createEl("button", {
+      cls: "helix-secondary-button",
+      text: "保存当前布局",
+      attr: { title: "将当前卡片位置保存到 Canvas，并覆盖上一版布局" },
+    });
+    save.addEventListener("click", () => void this.saveCurrentLayout());
     const addProject = actions.createEl("button", {
       cls: "helix-secondary-button",
       text: "新建项目",
     });
     addProject.addEventListener("click", this.options.onCreateProject);
+    this.undoButton = undo;
+    this.redoButton = redo;
+    this.arrangeButton = arrange;
+    this.saveLayoutButton = save;
+    this.updateLayoutControls();
   }
 
   private renderProjectStrip(parent: HTMLElement): void {
@@ -1020,6 +1085,7 @@ export class ProjectLineageWorkbench {
             point: LineagePoint;
           }>;
           moved: boolean;
+          beforeLayout: LineageLayoutSnapshot;
         }
       | null = null;
     card.addEventListener("pointerdown", (event) => {
@@ -1058,6 +1124,7 @@ export class ProjectLineageWorkbench {
         clientY: event.clientY,
         starts,
         moved: false,
+        beforeLayout: this.captureRawLayout(),
       };
       card.setPointerCapture(event.pointerId);
     });
@@ -1090,29 +1157,7 @@ export class ProjectLineageWorkbench {
       if (card.hasPointerCapture(event.pointerId)) card.releasePointerCapture(event.pointerId);
       for (const item of completed.starts) item.el.removeClass("is-dragging");
       if (!completed.moved || this.destroyed || this.movePending) return;
-      const moves = completed.starts.map((item) => {
-        const next = this.layout.get(item.node.entityId)!;
-        return lineageMovePayload(item.node, next, this.canvasOffset);
-      });
-      this.movePending = true;
-      const moveVersion = ++this.moveVersion;
-      void this.options.onMoveNodes(moves).then(() => {
-        if (this.destroyed || moveVersion !== this.moveVersion) return;
-        this.movePending = false;
-      }).catch((error) => {
-        if (this.destroyed || moveVersion !== this.moveVersion) return;
-        this.movePending = false;
-        for (const item of completed.starts) {
-          this.layout.set(item.node.entityId, item.point);
-          item.el.style.left = `${item.point.x}px`;
-          item.el.style.top = `${item.point.y}px`;
-        }
-        this.updateProjectContainerGeometry(
-          new Set(completed.starts.map((item) => item.node.projectId)),
-        );
-        this.renderEdges();
-        this.options.onError(error);
-      });
+      this.recordLayoutChange(completed.beforeLayout);
     };
     const cancelMove = (event: PointerEvent): void => {
       if (!drag || drag.pointerId !== event.pointerId) return;
@@ -1161,6 +1206,11 @@ export class ProjectLineageWorkbench {
       });
       container.style.setProperty("--helix-project-color", this.projectColor(project));
       this.applyProjectContainerBox(container, box);
+      container.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.options.onSelectProject(project.id);
+      });
       const header = this.projectHeaderLayer.createDiv({
         cls: `helix-lineage-project-container-header${
           project.id === this.options.selectedProjectId ? " is-current-project" : ""
@@ -1176,7 +1226,7 @@ export class ProjectLineageWorkbench {
       });
       open.createSpan({ cls: "helix-lineage-project-container-swatch" });
       open.createSpan({ text: project.title });
-      open.addEventListener("click", () => this.options.onOpenNote(project.notePath));
+      this.bindProjectTitleDrag(open, project);
       const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
         text: PROJECT_STATUS_LABELS[project.status],
@@ -1226,7 +1276,96 @@ export class ProjectLineageWorkbench {
         fold.addEventListener("click", () =>
           this.options.onToggleCompletedCollapse(project.id, !collapsed));
       }
+      const remove = header.createEl("button", {
+        cls: "helix-lineage-project-container-delete",
+        attr: {
+          "aria-label": `删除项目 ${project.title}`,
+          title: "删除项目",
+        },
+      });
+      setIcon(remove, "trash-2");
+      remove.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.options.onDeleteProject(project.id);
+      });
     }
+  }
+
+  private bindProjectTitleDrag(
+    button: HTMLButtonElement,
+    project: ProjectWorkspaceProject,
+  ): void {
+    let drag: {
+      pointerId: number;
+      x: number;
+      y: number;
+      moved: boolean;
+      before: LineageLayoutSnapshot;
+      starts: Array<{ entityId: string; point: LineagePoint }>;
+    } | null = null;
+    let suppressClick = false;
+    button.title = "单击打开项目；按住拖动整个项目";
+    button.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || this.destroyed || this.movePending) return;
+      const starts = this.options.snapshot.canvasNodes
+        .filter((node) => node.kind === "cycle" && node.projectId === project.id)
+        .flatMap((node) => {
+          const point = this.layout.get(node.entityId);
+          return point ? [{ entityId: node.entityId, point: { ...point } }] : [];
+        });
+      if (starts.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      drag = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        moved: false,
+        before: this.captureRawLayout(),
+        starts,
+      };
+      button.setPointerCapture(event.pointerId);
+    });
+    button.addEventListener("pointermove", (event) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const dx = (event.clientX - drag.x) / this.zoom;
+      const dy = (event.clientY - drag.y) / this.zoom;
+      if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+      drag.moved = true;
+      suppressClick = true;
+      for (const start of drag.starts) {
+        this.layout.set(start.entityId, {
+          x: Math.max(16, start.point.x + dx),
+          y: Math.max(16, start.point.y + dy),
+        });
+      }
+      this.renderLayoutPositions();
+    });
+    const finish = (event: PointerEvent, canceled: boolean): void => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const completed = drag;
+      drag = null;
+      if (button.hasPointerCapture(event.pointerId)) button.releasePointerCapture(event.pointerId);
+      if (canceled) {
+        this.applyRawLayout(completed.before);
+        this.renderLayoutPositions();
+      } else if (completed.moved) {
+        this.recordLayoutChange(completed.before);
+      }
+    };
+    button.addEventListener("pointerup", (event) => finish(event, false));
+    button.addEventListener("pointercancel", (event) => finish(event, true));
+    button.addEventListener("lostpointercapture", (event) => finish(event, true));
+    button.addEventListener("click", (event) => {
+      if (suppressClick) {
+        suppressClick = false;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      this.options.onOpenNote(project.notePath);
+    });
   }
 
   private updateProjectContainerGeometry(projectIds?: Iterable<string>): void {
@@ -2549,6 +2688,172 @@ export class ProjectLineageWorkbench {
         : undefined;
       if (node?.kind === "cycle") this.updateCreateActionLabel(card, node);
     }
+    this.updateLayoutControls();
+  }
+
+  private captureRawLayout(): LineageLayoutSnapshot {
+    return Object.fromEntries([...this.layout].map(([entityId, point]) => [
+      entityId,
+      {
+        x: point.x - this.canvasOffset.x,
+        y: point.y - this.canvasOffset.y,
+      },
+    ]));
+  }
+
+  private sameLayoutEntities(snapshot: LineageLayoutSnapshot): boolean {
+    const expected = [...this.layout.keys()].sort();
+    const actual = Object.keys(snapshot).sort();
+    return expected.length === actual.length && expected.every((id, index) => id === actual[index]);
+  }
+
+  private applyRawLayout(snapshot: LineageLayoutSnapshot): void {
+    for (const [entityId, point] of Object.entries(snapshot)) {
+      if (!this.layout.has(entityId)) continue;
+      this.layout.set(entityId, {
+        x: point.x + this.canvasOffset.x,
+        y: point.y + this.canvasOffset.y,
+      });
+    }
+  }
+
+  private renderLayoutPositions(): void {
+    if (this.nodeLayer) {
+      for (const card of this.nodeLayer.querySelectorAll<HTMLElement>(
+        ".helix-lineage-card[data-entity-id]",
+      )) {
+        const point = card.dataset.entityId
+          ? this.layout.get(card.dataset.entityId)
+          : undefined;
+        if (!point) continue;
+        card.style.left = `${point.x}px`;
+        card.style.top = `${point.y}px`;
+      }
+    }
+    const bounds = this.measure();
+    this.width = bounds.width;
+    this.height = bounds.height;
+    this.applyScale();
+    this.updateProjectContainerGeometry();
+    this.renderEdges();
+  }
+
+  private layoutsEqual(left: LineageLayoutSnapshot, right: LineageLayoutSnapshot): boolean {
+    return this.sameLayoutEntities(left) && Object.entries(left).every(([id, point]) =>
+      right[id]?.x === point.x && right[id]?.y === point.y);
+  }
+
+  private recordLayoutChange(before: LineageLayoutSnapshot): void {
+    const after = this.captureRawLayout();
+    if (this.layoutsEqual(before, after)) return;
+    this.layoutUndo.push(cloneLayoutSnapshot(before));
+    if (this.layoutUndo.length > 50) this.layoutUndo.shift();
+    this.layoutRedo = [];
+    this.layoutDirty = !this.layoutsEqual(after, this.persistedLayout);
+    this.updateLayoutControls();
+  }
+
+  private undoLayout(): void {
+    const previous = this.layoutUndo.pop();
+    if (!previous) return;
+    this.layoutRedo.push(this.captureRawLayout());
+    this.applyRawLayout(previous);
+    this.layoutDirty = !this.layoutsEqual(this.captureRawLayout(), this.persistedLayout);
+    this.renderLayoutPositions();
+    this.updateLayoutControls();
+  }
+
+  private redoLayout(): void {
+    const next = this.layoutRedo.pop();
+    if (!next) return;
+    this.layoutUndo.push(this.captureRawLayout());
+    this.applyRawLayout(next);
+    this.layoutDirty = !this.layoutsEqual(this.captureRawLayout(), this.persistedLayout);
+    this.renderLayoutPositions();
+    this.updateLayoutControls();
+  }
+
+  private currentArrangeScope(): LineageArrangeScope {
+    return lineageArrangeScope(
+      [...this.selected],
+      this.options.selectedProjectId,
+      this.options.snapshot.canvasNodes,
+    );
+  }
+
+  private arrangeCurrentScope(): void {
+    const scope = this.currentArrangeScope();
+    if (scope.kind === "disabled") return;
+    const before = this.captureRawLayout();
+    const stages = this.options.snapshot.canvasNodes
+      .filter((node) => node.kind === "cycle")
+      .map((node) => {
+        const point = before[node.entityId] ?? { x: node.x, y: node.y };
+        const cycle = this.options.snapshot.projects
+          .flatMap((project) => project.cycles)
+          .find((candidate) => candidate.id === node.entityId);
+        return {
+          id: node.entityId,
+          projectId: node.projectId,
+          sequence: cycle?.sequence ?? Number.MAX_SAFE_INTEGER,
+          x: point.x,
+          y: point.y,
+        };
+      });
+    const planned = planProjectGraphLayout(
+      this.options.snapshot.projects.map((project) => ({ id: project.id, x: 0, y: 0 })),
+      stages,
+      this.physicalEdges(),
+      new Set(scope.entityIds),
+    );
+    for (const stage of planned.stages) {
+      if (!scope.entityIds.includes(stage.id)) continue;
+      this.layout.set(stage.id, {
+        x: stage.x + this.canvasOffset.x,
+        y: stage.y + this.canvasOffset.y,
+      });
+    }
+    this.recordLayoutChange(before);
+    this.renderLayoutPositions();
+  }
+
+  private async saveCurrentLayout(): Promise<void> {
+    if (!this.layoutDirty || this.layoutSavePending) return;
+    const moves = this.options.snapshot.canvasNodes
+      .filter((node) => node.kind === "cycle")
+      .flatMap((node) => {
+        const point = this.layout.get(node.entityId);
+        return point ? [lineageMovePayload(node, point, this.canvasOffset)] : [];
+      });
+    this.layoutSavePending = true;
+    this.updateLayoutControls();
+    try {
+      await this.options.onSaveLayout(moves);
+    } catch (error) {
+      this.layoutSavePending = false;
+      this.updateLayoutControls();
+      this.options.onError(error);
+    }
+  }
+
+  private updateLayoutControls(): void {
+    if (this.undoButton) this.undoButton.disabled = this.layoutUndo.length === 0;
+    if (this.redoButton) this.redoButton.disabled = this.layoutRedo.length === 0;
+    const scope = this.currentArrangeScope();
+    if (this.arrangeButton) {
+      this.arrangeButton.disabled = scope.kind === "disabled";
+      this.arrangeButton.title = scope.kind === "disabled"
+        ? scope.reason === "cross-project"
+          ? "跨项目选择不能自动整理"
+          : "请先选择一个项目或同一项目内的阶段"
+        : scope.kind === "project"
+          ? "仅整理当前项目"
+          : "仅整理当前项目内选中的阶段";
+    }
+    if (this.saveLayoutButton) {
+      this.saveLayoutButton.disabled = !this.layoutDirty || this.layoutSavePending;
+      this.saveLayoutButton.textContent = this.layoutSavePending ? "正在保存…" : "保存当前布局";
+    }
   }
 
   private measure(): { width: number; height: number } {
@@ -2889,4 +3194,11 @@ function physicalEdgesFromSnapshot(
       fromCycleId,
       toCycleId: relation.toCycleId,
     })));
+}
+
+function cloneLayoutSnapshot(snapshot: LineageLayoutSnapshot): LineageLayoutSnapshot {
+  return Object.fromEntries(Object.entries(snapshot).map(([entityId, point]) => [
+    entityId,
+    { ...point },
+  ]));
 }

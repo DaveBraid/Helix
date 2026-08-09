@@ -2865,6 +2865,7 @@ export class ProjectWorkspaceService {
   async moveCanvasNodes(
     moves: ProjectWorkspaceNodeMove[],
     expectedCanvasRevisionHash: string,
+    options: { recordHistory?: boolean } = {},
   ): Promise<ProjectWorkspaceSnapshot> {
     const generation = this.beginOperation();
     if (moves.length === 0) return this.snapshot();
@@ -2902,10 +2903,16 @@ export class ProjectWorkspaceService {
       node.y = Math.round(move.y);
     }
     this.assertActive(generation);
-    await this.writeCanvas(canvas, generation, {
-      label: moves.length > 1 ? `移动 ${moves.length} 个阶段` : "移动阶段",
-      markdownTransitions: [],
-    });
+    await this.writeCanvas(
+      canvas,
+      generation,
+      options.recordHistory === false
+        ? undefined
+        : {
+            label: moves.length > 1 ? `移动 ${moves.length} 个阶段` : "移动阶段",
+            markdownTransitions: [],
+          },
+    );
     return this.snapshot();
   }
 
@@ -3202,6 +3209,114 @@ export class ProjectWorkspaceService {
       }],
     });
     return this.snapshot();
+  }
+
+  async deleteProject(projectId: string): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const snapshot = await this.ensureCanvas();
+    const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("找不到需要删除的项目");
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision || canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在项目删除前已经变化，本次操作未写入");
+    }
+    const projectRevision = await this.repository.read(project.notePath);
+    if (!projectRevision) throw new Error("项目 Markdown 已不存在");
+    const projectFrontmatter = frontmatterFromContent(projectRevision.content);
+    if (
+      projectFrontmatter?.["helix-kind"] !== "helix-project" ||
+      projectFrontmatter["helix-id"] !== projectId
+    ) {
+      throw new Error("项目 Markdown 身份已变化，本次操作未写入");
+    }
+    const stageRevisions: VaultRevision[] = [];
+    for (const stage of project.cycles) {
+      const revision = await this.repository.read(stage.notePath);
+      const frontmatter = revision ? frontmatterFromContent(revision.content) : null;
+      if (
+        !revision ||
+        (frontmatter?.["helix-kind"] !== "helix-stage" &&
+          frontmatter?.["helix-kind"] !== "helix-cycle") ||
+        frontmatter["helix-id"] !== stage.id ||
+        frontmatter["helix-project-id"] !== projectId
+      ) {
+        throw new Error(`阶段 Markdown 身份已变化，本次操作未写入：${stage.notePath}`);
+      }
+      stageRevisions.push(revision);
+    }
+    const deletedStageIds = new Set(project.cycles.map((stage) => stage.id));
+    const removedNodeIds = new Set(canvas.document.nodes.flatMap((node) => {
+      const stageId = managedStageId(node);
+      const isProjectNode = node.helixManaged === true &&
+        node.helixNodeKind === "project" && node.helixProjectId === projectId;
+      return isProjectNode || (stageId && deletedStageIds.has(stageId)) ? [node.id] : [];
+    }));
+    const unmanagedAttachments = canvas.document.edges.filter((edge) =>
+      (removedNodeIds.has(edge.fromNode) || removedNodeIds.has(edge.toNode)) &&
+      (edge.helixManaged !== true || isLegacyDerivesEdge(edge)));
+    if (unmanagedAttachments.length > 0) {
+      throw new Error(
+        `该项目还有 ${unmanagedAttachments.length} 条原生 Canvas 连线未交由 Helix 管理，` +
+        "为避免删除用户关系，本次操作已取消",
+      );
+    }
+    const physical = physicalManagedEdges(canvas.document).filter((edge) =>
+      !deletedStageIds.has(edge.fromCycleId) && !deletedStageIds.has(edge.toCycleId));
+    const remainingProjects = snapshot.projects.filter((candidate) => candidate.id !== projectId);
+    const remainingStageIds = remainingProjects.flatMap((candidate) =>
+      candidate.cycles.map((stage) => stage.id));
+    const normalized = normalizeProjectGraph(remainingStageIds, physical);
+    canvas.document.nodes = canvas.document.nodes.filter((node) => !removedNodeIds.has(node.id));
+    canvas.document.edges = canvas.document.edges.filter((edge) =>
+      !removedNodeIds.has(edge.fromNode) && !removedNodeIds.has(edge.toNode));
+    applyNormalizedManagedEdges(canvas.document, normalized.edges);
+    const sequenceLedger = validatedStageSequenceLedger(canvas.document);
+    delete sequenceLedger[projectId];
+    canvas.document.helixStageSequences = sequenceLedger;
+    const codeLedger = validatedStageCodeLedger(canvas.document);
+    delete codeLedger[projectId];
+    canvas.document.helixStageCodes = codeLedger;
+    if (canvas.document.helixCompletedCollapse) {
+      canvas.document.helixCompletedCollapse.projectIds =
+        canvas.document.helixCompletedCollapse.projectIds.filter((id) => id !== projectId);
+    }
+    const nextSnapshot: ProjectWorkspaceSnapshot = {
+      ...snapshot,
+      projects: remainingProjects,
+      canvasNodes: snapshot.canvasNodes.filter((node) => node.projectId !== projectId),
+    };
+    applyManagedLayout(canvas.document, nextSnapshot, physical);
+    const changedFocusTargets = remainingStageIds.filter((targetId) =>
+      relationSourceSignature(snapshot.relations, targetId) !==
+        relationSourceSignature(normalized.relations, targetId));
+    const focusUpdates = await this.focusMarkdownUpdates(
+      snapshot,
+      normalized.relations,
+      changedFocusTargets,
+    );
+    this.assertActive(generation);
+    return this.applyAtomicWorkspaceChange({
+      label: `删除项目：${project.title}`,
+      canvasBeforeHash: canvas.revision.hash,
+      canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+      markdownUpdates: focusUpdates,
+      markdownDeletions: [
+        {
+          path: projectRevision.path,
+          kind: "project",
+          entityId: projectId,
+          projectId,
+          beforeHash: projectRevision.hash,
+        },
+        ...stageRevisions.map((revision, index) => ({
+          path: revision.path,
+          kind: "stage" as const,
+          entityId: project.cycles[index]!.id,
+          projectId,
+          beforeHash: revision.hash,
+        })),
+      ],
+    });
   }
 
   private stageDeletionJournalPath(): string {

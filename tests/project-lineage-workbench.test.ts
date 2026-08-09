@@ -17,6 +17,7 @@ import {
   lineageCenteredPointPlan,
   lineageConnectionTargetIds,
   lineageGraphBox,
+  lineageArrangeScope,
   lineageGraphEdgeAnchors,
   lineageMovePayload,
   lineageProjectContainerBox,
@@ -32,6 +33,46 @@ import {
   lineageZoomLabel,
   projectedLineageRelations,
 } from "../src/ui/project-lineage-workbench";
+
+describe("Project Lineage arrange scope", () => {
+  const nodes = [
+    { ...node("project-a", "project", 0, 0), projectId: "project-a" },
+    { ...node("a-1", "cycle", 0, 240), projectId: "project-a" },
+    { ...node("a-2", "cycle", 400, 240), projectId: "project-a" },
+    { ...node("project-b", "project", 0, 700), projectId: "project-b" },
+    { ...node("b-1", "cycle", 0, 940), projectId: "project-b" },
+  ];
+
+  it("disables arrange without a selection", () => {
+    expect(lineageArrangeScope([], null, nodes)).toEqual({
+      kind: "disabled",
+      reason: "empty",
+    });
+  });
+
+  it("arranges every stage in the selected project", () => {
+    expect(lineageArrangeScope([], "project-a", nodes)).toEqual({
+      kind: "project",
+      projectId: "project-a",
+      entityIds: ["a-1", "a-2"],
+    });
+  });
+
+  it("limits arrange to selected cards from one project", () => {
+    expect(lineageArrangeScope(["a-2", "a-1"], "project-a", nodes)).toEqual({
+      kind: "selection",
+      projectId: "project-a",
+      entityIds: ["a-2", "a-1"],
+    });
+  });
+
+  it("disables arrange when selected cards span projects", () => {
+    expect(lineageArrangeScope(["a-1", "b-1"], null, nodes)).toEqual({
+      kind: "disabled",
+      reason: "cross-project",
+    });
+  });
+});
 
 describe("Project Lineage card-plus intent", () => {
   const nodes = [

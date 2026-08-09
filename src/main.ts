@@ -286,6 +286,8 @@ export default class HelixPlugin extends Plugin {
         createCycle: (projectId, sourceCycleIds, onCreated) =>
           this.showCreateCycleModal(projectId, sourceCycleIds, onCreated),
         deleteCycle: (cycleId, onDeleted) => this.showDeleteCycleModal(cycleId, onDeleted),
+        deleteProject: (projectId, onDeleted) =>
+          this.showDeleteProjectModal(projectId, onDeleted),
         manageRelation: (relationId, onChanged) =>
           this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
@@ -1184,6 +1186,27 @@ export default class HelixPlugin extends Plugin {
       });
   }
 
+  private showDeleteProjectModal(projectId: string, onDeleted?: () => void): void {
+    if (this.recoveryMode) {
+      new Notice("Helix 当前处于只读恢复模式，处理恢复问题前不能删除项目", 8_000);
+      return;
+    }
+    void this.withProjectWorkspaceRead(() => this.projectWorkspace.snapshot())
+      .then((snapshot) => {
+        const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+        if (!project) throw new Error("找不到需要删除的项目");
+        new DeleteProjectModal(this.app, project, async () => {
+          this.assertWritable();
+          await this.withWritableProjectMutation(() =>
+            this.projectWorkspace.deleteProject(projectId));
+          onDeleted?.();
+          new Notice(`项目“${project.title}”及其 ${project.cycles.length} 个阶段已移入废纸篓`);
+        }).open();
+      })
+      .catch((error) =>
+        new Notice(error instanceof Error ? error.message : String(error), 8_000));
+  }
+
   private showManageRelationModal(
     relationId: string,
     onChanged?: (focusEntityId: string) => void,
@@ -1690,6 +1713,60 @@ class ProjectPromptModal extends Modal {
         .then(() => this.close())
         .catch((error) => {
           confirm.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class DeleteProjectModal extends Modal {
+  private static readonly CONFIRMATION = "我确认删除该项目。";
+  private confirmation = "";
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly project: ProjectWorkspaceProject,
+    private readonly submit: () => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle(`删除项目：${this.project.title}`);
+    this.contentEl.createEl("p", {
+      cls: "helix-modal-note",
+      text: `项目笔记、${this.project.cycles.length} 个阶段笔记、项目容器及其 Helix 关系将一并移入 Obsidian 废纸篓。此操作不会删除任何滴答清单数据。`,
+    });
+    this.contentEl.createEl("p", {
+      text: `请输入“${DeleteProjectModal.CONFIRMATION}”以继续。`,
+    });
+    let remove: HTMLButtonElement;
+    new Setting(this.contentEl)
+      .setName("严格确认")
+      .addText((text) => text
+        .setPlaceholder(DeleteProjectModal.CONFIRMATION)
+        .onChange((value) => {
+          this.confirmation = value;
+          if (remove) remove.disabled = value !== DeleteProjectModal.CONFIRMATION;
+        }));
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    remove = actions.createEl("button", {
+      cls: "mod-warning",
+      text: "删除项目",
+    });
+    remove.disabled = true;
+    remove.addEventListener("click", () => {
+      if (this.confirmation !== DeleteProjectModal.CONFIRMATION) return;
+      remove.disabled = true;
+      void this.submit()
+        .then(() => this.close())
+        .catch((error) => {
+          remove.disabled = false;
           new Notice(error instanceof Error ? error.message : String(error), 8_000);
         });
     });

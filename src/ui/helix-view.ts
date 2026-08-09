@@ -129,6 +129,7 @@ import {
   LINEAGE_ALL_PROJECTS_FOCUS_ID,
   ProjectLineageWorkbench,
   type LineageCamera,
+  type LineageLayoutDraft,
   type ProjectLineageViewMode,
 } from "./project-lineage-workbench";
 import {
@@ -219,6 +220,7 @@ export class HelixView extends ItemView {
   private taskReferenceSnapshot: TaskReferenceSnapshot | null = null;
   private localProjectTaskSnapshot: LocalProjectTaskSnapshot | null = null;
   private lineageCamera: LineageCamera | undefined;
+  private lineageLayoutDraft: LineageLayoutDraft | undefined;
   private lineageFocusRequest: { entityId: string; generation: number } | null = null;
   private pendingKanbanArrivalCycleId: string | null = null;
   private viewGeneration = 0;
@@ -256,6 +258,7 @@ export class HelixView extends ItemView {
         onCreated?: (cycleId: string) => void,
       ) => void;
       deleteCycle: (cycleId: string, onDeleted?: (focusEntityId: string) => void) => void;
+      deleteProject: (projectId: string, onDeleted?: () => void) => void;
       manageRelation: (
         relationId: string,
         onChanged?: (focusEntityId: string) => void,
@@ -389,6 +392,7 @@ export class HelixView extends ItemView {
     if (token !== this.renderToken || this.closed) return;
     if (this.section === "projects") {
       this.lineageCamera = this.projectWorkbench?.camera() ?? this.lineageCamera;
+      if (this.projectWorkbench) this.lineageLayoutDraft = this.projectWorkbench.layoutDraft();
     }
     this.projectWorkbench?.destroy();
     this.projectWorkbench = null;
@@ -2495,6 +2499,7 @@ export class HelixView extends ItemView {
       workspace,
       lifecycleGeneration,
     );
+    content.addClass("is-project-workbench-content");
     const workbenchHost = content.createDiv({ cls: "helix-project-workbench-host" });
     const focusEntityId = this.currentLineageFocusId();
     const arrivalCycleId = this.pendingKanbanArrivalCycleId ?? undefined;
@@ -2505,6 +2510,7 @@ export class HelixView extends ItemView {
       mode: this.projectLineageMode,
       arrivalCycleId,
       initialCamera: this.lineageCamera,
+      initialLayoutDraft: this.lineageLayoutDraft,
       onFocusApplied: (entityId) =>
         this.acknowledgeLineageFocus(entityId, lifecycleGeneration),
       onModeChange: (mode) => {
@@ -2533,16 +2539,26 @@ export class HelixView extends ItemView {
         (nextFocusEntityId) =>
           this.requestLineageFocus(nextFocusEntityId, lifecycleGeneration),
       ),
+      onDeleteProject: (projectId) => this.actions.deleteProject(projectId, () => {
+        this.lineageLayoutDraft = undefined;
+        this.selectedProjectId = workspace.projects.find((project) => project.id !== projectId)?.id ?? null;
+        void this.render();
+      }),
       onOpenNote: (path) => {
         void this.actions.openProjectFile(path);
       },
-      onMoveNodes: async (moves) => {
+      onSaveLayout: async (moves) => {
         if (!workspace.canvasRevisionHash) throw new Error("项目 Canvas 不存在");
         await this.actions.mutateProjectWorkspace(() =>
           this.actions.projectWorkspace.moveCanvasNodes(
             moves,
             workspace.canvasRevisionHash!,
+            { recordHistory: false },
           ));
+        this.projectWorkbench?.markLayoutSaved();
+        this.lineageLayoutDraft = undefined;
+        new Notice("当前布局已保存");
+        await this.render();
       },
       onManageRelation: (relationId) => this.actions.manageRelation(
         relationId,
@@ -2609,28 +2625,6 @@ export class HelixView extends ItemView {
       onExpandCompletedProjects: (projectIds) => {
         void this.actions.mutateProjectWorkspace(() =>
           this.actions.projectWorkspace.setCompletedProjectsCollapsed(projectIds, false))
-          .then(() => this.render())
-          .catch((error) =>
-            new Notice(error instanceof Error ? error.message : String(error), 8_000));
-      },
-      onAutoLayout: () => {
-        void this.actions.mutateProjectWorkspace(() =>
-          this.actions.projectWorkspace.autoLayoutCanvas())
-          .then(() => this.render())
-          .catch((error) =>
-            new Notice(error instanceof Error ? error.message : String(error), 8_000));
-      },
-      history: this.actions.projectWorkspace.historyState(),
-      onUndo: () => {
-        void this.actions.mutateProjectWorkspace(() =>
-          this.actions.projectWorkspace.undoLastWorkspaceChange())
-          .then(() => this.render())
-          .catch((error) =>
-            new Notice(error instanceof Error ? error.message : String(error), 8_000));
-      },
-      onRedo: () => {
-        void this.actions.mutateProjectWorkspace(() =>
-          this.actions.projectWorkspace.redoLastWorkspaceChange())
           .then(() => this.render())
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));

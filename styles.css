@@ -4285,12 +4285,33 @@
    MIT-licensed andrewliang01/obsidian-research-card-manager relation canvas. */
 .helix-lineage-shell {
   display: flex;
-  height: calc(100vh - 88px);
+  height: 100%;
   min-height: 0;
   flex-direction: column;
   overflow: hidden;
   color: var(--text-normal);
   background: var(--background-primary);
+}
+
+.helix-content.is-project-workbench-content {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.helix-project-workbench-host {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.helix-content.is-project-workbench-content > .helix-native-relation-panel,
+.helix-content.is-project-workbench-content > .helix-project-linked-tasks {
+  flex: 0 0 auto;
+  margin: 10px 18px 0;
+  overflow: hidden;
 }
 
 .helix-lineage-toolbar {
@@ -4511,7 +4532,7 @@
     transparent
   );
   box-shadow: 0 2px 10px color-mix(in srgb, var(--helix-project-color, #5870a8) 7%, transparent);
-  pointer-events: none;
+  pointer-events: auto;
   transition: border-color .12s, opacity .12s, box-shadow .12s;
 }
 
@@ -4561,6 +4582,8 @@
 }
 
 .helix-lineage-project-container-title:hover { color: var(--link-color); }
+.helix-lineage-project-container-title { cursor: grab; }
+.helix-lineage-project-container-title:active { cursor: grabbing; }
 .helix-lineage-project-container-header.is-other-project { opacity: .55; }
 .helix-lineage-project-container-header.is-operation-focus {
   animation: helix-lineage-header-focus 1.55s ease-out;
@@ -4580,6 +4603,26 @@
   color: var(--text-muted);
   font-size: 9px;
 }
+
+.helix-lineage-project-container-delete {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+}
+
+.helix-lineage-project-container-delete:hover {
+  background: color-mix(in srgb, var(--helix-danger-soft) 70%, transparent);
+  color: var(--helix-danger-ink);
+}
+
+.helix-lineage-project-container-delete svg { width: 13px; height: 13px; }
 
 .helix-lineage-project-container-status {
   padding: 2px 6px;

@@ -1038,6 +1038,23 @@ describe("ProjectWorkspaceService", () => {
     expect(service.historyState()).toMatchObject({ undoCount: 0, redoCount: 0 });
   });
 
+  it("saves one current layout without retaining workspace undo history", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const revision = (await service.snapshot()).canvasRevisionHash!;
+
+    await service.moveCanvasNodes([
+      { nodeId: "cycle-node", x: 240, y: 360 },
+    ], revision, { recordHistory: false });
+
+    expect(repo.json(CANVAS).nodes).toContainEqual(expect.objectContaining({
+      id: "cycle-node",
+      x: 240,
+      y: 360,
+    }));
+    expect(service.historyState()).toMatchObject({ undoCount: 0, redoCount: 0 });
+  });
+
   it("preserves a non-managed Canvas edge by refusing stage deletion", async () => {
     const repo = linearRepository();
     const canvas = repo.json(CANVAS);
@@ -2544,6 +2561,50 @@ describe("ProjectWorkspaceService", () => {
       .rejects.toThrow(/Canvas 已回滚/);
     expect(await rollbackRepo.read("Helix/Projects/Alpha/Cycle-02.md")).not.toBeNull();
     expect(rollbackRepo.json(CANVAS)).toEqual(expectedCanvasAfterRepair);
+  });
+
+  it("deletes a complete project and all of its managed stages atomically", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+
+    await service.deleteProject("project-1");
+
+    expect(await repo.read("Helix/Projects/Alpha/Project.md")).toBeNull();
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-01.md")).toBeNull();
+    expect(repo.json(CANVAS).nodes).toEqual([]);
+    expect(repo.json(CANVAS).edges).toEqual([]);
+    await expect(service.snapshot()).resolves.toMatchObject({ projects: [] });
+  });
+
+  it("refuses project deletion when an unmanaged edge is attached", async () => {
+    const repo = baseRepository();
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push({
+      id: "user-note",
+      type: "text",
+      text: "用户节点",
+      x: 500,
+      y: 300,
+      width: 200,
+      height: 120,
+    });
+    canvas.edges.push({
+      id: "user-edge",
+      fromNode: "cycle-node",
+      toNode: "user-note",
+      label: "用户关系",
+    });
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    await service.ensureCanvas();
+    const beforeCanvas = (await repo.read(CANVAS))!.content;
+
+    await expect(service.deleteProject("project-1"))
+      .rejects.toThrow(/未交由 Helix 管理/);
+
+    expect((await repo.read(CANVAS))!.content).toBe(beforeCanvas);
+    expect(await repo.read("Helix/Projects/Alpha/Project.md")).not.toBeNull();
+    expect(await repo.read("Helix/Projects/Alpha/Cycle-01.md")).not.toBeNull();
   });
 
   it("bridges predecessors to successors when deleting a middle stage", async () => {

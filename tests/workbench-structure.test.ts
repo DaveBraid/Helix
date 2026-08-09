@@ -190,6 +190,26 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-sidebar-lists \{[\s\S]*overflow: hidden !important;/);
   });
 
+  it("keeps project layout editing local until one explicit Canvas save", () => {
+    const lineage = readFileSync(
+      resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"),
+      "utf8",
+    );
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(lineage).toMatch(/if \(this\.options\.mode !== "graph"\) return;[\s\S]*text: "整理"[\s\S]*text: "保存当前布局"[\s\S]*text: "新建项目"/);
+    expect(lineage).not.toContain('text: "整理全部"');
+    expect(lineage).toMatch(/lineageArrangeScope[\s\S]*reason: "cross-project"/);
+    expect(lineage).toMatch(/lineageArrangeScope[\s\S]*reason: "empty"/);
+    expect(lineage).toMatch(/container\.addEventListener\("dblclick"[\s\S]*onSelectProject\(project\.id\)/);
+    expect(lineage).toMatch(/bindProjectTitleDrag[\s\S]*node\.projectId === project\.id[\s\S]*recordLayoutChange/);
+    expect(view).toMatch(/moveCanvasNodes\([\s\S]*recordHistory: false/);
+    expect(main).toContain('private static readonly CONFIRMATION = "我确认删除该项目。";');
+    expect(main).toContain("this.projectWorkspace.deleteProject(projectId)");
+    expect(main).toContain("class DeleteProjectModal extends Modal");
+    expect(css).toMatch(/\.helix-content\.is-project-workbench-content \{[\s\S]*overflow: hidden;/);
+    expect(css).toMatch(/\.helix-lineage-viewport \{[\s\S]*overflow: auto;/);
+  });
+
   it("routes Canvas repair through the dedicated write-gated action", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(view).toMatch(/this\.actions\.repairProjectCanvas\(\)/);

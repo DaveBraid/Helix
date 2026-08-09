@@ -347,6 +347,15 @@ export class HelixView extends ItemView {
       this.renderPendingWhileInactive = false;
       void this.render();
     }));
+    // 工作区恢复时 active-leaf-change 可能早于 ItemView.onOpen；下一帧补一次
+    // 当前叶子检查，避免活动的 Helix 标签永远停在空白页。
+    const ownerWindow = this.containerEl.ownerDocument.defaultView ?? window;
+    ownerWindow.requestAnimationFrame(() => {
+      if (this.closed || this.app.workspace.activeLeaf !== this.leaf ||
+          !this.renderPendingWhileInactive) return;
+      this.renderPendingWhileInactive = false;
+      void this.render();
+    });
   }
 
   async onClose(): Promise<void> {

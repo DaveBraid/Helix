@@ -86,6 +86,9 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(
       /active-leaf-change[\s\S]*leaf !== this\.leaf[\s\S]*renderPendingWhileInactive[\s\S]*this\.render\(\)/,
     );
+    expect(view).toMatch(
+      /requestAnimationFrame[\s\S]*activeLeaf !== this\.leaf[\s\S]*renderPendingWhileInactive[\s\S]*this\.render\(\)/,
+    );
   });
 
   it("shows task references on projects without enabling project projection", () => {

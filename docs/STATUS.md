@@ -1,7 +1,7 @@
 # 当前开发状态
 
 最后更新：2026-08-10
-当前基线提交：`ac3e577 feat: edit project statuses in place`
+当前基线提交：`257ca05 fix: keep inline status menus open`
 工作树状态：工作树干净。
 当前阶段：Canvas 身份提示、项目边框与任务日期完成实机收口；项目滴答投影保持关闭。
 
@@ -20,7 +20,7 @@
 - 子任务支持完成、标题、日期、时间段、优先级、添加、删除和拖拽排序；保存使用同一 Stage revision/CAS，排序和元数据直接写回原 Markdown 标记，不建立第二份真值。
 - 阶段卡片主体保持中性；同项目只用项目色顶部细条、边框和轻阴影；五状态只用图标、文字和语义色。
 - 项目容器四边使用统一 1 px 边框；阶段卡片使用完整 4 px 项目色顶边，不再继承旧左侧色条定位。
-- 项目与阶段状态使用原位 5 项选择器，直接走 CAS 与恢复门禁，不再弹出模态。
+- 项目与阶段状态使用原位 5 项 Helix 菜单：按钮保持卡片原外观，菜单跨 Canvas 指针事件持续打开，选择后直接走 CAS 与恢复门禁；点击外部或 Escape 关闭。
 - 阶段卡片悬停、键盘聚焦或选中时，以同尺寸操作栏替换关系摘要，提供新增、连接、折叠、删除；现有关系拖拽、连线和画布相机逻辑保留。
 - 聚焦桥接以 Canvas 入边为关系源，支持继承、分支、合并、反向编辑及同窗竞争冲突。
 - 冲突中心按“需要你选择／等待远端核对／仅需检查”分组；文本使用真实行号 IDE diff，标量属性按需展开。
@@ -29,9 +29,8 @@
 
 ## 本轮改动
 
-- `helix-view.ts`、`styles.css`：空时间段占位完整显示，隐藏重复原生图标但保留平台选择器入口。
-- `project-lineage-workbench.ts`、`helix-view.ts`：项目／阶段状态改为原位选择并直接提交。
-- `workbench-structure.test.ts`、`design-qa.md`：锁定原位状态与时间布局合同，保存并排及实机证据。
+- `project-lineage-workbench.ts`、`styles.css`：原生 `select` 改为文档层 Helix 状态菜单；恢复阶段状态原来的右上角图标文字按钮，支持外部点击、Escape 和键盘移动。
+- `workbench-structure.test.ts`、`design-qa.md`：锁定菜单生命周期、原卡片布局及实机并排证据。
 
 ## 相关约束
 
@@ -45,8 +44,8 @@
 
 - 完整门禁：69 个测试文件、954 项测试，以及 `typecheck`、`build`、`release:check`、`git diff --check` 全部通过。
 - Obsidian CLI：重载后 `recoveryMode=false`、`recoveryIssues=[]`、工作区身份错误为空，所有窗口可见身份警告为 0；月历渲染 42 日并实测选择 `08月15日` 后自动收起，控制台无错误。
-- Obsidian CLI：空时间段两组输入均在属性单元内完整显示；阶段状态 `idea → paused → idea` 往返写入并恢复成功，未打开状态模态，控制台无错误。
-- 视觉 QA：项目容器／卡片源图与实现图完成同高并排比较，任务月历另有实机截图；`design-qa.md` 结果为 `passed`。
+- Obsidian CLI：状态菜单跨独立事件持续打开，五项齐全、无模态；阶段状态 `idea → paused → idea` 往返写入并恢复，控制台无错误。
+- 视觉 QA：原卡片与菜单打开态完成同屏并排，右上角状态位置和卡片尺寸保持；`design-qa.md` 结果为 `passed`。
 - 本轮未访问滴答远端；测试 Vault 滴答缓存仍为空，`autoSync=false`，API 口令保留。
 
 ## 未关闭问题

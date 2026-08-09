@@ -5119,6 +5119,7 @@
   position: fixed;
   z-index: 10000;
   display: grid;
+  gap: 4px;
   width: 148px;
   padding: 6px;
   border: 1px solid var(--background-modifier-border);

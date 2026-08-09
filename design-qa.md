@@ -12,6 +12,9 @@
 - 原位状态菜单实现图：`/private/tmp/helix-status-popover-fixed.png`
 - 原位状态聚焦图：`/private/tmp/helix-status-popover-focused.png`
 - 原位状态并排图：`/private/tmp/helix-status-popover-comparison.png`（左为原卡片外观，右为菜单打开状态）
+- 状态间距源图：`/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-47c13c4c-aa6e-4a55-ac91-2cab36278b8c.png`
+- 状态间距实现图：`/private/tmp/helix-status-popover-spaced.png`
+- 状态间距并排图：`/private/tmp/helix-status-popover-spacing-comparison.png`（左为选项相连，右为 4 px 等距）
 - viewport：Obsidian 1.13.4 桌面端；项目实现 2790 × 1846 px，日期实现同一窗口；源图 914 × 586 px。
 - normalization：项目实现裁出 965 × 594 px 容器区域并等比缩放到 412 px 高；源图等比缩放到同高后左右并排，未拉伸。
 - state：深色主题；项目页显示单阶段项目；任务详情月历打开，42 个日期单元完整呈现。
@@ -31,6 +34,7 @@
 4. P2：已经恢复的数据仍可能留下无限时长的旧身份警告 Notice。已在启动时跨 Obsidian 窗口清理不再对应当前 `recoveryIssues` 的提示，并统一跟踪、卸载时关闭新增长提示；重载后恢复模式关闭、问题数组为空、可见身份警告为 0。
 5. P1：两个原生时间输入的 `--:--` 被平台时钟图标裁断；单纯放宽会越过标签属性。已隐藏重复的原生指示器、保留点击唤起 `showPicker()`，将两个输入收紧到 70 px；并排图显示两组占位完整且不重叠。
 6. P2：项目与阶段状态原先点击后打开独立模态。初版原位实现使用原生 `select`，在缩放、拖拽 Canvas 中点击后会立即收起，且包装层移动了阶段状态位置。已恢复原来的右上角“图标＋状态”按钮，并改为挂载在文档层的 Helix 菜单；并排图确认卡片外观和对齐未变。菜单跨独立 CLI 事件仍保持打开，实测 `idea → paused → idea` 写入及恢复成功，点击外部／Escape 才关闭，未出现状态模态或控制台错误。
+7. P2：菜单选项原先无垂直间隔，连续背景使各状态粘连。已为菜单网格增加统一 4 px 间距；实机测得四处间隔均为 4 px，并排图显示边界清晰且菜单仍保持紧凑。
 
 ## 验收面
 

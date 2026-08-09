@@ -141,7 +141,7 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-lineage-card::before \{[\s\S]*inset: -1px -1px auto;[\s\S]*height: 4px/);
     expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
     expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
-    expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000/);
+    expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000;[\s\S]*gap: 4px/);
   });
 
   it("revalidates stale focus-bridge recovery locks before freezing startup", () => {

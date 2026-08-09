@@ -90,18 +90,19 @@ import type {
   HelixRuntimeState,
 } from "../services/helix-service";
 import { HelixService, isProjectionQueueOperation } from "../services/helix-service";
-import type {
-  ProjectConnectionPlan,
-  ProjectWorkspaceCycleStatusUpdatePlan,
-  ProjectWorkspaceCycleStatus,
-  ProjectWorkspaceFocusConflict,
-  ProjectWorkspaceNativeRelationAdoptionPlan,
-  ProjectWorkspaceNativeRelationCandidate,
-  ProjectWorkspaceProject,
-  ProjectWorkspaceProjectStatusUpdatePlan,
-  ProjectWorkspaceProjectStatus,
-  ProjectWorkspaceService,
-  ProjectWorkspaceSnapshot,
+import {
+  canSilentlyRepairProjectCanvas,
+  type ProjectConnectionPlan,
+  type ProjectWorkspaceCycleStatusUpdatePlan,
+  type ProjectWorkspaceCycleStatus,
+  type ProjectWorkspaceFocusConflict,
+  type ProjectWorkspaceNativeRelationAdoptionPlan,
+  type ProjectWorkspaceNativeRelationCandidate,
+  type ProjectWorkspaceProject,
+  type ProjectWorkspaceProjectStatusUpdatePlan,
+  type ProjectWorkspaceProjectStatus,
+  type ProjectWorkspaceService,
+  type ProjectWorkspaceSnapshot,
 } from "../services/project-workspace";
 import {
   TaskReferenceConflictError,
@@ -2151,7 +2152,7 @@ export class HelixView extends ItemView {
       return;
     }
 
-    if (workspace.canvasRepairRequired) {
+    if (workspace.canvasRepairRequired && !canSilentlyRepairProjectCanvas(workspace)) {
       const repair = content.createDiv({ cls: "helix-card helix-migration-card" });
       repair.createEl("strong", { text: "Canvas 需要修复" });
       const reasons = repair.createEl("ul");

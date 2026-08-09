@@ -26,7 +26,10 @@ import {
 import { aggregateAnalytics } from "./domain/analytics";
 import { patchManagedFrontmatter } from "./storage/frontmatter";
 import { HelixService } from "./services/helix-service";
-import { ProjectWorkspaceService } from "./services/project-workspace";
+import {
+  canSilentlyRepairProjectCanvas,
+  ProjectWorkspaceService,
+} from "./services/project-workspace";
 import { TaskReferenceService } from "./services/task-references";
 import { SerializedRunner } from "./services/serialized-runner";
 import { TaskMatrixRuleUpdater } from "./services/task-view-settings";
@@ -484,6 +487,8 @@ export default class HelixPlugin extends Plugin {
     void this.refreshActiveHelixStatusControl();
 
     this.refreshAutoSync(this.settings.autoSync);
+    // 首次加载也从权威 Markdown 复核派生 Canvas 缓存；安全项静默收口。
+    this.scheduleProjectRefresh();
     // 重启后从 Markdown/Canvas 权威源重扫；队列与写门仍由既有同步管线负责。
     this.projectAutoSync.request();
   }
@@ -1252,6 +1257,7 @@ export default class HelixPlugin extends Plugin {
         if (!this.recoveryMode && markdownPaths.length > 0) {
           await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
         }
+        if (!this.recoveryMode) await this.repairDerivedProjectCanvasCache();
         await this.service.refreshPersistedEvents();
         this.projectAutoSync.request();
       }).catch(async (error) => {
@@ -1263,6 +1269,18 @@ export default class HelixPlugin extends Plugin {
         new Notice(message, recoveryIssue ? 0 : 8_000);
       });
     }, 200);
+  }
+
+  /** 已持有 projectMutationRunner；只对可重建派生字段开启自写事件批次。 */
+  private async repairDerivedProjectCanvasCache(): Promise<void> {
+    const snapshot = await this.projectWorkspace.loadStableWorkspace();
+    if (!canSilentlyRepairProjectCanvas(snapshot)) return;
+    this.projectRefreshBatch.begin();
+    try {
+      await this.projectWorkspace.repairDerivedCanvasCache(snapshot);
+    } finally {
+      this.projectRefreshBatch.end();
+    }
   }
 
   private scheduleProjectIdentityProbe(path: string): void {

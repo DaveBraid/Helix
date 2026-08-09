@@ -192,6 +192,20 @@ export interface ProjectWorkspaceSnapshot {
   nativeRelationCandidates: ProjectWorkspaceNativeRelationCandidate[];
 }
 
+const SILENT_CANVAS_REPAIR_REASONS = new Set([
+  "Helix 管理节点摘要需要更新",
+  "阶段编号高水位需要补齐",
+]);
+
+/** 仅派生摘要与内部编号账本可静默更新；节点、边和迁移始终保留人工确认。 */
+export function canSilentlyRepairProjectCanvas(
+  snapshot: ProjectWorkspaceSnapshot,
+): boolean {
+  const reasons = snapshot.canvasRepairReasons ?? [];
+  return snapshot.canvasRepairRequired === true && reasons.length > 0 &&
+    reasons.every((reason) => SILENT_CANVAS_REPAIR_REASONS.has(reason));
+}
+
 export interface ProjectWorkspaceNativeRelationCandidate {
   edgeId: string;
   canvasRevisionHash: string;
@@ -2089,6 +2103,13 @@ export class ProjectWorkspaceService {
 
   async ensureCanvas(): Promise<ProjectWorkspaceSnapshot> {
     return this.ensureCanvasFromSnapshot(await this.readStableSnapshot(), { allowWrite: true });
+  }
+
+  async repairDerivedCanvasCache(
+    snapshot: ProjectWorkspaceSnapshot,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    if (!canSilentlyRepairProjectCanvas(snapshot)) return snapshot;
+    return this.ensureCanvasFromSnapshot(snapshot, { allowWrite: true });
   }
 
   private async ensureCanvasFromSnapshot(

@@ -140,6 +140,7 @@ describe("workbench layout and navigation structure", () => {
 
   it("keeps Canvas repair diagnostics beside the lineage workbench", () => {
     expect(view).toMatch(/Canvas 需要修复[\s\S]*const workbenchHost = content\.createDiv\(\{ cls: "helix-project-workbench-host" \}\)/);
+    expect(view).toMatch(/workspace\.canvasRepairRequired && !canSilentlyRepairProjectCanvas\(workspace\)/);
     expect(view).toMatch(/this\.projectWorkbench\.render\(workbenchHost\)/);
     expect(view).not.toMatch(/this\.projectWorkbench\.render\(content\)/);
   });

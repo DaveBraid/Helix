@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { projectTemplate, cycleTemplate } from "../src/domain/projects";
 import { stableHash } from "../src/domain/stable";
-import { ProjectWorkspaceService } from "../src/services/project-workspace";
+import {
+  canSilentlyRepairProjectCanvas,
+  ProjectWorkspaceService,
+} from "../src/services/project-workspace";
 import type { VaultRevision } from "../src/storage/vault-repository";
 
 const CANVAS = "Helix/Project Lineage.canvas";
@@ -241,6 +244,32 @@ describe("ProjectWorkspaceService", () => {
     repo.beforeCompare = undefined;
     await service.ensureCanvas();
     expect(repo.json(CANVAS).nodes[1]!.text).toContain("已完成");
+  });
+
+  it("silently repairs only derived Canvas summaries from a stable snapshot", async () => {
+    const repo = baseRepository();
+    const canvas = repo.json(CANVAS);
+    canvas.nodes[1]!.text = "[[Helix/Projects/Alpha/Cycle-01|旧摘要]]\n\n已暂停";
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const snapshot = await service.loadStableWorkspace();
+
+    expect(canSilentlyRepairProjectCanvas(snapshot)).toBe(true);
+    await service.repairDerivedCanvasCache(snapshot);
+    expect(repo.json(CANVAS).nodes[1]!.text).toContain("阶段标题 1");
+  });
+
+  it("does not silently repair missing nodes or managed relations", async () => {
+    const repo = baseRepository();
+    const canvas = repo.json(CANVAS);
+    canvas.nodes = canvas.nodes.filter((node: { id: string }) => node.id !== "project-node");
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const snapshot = await service.loadStableWorkspace();
+    repo.beforeCompare = () => { throw new Error("结构修复不得静默写入"); };
+
+    expect(canSilentlyRepairProjectCanvas(snapshot)).toBe(false);
+    await expect(service.repairDerivedCanvasCache(snapshot)).resolves.toBe(snapshot);
   });
 
   it("reports missing nodes, stale high-water and derived edges without writing on load", async () => {

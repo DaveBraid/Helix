@@ -1,9 +1,9 @@
 # 当前开发状态
 
-最后更新：2026-08-08
-当前基线提交：`fedfcea fix: isolate Helix from theme compositor artifacts`（v0.1.3 基于此提交）
+最后更新：2026-08-09
+当前基线提交：`cd79a8f fix: coalesce delayed project self-write events`
 工作树状态：工作树干净（本热修提交后）。
-当前阶段：`0.1.3` 项目自写事件批处理热修完成。
+当前阶段：`0.1.4` Canvas 派生缓存静默修复待提交。
 
 ## 本轮目标
 
@@ -20,13 +20,13 @@
 - `0.1.0` 不展示项目投影入口；统一门禁覆盖后台扫描、分栏、队列、恢复、重试和冲突写回。历史投影操作原样保留且不阻塞同对象普通任务，UI 只显示诊断。
 - Project／Stage 扫描仅解析含顶层 `helix-kind` 的 frontmatter；普通正文与聚焦块不解析、不改写，Helix 元数据仍严格校验。
 - Helix 自写 Project／Stage／Canvas 时合并同步与延迟 watcher 事件，quiet-window 后只触发一次稳定重扫；外部事件仍监听，失败也不吞事件。
-- 版本兼容基线为 Obsidian 桌面端 `1.12.2`；版本文件均已登记 `0.1.3`。
+- Canvas 摘要与阶段编号账本是可重建缓存，可在稳定 CAS 后静默修复；缺失节点、关系变化和迁移仍需人工确认。
+- 版本兼容基线为 Obsidian 桌面端 `1.12.2`；版本文件均已登记 `0.1.4`。
 
 ## 本轮改动
 
-- `src/services/project-refresh-batch.ts`、`src/main.ts`：为项目自写事务增加事件合并与稳定重扫边界。
-- `tests/project-refresh-batch.test.ts`：确定性覆盖延迟 Canvas 事件、同批单次重扫、外部事件放行及失败收口。
-- 版本文件、`README.md` 与本快照更新至 `0.1.3`。
+- `src/services/project-workspace.ts`、`src/main.ts`、`src/ui/helix-view.ts`：安全派生项后台修复并隐藏人工横幅，结构项继续人工确认。
+- 测试覆盖静默摘要更新、结构修复拒绝及真实 Obsidian 后台收口；版本文件更新至 `0.1.4`。
 
 ## 相关约束
 
@@ -37,7 +37,7 @@
 
 ## 当前验证
 
-- v0.1.3 已通过针对性测试（3 个文件、155 项）、完整测试（67 个文件、929 项）、`typecheck`、`build`、`release:check` 与 `git diff --check`；未访问正式 Vault 或滴答。
+- v0.1.4 完整测试 67 个文件、931 项及 `typecheck`、`build`、`release:check`、`git diff --check` 通过；真实测试 Vault 中过期摘要后台恢复、无横幅、Canvas 前后字节一致。
 - 最终 30 秒真实合同仍在 items 写入时超时并进入结果未知；后续复读无法唯一证明写入结果。全程零重发，安全清理完成：`cleanup clean`、`remoteArtifacts=false`。
 - 当前 `pending=0`、离线队列 `queue=0`、冲突 `conflict=0`、恢复问题 `recovery=0`，且未观察到限流。
 - 上述结果是外部真实环境阻塞，不是 items 合同通过；不得宣称生产项目投影可用。当前干净状态也不等于 2026-08-05 孤儿任务已清理。

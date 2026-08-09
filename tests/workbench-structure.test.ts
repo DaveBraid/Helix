@@ -342,4 +342,17 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/项目工作区只读[\s\S]*滴答项目同步诊断暂不可读[\s\S]*脱敏错误/);
     expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)/);
   });
+
+  it("uses a compact searchable conflict master list with one field-resolution detail pane", () => {
+    expect(view).toMatch(/renderConflictMasterDetail\([\s\S]*helix-conflict-master[\s\S]*helix-conflict-detail/);
+    expect(view).toMatch(/helix-conflict-search[\s\S]*搜索冲突标题或类型/);
+    expect(view).toContain("[\"all\", \"project\", \"task\", \"focus\"]");
+    expect(view).toContain("helix-conflict-filters");
+    expect(view).toMatch(/event\.key !== "ArrowDown"[\s\S]*event\.key !== "ArrowUp"[\s\S]*event\.key !== "Enter"/);
+    expect(view).toMatch(/item\.type === "focus"[\s\S]*renderFocusBridgeConflict[\s\S]*renderConflict\(detail/);
+    expect(view).toMatch(/helix-conflict-custom-toggle[\s\S]*aria-expanded[\s\S]*removeClass\("is-collapsed"\)/);
+    const conflictStyles = css.slice(css.indexOf(".helix-conflict-diagnostics"), css.indexOf(".helix-reconciliation-card"));
+    expect(conflictStyles).toMatch(/\.helix-conflict-center[\s\S]*grid-template-columns: minmax\(220px, 29%\) minmax\(0, 1fr\)/);
+    expect(conflictStyles).not.toContain("backdrop-filter");
+  });
 });

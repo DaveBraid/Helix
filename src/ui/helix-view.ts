@@ -3130,10 +3130,6 @@ export class HelixView extends ItemView {
 
   private async renderConflicts(content: HTMLElement, token: number): Promise<void> {
     this.renderPageTitle(content, "冲突中心");
-    content.createDiv({
-      cls: "helix-safety-note",
-      text: "竞争字段必须逐项选择；应用前会再次读取远端。",
-    });
     const [conflicts, persisted, queue, focusConflicts] = await Promise.all([
       this.store.list(),
       this.store.snapshot(),
@@ -3148,8 +3144,10 @@ export class HelixView extends ItemView {
       (projectId) => this.actions.readProjectProjection(projectId),
     );
     if (token !== this.renderToken) return;
+    const masterDetail = content.createDiv({ cls: "helix-conflict-master-detail-region" });
+    const diagnostics = content.createDiv({ cls: "helix-conflict-diagnostics" });
     const projectionIssueCount = this.renderProjectionConflicts(
-      content,
+      diagnostics,
       projectionLoad.models,
       persisted.didaProjectionState?.columnCreation,
       token,
@@ -3159,7 +3157,7 @@ export class HelixView extends ItemView {
     const cleanupNeedsAdoption = Boolean(cleanupPending &&
       cleanupPending.plan.tasks.length === 0 && cleanupPending.plan.projects.length === 0);
     if (cleanupPending || cleanupRuntime.adoptionSuggested) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "合同残留已冻结" });
       card.createEl("h3", { text: cleanupPending && !cleanupNeedsAdoption
         ? "专用测试对象等待安全清理"
@@ -3197,13 +3195,13 @@ export class HelixView extends ItemView {
       });
     }
     if (projectionLoad.diagnostic) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "项目工作区只读" });
       card.createEl("h3", { text: "滴答项目同步诊断暂不可读" });
       card.createEl("p", { text: `脱敏错误：${projectionLoad.diagnostic}` });
     }
     if (persisted.lineageConflict) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", {
         cls: "helix-chip is-danger",
         text: "旧版谱系同步已冻结",
@@ -3218,7 +3216,7 @@ export class HelixView extends ItemView {
       card.createEl("code", { text: persisted.lineageConflict.canvasPath });
     }
     for (const issue of this.state?.recoveryIssues ?? []) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "只读恢复模式" });
       card.createEl("h3", { text: "Helix 数据或事务状态需要人工修复" });
       card.createEl("p", { text: issue });
@@ -3234,7 +3232,7 @@ export class HelixView extends ItemView {
       (operation) => operation.status === "reconciliation",
     );
     for (const operation of reconciliation) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "远端结果未知" });
       card.createEl("h3", { text: String((operation.local.value as Partial<DidaTask>).title ?? operation.entityId) });
       card.createEl("p", {
@@ -3279,7 +3277,7 @@ export class HelixView extends ItemView {
     }
     const failed = queue.filter((operation) => operation.status === "failed");
     for (const operation of failed) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "写入失败" });
       card.createEl("h3", {
         text: String((operation.local.value as Partial<DidaTask>).title ?? operation.entityId),
@@ -3308,7 +3306,7 @@ export class HelixView extends ItemView {
         !conflicts.some((conflict) => conflict.id === operation.conflictId),
     );
     for (const operation of orphanedBlocked) {
-      const card = content.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
       card.createEl("span", { cls: "helix-chip is-danger", text: "队列已阻塞" });
       card.createEl("h3", { text: operation.entityId });
       card.createEl("p", { text: "关联冲突记录缺失。已停止写入；复制脱敏诊断摘要后再人工检查。" });
@@ -3320,7 +3318,6 @@ export class HelixView extends ItemView {
           .catch((error) => new Notice(error instanceof Error ? error.message : String(error)));
       });
     }
-    for (const conflict of focusConflicts) this.renderFocusBridgeConflict(content, conflict);
     if (conflictCenterIsEmpty({
       conflicts: conflicts.length,
       focusConflicts: focusConflicts.length,
@@ -3333,14 +3330,110 @@ export class HelixView extends ItemView {
       lineageConflict: Boolean(persisted.lineageConflict),
       contractCleanup: Boolean(cleanupPending || cleanupRuntime.adoptionSuggested),
     })) {
-      const empty = content.createDiv({ cls: "helix-empty-state" });
+      const empty = diagnostics.createDiv({ cls: "helix-empty-state" });
       const icon = empty.createDiv();
       setIcon(icon, "shield-check");
       empty.createEl("h3", { text: "没有待处理冲突" });
       empty.createEl("p", { text: "Helix 会在发生竞争修改时暂停单条记录，不阻塞其他对象同步。" });
       return;
     }
-    for (const conflict of conflicts) this.renderConflict(content, conflict);
+    this.renderConflictMasterDetail(masterDetail, conflicts, focusConflicts);
+  }
+
+  /** 冲突选择是逐字段操作；左栏只负责定位，右栏始终只呈现一个真实冲突。 */
+  private renderConflictMasterDetail(
+    content: HTMLElement,
+    conflicts: SyncConflict[],
+    focusConflicts: ProjectWorkspaceFocusConflict[],
+  ): void {
+    type CenterItem = {
+      id: string;
+      type: "task" | "project" | "focus";
+      title: string;
+      subtitle: string;
+      conflict: SyncConflict | ProjectWorkspaceFocusConflict;
+    };
+    const items: CenterItem[] = [
+      ...conflicts.map<CenterItem>((conflict) => ({
+        id: `sync:${conflict.id}`,
+        type: conflict.kind === "task" ? "task" : "project",
+        title: conflict.title,
+        subtitle: `${conflict.fields.length} 个字段 · 已复检 ${conflict.remoteRecheckCount} 次`,
+        conflict,
+      })),
+      ...focusConflicts.map<CenterItem>((conflict) => ({
+        id: `focus:${conflict.id}`,
+        type: "focus" as const,
+        title: `${conflict.sourceId} → ${conflict.targetId}`,
+        subtitle: conflict.reason === "simultaneous-edit" ? "来源与派生同时修改" : "需要只读诊断或手工修复",
+        conflict,
+      })),
+    ];
+    if (items.length === 0) return;
+    const shell = content.createDiv({ cls: "helix-conflict-center" });
+    const master = shell.createDiv({ cls: "helix-conflict-master" });
+    const detail = shell.createDiv({ cls: "helix-conflict-detail", attr: { tabindex: "-1" } });
+    const search = master.createEl("input", {
+      cls: "helix-conflict-search",
+      type: "search",
+      placeholder: "搜索冲突标题或类型",
+      attr: { "aria-label": "搜索冲突" },
+    });
+    const filters = master.createDiv({ cls: "helix-conflict-filters" });
+    const list = master.createDiv({ cls: "helix-conflict-list", attr: { role: "listbox", "aria-label": "冲突列表" } });
+    let type: "all" | CenterItem["type"] = "all";
+    let selected = items[0]!.id;
+    const filtered = () => items.filter((item) =>
+      (type === "all" || item.type === type) &&
+      `${item.title} ${item.subtitle} ${item.type}`.toLocaleLowerCase("zh-CN")
+        .includes(search.value.trim().toLocaleLowerCase("zh-CN")));
+    const showDetail = (item: CenterItem) => {
+      detail.empty();
+      if (item.type === "focus") this.renderFocusBridgeConflict(detail, item.conflict as ProjectWorkspaceFocusConflict);
+      else this.renderConflict(detail, item.conflict as SyncConflict);
+      detail.focus();
+    };
+    const renderList = () => {
+      const visible = filtered();
+      if (!visible.some((item) => item.id === selected)) selected = visible[0]?.id ?? "";
+      list.empty();
+      if (visible.length === 0) {
+        list.createDiv({ cls: "helix-conflict-list-empty", text: "没有匹配的冲突" });
+        detail.empty();
+        detail.createDiv({ cls: "helix-empty-state", text: "调整搜索或类型筛选后继续。" });
+        return;
+      }
+      for (const item of visible) {
+        const button = list.createEl("button", {
+          cls: `helix-conflict-list-item${item.id === selected ? " is-selected" : ""}`,
+          attr: { role: "option", "aria-selected": String(item.id === selected) },
+        });
+        button.createSpan({ cls: "helix-conflict-list-type", text: item.type === "focus" ? "聚焦" : item.type === "task" ? "任务" : "项目" });
+        button.createEl("strong", { text: item.title });
+        button.createEl("small", { text: item.subtitle });
+        button.addEventListener("click", () => { selected = item.id; renderList(); });
+      }
+      showDetail(visible.find((item) => item.id === selected)!);
+    };
+    (["all", "project", "task", "focus"] as const).forEach((candidate) => {
+      const button = filters.createEl("button", {
+        cls: candidate === type ? "is-selected" : "",
+        text: candidate === "all" ? `全部 ${items.length}` : candidate === "project" ? "项目" : candidate === "task" ? "任务" : "聚焦",
+      });
+      button.addEventListener("click", () => { type = candidate; filters.querySelectorAll("button").forEach((el) => el.toggleClass("is-selected", el === button)); renderList(); });
+    });
+    search.addEventListener("input", renderList);
+    master.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter") return;
+      const visible = filtered();
+      const index = Math.max(0, visible.findIndex((item) => item.id === selected));
+      if (event.key === "Enter") { event.preventDefault(); detail.focus(); return; }
+      const next = visible[index + (event.key === "ArrowDown" ? 1 : -1)];
+      if (!next) return;
+      event.preventDefault(); selected = next.id; renderList();
+      list.querySelector<HTMLElement>(`.helix-conflict-list-item:nth-child(${visible.indexOf(next) + 1})`)?.focus();
+    });
+    renderList();
   }
 
   private renderProjectionConflicts(
@@ -3585,7 +3678,12 @@ export class HelixView extends ItemView {
       this.renderConflictOption(options, conflict, field.path, "local", "本地", field.localValue, field.choice, applying);
       this.renderConflictOption(options, conflict, field.path, "remote", "远端", field.remoteValue, field.choice, applying);
       const custom = options.createDiv({
-        cls: `helix-conflict-custom${field.choice === "custom" ? " is-selected" : ""}`,
+        cls: `helix-conflict-custom${field.choice === "custom" ? " is-selected" : " is-collapsed"}`,
+      });
+      const revealCustom = custom.createEl("button", {
+        cls: "helix-secondary-button helix-conflict-custom-toggle",
+        text: field.choice === "custom" ? "自定义值" : "使用自定义值",
+        attr: { "aria-expanded": String(field.choice === "custom") },
       });
       const input = custom.createEl("textarea", {
         placeholder: "输入自定义合并值；数组或对象可使用 JSON",
@@ -3595,7 +3693,13 @@ export class HelixView extends ItemView {
       input.disabled = applying;
       const useCustom = custom.createEl("button", {
         cls: "helix-secondary-button",
-        text: "使用自定义值",
+        text: "确认自定义值",
+      });
+      revealCustom.disabled = applying;
+      revealCustom.addEventListener("click", () => {
+        custom.removeClass("is-collapsed");
+        revealCustom.setAttr("aria-expanded", "true");
+        input.focus();
       });
       useCustom.disabled = applying;
       useCustom.addEventListener("click", () => {

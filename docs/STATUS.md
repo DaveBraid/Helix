@@ -1,7 +1,7 @@
 # 当前开发状态
 
 最后更新：2026-08-10
-当前基线提交：`ed21247 fix: stabilize project editing and startup validation`
+当前基线提交：`dedf7c9 fix: render restored active Helix view`
 工作树状态：仅本状态快照待提交。
 当前阶段：本地项目与 Stage 编辑体验收口；项目滴答投影保持关闭。
 
@@ -29,7 +29,7 @@
 ## 本轮改动
 
 - `main.ts`：正文修改不重建状态栏，项目扫描延迟到编辑器失焦；启动验证改为布局就绪后的稳定快照，旧聚焦恢复锁仅在验证通过后自动清除。
-- `helix-view.ts`：非活动 Helix 叶子不再整页渲染；回到该叶子时应用最新缓存状态。
+- `helix-view.ts`：后台叶子只缓存状态；恢复事件早于 `onOpen` 时下一帧补首次渲染，避免抢焦与空白页。
 - `workbench-structure.test.ts`：锁定状态栏事件来源与后台叶子延迟渲染边界。
 
 ## 相关约束
@@ -46,6 +46,7 @@
 - Obsidian CLI：恢复问题为空；月历与五项状态菜单既有验收通过；控制台无错误。
 - Stage 编辑：用户重启后确认可持续编辑；此前已实机复现首字符触发后台 Helix 标签抢焦，修复禁止后台渲染并延迟输入期扫描。
 - 启动冲突：用户重启后项目页可用；稳定复核自动清除旧记录。当前 `conflicts`、`recoveryIssues`、待处理队列和 UI 徽标均为 0，Canvas 与四份 Project／Stage 身份一致。
+- Helix 首屏：已重载并实机点击恢复的 Helix 标签，首页、导航、任务、项目脉搏和挑战完整渲染。
 - 本轮未访问滴答远端；测试 Vault 滴答缓存仍为空，`autoSync=false`，API 口令保留。
 
 ## 未关闭问题

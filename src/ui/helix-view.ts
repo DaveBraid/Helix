@@ -52,6 +52,7 @@ import {
   instantToWallDateTime,
   wallDateTimeToInstant,
 } from "../domain/task-datetime";
+import { sideBySideTextDiff } from "../domain/text-diff";
 import {
   taskScheduleEditorMode,
   taskScheduleForSubmission,
@@ -121,7 +122,7 @@ import {
   type TaskReferenceService,
 } from "../services/task-references";
 import { HelixDataStore } from "../storage/data-store";
-import type { ResolutionAuditEntry, ResolutionChoice, SyncConflict } from "../sync/types";
+import type { ConflictField, ResolutionAuditEntry, ResolutionChoice, SyncConflict } from "../sync/types";
 import { analyticsChartSeries } from "./chart-series";
 import { inProgressPresentation } from "./in-progress-presentation";
 import {
@@ -3897,6 +3898,130 @@ export class HelixView extends ItemView {
     });
   }
 
+  private renderConflictTextDiff(
+    parent: HTMLElement,
+    conflict: SyncConflict,
+    field: ConflictField,
+    applying: boolean,
+  ): void {
+    const localValue = String(field.localValue ?? "");
+    const remoteValue = String(field.remoteValue ?? "");
+    const previewLimit = 400;
+    const localLines = localValue.replace(/\r\n?/g, "\n").split("\n");
+    const remoteLines = remoteValue.replace(/\r\n?/g, "\n").split("\n");
+    const previewTruncated = localLines.length > previewLimit || remoteLines.length > previewLimit;
+    const rows = sideBySideTextDiff(
+      localLines.slice(0, previewLimit).join("\n"),
+      remoteLines.slice(0, previewLimit).join("\n"),
+    );
+    const lastLine = Math.max(
+      ...rows.flatMap((row) => [row.leftNumber ?? 0, row.rightNumber ?? 0]),
+      1,
+    );
+    const section = parent.createDiv({ cls: "helix-conflict-ide-field" });
+    const head = section.createDiv({ cls: "helix-conflict-ide-field-head" });
+    const identity = head.createDiv();
+    identity.createEl("strong", { text: `差异预览（第 1–${lastLine} 行）` });
+    identity.createSpan({ text: `${field.label} · ${field.path}` });
+    const base = head.createDiv({ cls: "helix-conflict-ide-base" });
+    base.createSpan({ text: previewTruncated ? "前 400 行预览" : "Base（共同基线）" });
+    const baseValue = String(field.baseValue ?? "（空）");
+    base.createEl("code", { text: baseValue.length > 160 ? `${baseValue.slice(0, 160)}…` : baseValue });
+
+    const ide = section.createDiv({
+      cls: `helix-conflict-ide is-${this.conflictDiffMode}${field.choice ? ` is-${field.choice}` : ""}`,
+    });
+    const choose = (choice: "local" | "remote") => {
+      void this.service.chooseConflict(conflict.id, field.path, choice)
+        .then(() => this.render())
+        .catch((error) => new Notice(messageOf(error), 8_000));
+    };
+    if (this.conflictDiffMode === "split") {
+      const paneHead = ide.createDiv({ cls: "helix-conflict-ide-pane-head is-local" });
+      paneHead.createSpan({ text: "本地（你的版本）" });
+      const useLocal = paneHead.createEl("button", {
+        cls: field.choice === "local" ? "is-selected" : "",
+        text: field.choice === "local" ? "已选本地" : "采用本地",
+      });
+      useLocal.disabled = applying;
+      useLocal.addEventListener("click", () => choose("local"));
+      const remoteHead = ide.createDiv({ cls: "helix-conflict-ide-pane-head is-remote" });
+      remoteHead.createSpan({ text: "远端（同步版本）" });
+      const useRemote = remoteHead.createEl("button", {
+        cls: field.choice === "remote" ? "is-selected" : "",
+        text: field.choice === "remote" ? "已选远端" : "采用远端",
+      });
+      useRemote.disabled = applying;
+      useRemote.addEventListener("click", () => choose("remote"));
+      for (const row of rows) {
+        const left = ide.createDiv({ cls: `helix-conflict-ide-line is-${row.leftTone}` });
+        left.createSpan({ text: row.leftNumber === undefined ? "" : String(row.leftNumber) });
+        left.createEl("code", { text: row.leftText || " " });
+        const right = ide.createDiv({ cls: `helix-conflict-ide-line is-${row.rightTone}` });
+        right.createSpan({ text: row.rightNumber === undefined ? "" : String(row.rightNumber) });
+        right.createEl("code", { text: row.rightText || " " });
+      }
+    } else {
+      const unifiedHead = ide.createDiv({ cls: "helix-conflict-ide-unified-head" });
+      unifiedHead.createSpan({ text: "统一差异 · − 本地删除／＋远端新增" });
+      const actions = unifiedHead.createDiv();
+      actions.createEl("button", { text: "采用本地" }).addEventListener("click", () => choose("local"));
+      actions.createEl("button", { text: "采用远端" }).addEventListener("click", () => choose("remote"));
+      for (const row of rows) {
+        if (row.leftTone === "unchanged") {
+          const line = ide.createDiv({ cls: "helix-conflict-ide-unified-line is-unchanged" });
+          line.createSpan({ text: String(row.leftNumber ?? "") });
+          line.createSpan({ text: String(row.rightNumber ?? "") });
+          line.createEl("code", { text: `  ${row.leftText || " "}` });
+          continue;
+        }
+        if (row.leftTone !== "empty") {
+          const line = ide.createDiv({ cls: "helix-conflict-ide-unified-line is-removed" });
+          line.createSpan({ text: String(row.leftNumber ?? "") });
+          line.createSpan({ text: "" });
+          line.createEl("code", { text: `− ${row.leftText || " "}` });
+        }
+        if (row.rightTone !== "empty") {
+          const line = ide.createDiv({ cls: "helix-conflict-ide-unified-line is-added" });
+          line.createSpan({ text: "" });
+          line.createSpan({ text: String(row.rightNumber ?? "") });
+          line.createEl("code", { text: `＋ ${row.rightText || " "}` });
+        }
+      }
+    }
+
+    const custom = section.createDiv({
+      cls: `helix-conflict-custom helix-conflict-ide-custom${field.choice === "custom" ? " is-selected" : " is-collapsed"}`,
+    });
+    const reveal = custom.createEl("button", {
+      cls: "helix-secondary-button helix-conflict-custom-toggle",
+      text: field.choice === "custom" ? "自定义合并内容" : "手动编辑合并内容",
+      attr: { "aria-expanded": String(field.choice === "custom") },
+    });
+    reveal.disabled = applying;
+    const editor = custom.createEl("textarea", {
+      placeholder: "输入最终合并后的完整正文",
+      attr: { "aria-label": `${field.label} 自定义合并内容` },
+    });
+    editor.value = field.choice === "custom" ? String(field.customValue ?? "") : localValue;
+    editor.disabled = applying;
+    const apply = custom.createEl("button", {
+      cls: "helix-secondary-button",
+      text: "采用手动合并内容",
+    });
+    apply.disabled = applying;
+    reveal.addEventListener("click", () => {
+      custom.removeClass("is-collapsed");
+      reveal.setAttr("aria-expanded", "true");
+      editor.focus();
+    });
+    apply.addEventListener("click", () => {
+      void this.service.chooseConflict(conflict.id, field.path, "custom", editor.value)
+        .then(() => this.render())
+        .catch((error) => new Notice(messageOf(error), 8_000));
+    });
+  }
+
   private renderConflict(content: HTMLElement, conflict: SyncConflict, embedded = false): void {
     const applying = conflict.status === "applying";
     const projectionReadOnly =
@@ -3920,8 +4045,23 @@ export class HelixView extends ItemView {
       }
       return;
     }
+    const hasEmbeddedTextDiff = embedded && conflict.fields.some((field) =>
+      field.group === "text" && typeof field.localValue === "string" && typeof field.remoteValue === "string");
+    let otherFields: HTMLElement | null = null;
     for (const field of conflict.fields) {
-      const row = card.createDiv({ cls: "helix-conflict-field" });
+      if (embedded && field.group === "text" &&
+        typeof field.localValue === "string" && typeof field.remoteValue === "string") {
+        this.renderConflictTextDiff(card, conflict, field, applying);
+        continue;
+      }
+      if (hasEmbeddedTextDiff && !otherFields) {
+        const details = card.createEl("details", { cls: "helix-conflict-other-fields" });
+        details.createEl("summary", {
+          text: `其他 ${conflict.fields.filter((candidate) => candidate.group !== "text").length} 个属性冲突`,
+        });
+        otherFields = details.createDiv({ cls: "helix-conflict-other-fields-content" });
+      }
+      const row = (otherFields ?? card).createDiv({ cls: "helix-conflict-field" });
       const label = row.createDiv({ cls: "helix-conflict-label" });
       label.createEl("strong", { text: field.label });
       label.createSpan({ text: field.path });

@@ -1,34 +1,37 @@
 # 冲突中心视觉验收
 
-- source visual truth path: `/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-a314f66d-6683-41c5-985b-d04727b75a14.png`
-- implementation screenshot path: `/private/tmp/helix-conflict-final-opaque.png`
-- side-by-side comparison: `/private/tmp/helix-conflict-side-by-side.png`
-- viewport: Obsidian 桌面端深色模式；实现截图 2790 × 1846 px，device scale factor 2。
-- dimensions and normalization: 源图 1487 × 1058 px；实现图按比例缩放至 1601 × 1058 px 后横向并排，未裁切、未拉伸。
-- state: 六类仅内存演示冲突，覆盖任务／项目／聚焦、需选择／远端结果未知／仅检查三种优先级；展开聚焦三方内容，右侧展示三条真实审计结构的演示记录。
-- primary interactions tested: 三组共六行正确投影；搜索命中 1 行、聚焦筛选命中 3 行、恢复全部后 6 行；并排／统一视图切换成功；未点击任何写回动作。
-- console errors checked: `dev:errors` 无错误；演示数据只存在当前插件实例内，未写入 Vault 或滴答。
+- source visual truth path: `/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-ea337a37-dca3-4e8c-be29-31a766afcb16.png`
+- user-reported implementation path: `/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-4da469a7-e2c0-4f21-b546-ac0098f2b25d.png`
+- final implementation screenshot path: `/private/tmp/helix-conflict-ide-v2.png`
+- full-view comparison: `/private/tmp/helix-conflict-ide-full-compare.png`
+- focused IDE comparison: `/private/tmp/helix-conflict-ide-focus-compare-v2.png`
+- viewport: Obsidian 桌面端深色模式；实现截图 4970 × 2820 px，约对应 2485 × 1410 CSS px，device scale factor 2。
+- dimensions and normalization: 源图 1487 × 1058 px；全景比较将实现图等比缩放到 1058 px 高后并排。局部比较裁切源图 IDE 区域 `1015 × 360`、实现图 IDE 区域 `3600 × 800`，均等比缩放到 520 px 高后并排，未拉伸。
+- state: 六类仅内存拟真冲突；任务正文冲突选中，正文为 7 行 Markdown，其他三个属性冲突默认折叠。
+- primary interactions tested: 并排视图渲染 14 个左右行单元；统一视图渲染 11 行并恢复并排；所有冲突按钮扫描无文字溢出；属性冲突可展开；未触发真实写回。
+- console errors checked: 冲突渲染与交互无异常；捕获到一条 Electron `ResizeObserver loop completed`，来自既有观察器循环，未影响本界面。
 
 ## 对照结论
 
-实现已采用源图的完整信息架构：标题、三项摘要、搜索与筛选同排；冲突按处理优先级分组为表格；选中行内展开三步处理轨道与三方差异；底部保留安全批量区；右侧为最近处理时间线。任务／项目冲突显示 Base／本地／远端逐字段值，聚焦冲突显示 Base／来源／派生内容，均复用真实合并能力。
+实现已具备源图的 IDE 式原文差异：真实行号、等宽字体、本地／远端双栏、未变行、删除红底、新增绿底、空行对齐、行范围标题及两侧采用按钮。统一视图使用单栏 `−／＋` 行流，不再只是视觉开关。Base 共同基线保留在标题区，其他标量属性按需展开，首屏结构与源图一致。
 
-视觉密度、圆角、细边框、语义色、行高和左右比例与源图保持同一方向。实现没有照搬概念图中不安全或不存在的“忽略”“盲目重试”“撤销远端”等操作；远端结果未知进入“等待远端核对”，禁止重发。Obsidian 外层文件栏会减少可用宽度，因此 Helix 内容区允许横向滚动，固定侧栏不跟随。
+冲突中心关键正文提高到 12–13 px、1.4–1.6 行高；对象标题为 13 px，步骤标题为 13 px。所有按钮改为自适应高度与正常换行，自动扫描结果为 0 个 `scrollWidth > clientWidth` 溢出项。
 
 ## 比较历史
 
-1. P1：初版仍是简单主从两栏，与源图的信息架构差距大。已重构为摘要工具栏、三级分组表格、行内展开、最近处理和批量区。
-2. P1：重构首轮标题与摘要分两行，展开区过高，后续分组掉出首屏。已合并顶栏，并隐藏默认折叠的逐字段自定义编辑器；手动编辑仍可按需展开。
-3. P1：动态重排后旧标题在 Cupertino／Electron 合成层中残留，DOM 实际只有一个标题。已给主内容与滚动层补不透明背景和独立绘制层，最终截图无残影。
-4. P2：首轮操作文案过泛。已改为“对比字段／查看详情”，并提供并排／统一视图、保留本地、采用远端和手动编辑。
-5. 最终未发现未关闭的 P0、P1 或 P2。可接受差异：源图以代码行 diff 为例，实现依据真实冲突类型呈现结构化字段或聚焦正文，不伪造文件行号。
+1. P1：用户截图中的正文仍是普通三方值卡片，没有源图 IDE 行级差异。已新增 LCS 行对齐模型、并排 IDE 与统一差异视图；局部并排证据显示行号、红绿变更和双栏结构已落实。
+2. P1：原界面大量 8–10 px 字号，在高密度桌面截图中难以阅读。已把冲突表格、步骤、正文、按钮及时间线提高到 10–13 px，并增加行高。
+3. P1：本地／远端值和中部按钮受主题固定高度影响发生文字溢出。已取消固定高度，允许值换行和按钮自适应；实机扫描全部按钮无溢出。
+4. P2：IDE 后继续展开三个标量字段导致首屏过长。已折叠为“其他 3 个属性冲突”，需要时再展开，合并按钮紧随差异区。
+5. P2：初版“统一视图”只改变列布局，没有统一 diff 语义。已改为带本地／远端行号及 `−／＋` 前缀的单列差异流，实机切换通过。
+6. 最终未发现未关闭的 P0、P1 或 P2。可接受差异：源图以固定第 12–18 行为概念内容；实现使用真实字段正文和实际第 1–N 行，不伪造文件行号。
 
 ## 验收面
 
-- 字体与排版：标题、摘要、分组、表头、行与展开区层级清晰。
-- 间距与布局：宽屏双列稳定；主表、步骤轨道和时间线无挤压。
-- 色彩与令牌：全程使用 Helix／Obsidian 语义变量，深色模式对比度正常。
-- 图像与资产：无位图依赖；来源与状态使用 Obsidian 矢量图标。
-- 文案与安全：只呈现真实能力；结果未知保持冻结，批量动作只采用已有安全建议。
+- 字体与排版：正文、步骤、表格和按钮达到可读字号，等宽 diff 行节奏稳定。
+- 间距与布局：IDE 双栏对齐，属性默认折叠，操作区紧随正文，无文字溢出。
+- 色彩与令牌：删除／新增使用 Helix 危险色与成功色，深色模式对比清晰。
+- 图像与资产：无位图依赖；继续使用 Obsidian 图标和主题字体。
+- 文案与安全：只显示真实行号和真实值；远端结果未知仍冻结，未增加盲目重试。
 
 final result: passed

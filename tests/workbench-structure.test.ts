@@ -351,6 +351,9 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/helix-conflict-table-head[\s\S]*来源[\s\S]*对象[\s\S]*诊断[\s\S]*严重性[\s\S]*操作/);
     expect(view).toMatch(/预览差异[\s\S]*选择方案[\s\S]*完成处理/);
     expect(view).toMatch(/并排视图[\s\S]*统一视图/);
+    expect(view).toMatch(/renderConflictTextDiff[\s\S]*sideBySideTextDiff[\s\S]*helix-conflict-ide-line/);
+    expect(view).toMatch(/previewLimit = 400[\s\S]*前 400 行预览/);
+    expect(view).toMatch(/统一差异[\s\S]*helix-conflict-ide-unified-line/);
     expect(view).toMatch(/保留本地[\s\S]*采用远端[\s\S]*手动编辑/);
     expect(view).toMatch(/helix-focus-custom[\s\S]*is-collapsed[\s\S]*helix-focus-custom-toggle/);
     expect(view).toMatch(/批量采用建议[\s\S]*清除选择[\s\S]*最近处理/);
@@ -360,6 +363,8 @@ describe("workbench layout and navigation structure", () => {
     const conflictStyles = css.slice(css.indexOf(".helix-conflict-diagnostics"), css.indexOf(".helix-reconciliation-card"));
     expect(conflictStyles).toMatch(/\.helix-conflict-workspace[\s\S]*grid-template-columns: minmax\(720px, 1fr\) 190px/);
     expect(conflictStyles).toMatch(/\.helix-conflict-expanded[\s\S]*grid-template-columns: 168px minmax\(0, 1fr\)/);
+    expect(css).toMatch(/\.helix-conflict-ide-line[\s\S]*font-family: var\(--font-monospace\)/);
+    expect(css).toMatch(/\.helix-conflict-option code[\s\S]*overflow-wrap: anywhere[\s\S]*white-space: normal/);
     expect(conflictStyles).not.toContain("backdrop-filter");
   });
 });

@@ -69,6 +69,25 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toContain("复盘已打开，但自动摘要未更新");
   });
 
+  it("does not rebuild the active Stage status control on every editor transaction", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const modifyListener = main.slice(
+      main.indexOf('this.app.vault.on("modify"'),
+      main.indexOf('this.app.metadataCache.on("changed"'),
+    );
+    expect(modifyListener).not.toContain("refreshActiveStatusForPaths");
+    expect(main).toMatch(
+      /metadataCache\.on\("changed", \(file\) => \{\s*this\.refreshActiveStatusForPaths\(file\.path\)/,
+    );
+    expect(main).toContain("if (signature === this.projectStatusSignature) return;");
+    expect(view).toMatch(
+      /service\.subscribe[\s\S]*activeLeaf === this\.leaf[\s\S]*renderPendingWhileInactive = true/,
+    );
+    expect(view).toMatch(
+      /active-leaf-change[\s\S]*leaf !== this\.leaf[\s\S]*renderPendingWhileInactive[\s\S]*this\.render\(\)/,
+    );
+  });
+
   it("shows task references on projects without enabling project projection", () => {
     expect(view).toMatch(/renderProjects\(content[\s\S]*refreshTaskReferenceSnapshot\(token\)/);
     expect(view).toMatch(/renderProjectLinkedTasks[\s\S]*关联任务[\s\S]*renderTaskRow/);
@@ -144,13 +163,15 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000;[\s\S]*gap: 4px/);
   });
 
-  it("revalidates stale focus-bridge recovery locks before freezing startup", () => {
+  it("waits for the complete Obsidian index before validating focus-bridge recovery", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
-    expect(main).toMatch(/staleFocusBridgeIssues[\s\S]*projectWorkspace\.snapshot\(\)[\s\S]*resolveRecoveryIssuesAfterValidation/);
+    expect(main).toMatch(/onLayoutReady[\s\S]*finishProjectStartup\(staleFocusBridgeIssues\)/);
+    expect(main).toMatch(/finishProjectStartup[\s\S]*loadStableWorkspace\(\)[\s\S]*resolveRecoveryIssuesAfterValidation/);
+    expect(main).toMatch(/finally \{\s*this\.projectStartupReady = true/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*!this\.projectStartupReady[\s\S]*return/);
+    expect(main).toContain("Helix 正在等待 Obsidian 完成项目索引，稍后即可写入");
     expect(main).toMatch(/dismissResolvedRecoveryNotices\(data\.recoveryIssues\)/);
     expect(main).toMatch(/showPersistentNotice[\s\S]*helix-persistent-notice/);
-    expect(main.indexOf("resolveRecoveryIssuesAfterValidation"))
-      .toBeLessThan(main.indexOf("this.recoveryMode = data.recoveryIssues.length > 0"));
   });
 
   it("keeps an empty quick-property suggestion menu out of layout", () => {

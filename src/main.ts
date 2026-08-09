@@ -143,17 +143,21 @@ export default class HelixPlugin extends Plugin {
   private immediateSyncTimerId: number | null = null;
   private unloaded = false;
   private recoveryMode = false;
+  private projectStartupReady = false;
   private dataGeneration!: DataGeneration;
   private projectRefreshTimer: number | null = null;
   private projectMutationDepth = 0;
   private projectRefreshBatch!: ProjectRefreshBatch;
   private projectCanvasRefreshPending = false;
   private readonly projectMarkdownRefreshPaths = new Set<string>();
+  private readonly deferredProjectEditorRefreshPaths = new Set<string>();
+  private readonly deferredProjectEditorBlurListeners = new Map<HTMLElement, EventListener>();
   private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
   private readonly settingsMutationRunner = new SerializedRunner();
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
   private projectStatusItem: HTMLElement | null = null;
+  private projectStatusSignature: string | null = null;
   private readonly persistentNotices = new Set<Notice>();
 
   async onload(): Promise<void> {
@@ -194,18 +198,10 @@ export default class HelixPlugin extends Plugin {
     );
     const staleFocusBridgeIssues = data.recoveryIssues.filter((issue) =>
       issue.startsWith(FOCUS_BRIDGE_RECOVERY_PREFIX));
-    if (staleFocusBridgeIssues.length > 0) {
-      try {
-        // 只读权威 Markdown/Canvas 快照已恢复一致时，旧启动失败记录不应永久锁死插件。
-        await this.projectWorkspace.snapshot();
-        await this.store.resolveRecoveryIssuesAfterValidation(staleFocusBridgeIssues);
-        data.recoveryIssues = data.recoveryIssues.filter((issue) =>
-          !staleFocusBridgeIssues.includes(issue));
-      } catch {
-        // 当前结构仍不可读或恢复记录发生竞争：保持原恢复锁，禁止猜测清理。
-      }
-    }
-    this.recoveryMode = data.recoveryIssues.length > 0;
+    // Vault 在插件 onload 时仍可能逐文件触发 create；聚焦桥接问题必须等布局就绪、
+    // Markdown 索引完整后再复核。此前用不完整 getMarkdownFiles() 扫描会制造假冲突。
+    this.recoveryMode = data.recoveryIssues.some((issue) =>
+      !issue.startsWith(FOCUS_BRIDGE_RECOVERY_PREFIX));
     if (this.recoveryMode) {
       this.projectWorkspace.freezePendingStageDeletion(
         "Helix 处于只读恢复模式，阶段删除事务不会自动执行，项目写入已冻结；请处理冲突中心列出的恢复问题",
@@ -241,16 +237,6 @@ export default class HelixPlugin extends Plugin {
         } catch (error) {
           new Notice(`Helix 默认模板未完全补齐：${error instanceof Error ? error.message : String(error)}`, 10_000);
         }
-      }
-    }
-    if (!this.recoveryMode) {
-      try {
-        await this.projectWorkspace.initializeFocusBridgeState();
-      } catch (error) {
-        const message = `Helix 阶段聚焦桥接需要人工检查：${
-          error instanceof Error ? error.message : String(error)}`;
-        await this.enterProjectRecoveryMode(message);
-        this.showPersistentNotice(message);
       }
     }
     this.service = new HelixService(this.store, this.secrets);
@@ -451,8 +437,8 @@ export default class HelixPlugin extends Plugin {
     this.addSettingTab(new HelixSettingTab(this.app, this));
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        this.refreshActiveStatusForPaths(file.path);
         if (this.isProjectWorkspaceFile(file.path)) {
+          if (this.deferProjectRefreshForActiveEditor(file.path)) return;
           this.scheduleProjectRefresh(file.path);
           return;
         }
@@ -461,6 +447,11 @@ export default class HelixPlugin extends Plugin {
           return;
         }
         this.scheduleProjectIdentityProbe(file.path);
+      }),
+    );
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file) => {
+        this.refreshActiveStatusForPaths(file.path);
       }),
     );
     this.registerEvent(
@@ -521,10 +512,32 @@ export default class HelixPlugin extends Plugin {
     void this.refreshActiveHelixStatusControl();
 
     this.refreshAutoSync(this.settings.autoSync);
-    // 首次加载也从权威 Markdown 复核派生 Canvas 缓存；安全项静默收口。
-    this.scheduleProjectRefresh();
+    this.app.workspace.onLayoutReady(() => {
+      void this.finishProjectStartup(staleFocusBridgeIssues);
+    });
     // 重启后从 Markdown/Canvas 权威源重扫；队列与写门仍由既有同步管线负责。
     this.projectAutoSync.request();
+  }
+
+  private async finishProjectStartup(staleFocusBridgeIssues: readonly string[]): Promise<void> {
+    if (this.unloaded || this.projectStartupReady) return;
+    try {
+      if (staleFocusBridgeIssues.length > 0) {
+        // 布局就绪后再读取双稳定快照；只有权威 Markdown/Canvas 确实一致才清旧锁。
+        await this.projectWorkspace.loadStableWorkspace();
+        await this.store.resolveRecoveryIssuesAfterValidation(staleFocusBridgeIssues);
+      }
+      if (!this.recoveryMode) await this.projectWorkspace.initializeFocusBridgeState();
+    } catch (error) {
+      const message = `${FOCUS_BRIDGE_RECOVERY_PREFIX}${
+        error instanceof Error ? error.message : String(error)}`;
+      await this.enterProjectRecoveryMode(message);
+      this.showPersistentNotice(message);
+    } finally {
+      this.projectStartupReady = true;
+    }
+    await this.service.refreshPersistedEvents();
+    if (!this.recoveryMode) this.scheduleProjectRefresh();
   }
 
   private activeHelixStatusTarget(): ActiveHelixStatusTarget | null {
@@ -543,15 +556,26 @@ export default class HelixPlugin extends Plugin {
   private async refreshActiveHelixStatusControl(): Promise<void> {
     const item = this.projectStatusItem;
     if (!item) return;
+    const file = this.app.workspace.getActiveFile();
+    const frontmatter = file ? this.app.metadataCache.getFileCache(file)?.frontmatter : undefined;
+    const target = this.activeHelixStatusTarget();
+    const signature = target
+      ? `${file?.path ?? ""}:${target.kind}:${target.status}`
+      : file && (frontmatter?.["helix-kind"] === "helix-project" ||
+          frontmatter?.["helix-kind"] === "helix-stage" ||
+          frontmatter?.["helix-kind"] === "helix-cycle")
+        ? `${file.path}:invalid:${String(frontmatter?.["helix-status"] ?? "")}`
+        : `${file?.path ?? ""}:hidden`;
+    // CodeMirror 会在每个输入事务后触发 vault.modify。状态未变时销毁并重建
+    // 状态栏控件会让 Obsidian 的焦点恢复链把光标从编辑器移走。
+    if (signature === this.projectStatusSignature) return;
+    this.projectStatusSignature = signature;
     item.empty();
     item.onclick = null;
     item.onkeydown = null;
     item.removeAttribute("role");
     item.removeAttribute("tabindex");
     item.removeAttribute("title");
-    const file = this.app.workspace.getActiveFile();
-    const frontmatter = file ? this.app.metadataCache.getFileCache(file)?.frontmatter : undefined;
-    const target = this.activeHelixStatusTarget();
     if (!target) {
       if (file && (frontmatter?.["helix-kind"] === "helix-project" ||
         frontmatter?.["helix-kind"] === "helix-stage" || frontmatter?.["helix-kind"] === "helix-cycle")) {
@@ -620,6 +644,11 @@ export default class HelixPlugin extends Plugin {
       window.clearTimeout(timer);
     }
     this.projectIdentityProbeTimers.clear();
+    for (const [element, listener] of this.deferredProjectEditorBlurListeners) {
+      element.removeEventListener("focusout", listener, true);
+    }
+    this.deferredProjectEditorBlurListeners.clear();
+    this.deferredProjectEditorRefreshPaths.clear();
     this.service?.dispose();
     this.projectWorkspace?.dispose();
     if (this.dataGeneration) invalidateDataGeneration(this.dataGeneration);
@@ -1352,7 +1381,7 @@ export default class HelixPlugin extends Plugin {
   }
 
   private scheduleProjectRefresh(changedPath?: string): void {
-    if (this.unloaded) return;
+    if (this.unloaded || !this.projectStartupReady) return;
     if (changedPath && changedPath.endsWith(".md")) {
       this.projectMarkdownRefreshPaths.add(normalizePath(changedPath));
     }
@@ -1393,6 +1422,32 @@ export default class HelixPlugin extends Plugin {
     }, 200);
   }
 
+  /** 用户持续输入时不运行会重建派生视图的项目扫描；编辑器失焦后合并为一次刷新。 */
+  private deferProjectRefreshForActiveEditor(path: string): boolean {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const normalized = normalizePath(path);
+    if (!view || normalizePath(view.file?.path ?? "") !== normalized || !view.editor.hasFocus()) {
+      return false;
+    }
+    this.deferredProjectEditorRefreshPaths.add(normalized);
+    const element = view.contentEl;
+    if (this.deferredProjectEditorBlurListeners.has(element)) return true;
+    const ownerWindow = element.ownerDocument.defaultView ?? window;
+    const listener: EventListener = () => {
+      ownerWindow.requestAnimationFrame(() => {
+        if (this.unloaded || view.editor.hasFocus()) return;
+        element.removeEventListener("focusout", listener, true);
+        this.deferredProjectEditorBlurListeners.delete(element);
+        const paths = [...this.deferredProjectEditorRefreshPaths];
+        this.deferredProjectEditorRefreshPaths.clear();
+        for (const changedPath of paths) this.scheduleProjectRefresh(changedPath);
+      });
+    };
+    element.addEventListener("focusout", listener, true);
+    this.deferredProjectEditorBlurListeners.set(element, listener);
+    return true;
+  }
+
   /** 已持有 projectMutationRunner；只对可重建派生字段开启自写事件批次。 */
   private async repairDerivedProjectCanvasCache(): Promise<void> {
     const snapshot = await this.projectWorkspace.loadStableWorkspace();
@@ -1406,7 +1461,7 @@ export default class HelixPlugin extends Plugin {
   }
 
   private scheduleProjectIdentityProbe(path: string): void {
-    if (this.unloaded || !path.endsWith(".md")) return;
+    if (this.unloaded || !this.projectStartupReady || !path.endsWith(".md")) return;
     const normalized = normalizePath(path);
     const existing = this.projectIdentityProbeTimers.get(normalized);
     if (existing !== undefined) window.clearTimeout(existing);
@@ -1487,6 +1542,9 @@ export default class HelixPlugin extends Plugin {
   }
 
   private assertWritable(): void {
+    if (!this.projectStartupReady) {
+      throw new Error("Helix 正在等待 Obsidian 完成项目索引，稍后即可写入");
+    }
     if (this.recoveryMode) {
       throw new Error("Helix 当前处于只读恢复模式，处理冲突中心列出的恢复问题前不能写入");
     }

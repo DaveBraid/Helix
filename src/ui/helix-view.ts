@@ -231,6 +231,7 @@ export class HelixView extends ItemView {
   private previewInProgress = new Set(SAMPLE_TASKS.map((task) => task.id));
   private state: HelixRuntimeState | null = null;
   private unsubscribe: (() => void) | null = null;
+  private renderPendingWhileInactive = false;
   private charts: echarts.ECharts[] = [];
   private chartObservers: ResizeObserver[] = [];
   private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
@@ -334,12 +335,23 @@ export class HelixView extends ItemView {
     this.contentEl.addClass("helix-root");
     this.unsubscribe = this.service.subscribe((state) => {
       this.state = state;
-      void this.render();
+      if (this.app.workspace.activeLeaf === this.leaf) {
+        this.renderPendingWhileInactive = false;
+        void this.render();
+      } else {
+        this.renderPendingWhileInactive = true;
+      }
     });
+    this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
+      if (leaf !== this.leaf || !this.renderPendingWhileInactive) return;
+      this.renderPendingWhileInactive = false;
+      void this.render();
+    }));
   }
 
   async onClose(): Promise<void> {
     this.closed = true;
+    this.renderPendingWhileInactive = false;
     this.viewGeneration += 1;
     this.renderToken += 1;
     this.unsubscribe?.();

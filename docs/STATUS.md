@@ -1,14 +1,14 @@
 # 当前开发状态
 
 最后更新：2026-08-09
-当前基线提交：`8e9bd3d feat: project Stage actions into local tasks`
+当前基线提交：`159ce76 feat: redesign conflict center for three-way resolution`
 工作树状态：仅本状态快照待提交；快照提交后工作树应干净。测试 Vault 的 Helix 业务数据为一组本地验收项目。
-当前阶段：本地项目行动—任务闭环已完成开发、CLI 实机验收和阶段提交；暂不发布。
+当前阶段：冲突中心 master-detail 重构、视觉 QA 和发布门禁已通过。
 
 ## 本轮目标
 
-- 让 Stage“计划行动”自动进入任务页，支持本地父子任务和紧凑统一编辑器。
-- 非目标：不恢复项目滴答投影，不访问或写入滴答远端，不修改正式 Vault，不升版本或发布。
+- 将冲突中心改为固定侧栏内的 master-detail 工作区：搜索、类型筛选、紧凑列表与单一字段详情。
+- 非目标：不恢复项目滴答投影，不访问或写入滴答远端，不修改正式 Vault，不发布。
 
 ## 当前事实
 
@@ -21,15 +21,14 @@
 - 普通滴答任务与本地项目任务共用紧凑编辑器外壳；滴答低频属性折叠显示，本地编辑器直接提供子任务区。
 - 聚焦桥接仍以 Canvas 入边为关系源，支持继承、分支、合并、反向编辑和同窗竞争冲突。
 - 当前版本不展示项目滴答投影入口；统一门禁覆盖后台扫描、队列、恢复、重试和冲突写回。
-- 凭证仅存 SecretStorage；版本仍为 `0.1.5`，最低 Obsidian 桌面端 `1.12.2`。
+- 凭证仅存 SecretStorage；版本为 `0.1.6`，最低 Obsidian 桌面端 `1.12.2`。
+- 冲突中心左栏只用于定位真实任务、项目和聚焦桥接冲突；右栏复用原有 Base／Local／Remote 逐字段选择与应用逻辑。恢复和投影诊断保留原有只读／受门禁操作，不新增忽略或批量动作。
 
 ## 本轮改动
 
-- `src/domain/dida-project-projection.ts`：扩展本地行动层级、隐藏属性标记、原生勾选收敛及安全增删改。
-- `src/services/local-project-tasks.ts`：新增 Stage 权威任务快照与 CAS 服务，不依赖 `data.json` 或滴答队列。
-- `src/main.ts`：接入本地任务服务并复用项目串行写门；读取不再创建空写事务或重复刷新。
-- `src/ui/helix-view.ts`、`styles.css`：任务页合并本地行动，支持本地创建、行内标题、状态操作、父子任务编辑及统一紧凑编辑器。
-- `tests/`、`docs/ARCHITECTURE.md`：补充领域、服务、结构门禁和权威数据边界。
+- `src/ui/helix-view.ts`、`styles.css`：冲突中心使用两栏 master-detail，提供搜索、类型筛选、键盘上下切换／Enter 聚焦详情，并保持逐字段合并控件。
+- `tests/workbench-structure.test.ts`：增加冲突中心结构、键盘路径和无 backdrop-filter 门禁。
+- `package.json`、`manifest.json`、`package-lock.json`、`versions.json`：版本更新为 `0.1.6`。
 
 ## 相关约束
 
@@ -41,7 +40,8 @@
 
 ## 当前验证
 
-- 完整门禁：68 个测试文件、950 项测试，以及 `typecheck`、`build`、`release:check`、`git diff --check` 全部通过。
+- 完整门禁：68 个测试文件、951 项测试，以及 `typecheck`、`build`、`release:check`、`git diff --check` 全部通过。
+- 冲突中心桌面端视觉 QA 已通过：修复列表项主题高度重叠和自定义编辑器默认展开，最终无 P0–P2；证据见根目录 `design-qa.md`。
 - Obsidian CLI 实机已通过：任务页自动显示 Stage 顶层行动、从任务页创建行动、父子任务编辑、属性持久化、安全级联删除和重载后读取。
 - Obsidian CLI 实机已通过：原生勾选／取消勾选自动更新状态且备注等属性不丢失；v1/v2/v3 隐藏标记均不出现在 Live Preview。
 - 自动刷新空转回归已通过：打开任务页后 1.8 秒内自发重绘次数为 0；本地任务 3 行，控制台无错误。
@@ -56,6 +56,6 @@
 
 ## 下一步
 
-1. 继续打磨项目与复盘高频体验，优先处理本地任务跨 Stage／项目移动的安全事务和复盘入口。
-2. 完成下一轮本地实机验收并形成阶段提交，保持版本号不变。
+1. 在正式 Vault 以真实冲突验证搜索、筛选、三方字段选择和应用后的刷新；不得制造或覆盖用户数据来造冲突。
+2. 继续打磨项目与复盘高频体验，保持 Markdown／Canvas 权威源与向后兼容。
 3. 本地功能达到正式版质量后，再用唯一专用临时对象研究滴答 `items` 合同；通过前不解除投影门禁。

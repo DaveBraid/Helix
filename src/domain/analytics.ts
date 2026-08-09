@@ -15,6 +15,7 @@ export interface AnalyticsSummary {
   totalTasks: number;
   totalHabitCheckins: number;
   totalFocusMinutes: number;
+  totalReviews: number;
   activeDays: number;
 }
 
@@ -91,6 +92,7 @@ export function aggregateAnalytics(
     totalTasks: daily.reduce((sum, item) => sum + item.tasksCompleted, 0),
     totalHabitCheckins: daily.reduce((sum, item) => sum + item.habitCheckins, 0),
     totalFocusMinutes: daily.reduce((sum, item) => sum + item.focusMinutes, 0),
+    totalReviews: daily.reduce((sum, item) => sum + item.reviewsClosed, 0),
     activeDays: daily.filter((item) => item.activity > 0).length,
   };
 }

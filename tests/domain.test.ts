@@ -159,6 +159,29 @@ describe("event analytics and rewards", () => {
     expect(analytics.totalTasks).toBe(0);
   });
 
+  it("counts one closed review once across analytics and rewards", () => {
+    const closed: HelixEvent = {
+      id: deterministicEventId({
+        type: "review-closed",
+        entityId: "Helix/Journals/Daily/2026-08-09.md",
+        occurrenceKey: "Helix/Journals/Daily/2026-08-09.md",
+        occurredAt: "2026-08-09T08:00:00Z",
+      }),
+      type: "review-closed",
+      entityId: "Helix/Journals/Daily/2026-08-09.md",
+      occurrenceKey: "Helix/Journals/Daily/2026-08-09.md",
+      occurredAt: "2026-08-09T08:00:00Z",
+    };
+    const ledger = new EventLedger([closed]);
+    expect(ledger.append({ ...closed, occurredAt: "2026-08-09T09:00:00Z" })).toBe(false);
+    const events = ledger.list();
+    expect(aggregateAnalytics(events, {
+      from: "2026-08-09",
+      to: "2026-08-09",
+    }).totalReviews).toBe(1);
+    expect(deriveProgress(events).xp).toBe(25);
+  });
+
   it("rotates a deterministic weekly challenge", () => {
     expect(rotatingChallenges(new Date("2026-07-30T12:00:00Z"))[0]).toEqual(
       rotatingChallenges(new Date("2026-08-01T12:00:00Z"))[0],

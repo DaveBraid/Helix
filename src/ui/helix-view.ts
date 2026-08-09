@@ -2054,12 +2054,9 @@ export class HelixView extends ItemView {
           void this.openTaskEditor(currentTask, this.state?.projects ?? []);
         });
       } else {
-        const mappedDidaProjectId = reference.project?.didaProjectId;
         const candidates = tasks.filter((task) =>
           !task.id.startsWith("local-") &&
-          !snapshot.byTaskId.has(task.id) &&
-          !!mappedDidaProjectId &&
-          task.projectId === mappedDidaProjectId);
+          !snapshot.byTaskId.has(task.id));
         const rebind = actions.createEl("button", { text: "重新绑定" });
         rebind.disabled = candidates.length === 0;
         rebind.addEventListener("click", () => {
@@ -2070,12 +2067,6 @@ export class HelixView extends ItemView {
             async (nextTaskId) => {
               const target = candidates.find((task) => task.id === nextTaskId);
               if (!target) throw new Error("待绑定任务已不在候选列表");
-              if (
-                reference.project?.didaProjectId &&
-                target.projectId !== reference.project.didaProjectId
-              ) {
-                throw new Error("新任务所属清单与 Helix 项目映射不一致，拒绝重绑");
-              }
               const verified = await this.service.verifyRemoteTask(target.projectId, target.id);
               await this.actions.taskReferences.rebindTaskId(
                 reference.taskId,
@@ -2116,6 +2107,8 @@ export class HelixView extends ItemView {
   }
 
   private async renderProjects(content: HTMLElement, token: number): Promise<void> {
+    await this.refreshTaskReferenceSnapshot(token);
+    if (token !== this.renderToken) return;
     let workspace: ProjectWorkspaceSnapshot;
     try {
       workspace = await this.actions.readProjectWorkspace(() =>
@@ -2368,6 +2361,52 @@ export class HelixView extends ItemView {
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
     this.projectWorkbench.render(workbenchHost);
+    this.renderProjectLinkedTasks(content, workspace);
+  }
+
+  private renderProjectLinkedTasks(
+    content: HTMLElement,
+    workspace: ProjectWorkspaceSnapshot,
+  ): void {
+    const snapshot = this.taskReferenceSnapshot;
+    if (!snapshot) return;
+    const projectIds = this.selectedProjectId
+      ? new Set([this.selectedProjectId])
+      : new Set(workspace.projects.map((project) => project.id));
+    const references = snapshot.references.filter((reference) =>
+      projectIds.has(reference.projectId));
+    const taskById = new Map((this.state?.tasks ?? []).map((task) => [task.id, task]));
+    const card = content.createDiv({ cls: "helix-card helix-project-linked-tasks" });
+    const header = card.createDiv({ cls: "helix-section-header" });
+    header.createEl("h3", { text: "关联任务" });
+    header.createSpan({ cls: "helix-chip is-soft", text: String(references.length) });
+    if (references.length === 0) {
+      card.createDiv({ cls: "helix-empty", text: "暂无关联任务" });
+      return;
+    }
+    for (const reference of references) {
+      const task = taskById.get(reference.taskId);
+      if (task) {
+        const didaProject = (this.state?.projects ?? []).find((project) =>
+          project.id === task.projectId);
+        this.renderTaskRow(card, task, didaProject, false);
+        continue;
+      }
+      const row = card.createDiv({ cls: "helix-task-row" });
+      const copy = row.createDiv({ cls: "helix-task-copy" });
+      copy.createDiv({ cls: "helix-task-title", text: "任务暂不在同步缓存中" });
+      copy.createDiv({
+        cls: "helix-task-meta",
+        text: reference.stages.map((stage) => `阶段 ${stage.stageCode}`).join(" · ") ||
+          reference.project?.title || reference.projectId,
+      });
+      const open = row.createEl("button", {
+        cls: "helix-mini-action",
+        attr: { "aria-label": "打开任务关联笔记", title: "打开任务关联笔记" },
+      });
+      setIcon(open, "file-text");
+      open.addEventListener("click", () => void this.actions.openProjectFile(reference.notePath));
+    }
   }
 
   private async requestCycleStatusChange(
@@ -2643,6 +2682,7 @@ export class HelixView extends ItemView {
       [String(summary.totalTasks), "完成任务", "近 14 日"],
       [String(summary.totalFocusMinutes), "专注分钟", "近 14 日"],
       [String(summary.totalHabitCheckins), "习惯打卡", "近 14 日"],
+      [String(summary.totalReviews), "完成复盘", "近 14 日"],
       [String(progress.level), "当前等级", `${progress.xp} XP`],
     ]) {
       const card = stats.createDiv({ cls: "helix-card helix-stat" });

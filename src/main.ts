@@ -1149,6 +1149,7 @@ export default class HelixPlugin extends Plugin {
       `- 完成任务：${summary.totalTasks}`,
       `- 习惯打卡：${summary.totalHabitCheckins}`,
       `- 专注时长：${summary.totalFocusMinutes} 分钟`,
+      `- 完成复盘：${summary.totalReviews}`,
       `- 活跃天数：${summary.activeDays}`,
     ].join("\n");
     const existing = await this.vaultRepository.read(path);

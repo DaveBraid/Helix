@@ -69,6 +69,16 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toContain("复盘已打开，但自动摘要未更新");
   });
 
+  it("shows task references on projects without enabling project projection", () => {
+    expect(view).toMatch(/renderProjects\(content[\s\S]*refreshTaskReferenceSnapshot\(token\)/);
+    expect(view).toMatch(/renderProjectLinkedTasks[\s\S]*关联任务[\s\S]*renderTaskRow/);
+    const linkedTasks = view.slice(
+      view.indexOf("private renderProjectLinkedTasks"),
+      view.indexOf("private async requestCycleStatusChange"),
+    );
+    expect(linkedTasks).not.toMatch(/didaProjectId|projection/i);
+  });
+
   it("keeps shell, sidebar and header fixed while only main content scrolls", () => {
     expect(css).toMatch(/\.helix-root \{[\s\S]*height: 100%;[\s\S]*overflow: hidden !important;/);
     expect(css).toMatch(/\.helix-shell \{[\s\S]*height: 100%;[\s\S]*overflow: hidden !important;/);

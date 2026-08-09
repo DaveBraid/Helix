@@ -82,6 +82,14 @@ export interface ManagedPlanAction {
   uuid: string;
   title: string;
   state: ProjectionActionState;
+  parentUuid?: string;
+  content?: string;
+  startDate?: string;
+  dueDate?: string;
+  timeZone?: string;
+  isAllDay?: boolean;
+  priority?: 0 | 1 | 3 | 5;
+  tags?: string[];
   remoteId?: string;
   line: number;
 }
@@ -156,7 +164,9 @@ export type ProjectionIntent =
   | { kind: "reopen-action"; entry: ProjectionLedgerEntry }
   | { kind: "delete-action"; entry: ProjectionLedgerEntry };
 
-const ACTION_MARKER = /^<!-- helix-dida-action:v1 uuid=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
+const ACTION_MARKER_V1 = /^<!-- helix-dida-action:v1 uuid=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
+const ACTION_MARKER_V2 = /^<!-- helix-dida-action:v2 uuid=([^ ]+) parent=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
+const ACTION_MARKER_V3 = /^<!-- helix-dida-action:v3 uuid=([^ ]+) parent=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) priority=(0|1|3|5) start=([^ ]+) due=([^ ]+) zone=([^ ]+) allDay=(0|1) tags=([^ ]+) note=([^ ]+) -->$/;
 const CHECKBOX = /^(\s*)[-*+] \[([ xX])\] (.*?)(?:\s+<!-- helix-dida-action:v1 [\s\S]+ -->)?\s*$/;
 
 export function buildProjectionActivationPreview(input: {
@@ -224,13 +234,14 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
       continue;
     }
     const markerText = line.slice(markerStart).trim();
-    const marker = ACTION_MARKER.exec(markerText);
+    const marker = parseActionMarker(markerText);
     if (!marker) throw new Error(`计划行动同步标记损坏：第 ${index + 1} 行`);
-    const uuid = decodeMarkerValue(marker[1]!, "行动 UUID");
-    const remote = marker[2] === "-" ? undefined : decodeMarkerValue(marker[2]!, "远端任务 ID");
-    const state = marker[3] as ProjectionActionState;
+    const { uuid, parentUuid, remoteId: remote, state } = marker;
     assertStableId(uuid, "行动 UUID");
     if (uuids.has(uuid)) throw new Error(`计划行动 UUID 重复：${uuid}`);
+    if (parentUuid && !uuids.has(parentUuid)) {
+      throw new Error(`计划行动父任务必须位于子任务之前：第 ${index + 1} 行`);
+    }
     if (remote && remoteIds.has(remote)) throw new Error(`计划行动远端 ID 重复：${remote}`);
     uuids.add(uuid);
     if (remote) remoteIds.add(remote);
@@ -240,7 +251,21 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     if (checked !== (state === "completed")) {
       throw new Error(`计划行动勾选状态与同步状态不一致：第 ${index + 1} 行`);
     }
-    actions.push({ uuid, title: rawTitle, state, remoteId: remote, line: index + 1 });
+    actions.push({
+      uuid,
+      title: rawTitle,
+      state,
+      ...(parentUuid ? { parentUuid } : {}),
+      ...(marker.content ? { content: marker.content } : {}),
+      ...(marker.startDate ? { startDate: marker.startDate } : {}),
+      ...(marker.dueDate ? { dueDate: marker.dueDate } : {}),
+      ...(marker.timeZone ? { timeZone: marker.timeZone } : {}),
+      ...(marker.isAllDay ? { isAllDay: true } : {}),
+      ...(marker.priority ? { priority: marker.priority } : {}),
+      ...(marker.tags?.length ? { tags: marker.tags } : {}),
+      ...(remote ? { remoteId: remote } : {}),
+      line: index + 1,
+    });
   }
   return { actions, unmanagedChecklistLines, section: { ...section, eol } };
 }
@@ -257,7 +282,7 @@ export function managedActionMarkerSpans(markdown: string): Array<{ from: number
     const line = lines[action.line - 1] ?? "";
     const markerFrom = line.indexOf("<!-- helix-dida-action:");
     const markerText = markerFrom >= 0 ? line.slice(markerFrom).trim() : "";
-    if (markerFrom < 0 || !ACTION_MARKER.test(markerText)) {
+    if (markerFrom < 0 || !parseActionMarker(markerText)) {
       throw new Error(`计划行动同步标记损坏：第 ${action.line} 行`);
     }
     const from = lineStarts[action.line - 1]! + markerFrom;
@@ -265,7 +290,12 @@ export function managedActionMarkerSpans(markdown: string): Array<{ from: number
   });
 }
 
-export function adoptPlanAction(markdown: string, lineNumber: number, uuid: string): string {
+export function adoptPlanAction(
+  markdown: string,
+  lineNumber: number,
+  uuid: string,
+  parentUuid?: string,
+): string {
   assertStableId(uuid, "行动 UUID");
   const parsed = parseManagedPlanActions(markdown);
   if (!parsed.unmanagedChecklistLines.includes(lineNumber)) throw new Error("只能将计划行动中尚未加入同步的清单项加入同步");
@@ -275,8 +305,155 @@ export function adoptPlanAction(markdown: string, lineNumber: number, uuid: stri
   const checkbox = CHECKBOX.exec(lines[index] ?? "");
   if (!checkbox) throw new Error("目标行已变化，请重新预览");
   const state: ProjectionActionState = checkbox[2]!.toLowerCase() === "x" ? "completed" : "active";
-  lines[index] = `${lines[index]!.trimEnd()} ${renderActionMarker(uuid, undefined, state)}`;
+  if (parentUuid && !parsed.actions.some((action) => action.uuid === parentUuid)) {
+    throw new Error("计划行动父任务不存在");
+  }
+  lines[index] = `${lines[index]!.trimEnd()} ${renderActionMarker(uuid, undefined, state, parentUuid)}`;
   return lines.join(parsed.section.eol);
+}
+
+/** 为“计划行动”中的有效原生复选项一次性补齐稳定身份；空模板占位保持原样。 */
+export function adoptAllPlanActions(
+  markdown: string,
+  uuidFactory: () => string = () => crypto.randomUUID(),
+): string {
+  const parsed = parseManagedPlanActions(markdown);
+  if (parsed.unmanagedChecklistLines.length === 0) return markdown;
+  const unmanaged = new Set(parsed.unmanagedChecklistLines);
+  const managedByLine = new Map(parsed.actions.map((action) => [action.line, action]));
+  const lines = markdown.split(/\r?\n/);
+  const stack: Array<{ indent: number; uuid: string }> = [];
+  let changed = false;
+  for (let lineNumber = parsed.section.start + 2; lineNumber <= parsed.section.end; lineNumber += 1) {
+    if (!unmanaged.has(lineNumber) && !managedByLine.has(lineNumber)) continue;
+    const line = lines[lineNumber - 1] ?? "";
+    const checkbox = CHECKBOX.exec(line);
+    if (!checkbox) continue;
+    const indent = indentationWidth(checkbox[1]!);
+    while (stack.length > 0 && stack[stack.length - 1]!.indent >= indent) stack.pop();
+    const existing = managedByLine.get(lineNumber);
+    if (existing) {
+      stack.push({ indent, uuid: existing.uuid });
+      continue;
+    }
+    const title = checkbox[3]!.trim();
+    if (!title) continue;
+    assertManagedActionTitle(title);
+    const uuid = uuidFactory();
+    assertStableId(uuid, "行动 UUID");
+    const state: ProjectionActionState = checkbox[2]!.toLowerCase() === "x" ? "completed" : "idea";
+    const parentUuid = stack[stack.length - 1]?.uuid;
+    lines[lineNumber - 1] = `${line.trimEnd()} ${renderActionMarker(uuid, undefined, state, parentUuid)}`;
+    stack.push({ indent, uuid });
+    changed = true;
+  }
+  const next = changed ? lines.join(parsed.section.eol) : markdown;
+  if (changed) parseManagedPlanActions(next);
+  return next;
+}
+
+/** 原生勾选只驱动尚未绑定远端的本地任务；远端身份存在时仍保持严格冲突检查。 */
+export function reconcileLocalPlanActionCheckboxes(markdown: string): string {
+  const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
+  const lines = markdown.split(/\r?\n/);
+  const section = exactHeadingSection(lines, PLAN_ACTION_HEADING, 1);
+  let changed = false;
+  let fence: { char: "`" | "~"; length: number } | undefined;
+  for (let index = section.start + 1; index < section.end; index += 1) {
+    const line = lines[index] ?? "";
+    const fenceMarker = /^( {0,3})(`{3,}|~{3,})/.exec(line)?.[2];
+    if (fenceMarker) {
+      const char = fenceMarker[0] as "`" | "~";
+      if (!fence) fence = { char, length: fenceMarker.length };
+      else if (char === fence.char && fenceMarker.length >= fence.length &&
+        new RegExp(`^ {0,3}${char === "`" ? "`" : "~"}{${fence.length},}\\s*$`).test(line)) {
+        fence = undefined;
+      }
+      continue;
+    }
+    if (fence) continue;
+    const checkbox = CHECKBOX.exec(line);
+    const markerStart = line.indexOf("<!-- helix-dida-action:");
+    if (!checkbox || markerStart < 0) continue;
+    const marker = parseActionMarker(line.slice(markerStart).trim());
+    if (!marker || marker.remoteId) continue;
+    const checked = checkbox[2]!.toLowerCase() === "x";
+    const nextState = checked
+      ? "completed"
+      : marker.state === "completed"
+        ? "idea"
+        : marker.state;
+    if (nextState === marker.state) continue;
+    lines[index] = `${line.slice(0, markerStart).trimEnd()} ${
+      renderActionMarker(marker.uuid, undefined, nextState, marker.parentUuid, marker)
+    }`;
+    changed = true;
+  }
+  const next = changed ? lines.join(eol) : markdown;
+  if (changed) parseManagedPlanActions(next);
+  return next;
+}
+
+export function appendManagedPlanAction(markdown: string, input: {
+  uuid: string;
+  title: string;
+  state?: ProjectionActionState;
+  parentUuid?: string;
+  content?: string;
+  startDate?: string;
+  dueDate?: string;
+  timeZone?: string;
+  isAllDay?: boolean;
+  priority?: 0 | 1 | 3 | 5;
+  tags?: string[];
+}): string {
+  assertStableId(input.uuid, "行动 UUID");
+  assertManagedActionTitle(input.title);
+  const parsed = parseManagedPlanActions(markdown);
+  if (parsed.actions.some((action) => action.uuid === input.uuid)) throw new Error("行动 UUID 已存在");
+  const lines = markdown.split(/\r?\n/);
+  let insertAt = parsed.section.end;
+  let indent = "";
+  if (input.parentUuid) {
+    const parent = parsed.actions.find((action) => action.uuid === input.parentUuid);
+    if (!parent) throw new Error("计划行动父任务不存在");
+    const parentLayout = /^(\s*)[-*+] \[[ xX]\]/.exec(lines[parent.line - 1] ?? "");
+    if (!parentLayout) throw new Error("父任务行结构已变化");
+    indent = `${parentLayout[1]}  `;
+    const parentWidth = indentationWidth(parentLayout[1]!);
+    insertAt = parsed.section.end;
+    for (let index = parent.line; index < parsed.section.end; index += 1) {
+      const candidate = /^(\s*)[-*+] \[[ xX]\]/.exec(lines[index] ?? "");
+      if (candidate && indentationWidth(candidate[1]!) <= parentWidth) {
+        insertAt = index;
+        break;
+      }
+    }
+  }
+  const state = input.state ?? "idea";
+  const line = `${indent}- [${state === "completed" ? "x" : " "}] ${input.title} ${
+    renderActionMarker(input.uuid, undefined, state, input.parentUuid, input)
+  }`;
+  lines.splice(insertAt, 0, line);
+  return lines.join(parsed.section.eol);
+}
+
+export function removeManagedPlanAction(markdown: string, uuid: string): string {
+  const parsed = parseManagedPlanActions(markdown);
+  const target = parsed.actions.find((action) => action.uuid === uuid);
+  if (!target) throw new Error("找不到需要删除的计划行动");
+  const removed = new Set([uuid]);
+  for (const action of parsed.actions) {
+    if (action.parentUuid && removed.has(action.parentUuid)) removed.add(action.uuid);
+  }
+  const targets = parsed.actions.filter((action) => removed.has(action.uuid));
+  if (targets.some((action) => action.remoteId)) {
+    throw new Error("计划行动仍绑定滴答身份，当前本地模式禁止删除");
+  }
+  const targetLines = new Set(targets.map((action) => action.line));
+  return markdown.split(/\r?\n/)
+    .filter((_line, index) => !targetLines.has(index + 1))
+    .join(parsed.section.eol);
 }
 
 export function patchManagedPlanAction(markdown: string, input: {
@@ -284,6 +461,13 @@ export function patchManagedPlanAction(markdown: string, input: {
   title?: string;
   state?: ProjectionActionState;
   remoteId?: string | null;
+  content?: string;
+  startDate?: string | null;
+  dueDate?: string | null;
+  timeZone?: string | null;
+  isAllDay?: boolean;
+  priority?: 0 | 1 | 3 | 5;
+  tags?: string[];
 }): string {
   const parsed = parseManagedPlanActions(markdown);
   const current = parsed.actions.find((action) => action.uuid === input.uuid);
@@ -297,13 +481,24 @@ export function patchManagedPlanAction(markdown: string, input: {
   const original = lines[current.line - 1] ?? "";
   const layout = /^(\s*)([-*+]) \[[ xX]\]/.exec(original);
   if (!layout) throw new Error("已加入同步的计划行动行结构已变化");
-  lines[current.line - 1] = `${layout[1]}${layout[2]} [${state === "completed" ? "x" : " "}] ${title} ${renderActionMarker(current.uuid, remoteId, state)}`;
+  const metadata = {
+    content: input.content === undefined ? current.content : input.content || undefined,
+    startDate: input.startDate === undefined ? current.startDate : input.startDate || undefined,
+    dueDate: input.dueDate === undefined ? current.dueDate : input.dueDate || undefined,
+    timeZone: input.timeZone === undefined ? current.timeZone : input.timeZone || undefined,
+    isAllDay: input.isAllDay ?? current.isAllDay,
+    priority: input.priority ?? current.priority,
+    tags: input.tags ?? current.tags,
+  };
+  lines[current.line - 1] = `${layout[1]}${layout[2]} [${state === "completed" ? "x" : " "}] ${title} ${renderActionMarker(current.uuid, remoteId, state, current.parentUuid, metadata)}`;
   return lines.join(parsed.section.eol);
 }
 
 export function restoreManagedPlanAction(
   markdown: string,
-  action: Pick<ManagedPlanAction, "uuid" | "title" | "state" | "remoteId">,
+  action: Pick<ManagedPlanAction,
+    "uuid" | "title" | "state" | "remoteId" | "parentUuid" | "content" |
+    "startDate" | "dueDate" | "timeZone" | "isAllDay" | "priority" | "tags">,
 ): string {
   assertManagedActionTitle(action.title);
   const parsed = parseManagedPlanActions(markdown);
@@ -313,7 +508,7 @@ export function restoreManagedPlanAction(
   }
   const lines = markdown.split(/\r?\n/);
   lines.splice(parsed.section.end, 0,
-    `- [${action.state === "completed" ? "x" : " "}] ${action.title} ${renderActionMarker(action.uuid, action.remoteId, action.state)}`);
+    `- [${action.state === "completed" ? "x" : " "}] ${action.title} ${renderActionMarker(action.uuid, action.remoteId, action.state, action.parentUuid, action)}`);
   return lines.join(parsed.section.eol);
 }
 
@@ -585,8 +780,104 @@ function patchFrontmatterScalar(markdown: string, key: string, value: string): s
   return `${match[1]}${lines.join(eol)}${match[3]}${markdown.slice(match[0].length)}`;
 }
 
-function renderActionMarker(uuid: string, remoteId: string | undefined, state: ProjectionActionState): string {
+function renderActionMarker(
+  uuid: string,
+  remoteId: string | undefined,
+  state: ProjectionActionState,
+  parentUuid?: string,
+  metadata: Pick<ManagedPlanAction,
+    "content" | "startDate" | "dueDate" | "timeZone" | "isAllDay" | "priority" | "tags"> = {},
+): string {
+  const hasMetadata = Boolean(
+    metadata.content || metadata.startDate || metadata.dueDate || metadata.timeZone ||
+    metadata.isAllDay || metadata.priority || metadata.tags?.length,
+  );
+  if (hasMetadata) {
+    return `<!-- helix-dida-action:v3 uuid=${encodeURIComponent(uuid)} parent=${parentUuid ? encodeURIComponent(parentUuid) : "-"} remoteId=${remoteId ? encodeURIComponent(remoteId) : "-"} state=${state} priority=${metadata.priority ?? 0} start=${encodeMarkerOptional(metadata.startDate)} due=${encodeMarkerOptional(metadata.dueDate)} zone=${encodeMarkerOptional(metadata.timeZone)} allDay=${metadata.isAllDay ? 1 : 0} tags=${encodeMarkerOptional(metadata.tags?.length ? JSON.stringify(metadata.tags) : undefined)} note=${encodeMarkerOptional(metadata.content)} -->`;
+  }
+  if (parentUuid) {
+    return `<!-- helix-dida-action:v2 uuid=${encodeURIComponent(uuid)} parent=${encodeURIComponent(parentUuid)} remoteId=${remoteId ? encodeURIComponent(remoteId) : "-"} state=${state} -->`;
+  }
   return `<!-- helix-dida-action:v1 uuid=${encodeURIComponent(uuid)} remoteId=${remoteId ? encodeURIComponent(remoteId) : "-"} state=${state} -->`;
+}
+
+function parseActionMarker(marker: string): {
+  uuid: string;
+  parentUuid?: string;
+  remoteId?: string;
+  state: ProjectionActionState;
+  content?: string;
+  startDate?: string;
+  dueDate?: string;
+  timeZone?: string;
+  isAllDay?: boolean;
+  priority?: 0 | 1 | 3 | 5;
+  tags?: string[];
+} | null {
+  const v3 = ACTION_MARKER_V3.exec(marker);
+  if (v3) {
+    const parentUuid = decodeMarkerOptional(v3[2]!, "父任务 UUID");
+    const remoteId = decodeMarkerOptional(v3[3]!, "远端任务 ID");
+    const startDate = decodeMarkerOptional(v3[6]!, "开始时间");
+    const dueDate = decodeMarkerOptional(v3[7]!, "截止时间");
+    const timeZone = decodeMarkerOptional(v3[8]!, "时区");
+    const tagsText = decodeMarkerOptional(v3[10]!, "标签");
+    const content = decodeMarkerOptional(v3[11]!, "备注");
+    if (startDate && !Number.isFinite(Date.parse(startDate))) throw new Error("开始时间无效");
+    if (dueDate && !Number.isFinite(Date.parse(dueDate))) throw new Error("截止时间无效");
+    let tags: string[] | undefined;
+    if (tagsText) {
+      try {
+        const parsed = JSON.parse(tagsText);
+        if (!Array.isArray(parsed) || parsed.some((tag) => typeof tag !== "string" || !tag.trim())) throw new Error();
+        tags = [...new Set(parsed.map((tag) => tag.trim()))];
+      } catch {
+        throw new Error("标签编码无效");
+      }
+    }
+    return {
+      uuid: decodeMarkerValue(v3[1]!, "行动 UUID"),
+      ...(parentUuid ? { parentUuid } : {}),
+      ...(remoteId ? { remoteId } : {}),
+      state: v3[4] as ProjectionActionState,
+      ...(Number(v3[5]) === 0 ? {} : { priority: Number(v3[5]) as 1 | 3 | 5 }),
+      ...(startDate ? { startDate } : {}),
+      ...(dueDate ? { dueDate } : {}),
+      ...(timeZone ? { timeZone } : {}),
+      ...(v3[9] === "1" ? { isAllDay: true } : {}),
+      ...(tags?.length ? { tags } : {}),
+      ...(content ? { content } : {}),
+    };
+  }
+  const v2 = ACTION_MARKER_V2.exec(marker);
+  if (v2) {
+    const parentUuid = v2[2] === "-" ? undefined : decodeMarkerValue(v2[2]!, "父任务 UUID");
+    return {
+      uuid: decodeMarkerValue(v2[1]!, "行动 UUID"),
+      ...(parentUuid ? { parentUuid } : {}),
+      ...(v2[3] === "-" ? {} : { remoteId: decodeMarkerValue(v2[3]!, "远端任务 ID") }),
+      state: v2[4] as ProjectionActionState,
+    };
+  }
+  const v1 = ACTION_MARKER_V1.exec(marker);
+  if (!v1) return null;
+  return {
+    uuid: decodeMarkerValue(v1[1]!, "行动 UUID"),
+    ...(v1[2] === "-" ? {} : { remoteId: decodeMarkerValue(v1[2]!, "远端任务 ID") }),
+    state: v1[3] as ProjectionActionState,
+  };
+}
+
+function encodeMarkerOptional(value: string | undefined): string {
+  return value ? encodeURIComponent(value) : "-";
+}
+
+function decodeMarkerOptional(value: string, label: string): string | undefined {
+  return value === "-" ? undefined : decodeMarkerValue(value, label);
+}
+
+function indentationWidth(value: string): number {
+  return [...value].reduce((width, char) => width + (char === "\t" ? 4 : 1), 0);
 }
 
 function decodeMarkerValue(value: string, label: string): string {

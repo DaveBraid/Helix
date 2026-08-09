@@ -3,11 +3,15 @@ import type { DidaChecklistItem, DidaColumn, DidaProject, DidaTask } from "../sr
 import { stableHash } from "../src/domain/stable";
 import {
   adoptPlanAction,
+  adoptAllPlanActions,
+  appendManagedPlanAction,
   assertProjectionActivation,
   buildProjectionActivationPreview,
   buildProjectionLedger,
   parseManagedPlanActions,
   patchManagedPlanAction,
+  removeManagedPlanAction,
+  reconcileLocalPlanActionCheckboxes,
   patchProjectParentTaskId,
   planProjectionChanges,
   projectionMarker,
@@ -141,6 +145,97 @@ describe("Dida project projection domain", () => {
     const adopted = adoptPlanAction(stage("  * [ ] 缩进行动"), 10, "uuid-layout");
     const patched = patchManagedPlanAction(adopted, { uuid: "uuid-layout", title: "保留结构" });
     expect(patched).toContain("  * [ ] 保留结构 <!-- helix-dida-action:v1");
+  });
+
+  it("silently adopts valid native actions, preserves the empty template row and records hierarchy", () => {
+    let sequence = 0;
+    const source = stage("- [ ] 根任务\n  - [ ] 子任务\n- [ ]\n- 普通列表");
+    const adopted = adoptAllPlanActions(source, () => `uuid-${++sequence}`);
+    expect(parseManagedPlanActions(adopted).actions).toEqual([
+      { uuid: "uuid-1", title: "根任务", state: "idea", line: 10 },
+      { uuid: "uuid-2", parentUuid: "uuid-1", title: "子任务", state: "idea", line: 11 },
+    ]);
+    expect(adopted).toContain("- [ ]\n- 普通列表");
+    expect(adoptAllPlanActions(adopted, () => "unexpected")).toBe(adopted);
+  });
+
+  it("appends and removes a parent task subtree without touching unrelated Markdown", () => {
+    const root = appendManagedPlanAction(stage("用户正文"), {
+      uuid: "root-task",
+      title: "根任务",
+      state: "idea",
+    });
+    const child = appendManagedPlanAction(root, {
+      uuid: "child-task",
+      title: "子任务",
+      state: "active",
+      parentUuid: "root-task",
+    });
+    const sibling = appendManagedPlanAction(child, {
+      uuid: "sibling-task",
+      title: "同级任务",
+      state: "active",
+    });
+    expect(parseManagedPlanActions(sibling).actions).toEqual([
+      { uuid: "root-task", title: "根任务", state: "idea", line: 12 },
+      { uuid: "child-task", parentUuid: "root-task", title: "子任务", state: "active", line: 13 },
+      { uuid: "sibling-task", title: "同级任务", state: "active", line: 14 },
+    ]);
+    const removed = removeManagedPlanAction(sibling, "root-task");
+    expect(removed).toContain("用户正文");
+    expect(parseManagedPlanActions(removed).actions).toEqual([
+      { uuid: "sibling-task", title: "同级任务", state: "active", line: 12 },
+    ]);
+  });
+
+  it("rejects a child marker whose parent is missing or ordered after it", () => {
+    expect(() => parseManagedPlanActions(stage(
+      "  - [ ] 子任务 <!-- helix-dida-action:v2 uuid=child parent=missing remoteId=- state=active -->",
+    ))).toThrow(/父任务必须位于子任务之前/);
+  });
+
+  it("accepts native checkbox completion for local tasks but never rewrites a remote-bound item", () => {
+    const local = adoptPlanAction(stage("- [ ] 本地任务"), 10, "local-task");
+    const checked = local.replace("- [ ] 本地任务", "- [x] 本地任务");
+    const reconciled = reconcileLocalPlanActionCheckboxes(checked);
+    expect(parseManagedPlanActions(reconciled).actions[0]?.state).toBe("completed");
+    const reopened = reconcileLocalPlanActionCheckboxes(reconciled.replace("- [x]", "- [ ]"));
+    expect(parseManagedPlanActions(reopened).actions[0]?.state).toBe("idea");
+
+    const remote = patchManagedPlanAction(local, { uuid: "local-task", remoteId: "remote-task" });
+    const remoteChecked = remote.replace("- [ ] 本地任务", "- [x] 本地任务");
+    expect(reconcileLocalPlanActionCheckboxes(remoteChecked)).toBe(remoteChecked);
+    expect(() => parseManagedPlanActions(remoteChecked)).toThrow(/勾选状态/);
+  });
+
+  it("roundtrips local editor metadata in the hidden action marker", () => {
+    const adopted = adoptPlanAction(stage("- [ ] 元数据任务"), 10, "meta-task");
+    const updated = patchManagedPlanAction(adopted, {
+      uuid: "meta-task",
+      content: "两行备注\n第二行",
+      startDate: "2026-08-10T01:00:00.000Z",
+      dueDate: "2026-08-10T02:00:00.000Z",
+      timeZone: "Asia/Shanghai",
+      isAllDay: false,
+      priority: 5,
+      tags: ["科研", "阶段 验收"],
+    });
+    expect(updated).toContain("helix-dida-action:v3");
+    expect(parseManagedPlanActions(updated).actions[0]).toMatchObject({
+      uuid: "meta-task",
+      content: "两行备注\n第二行",
+      startDate: "2026-08-10T01:00:00.000Z",
+      dueDate: "2026-08-10T02:00:00.000Z",
+      timeZone: "Asia/Shanghai",
+      priority: 5,
+      tags: ["科研", "阶段 验收"],
+    });
+    const checked = reconcileLocalPlanActionCheckboxes(updated.replace("- [ ]", "- [x]"));
+    expect(parseManagedPlanActions(checked).actions[0]).toMatchObject({
+      state: "completed",
+      content: "两行备注\n第二行",
+      priority: 5,
+    });
   });
 
   it("ignores headings in both fence styles and stops at the next H1", () => {

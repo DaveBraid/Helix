@@ -664,6 +664,288 @@
   padding: 10px 0 4px;
 }
 
+.modal.helix-task-editor-modal {
+  width: min(620px, calc(100vw - 32px));
+  padding: 0;
+  overflow: hidden;
+}
+
+.helix-task-editor {
+  display: grid;
+  gap: 14px;
+  padding: 2px 4px 4px;
+  color: var(--text-normal);
+}
+
+.helix-task-editor-context,
+.helix-task-editor-properties,
+.helix-task-editor-section-head,
+.helix-task-editor-footer,
+.helix-task-editor-subtask,
+.helix-task-editor-subtask-add {
+  display: flex;
+  align-items: center;
+}
+
+.helix-task-editor-context {
+  gap: 8px;
+  min-width: 0;
+}
+
+.helix-task-editor-location {
+  min-width: 0;
+  overflow: hidden;
+  padding: 3px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-editor-location:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.helix-task-editor-title {
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+  font-size: 20px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.helix-task-editor-title:focus {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 28%, transparent);
+}
+
+.helix-task-editor-content {
+  width: 100%;
+  min-height: 82px;
+  resize: vertical;
+  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 74%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background-secondary) 40%, transparent);
+  box-shadow: none;
+  color: var(--text-normal);
+  line-height: 1.55;
+}
+
+.helix-task-editor-context-copy {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-editor-details {
+  overflow: visible;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--background-secondary) 36%, transparent);
+}
+
+.helix-task-editor-details > summary {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 0 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
+.helix-task-editor-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.helix-task-editor-details > summary svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+}
+
+.helix-task-editor-summary-value {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 450;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-editor-details-body {
+  position: relative;
+  padding: 0 12px 8px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.helix-task-editor-details-body .setting-item {
+  gap: 14px;
+  padding: 10px 0;
+}
+
+.helix-task-editor-details-body .setting-item-name {
+  font-size: 12px;
+}
+
+.helix-task-editor-details-body .setting-item-description {
+  font-size: 10px;
+}
+
+.helix-task-editor-properties {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.helix-task-editor-property {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--background-secondary) 72%, transparent);
+  color: var(--text-muted);
+}
+
+.helix-task-editor-property svg {
+  width: 15px;
+  height: 15px;
+}
+
+.helix-task-editor-property select {
+  padding: 0 22px 0 0;
+  border: 0;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+}
+
+.helix-task-editor-property input[type="text"],
+.helix-task-editor-property input[type="datetime-local"] {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+}
+
+.helix-task-editor-property.is-date input {
+  width: 154px;
+}
+
+.helix-task-editor-property.is-wide {
+  flex: 1 1 180px;
+}
+
+.helix-task-editor-property.is-wide input {
+  width: 100%;
+}
+
+.helix-task-editor-property.is-toggle input {
+  margin: 0;
+}
+
+.helix-task-editor-subtasks {
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--background-secondary) 42%, transparent);
+}
+
+.helix-task-editor-section-head {
+  justify-content: space-between;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.helix-task-editor-section-head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.helix-task-editor-subtask-list {
+  display: grid;
+}
+
+.helix-task-editor-subtask,
+.helix-task-editor-subtask-add {
+  gap: 9px;
+  min-height: 42px;
+  padding: 5px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--background-modifier-border) 72%, transparent);
+}
+
+.helix-task-editor-subtask input,
+.helix-task-editor-subtask-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+}
+
+.helix-task-editor-subtask-add {
+  border-bottom: 0;
+  color: var(--text-faint);
+}
+
+.helix-task-editor-icon-button,
+.helix-task-editor-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.helix-task-editor-icon-button:hover,
+.helix-task-editor-delete:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.helix-task-editor-delete.is-armed {
+  background: color-mix(in srgb, var(--text-error) 14%, transparent);
+  color: var(--text-error);
+}
+
+.helix-task-editor-footer {
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.helix-task-editor-footer-spacer {
+  flex: 1 1 auto;
+}
+
+.helix-task-row.is-local-project-task {
+  --helix-task-local-tint: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
+  background: var(--helix-task-local-tint);
+}
+
 .helix-task-reference-warning {
   margin: 8px 0 12px;
   padding: 10px 12px;

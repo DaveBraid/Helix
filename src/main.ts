@@ -107,6 +107,11 @@ import {
 import { helixMarkerVisibilityExtension } from "./editor/helix-marker-visibility";
 import { ProjectRefreshBatch } from "./services/project-refresh-batch";
 import {
+  LocalProjectTaskService,
+  type LocalProjectTaskDraft,
+  type LocalProjectTaskSnapshot,
+} from "./services/local-project-tasks";
+import {
   PROJECT_DIDA_PROJECTION_AVAILABLE,
   assertProjectDidaProjectionAvailable,
 } from "./release-capabilities";
@@ -125,6 +130,7 @@ export default class HelixPlugin extends Plugin {
   templateManager!: HelixTemplateManager;
   projectWorkspace!: ProjectWorkspaceService;
   taskReferences!: TaskReferenceService;
+  localProjectTasks!: LocalProjectTaskService;
   projectProjection!: DidaProjectProjectionService;
   private projectAutoSync!: ProjectAutoSyncCoordinator;
   /** 设置页和命令面板使用同一确认规则，但绝不允许跨入口确认。 */
@@ -179,6 +185,9 @@ export default class HelixPlugin extends Plugin {
       this.vaultRepository,
       this.projectWorkspace,
       () => this.settings.rootFolder,
+    );
+    this.localProjectTasks = new LocalProjectTaskService(
+      new VaultProjectionMarkdownAdapter(this.vaultRepository),
     );
     const staleFocusBridgeIssues = data.recoveryIssues.filter((issue) =>
       issue.startsWith(FOCUS_BRIDGE_RECOVERY_PREFIX));
@@ -293,6 +302,11 @@ export default class HelixPlugin extends Plugin {
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
         taskReferences: this.taskReferences,
+        readLocalProjectTasks: () => this.readLocalProjectTasks(),
+        createLocalProjectTask: (input) => this.createLocalProjectTask(input),
+        updateLocalProjectTask: (input) => this.updateLocalProjectTask(input),
+        saveLocalProjectTask: (input) => this.saveLocalProjectTask(input),
+        deleteLocalProjectTask: (input) => this.deleteLocalProjectTask(input),
         readProjectWorkspace: (operation) => this.withProjectWorkspaceRead(operation),
         mutateProjectWorkspace: (operation) => this.withWritableProjectMutation(operation),
         repairProjectCanvas: () => this.repairProjectCanvas(),
@@ -629,6 +643,70 @@ export default class HelixPlugin extends Plugin {
   async readProjectProjection(projectId: string): Promise<ProjectionProjectReadModel> {
     return this.withProjectWorkspaceRead(async () =>
       this.projectProjection.readProject(await this.projectionInput(projectId)));
+  }
+
+  async readLocalProjectTasks(): Promise<LocalProjectTaskSnapshot> {
+    this.assertWritable();
+    return this.withProjectWorkspaceRead(async () =>
+      this.localProjectTasks.snapshot(
+        await this.projectWorkspace.loadStableWorkspace(),
+        { adoptUnmanaged: true },
+      ));
+  }
+
+  async createLocalProjectTask(input: {
+    projectId: string;
+    stageId: string;
+    title: string;
+    parentUuid?: string;
+  }): Promise<string> {
+    return this.withWritableProjectMutation(async () =>
+      this.localProjectTasks.createTask(
+        await this.projectWorkspace.loadStableWorkspace(),
+        input,
+      ));
+  }
+
+  async updateLocalProjectTask(input: {
+    projectId: string;
+    stageId: string;
+    uuid: string;
+    expectedHash: string;
+    title?: string;
+    state?: ProjectionActionState;
+  }): Promise<void> {
+    await this.withWritableProjectMutation(async () =>
+      this.localProjectTasks.updateTask(
+        await this.projectWorkspace.loadStableWorkspace(),
+        input,
+      ));
+  }
+
+  async deleteLocalProjectTask(input: {
+    projectId: string;
+    stageId: string;
+    uuid: string;
+    expectedHash: string;
+  }): Promise<void> {
+    await this.withWritableProjectMutation(async () =>
+      this.localProjectTasks.deleteTask(
+        await this.projectWorkspace.loadStableWorkspace(),
+        input,
+      ));
+  }
+
+  async saveLocalProjectTask(input: {
+    projectId: string;
+    stageId: string;
+    uuid: string;
+    expectedHash: string;
+    draft: LocalProjectTaskDraft;
+  }): Promise<void> {
+    await this.withWritableProjectMutation(async () =>
+      this.localProjectTasks.saveTask(
+        await this.projectWorkspace.loadStableWorkspace(),
+        input,
+      ));
   }
 
   async readProjectProjectionConfiguration(): Promise<ProjectionPersistentState> {

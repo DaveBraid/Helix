@@ -1,0 +1,209 @@
+import { describe, expect, it } from "vitest";
+import { stableHash } from "../src/domain/stable";
+import {
+  LocalProjectTaskService,
+  isLocalProjectTaskId,
+  type LocalProjectTaskSnapshot,
+} from "../src/services/local-project-tasks";
+import type {
+  ProjectionMarkdownPort,
+  ProjectionMarkdownRevision,
+} from "../src/services/dida-project-projection";
+import type { ProjectWorkspaceSnapshot } from "../src/services/project-workspace";
+
+const stage = `---
+helix-kind: helix-stage
+helix-id: stage-1
+---
+
+# 阶段 1 · 验收
+
+# 本阶段问题聚焦
+
+# 计划行动
+
+- [ ] 根任务
+  - [ ] 子任务
+- [ ]
+
+# 行动结果
+
+用户正文
+`;
+
+class MemoryMarkdown implements ProjectionMarkdownPort {
+  writes = 0;
+  constructor(private content = stage) {}
+  async read(path: string): Promise<ProjectionMarkdownRevision | null> {
+    return path === "Stage.md" ? { path, content: this.content, hash: stableHash(this.content) } : null;
+  }
+  async compareAndWrite(
+    revision: ProjectionMarkdownRevision,
+    content: string,
+  ): Promise<ProjectionMarkdownRevision> {
+    if (revision.hash !== stableHash(this.content)) throw new Error("CAS 竞争");
+    this.content = content;
+    this.writes += 1;
+    return { path: revision.path, content, hash: stableHash(content) };
+  }
+  value(): string { return this.content; }
+}
+
+function workspace(): ProjectWorkspaceSnapshot {
+  return {
+    canvasPath: "Helix/Project Lineage.canvas",
+    canvasRevisionHash: "canvas",
+    managedMarkdownRevisionHashes: {},
+    projects: [{
+      id: "project-1",
+      title: "项目 A",
+      status: "active",
+      notePath: "Project.md",
+      color: "#123456",
+      cycles: [{
+        id: "stage-1",
+        title: "验收",
+        notePath: "Stage.md",
+        sequence: 1,
+        stageCode: "1",
+        status: "active",
+      }],
+    }],
+    nextStageSequenceByProject: { "project-1": 2 },
+    relations: [],
+    migrationWarnings: [],
+    migrationItems: [],
+    migrationRequired: false,
+    canvasNodes: [],
+    collapsedCompletedProjectIds: [],
+    nativeRelationCandidates: [],
+  };
+}
+
+function expectClean(snapshot: LocalProjectTaskSnapshot): void {
+  expect(snapshot.issues).toEqual([]);
+  expect(snapshot.tasks.every((task) => isLocalProjectTaskId(task.id))).toBe(true);
+}
+
+describe("LocalProjectTaskService", () => {
+  it("adopts native Stage actions once and exposes only roots in the task collection", async () => {
+    const markdown = new MemoryMarkdown();
+    const service = new LocalProjectTaskService(markdown);
+    const first = await service.snapshot(workspace(), { adoptUnmanaged: true });
+    expectClean(first);
+    expect(first.tasks).toHaveLength(2);
+    expect(first.roots).toHaveLength(1);
+    expect(first.roots[0]).toMatchObject({
+      title: "根任务",
+      projectTitle: "项目 A",
+      stageTitle: "验收",
+      childCount: 1,
+    });
+    expect(first.tasks[1]?.parentUuid).toBe(first.tasks[0]?.uuid);
+    expect(markdown.writes).toBe(1);
+    await service.snapshot(workspace(), { adoptUnmanaged: true });
+    expect(markdown.writes).toBe(1);
+    expect(markdown.value()).toContain("- [ ]\n\n# 行动结果");
+  });
+
+  it("creates a root and child, updates the child, then deletes the subtree with CAS", async () => {
+    const markdown = new MemoryMarkdown(stage.replace("- [ ] 根任务\n  - [ ] 子任务\n", ""));
+    const service = new LocalProjectTaskService(markdown);
+    const rootId = await service.createTask(workspace(), {
+      projectId: "project-1",
+      stageId: "stage-1",
+      title: "新根任务",
+    });
+    let current = await service.snapshot(workspace());
+    const root = current.byId.get(rootId)!;
+    const childId = await service.createTask(workspace(), {
+      projectId: root.projectId,
+      stageId: root.stageId,
+      parentUuid: root.uuid,
+      title: "新子任务",
+      state: "active",
+    });
+    current = await service.snapshot(workspace());
+    const child = current.byId.get(childId)!;
+    await service.updateTask(workspace(), {
+      projectId: child.projectId,
+      stageId: child.stageId,
+      uuid: child.uuid,
+      expectedHash: child.revisionHash,
+      title: "子任务已修改",
+      state: "completed",
+    });
+    current = await service.snapshot(workspace());
+    expect(current.byId.get(childId)).toMatchObject({ title: "子任务已修改", state: "completed" });
+    const refreshedRoot = current.byId.get(rootId)!;
+    await service.deleteTask(workspace(), {
+      projectId: refreshedRoot.projectId,
+      stageId: refreshedRoot.stageId,
+      uuid: refreshedRoot.uuid,
+      expectedHash: refreshedRoot.revisionHash,
+    });
+    expect((await service.snapshot(workspace())).tasks).toEqual([]);
+    expect(markdown.value()).toContain("用户正文");
+  });
+
+  it("refuses stale writes without changing Markdown", async () => {
+    const markdown = new MemoryMarkdown();
+    const service = new LocalProjectTaskService(markdown);
+    const current = await service.snapshot(workspace(), { adoptUnmanaged: true });
+    const root = current.roots[0]!;
+    const before = markdown.value();
+    await expect(service.updateTask(workspace(), {
+      projectId: root.projectId,
+      stageId: root.stageId,
+      uuid: root.uuid,
+      expectedHash: "stale",
+      title: "覆盖",
+    })).rejects.toThrow(/已变化/);
+    expect(markdown.value()).toBe(before);
+  });
+
+  it("saves the root and direct child collection in one Markdown CAS", async () => {
+    const markdown = new MemoryMarkdown();
+    const service = new LocalProjectTaskService(markdown);
+    const current = await service.snapshot(workspace(), { adoptUnmanaged: true });
+    const root = current.roots[0]!;
+    const child = current.tasks.find((task) => task.parentUuid === root.uuid)!;
+    const writesBefore = markdown.writes;
+    await service.saveTask(workspace(), {
+      projectId: root.projectId,
+      stageId: root.stageId,
+      uuid: root.uuid,
+      expectedHash: root.revisionHash,
+      draft: {
+        title: "根任务已改",
+        state: "active",
+        content: "实验备注",
+        startDate: "2026-08-10T01:00:00.000Z",
+        dueDate: "2026-08-10T02:00:00.000Z",
+        timeZone: "Asia/Shanghai",
+        isAllDay: false,
+        priority: 5,
+        tags: ["科研", "验收"],
+        children: [
+          { uuid: child.uuid, title: "子任务已完成", state: "completed" },
+          { title: "新增子任务", state: "idea" },
+        ],
+      },
+    });
+    expect(markdown.writes).toBe(writesBefore + 1);
+    const saved = await service.snapshot(workspace());
+    expect(saved.roots[0]?.title).toBe("根任务已改");
+    expect(saved.roots[0]).toMatchObject({
+      content: "实验备注",
+      startDate: "2026-08-10T01:00:00.000Z",
+      dueDate: "2026-08-10T02:00:00.000Z",
+      timeZone: "Asia/Shanghai",
+      priority: 5,
+      tags: ["科研", "验收"],
+    });
+    expect(saved.tasks.filter((task) => task.parentUuid === root.uuid)).toEqual([
+      expect.objectContaining({ uuid: child.uuid, title: "子任务已完成", state: "completed" }),
+      expect.objectContaining({ title: "新增子任务", state: "idea" }),
+    ]);
+  });
+});

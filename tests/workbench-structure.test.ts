@@ -79,6 +79,38 @@ describe("workbench layout and navigation structure", () => {
     expect(linkedTasks).not.toMatch(/didaProjectId|projection/i);
   });
 
+  it("projects Stage actions into tasks without creating a second local task store", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const localTasks = readFileSync(
+      resolve(process.cwd(), "src/services/local-project-tasks.ts"),
+      "utf8",
+    );
+    expect(main).toMatch(
+      /readLocalProjectTasks[\s\S]*loadStableWorkspace\(\)[\s\S]*adoptUnmanaged: true/,
+    );
+    const localRead = main.slice(
+      main.indexOf("async readLocalProjectTasks"),
+      main.indexOf("async createLocalProjectTask"),
+    );
+    expect(localRead).toContain("this.assertWritable();");
+    expect(localRead).toContain("this.withProjectWorkspaceRead");
+    expect(localRead).not.toContain("withWritableProjectMutation");
+    expect(view).toMatch(/render\(\)[\s\S]*refreshLocalProjectTaskSnapshot\(token\)/);
+    expect(view).toMatch(/localProjectTaskDidaTasks[\s\S]*this\.localProjectTaskSnapshot/);
+    expect(view).toMatch(/saveLocalProjectTask[\s\S]*LocalProjectTaskEditModal/);
+    expect(localTasks).not.toMatch(/data\.json|HelixDataStore|OfflineQueue/);
+  });
+
+  it("uses one compact editor shell and exposes local subtasks without Dida writes", () => {
+    expect(view).toContain('class LocalProjectTaskEditModal extends Modal');
+    expect(view).toContain('class TaskEditModal extends Modal');
+    expect(view.match(/addClass\("helix-task-editor-modal"\)/g)).toHaveLength(2);
+    expect(view.match(/addClass\([^\n]*"helix-task-editor"/g)).toHaveLength(2);
+    expect(view).toMatch(/LocalProjectTaskEditModal[\s\S]*添加子任务[\s\S]*void this\.save\(/);
+    expect(view).toMatch(/const properties = this\.contentEl\.createEl\("details"[\s\S]*text: "属性"/);
+    expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
+  });
+
   it("revalidates stale focus-bridge recovery locks before freezing startup", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(main).toMatch(/staleFocusBridgeIssues[\s\S]*projectWorkspace\.snapshot\(\)[\s\S]*resolveRecoveryIssuesAfterValidation/);

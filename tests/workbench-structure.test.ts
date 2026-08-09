@@ -102,6 +102,10 @@ describe("workbench layout and navigation structure", () => {
   });
 
   it("uses one compact editor shell and exposes local subtasks without Dida writes", () => {
+    const localEditor = view.slice(
+      view.indexOf("class LocalProjectTaskEditModal"),
+      view.indexOf("function knownReminderPreset"),
+    );
     expect(view).toContain('class LocalProjectTaskEditModal extends Modal');
     expect(view).toContain('class TaskEditModal extends Modal');
     expect(view.match(/addClass\("helix-task-editor-modal"\)/g)).toHaveLength(2);
@@ -109,6 +113,25 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/LocalProjectTaskEditModal[\s\S]*添加子任务[\s\S]*void this\.save\(/);
     expect(view).toMatch(/const properties = this\.contentEl\.createEl\("details"[\s\S]*text: "属性"/);
     expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
+    expect(localEditor).toMatch(/helix-task-editor-title-row[\s\S]*helix-task-editor-properties/);
+    expect(localEditor).toMatch(/timeMode[\s\S]*"none"[\s\S]*"point"[\s\S]*"range"/);
+    expect(localEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
+    expect(localEditor).toMatch(/helix-task-editor-subtask-grip[\s\S]*draggable: "true"[\s\S]*dragstart[\s\S]*drop/);
+    expect(localEditor).not.toContain('placeholder: "添加备注…"');
+    expect(localEditor).not.toContain('text: "时区"');
+    expect(css).toMatch(/Dense task canvas[\s\S]*grid-template-columns: repeat\(3/);
+  });
+
+  it("uses project-colored neutral stage cards with one hover action bar", () => {
+    const lineage = readFileSync(
+      resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"),
+      "utf8",
+    );
+    expect(lineage).toMatch(/helix-lineage-card-top[\s\S]*helix-lineage-status-button/);
+    expect(lineage).toMatch(/helix-lineage-card-actions[\s\S]*新增[\s\S]*连接[\s\S]*折叠[\s\S]*删除/);
+    expect(css).toMatch(/阶段卡片：项目色统一[\s\S]*background: var\(--background-primary\)/);
+    expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
+    expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
   });
 
   it("revalidates stale focus-bridge recovery locks before freezing startup", () => {

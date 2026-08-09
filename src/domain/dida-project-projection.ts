@@ -494,6 +494,32 @@ export function patchManagedPlanAction(markdown: string, input: {
   return lines.join(parsed.section.eol);
 }
 
+/** 只重排同一父任务的直接子任务行；标记与未知元数据逐字保留。 */
+export function reorderManagedPlanChildren(
+  markdown: string,
+  parentUuid: string,
+  orderedUuids: string[],
+): string {
+  const parsed = parseManagedPlanActions(markdown);
+  const children = parsed.actions.filter((action) => action.parentUuid === parentUuid);
+  const existing = new Set(children.map((child) => child.uuid));
+  if (
+    orderedUuids.length !== children.length ||
+    new Set(orderedUuids).size !== orderedUuids.length ||
+    orderedUuids.some((uuid) => !existing.has(uuid))
+  ) throw new Error("子任务排序身份与当前 Markdown 不一致");
+  if (children.length < 2) return markdown;
+  const lines = markdown.split(/\r?\n/);
+  const rawByUuid = new Map(children.map((child) => [child.uuid, lines[child.line - 1]!]));
+  const childLineIndices = new Set(children.map((child) => child.line - 1));
+  const insertAt = Math.min(...childLineIndices);
+  const remaining = lines.filter((_line, index) => !childLineIndices.has(index));
+  remaining.splice(insertAt, 0, ...orderedUuids.map((uuid) => rawByUuid.get(uuid)!));
+  const next = remaining.join(parsed.section.eol);
+  parseManagedPlanActions(next);
+  return next;
+}
+
 export function restoreManagedPlanAction(
   markdown: string,
   action: Pick<ManagedPlanAction,

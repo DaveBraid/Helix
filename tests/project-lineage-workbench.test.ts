@@ -77,11 +77,11 @@ describe("Project Lineage card-plus intent", () => {
     expect(lineageGraphBox(compactNative, point)).toEqual({
       x: 40,
       y: 60,
-      width: 248,
-      height: 128,
-      right: 288,
-      bottom: 188,
-      centerY: 124,
+      width: 292,
+      height: 144,
+      right: 332,
+      bottom: 204,
+      centerY: 132,
     });
     expect(lineageGraphBox(largeNative, point))
       .toEqual(lineageGraphBox(compactNative, point));
@@ -91,8 +91,8 @@ describe("Project Lineage card-plus intent", () => {
       largeNative,
       { x: 500, y: 200 },
     )).toEqual({
-      start: { x: 288, y: 124 },
-      end: { x: 500, y: 264 },
+      start: { x: 332, y: 132 },
+      end: { x: 500, y: 272 },
     });
   });
 
@@ -131,12 +131,12 @@ describe("Project Lineage card-plus intent", () => {
     )).toEqual({
       x: 12,
       y: 2,
-      width: 764,
-      height: 354,
-      right: 776,
-      bottom: 356,
-      centerX: 394,
-      centerY: 179,
+      width: 808,
+      height: 370,
+      right: 820,
+      bottom: 372,
+      centerX: 416,
+      centerY: 187,
     });
   });
 

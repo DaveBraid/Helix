@@ -185,8 +185,15 @@ describe("LocalProjectTaskService", () => {
         priority: 5,
         tags: ["科研", "验收"],
         children: [
-          { uuid: child.uuid, title: "子任务已完成", state: "completed" },
-          { title: "新增子任务", state: "idea" },
+          {
+            title: "新增子任务",
+            state: "idea",
+            startDate: "2026-08-11T01:00:00.000Z",
+            dueDate: "2026-08-11T02:00:00.000Z",
+            timeZone: "Asia/Shanghai",
+            priority: 3,
+          },
+          { uuid: child.uuid, title: "子任务已完成", state: "completed", priority: 0 },
         ],
       },
     });
@@ -202,8 +209,14 @@ describe("LocalProjectTaskService", () => {
       tags: ["科研", "验收"],
     });
     expect(saved.tasks.filter((task) => task.parentUuid === root.uuid)).toEqual([
+      expect.objectContaining({
+        title: "新增子任务",
+        state: "idea",
+        startDate: "2026-08-11T01:00:00.000Z",
+        dueDate: "2026-08-11T02:00:00.000Z",
+        priority: 3,
+      }),
       expect.objectContaining({ uuid: child.uuid, title: "子任务已完成", state: "completed" }),
-      expect.objectContaining({ title: "新增子任务", state: "idea" }),
     ]);
   });
 });

@@ -4831,6 +4831,16 @@ const REPEAT_PRESETS = new Set([
   "RRULE:FREQ=YEARLY;INTERVAL=1",
 ]);
 
+interface LocalTaskEditorChild {
+  uuid?: string;
+  title: string;
+  state: ProjectionActionState;
+  date: string;
+  startTime: string;
+  endTime: string;
+  priority: 0 | 1 | 3 | 5;
+}
+
 class LocalProjectTaskEditModal extends Modal {
   private title: string;
   private state: ProjectionActionState;
@@ -4841,7 +4851,12 @@ class LocalProjectTaskEditModal extends Modal {
   private isAllDay: boolean;
   private priority: 0 | 1 | 3 | 5;
   private tags: string[];
-  private children: Array<{ uuid?: string; title: string; state: ProjectionActionState }>;
+  private scheduleDate: string;
+  private startTime: string;
+  private endTime: string;
+  private timeMode: "none" | "point" | "range";
+  private scheduleDirty = false;
+  private children: LocalTaskEditorChild[];
 
   constructor(
     app: HelixView["app"],
@@ -4861,46 +4876,69 @@ class LocalProjectTaskEditModal extends Modal {
     this.isAllDay = task.isAllDay ?? false;
     this.priority = task.priority;
     this.tags = [...task.tags];
-    this.children = children.map((child) => ({
-      uuid: child.uuid,
-      title: child.title,
-      state: child.state,
-    }));
+    const startWall = instantToWallDateTime(task.startDate, this.timeZone);
+    const dueWall = instantToWallDateTime(task.dueDate, this.timeZone);
+    this.scheduleDate = (startWall || dueWall).slice(0, 10);
+    this.startTime = startWall.slice(11, 16);
+    this.endTime = dueWall.slice(11, 16);
+    this.timeMode = task.isAllDay || (!this.startTime && !this.endTime)
+      ? "none"
+      : this.startTime && this.endTime && this.startTime !== this.endTime
+        ? "range"
+        : "point";
+    this.children = children.map((child) => {
+      const zone = safeTaskTimeZone(child.timeZone ?? this.timeZone);
+      const childStart = instantToWallDateTime(child.startDate, zone);
+      const childDue = instantToWallDateTime(child.dueDate, zone);
+      return {
+        uuid: child.uuid,
+        title: child.title,
+        state: child.state,
+        date: (childStart || childDue).slice(0, 10),
+        startTime: childStart.slice(11, 16),
+        endTime: childDue.slice(11, 16),
+        priority: child.priority,
+      };
+    });
   }
 
   onOpen(): void {
-    this.setTitle("编辑任务");
+    this.setTitle("");
     this.modalEl.addClass("helix-task-editor-modal");
-    this.contentEl.addClass("helix-task-editor");
+    this.contentEl.addClass("helix-task-editor", "is-local-task-editor");
     const context = this.contentEl.createDiv({ cls: "helix-task-editor-context" });
-    context.createSpan({ cls: "helix-chip is-soft", text: "Helix 本地" });
+    context.createSpan({ text: "Helix 本地" });
+    context.createSpan({ cls: "helix-task-editor-context-separator", text: "/" });
+    context.createSpan({ text: this.task.projectTitle });
+    context.createSpan({ cls: "helix-task-editor-context-separator", text: "/" });
     const location = context.createEl("button", {
       cls: "helix-task-editor-location",
-      text: `${this.task.projectTitle} / 阶段 ${this.task.stageCode} ${this.task.stageTitle}`,
+      text: `阶段 ${this.task.stageCode} ${this.task.stageTitle}`,
       attr: { title: "打开阶段笔记" },
     });
     location.addEventListener("click", () => {
       void this.openStage().catch((error) => new Notice(messageOf(error), 8_000));
     });
 
-    const title = this.contentEl.createEl("textarea", {
+    const titleRow = this.contentEl.createDiv({ cls: "helix-task-editor-title-row" });
+    const title = titleRow.createEl("textarea", {
       cls: "helix-task-editor-title",
-      attr: { rows: "2", "aria-label": "任务标题", placeholder: "任务标题" },
+      attr: { rows: "1", "aria-label": "任务标题", placeholder: "任务标题" },
     });
     title.value = this.title;
     title.addEventListener("input", () => { this.title = title.value; });
-
-    const note = this.contentEl.createEl("textarea", {
-      cls: "helix-task-editor-content",
-      attr: { rows: "3", "aria-label": "任务备注", placeholder: "添加备注…" },
-    });
-    note.value = this.content;
-    note.addEventListener("input", () => { this.content = note.value; });
+    const titleEdit = titleRow.createSpan({ cls: "helix-task-editor-title-icon" });
+    setIcon(titleEdit, "pencil");
 
     const properties = this.contentEl.createDiv({ cls: "helix-task-editor-properties" });
-    const statusField = properties.createEl("label", { cls: "helix-task-editor-property" });
-    const statusIcon = statusField.createSpan();
-    setIcon(statusIcon, "circle-dot");
+    const property = (label: string, icon: string, cls = ""): HTMLElement => {
+      const field = properties.createDiv({ cls: `helix-task-editor-property ${cls}`.trim() });
+      const iconEl = field.createSpan({ cls: "helix-task-editor-property-icon" });
+      setIcon(iconEl, icon);
+      field.createSpan({ cls: "helix-task-editor-property-label", text: label });
+      return field;
+    };
+    const statusField = property("状态", "circle-dot");
     const status = statusField.createEl("select", { attr: { "aria-label": "任务状态" } });
     for (const value of ["idea", "active", "completed", "paused", "terminated"] as const) {
       status.createEl("option", { value, text: localTaskStateLabel(value) });
@@ -4909,9 +4947,7 @@ class LocalProjectTaskEditModal extends Modal {
     status.addEventListener("change", () => {
       this.state = status.value as ProjectionActionState;
     });
-    const priorityField = properties.createEl("label", { cls: "helix-task-editor-property" });
-    const priorityIcon = priorityField.createSpan();
-    setIcon(priorityIcon, "flag");
+    const priorityField = property("优先级", "flag");
     const priority = priorityField.createEl("select", { attr: { "aria-label": "优先级" } });
     for (const [value, label] of [["0", "无优先级"], ["1", "低优先级"], ["3", "中优先级"], ["5", "高优先级"]]) {
       priority.createEl("option", { value, text: label });
@@ -4920,35 +4956,54 @@ class LocalProjectTaskEditModal extends Modal {
     priority.addEventListener("change", () => {
       this.priority = Number(priority.value) as 0 | 1 | 3 | 5;
     });
-    const startField = properties.createEl("label", { cls: "helix-task-editor-property is-date" });
-    const startIcon = startField.createSpan();
-    setIcon(startIcon, "play");
-    const start = startField.createEl("input", {
-      type: "datetime-local",
-      value: this.startDate,
-      attr: { "aria-label": "开始时间", title: "开始时间" },
+    const dateField = property("日期", "calendar-days");
+    const date = dateField.createEl("input", {
+      type: "date",
+      value: this.scheduleDate,
+      attr: { "aria-label": "任务日期" },
     });
-    start.addEventListener("input", () => { this.startDate = start.value; });
-    const dueField = properties.createEl("label", { cls: "helix-task-editor-property is-date" });
-    const dueIcon = dueField.createSpan();
-    setIcon(dueIcon, "calendar-clock");
-    const due = dueField.createEl("input", {
-      type: "datetime-local",
-      value: this.dueDate,
-      attr: { "aria-label": "截止时间", title: "截止时间" },
+    date.addEventListener("input", () => {
+      this.scheduleDate = date.value;
+      this.scheduleDirty = true;
     });
-    due.addEventListener("input", () => { this.dueDate = due.value; });
-    const allDayField = properties.createEl("label", { cls: "helix-task-editor-property is-toggle" });
-    const allDay = allDayField.createEl("input", {
-      type: "checkbox",
-      attr: { "aria-label": "全天" },
+    const timeField = property("时间", "clock-3", "is-time");
+    const timeMode = timeField.createEl("select", { attr: { "aria-label": "时间类型" } });
+    timeMode.createEl("option", { value: "none", text: "无时间" });
+    timeMode.createEl("option", { value: "point", text: "时间点" });
+    timeMode.createEl("option", { value: "range", text: "时间段" });
+    timeMode.value = this.timeMode;
+    const timeInputs = timeField.createDiv({ cls: "helix-task-editor-time-inputs" });
+    const start = timeInputs.createEl("input", {
+      type: "time",
+      value: this.startTime || this.endTime,
+      attr: { "aria-label": "开始时间" },
     });
-    allDay.checked = this.isAllDay;
-    allDay.addEventListener("change", () => { this.isAllDay = allDay.checked; });
-    allDayField.createSpan({ text: "全天" });
-    const tagsField = properties.createEl("label", { cls: "helix-task-editor-property is-wide" });
-    const tagsIcon = tagsField.createSpan();
-    setIcon(tagsIcon, "tags");
+    const timeDash = timeInputs.createSpan({ text: "–" });
+    const due = timeInputs.createEl("input", {
+      type: "time",
+      value: this.endTime,
+      attr: { "aria-label": "结束时间" },
+    });
+    const syncTimeMode = (): void => {
+      timeInputs.toggleClass("is-hidden", this.timeMode === "none");
+      due.toggleClass("is-hidden", this.timeMode !== "range");
+      timeDash.toggleClass("is-hidden", this.timeMode !== "range");
+    };
+    timeMode.addEventListener("change", () => {
+      this.timeMode = timeMode.value as "none" | "point" | "range";
+      this.scheduleDirty = true;
+      syncTimeMode();
+    });
+    start.addEventListener("input", () => {
+      this.startTime = start.value;
+      this.scheduleDirty = true;
+    });
+    due.addEventListener("input", () => {
+      this.endTime = due.value;
+      this.scheduleDirty = true;
+    });
+    syncTimeMode();
+    const tagsField = property("标签", "tags", "is-tags");
     const tags = tagsField.createEl("input", {
       type: "text",
       value: this.tags.join(" "),
@@ -4958,26 +5013,40 @@ class LocalProjectTaskEditModal extends Modal {
     tags.addEventListener("input", () => {
       this.tags = [...new Set(tags.value.split(/[\s,，]+/u).map((tag) => tag.trim()).filter(Boolean))];
     });
-    const zoneField = properties.createEl("label", { cls: "helix-task-editor-property is-wide" });
-    const zoneIcon = zoneField.createSpan();
-    setIcon(zoneIcon, "globe-2");
-    const zone = zoneField.createEl("input", {
-      type: "text",
-      value: this.timeZone,
-      attr: { "aria-label": "时区", title: "时区" },
-    });
-    zone.addEventListener("input", () => { this.timeZone = zone.value; });
 
     const section = this.contentEl.createDiv({ cls: "helix-task-editor-subtasks" });
     const sectionHead = section.createDiv({ cls: "helix-task-editor-section-head" });
     sectionHead.createEl("strong", { text: "子任务" });
     const count = sectionHead.createSpan();
-    const list = section.createDiv({ cls: "helix-task-editor-subtask-list" });
+    const subtaskBody = section.createDiv({ cls: "helix-task-editor-subtask-body" });
+    const progress = subtaskBody.createDiv({ cls: "helix-task-editor-progress" });
+    const progressRing = progress.createDiv({
+      cls: "helix-task-editor-progress-ring",
+      attr: { role: "progressbar", "aria-label": "子任务进度" },
+    });
+    const progressValue = progressRing.createSpan();
+    const progressCount = progress.createSpan({ cls: "helix-task-editor-progress-count" });
+    const listWrap = subtaskBody.createDiv({ cls: "helix-task-editor-subtask-list-wrap" });
+    const list = listWrap.createDiv({ cls: "helix-task-editor-subtask-list" });
+    let draggedIndex: number | null = null;
     const renderChildren = (): void => {
       list.empty();
-      count.setText(String(this.children.length));
+      const completed = this.children.filter((child) => child.state === "completed").length;
+      const percent = this.children.length === 0 ? 0 : Math.round(completed / this.children.length * 100);
+      count.setText(`${completed}/${this.children.length} 已完成`);
+      progressRing.style.setProperty("--helix-task-progress", `${percent}%`);
+      progressRing.setAttribute("aria-valuenow", String(percent));
+      progressRing.setAttribute("aria-valuemin", "0");
+      progressRing.setAttribute("aria-valuemax", "100");
+      progressValue.setText(`${percent}%`);
+      progressCount.setText(`${completed} / ${this.children.length}`);
       this.children.forEach((child, index) => {
         const row = list.createDiv({ cls: "helix-task-editor-subtask" });
+        const grip = row.createSpan({
+          cls: "helix-task-editor-subtask-grip",
+          attr: { "aria-hidden": "true", draggable: "true" },
+        });
+        setIcon(grip, "grip-vertical");
         const toggle = row.createEl("button", {
           cls: `helix-task-check${child.state === "completed" ? " is-completed" : ""}`,
           attr: { "aria-label": child.state === "completed" ? "重新打开子任务" : "完成子任务" },
@@ -4993,19 +5062,44 @@ class LocalProjectTaskEditModal extends Modal {
           attr: { "aria-label": `子任务 ${index + 1}` },
         });
         input.addEventListener("input", () => { child.title = input.value; });
-        const remove = row.createEl("button", {
-          cls: "helix-task-editor-icon-button",
-          attr: { "aria-label": `删除子任务 ${child.title}`, title: "删除子任务" },
-        });
-        setIcon(remove, "x");
-        remove.addEventListener("click", () => {
-          this.children.splice(index, 1);
+        const childMeta = row.createDiv({ cls: "helix-task-editor-subtask-meta" });
+        if (child.date) childMeta.createSpan({ text: child.date.slice(5).replace("-", "/") });
+        if (child.startTime) childMeta.createSpan({ text: child.endTime && child.endTime !== child.startTime ? `${child.startTime}–${child.endTime}` : child.startTime });
+        if (child.priority) childMeta.createSpan({ cls: `is-priority-${child.priority}`, text: child.priority === 5 ? "高" : child.priority === 3 ? "中" : "低" });
+        const more = row.createEl("details", { cls: "helix-task-editor-subtask-more" });
+        const summary = more.createEl("summary", { attr: { "aria-label": `编辑子任务 ${child.title}` } });
+        setIcon(summary, "ellipsis");
+        const menu = more.createDiv({ cls: "helix-task-editor-subtask-menu" });
+        const childDate = menu.createEl("input", { type: "date", value: child.date, attr: { "aria-label": "子任务日期" } });
+        const childStart = menu.createEl("input", { type: "time", value: child.startTime, attr: { "aria-label": "子任务开始时间" } });
+        const childEnd = menu.createEl("input", { type: "time", value: child.endTime, attr: { "aria-label": "子任务结束时间" } });
+        const childPriority = menu.createEl("select", { attr: { "aria-label": "子任务优先级" } });
+        for (const [value, label] of [["0", "无优先级"], ["1", "低优先级"], ["3", "中优先级"], ["5", "高优先级"]]) childPriority.createEl("option", { value, text: label });
+        childPriority.value = String(child.priority);
+        const rerender = (): void => renderChildren();
+        childDate.addEventListener("change", () => { child.date = childDate.value; rerender(); });
+        childStart.addEventListener("change", () => { child.startTime = childStart.value; rerender(); });
+        childEnd.addEventListener("change", () => { child.endTime = childEnd.value; rerender(); });
+        childPriority.addEventListener("change", () => { child.priority = Number(childPriority.value) as 0 | 1 | 3 | 5; rerender(); });
+        const remove = menu.createEl("button", { cls: "helix-task-editor-subtask-remove", text: "删除子任务" });
+        remove.addEventListener("click", () => { this.children.splice(index, 1); renderChildren(); });
+        grip.addEventListener("dragstart", () => { draggedIndex = index; row.addClass("is-dragging"); });
+        grip.addEventListener("dragend", () => { draggedIndex = null; row.removeClass("is-dragging"); });
+        row.addEventListener("dragover", (event) => { event.preventDefault(); row.addClass("is-drop-target"); });
+        row.addEventListener("dragleave", () => row.removeClass("is-drop-target"));
+        row.addEventListener("drop", (event) => {
+          event.preventDefault();
+          row.removeClass("is-drop-target");
+          if (draggedIndex === null || draggedIndex === index) return;
+          const [moved] = this.children.splice(draggedIndex, 1);
+          if (moved) this.children.splice(index, 0, moved);
+          draggedIndex = null;
           renderChildren();
         });
       });
     };
     renderChildren();
-    const addRow = section.createDiv({ cls: "helix-task-editor-subtask-add" });
+    const addRow = listWrap.createDiv({ cls: "helix-task-editor-subtask-add" });
     const plus = addRow.createSpan();
     setIcon(plus, "plus");
     const addInput = addRow.createEl("input", {
@@ -5016,7 +5110,7 @@ class LocalProjectTaskEditModal extends Modal {
     const addChild = (): void => {
       const childTitle = addInput.value.trim();
       if (!childTitle) return;
-      this.children.push({ title: childTitle, state: "idea" });
+      this.children.push({ title: childTitle, state: "idea", date: "", startTime: "", endTime: "", priority: 0 });
       addInput.value = "";
       renderChildren();
       addInput.focus();
@@ -5033,6 +5127,7 @@ class LocalProjectTaskEditModal extends Modal {
       attr: { title: "删除任务及其子任务", "aria-label": "删除任务及其子任务" },
     });
     setIcon(remove, "trash-2");
+    remove.createSpan({ text: "删除任务" });
     let deleteArmed = false;
     remove.addEventListener("click", () => {
       if (!deleteArmed) {
@@ -5071,11 +5166,25 @@ class LocalProjectTaskEditModal extends Modal {
       let dueDate: string | undefined;
       try {
         assertTimeZone(timeZone);
-        startDate = wallDateTimeToInstant(this.startDate, timeZone) ?? undefined;
-        dueDate = wallDateTimeToInstant(this.dueDate, timeZone) ?? undefined;
+        if (!this.scheduleDirty) {
+          startDate = this.task.startDate;
+          dueDate = this.task.dueDate;
+        } else if (this.scheduleDate) {
+          if (this.timeMode === "none") {
+            startDate = wallDateTimeToInstant(`${this.scheduleDate}T00:00`, timeZone) ?? undefined;
+            dueDate = startDate;
+          } else {
+            const startValue = this.startTime || this.endTime;
+            if (!startValue) throw new Error("请选择任务时间");
+            startDate = wallDateTimeToInstant(`${this.scheduleDate}T${startValue}`, timeZone) ?? undefined;
+            const endValue = this.timeMode === "range" ? this.endTime : startValue;
+            if (!endValue) throw new Error("请选择结束时间");
+            dueDate = wallDateTimeToInstant(`${this.scheduleDate}T${endValue}`, timeZone) ?? undefined;
+          }
+        }
       } catch (error) {
         new Notice(messageOf(error));
-        zone.focus();
+        date.focus();
         return;
       }
       if (startDate && dueDate && Date.parse(startDate) > Date.parse(dueDate)) {
@@ -5083,9 +5192,32 @@ class LocalProjectTaskEditModal extends Modal {
         due.focus();
         return;
       }
-      const children = this.children
-        .map((child) => ({ ...child, title: child.title.trim() }))
-        .filter((child) => child.title.length > 0);
+      let children: LocalProjectTaskDraft["children"];
+      try {
+        children = this.children.map((child) => {
+          const childStart = child.date && child.startTime
+            ? wallDateTimeToInstant(`${child.date}T${child.startTime}`, timeZone) ?? undefined
+            : undefined;
+          const childDue = child.date && (child.endTime || child.startTime)
+            ? wallDateTimeToInstant(`${child.date}T${child.endTime || child.startTime}`, timeZone) ?? undefined
+            : undefined;
+          return {
+            uuid: child.uuid,
+            title: child.title.trim(),
+            state: child.state,
+            startDate: childStart,
+            dueDate: childDue,
+            timeZone: childStart || childDue ? timeZone : undefined,
+            priority: child.priority,
+          };
+        }).filter((child) => child.title.length > 0);
+        const invalidChild = children.find((child) =>
+          child.startDate && child.dueDate && Date.parse(child.startDate) > Date.parse(child.dueDate));
+        if (invalidChild) throw new Error(`子任务“${invalidChild.title}”的结束时间早于开始时间`);
+      } catch (error) {
+        new Notice(messageOf(error));
+        return;
+      }
       save.disabled = true;
       void this.save({
         title: taskTitle,
@@ -5094,7 +5226,7 @@ class LocalProjectTaskEditModal extends Modal {
         startDate,
         dueDate,
         timeZone,
-        isAllDay: this.isAllDay,
+        isAllDay: this.scheduleDirty ? this.timeMode === "none" && Boolean(this.scheduleDate) : this.isAllDay,
         priority: this.priority,
         tags: this.tags,
         children,

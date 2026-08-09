@@ -6,6 +6,7 @@ import {
   patchManagedPlanAction,
   reconcileLocalPlanActionCheckboxes,
   removeManagedPlanAction,
+  reorderManagedPlanChildren,
   type ProjectionActionState,
 } from "../domain/dida-project-projection";
 import type { ProjectWorkspaceSnapshot } from "./project-workspace";
@@ -68,6 +69,10 @@ export interface LocalProjectTaskDraft {
     uuid?: string;
     title: string;
     state: ProjectionActionState;
+    startDate?: string;
+    dueDate?: string;
+    timeZone?: string;
+    priority?: 0 | 1 | 3 | 5;
   }>;
 }
 
@@ -250,22 +255,34 @@ export class LocalProjectTaskService {
     for (const child of existingChildren) {
       if (!submittedIds.includes(child.uuid)) content = removeManagedPlanAction(content, child.uuid);
     }
+    const orderedChildUuids: string[] = [];
     for (const child of input.draft.children) {
+      const childUuid = child.uuid ?? crypto.randomUUID();
+      orderedChildUuids.push(childUuid);
       if (child.uuid) {
         content = patchManagedPlanAction(content, {
           uuid: child.uuid,
           title: child.title.trim(),
           state: child.state,
+          startDate: child.startDate ?? null,
+          dueDate: child.dueDate ?? null,
+          timeZone: child.timeZone ?? null,
+          priority: child.priority ?? 0,
         });
       } else {
         content = appendManagedPlanAction(content, {
-          uuid: crypto.randomUUID(),
+          uuid: childUuid,
           title: child.title.trim(),
           state: child.state,
           parentUuid: root.uuid,
+          startDate: child.startDate,
+          dueDate: child.dueDate,
+          timeZone: child.timeZone,
+          priority: child.priority ?? 0,
         });
       }
     }
+    content = reorderManagedPlanChildren(content, root.uuid, orderedChildUuids);
     await this.markdown.compareAndWrite(revision, content);
   }
 

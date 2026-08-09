@@ -98,8 +98,8 @@ const PADDING = 64;
 const GRID_SIZE = 28;
 const MAX_ZOOM = 1.2;
 const MIN_FIT_ZOOM = 0.0001;
-const GRAPH_CARD_WIDTH = 248;
-const GRAPH_CARD_HEIGHT = 128;
+const GRAPH_CARD_WIDTH = 292;
+const GRAPH_CARD_HEIGHT = 144;
 const PROJECT_CONTAINER_SIDE_PADDING = 28;
 const PROJECT_CONTAINER_TOP_PADDING = 58;
 const PROJECT_CONTAINER_BOTTOM_PADDING = 28;
@@ -1237,7 +1237,28 @@ export class ProjectLineageWorkbench {
           owner.cycles.find((cycle) => cycle.id === node.entityId)?.sequence ?? ""
       }`,
     });
-    const open = top.createEl("button", {
+    let cycle: ProjectWorkspaceCycle | undefined;
+    if (node.kind === "cycle") {
+      cycle = owner.cycles.find((item) => item.id === node.entityId);
+      if (cycle) {
+        const presentation = STAGE_STATUS_PRESENTATION[cycle.status];
+        const status = top.createEl("button", {
+          cls: `helix-lineage-status-button is-${cycle.status}`,
+          attr: {
+            "aria-label": `修改 ${cycle.title} 的阶段状态，当前${presentation.label}`,
+            title: "修改阶段状态",
+          },
+        });
+        const statusIcon = status.createSpan({ cls: "helix-lineage-status-icon" });
+        setIcon(statusIcon, presentation.icon);
+        status.createSpan({ text: presentation.label });
+        status.addEventListener("click", (event) => {
+          event.stopPropagation();
+          this.options.onEditCycleStatus(cycle!.id);
+        });
+      }
+    }
+    const open = card.createEl("button", {
       cls: "helix-lineage-card-title",
       text: node.title,
       attr: { "aria-label": `打开 ${node.title}` },
@@ -1264,24 +1285,6 @@ export class ProjectLineageWorkbench {
       });
       meta.createSpan({ text: `${owner.cycles.length} 个阶段` });
     } else {
-      const cycle = owner.cycles.find((item) => item.id === node.entityId)!;
-      const presentation = STAGE_STATUS_PRESENTATION[cycle.status];
-      const status = meta.createEl("button", {
-        cls: `helix-lineage-status-button is-${cycle.status}`,
-        attr: {
-          "aria-label": `修改 ${cycle.title} 的阶段状态，当前${
-            presentation.label
-          }`,
-          title: "修改阶段状态",
-        },
-      });
-      const statusIcon = status.createSpan({ cls: "helix-lineage-status-icon" });
-      setIcon(statusIcon, presentation.icon);
-      status.createSpan({ text: presentation.label });
-      status.addEventListener("click", (event) => {
-        event.stopPropagation();
-        this.options.onEditCycleStatus(cycle.id);
-      });
       meta.createSpan({ text: owner.title });
     }
     const relation = this.options.snapshot.relations.find(
@@ -1317,7 +1320,11 @@ export class ProjectLineageWorkbench {
     card: HTMLElement,
     node: ProjectWorkspaceCanvasNode,
   ): void {
-    const add = card.createEl("button", {
+    const actions = card.createDiv({
+      cls: "helix-lineage-card-actions",
+      attr: { "aria-label": "阶段操作" },
+    });
+    const add = actions.createEl("button", {
       cls: "helix-lineage-add-child",
       attr: {
         "aria-label": `从 ${node.title} 添加子阶段`,
@@ -1330,7 +1337,8 @@ export class ProjectLineageWorkbench {
       this.options.onCreateCycle(node.projectId, this.creationSources(node));
     });
     this.updateCreateActionLabel(card, node);
-    const connector = card.createEl("button", {
+    add.createSpan({ text: "新增" });
+    const connector = actions.createEl("button", {
       cls: "helix-lineage-connector",
       attr: {
         "aria-label": `从 ${node.title} 连接到已有阶段`,
@@ -1338,6 +1346,7 @@ export class ProjectLineageWorkbench {
       },
     });
     setIcon(connector, "git-branch");
+    connector.createSpan({ text: "连接" });
     connector.addEventListener("click", (event) => {
       event.stopPropagation();
       if (this.suppressConnectorClick) return;
@@ -1437,7 +1446,22 @@ export class ProjectLineageWorkbench {
     connector.addEventListener("pointerup", finishConnection);
     connector.addEventListener("pointercancel", cancelConnection);
     connector.addEventListener("lostpointercapture", cancelConnection);
-    const remove = card.createEl("button", {
+    const owner = this.projectFor(node.projectId);
+    const fold = actions.createEl("button", {
+      cls: "helix-lineage-fold-node",
+      attr: {
+        "aria-label": `折叠 ${owner.title} 的已完成阶段`,
+        title: "折叠已完成阶段",
+      },
+    });
+    setIcon(fold, "fold-vertical");
+    fold.createSpan({ text: "折叠" });
+    fold.disabled = !this.hasCollapsibleCompleted(owner);
+    fold.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.options.onToggleCompletedCollapse(owner.id, true);
+    });
+    const remove = actions.createEl("button", {
       cls: "helix-lineage-delete-node",
       attr: {
         "aria-label": `删除阶段 ${node.title}`,
@@ -1445,6 +1469,7 @@ export class ProjectLineageWorkbench {
       },
     });
     setIcon(remove, "trash-2");
+    remove.createSpan({ text: "删除" });
     remove.addEventListener("click", (event) => {
       event.stopPropagation();
       this.options.onDeleteCycle(node.entityId);

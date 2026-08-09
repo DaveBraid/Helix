@@ -7,6 +7,8 @@ export interface TextRange {
   to: number;
 }
 
+const HIDDEN_FOCUS_MARKER_LINE_CLASS = "helix-hidden-focus-marker-line";
+
 const EXACT_MARKERS = [
   /^<!-- helix-focus-bridge:start version=1 -->$/,
   /^<!-- helix-focus-bridge:end -->$/,
@@ -53,7 +55,7 @@ export function hiddenHelixMarkerRanges(
     }
     if (EXACT_MARKERS.some((pattern) => pattern.test(line.text)) &&
       !selections.some((selection) => intersects(line, selection))) {
-      // ViewPlugin 装饰不得改变垂直布局；只替换标记字符，保留换行与空行高度。
+      // 返回精确标记行；Live Preview 会隐藏字符并折叠该纯技术行。
       ranges.push(line);
     }
   }
@@ -70,8 +72,17 @@ export function hiddenHelixMarkerRanges(
 function decorations(view: EditorView): DecorationSet {
   if (!view.state.field(editorLivePreviewField, false)) return Decoration.none;
   const selections = view.state.selection.ranges.map((range) => ({ from: range.from, to: range.to }));
-  return Decoration.set(hiddenHelixMarkerRanges(view.state.doc.toString(), selections)
-    .map((range) => Decoration.replace({}).range(range.from, range.to)), true);
+  const source = view.state.doc.toString();
+  const ranges = hiddenHelixMarkerRanges(source, selections);
+  return Decoration.set(ranges.flatMap((range) => {
+    const hidden = Decoration.replace({}).range(range.from, range.to);
+    const text = source.slice(range.from, range.to);
+    if (!EXACT_MARKERS.some((pattern) => pattern.test(text))) return [hidden];
+    return [
+      Decoration.line({ class: HIDDEN_FOCUS_MARKER_LINE_CLASS }).range(range.from),
+      hidden,
+    ];
+  }), true);
 }
 
 export const helixMarkerVisibilityExtension = ViewPlugin.fromClass(class {

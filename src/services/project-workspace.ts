@@ -19,6 +19,7 @@ import {
   type HelixStageStatus,
 } from "../domain/project-status";
 import {
+  maintainedStageCodes,
   nextBranchStageCodes,
   nextMajorStageCode,
   nextUnusedMajorStageCode,
@@ -83,7 +84,7 @@ interface CanvasDocument {
   nodes: CanvasNode[];
   edges: CanvasEdge[];
   helixStageSequences?: Record<string, number>;
-  /** 已发放展示编号的防复用账本；不承载阶段关系、状态或正文真值。 */
+  /** 当前阶段展示编号索引；可由 Markdown 与关系图重建，不承载真值。 */
   helixStageCodes?: Record<string, string[]>;
   helixCompletedCollapse?: {
     version: 1;
@@ -3015,6 +3016,8 @@ export class ProjectWorkspaceService {
       project.cycles.filter((candidate) => candidate.id !== cycleId)
         .map((candidate) => candidate.id));
     const normalized = normalizeProjectGraph(remainingCycleIds, physical);
+    const remainingOwnerCycles = owner.cycles.filter((candidate) => candidate.id !== cycleId);
+    const maintainedCodes = maintainedStageCodes(remainingOwnerCycles, normalized.relations);
     canvas.document.nodes = canvas.document.nodes.filter((candidate) => candidate.id !== node.id);
     canvas.document.edges = canvas.document.edges.filter((edge) =>
       edge.fromNode !== node.id && edge.toNode !== node.id);
@@ -3029,13 +3032,22 @@ export class ProjectWorkspaceService {
         project.id === owner.id
           ? {
               ...project,
-              cycles: project.cycles.filter((candidate) => candidate.id !== cycleId),
+              cycles: remainingOwnerCycles.map((candidate) => ({
+                ...candidate,
+                stageCode: maintainedCodes.get(candidate.id) ?? candidate.stageCode,
+              })),
             }
           : project),
       canvasNodes: snapshot.canvasNodes.filter((candidate) =>
         candidate.entityId !== cycleId),
     };
     applyManagedLayout(canvas.document, layoutSnapshot, physical, affected);
+    canvas.document.helixStageCodes = replaceProjectStageCodes(
+      canvas.document,
+      owner.id,
+      remainingOwnerCycles.map((candidate) =>
+        maintainedCodes.get(candidate.id) ?? candidate.stageCode),
+    );
 
     const nextCanvasContent = JSON.stringify(canvas.document, null, 2);
     const changedFocusTargets = remainingCycleIds.filter((targetId) =>
@@ -3048,13 +3060,50 @@ export class ProjectWorkspaceService {
       normalized.relations,
       changedFocusTargets,
     );
-    if (focusUpdates.length > 0) {
+    const markdownUpdates = new Map(focusUpdates.map((update) =>
+      [normalizePath(update.path), update] as const));
+    for (const surviving of remainingOwnerCycles) {
+      const nextCode = maintainedCodes.get(surviving.id) ?? surviving.stageCode;
+      if (nextCode === surviving.stageCode) continue;
+      const path = normalizePath(surviving.notePath);
+      const existing = markdownUpdates.get(path);
+      const revision = await this.repository.read(path);
+      if (!revision || (existing && existing.beforeHash !== revision.hash)) {
+        throw new Error(`阶段编号维护前 Markdown 已变化：${path}`);
+      }
+      const frontmatter = frontmatterFromContent(revision.content);
+      const currentCode = managedFrontmatterString(revision.content, "helix-stage-code");
+      if (
+        frontmatter?.["helix-id"] !== surviving.id ||
+        frontmatter["helix-project-id"] !== owner.id ||
+        (currentCode.present
+          ? currentCode.value !== surviving.stageCode
+          : surviving.stageCode !== String(surviving.sequence))
+      ) {
+        throw new Error(`阶段编号维护前身份或展示编号已变化：${path}`);
+      }
+      const sourceContent = existing?.afterContent ?? revision.content;
+      const afterContent = rewriteManagedStageHeading(
+        patchManagedFrontmatter(sourceContent, { "helix-stage-code": nextCode }),
+        surviving.stageCode,
+        nextCode,
+      );
+      markdownUpdates.set(path, {
+        path,
+        kind: "stage",
+        entityId: surviving.id,
+        projectId: owner.id,
+        beforeHash: revision.hash,
+        afterContent,
+      });
+    }
+    if (markdownUpdates.size > 0) {
       this.assertActive(generation);
       return this.applyAtomicWorkspaceChange({
         label: bridge ? "删除并桥接阶段" : "删除阶段",
         canvasBeforeHash: canvas.revision.hash,
         canvasAfterContent: nextCanvasContent,
-        markdownUpdates: focusUpdates,
+        markdownUpdates: [...markdownUpdates.values()],
         markdownDeletions: [{
           path: cycleRevision.path,
           kind: "stage",
@@ -4051,7 +4100,7 @@ export class ProjectWorkspaceService {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: 1,
       };
-      canvas.document.helixStageCodes = recordIssuedStageCodes(
+      canvas.document.helixStageCodes = replaceProjectStageCodes(
         canvas.document,
         projectId,
         ["1"],
@@ -4189,10 +4238,12 @@ export class ProjectWorkspaceService {
       if (!cycle) throw new Error("找不到前置阶段");
       return cycle;
     });
-    const codeCandidates = [
-      ...project.cycles.map((cycle) => ({ code: cycle.stageCode, sequence: cycle.sequence })),
-      ...issuedStageCodes(canvas.document, projectId).map((code) => ({ code, sequence: 1 })),
-    ];
+    // 展示编号只由当前图谱占用情况决定。物理文件序号仍使用高水位单调递增，
+    // 但已删除阶段不得永久占住用户可见的继承／分支／合并编号。
+    const codeCandidates = project.cycles.map((cycle) => ({
+      code: cycle.stageCode,
+      sequence: cycle.sequence,
+    }));
     let stageCodes: string[];
     const stageCodeConversions: Array<{ cycle: ProjectWorkspaceCycle; stageCode: string }> = [];
     if (relationKind === "branch") {
@@ -4452,11 +4503,15 @@ export class ProjectWorkspaceService {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: specs.at(-1)!.sequence,
       };
-      canvas.document.helixStageCodes = recordIssuedStageCodes(
+      const convertedCodes = new Map(stageCodeConversions.map((conversion) =>
+        [conversion.cycle.id, conversion.stageCode] as const));
+      canvas.document.helixStageCodes = replaceProjectStageCodes(
         canvas.document,
         projectId,
-        [...stageCodeConversions.map((conversion) => conversion.stageCode),
-          ...specs.map((spec) => spec.stageCode)],
+        [
+          ...project.cycles.map((cycle) => convertedCodes.get(cycle.id) ?? cycle.stageCode),
+          ...specs.map((spec) => spec.stageCode),
+        ],
       );
       const physical = physicalManagedEdges(canvas.document);
       const normalized = normalizeProjectGraph(
@@ -5211,10 +5266,6 @@ function validatedStageSequenceLedger(
   return ledger as Record<string, number>;
 }
 
-function issuedStageCodes(document: CanvasDocument, projectId: string): string[] {
-  return validatedStageCodeLedger(document)[projectId] ?? [];
-}
-
 function validatedStageCodeLedger(document: CanvasDocument): Record<string, string[]> {
   const raw = document.helixStageCodes;
   if (raw === undefined) return {};
@@ -5235,21 +5286,18 @@ function validatedStageCodeLedger(document: CanvasDocument): Record<string, stri
   return ledger;
 }
 
-function recordIssuedStageCodes(
+function replaceProjectStageCodes(
   document: CanvasDocument,
   projectId: string,
-  added: readonly string[],
+  current: readonly string[],
 ): Record<string, string[]> {
   const ledger = validatedStageCodeLedger(document);
-  if (added.some((code) => !parseStageCode(code))) {
-    throw new Error("新增阶段展示编号无效");
+  if (current.some((code) => !parseStageCode(code)) || new Set(current).size !== current.length) {
+    throw new Error("当前阶段展示编号无效或重复");
   }
   return {
     ...ledger,
-    [projectId]: [...new Set([
-      ...(ledger[projectId] ?? []),
-      ...added,
-    ])],
+    [projectId]: [...current],
   };
 }
 

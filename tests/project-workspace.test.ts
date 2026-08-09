@@ -2227,7 +2227,7 @@ describe("ProjectWorkspaceService", () => {
     expect(firstContent).toContain('helix-stage-code: "2.1"');
     expect(firstContent).toContain("# 阶段 2.1 · 第一条路线");
     expect(repo.json(CANVAS).helixStageCodes).toMatchObject({
-      "project-1": ["2", "2.1", "2.2"],
+      "project-1": ["1", "2.1", "2.2"],
     });
     expect(repo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
       expect.objectContaining({ helixStageId: first.id, x: 816, y: 0 }),
@@ -3238,7 +3238,7 @@ describe("ProjectWorkspaceService", () => {
     await expect(service.snapshot()).rejects.toThrow(/冻结|事务日志已保留/);
   });
 
-  it("keeps stage numbering monotonic after the highest stage is deleted", async () => {
+  it("keeps physical stage sequence monotonic but reuses a deleted branch display code", async () => {
     const repo = baseRepository();
     const service = workspace(repo);
     await service.createCycle(
@@ -3269,10 +3269,78 @@ describe("ProjectWorkspaceService", () => {
 
     expect(await repo.read("Helix/Projects/Alpha/Stage-04.md")).not.toBeNull();
     expect((await repo.read("Helix/Projects/Alpha/Stage-04.md"))?.content)
-      .toContain('helix-stage-code: "2.3"');
+      .toContain('helix-stage-code: "2.2"');
     expect(repo.json(CANVAS).helixStageSequences).toMatchObject({
       "project-1": 4,
     });
+    expect(repo.json(CANVAS).helixStageCodes["project-1"]).toEqual(["1", "2.1", "2.2"]);
+  });
+
+  it("reuses deleted inheritance and merge display codes without reusing physical files", async () => {
+    const inheritedRepo = baseRepository();
+    const inheritedService = workspace(inheritedRepo);
+    const inherited = await inheritedService.createCycle("project-1", "inherit", ["cycle-1"], {
+      stageTitle: "继承阶段",
+    });
+    await inheritedService.deleteCycle(inherited.id);
+    const recreatedInheritance = await inheritedService.createCycle(
+      "project-1",
+      "inherit",
+      ["cycle-1"],
+      { stageTitle: "重新继承" },
+    );
+    expect(recreatedInheritance.sequence).toBe(3);
+    expect(recreatedInheritance.stageCode).toBe("2");
+    expect(recreatedInheritance.notePath).toContain("Stage-03.md");
+
+    const mergeRepo = baseRepository();
+    const mergeService = workspace(mergeRepo);
+    await mergeService.createCycle("project-1", "branch", ["cycle-1"], {
+      confirmBranchConversion: true,
+      stageTitle: "路线一",
+      secondaryStageTitle: "路线二",
+    });
+    const branches = (await mergeService.snapshot()).projects[0]!.cycles
+      .filter((cycle) => cycle.stageCode.startsWith("2."));
+    const merged = await mergeService.createCycle(
+      "project-1",
+      "merge",
+      branches.map((cycle) => cycle.id),
+      { stageTitle: "合并阶段" },
+    );
+    await mergeService.deleteCycle(merged.id);
+    const recreatedMerge = await mergeService.createCycle(
+      "project-1",
+      "merge",
+      branches.map((cycle) => cycle.id),
+      { stageTitle: "重新合并" },
+    );
+    expect(recreatedMerge.sequence).toBe(5);
+    expect(recreatedMerge.stageCode).toBe("3");
+    expect(recreatedMerge.notePath).toContain("Stage-05.md");
+  });
+
+  it("renumbers an existing bridged successor atomically when deleting a middle stage", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const middle = await service.createCycle("project-1", "inherit", ["cycle-1"], {
+      stageTitle: "中间阶段",
+    });
+    const successor = await service.createCycle("project-1", "inherit", [middle.id], {
+      stageTitle: "后继阶段",
+    });
+
+    await service.deleteCycle(middle.id, { bridge: true });
+
+    const current = (await service.snapshot()).projects[0]!.cycles.find(
+      (cycle) => cycle.id === successor.id,
+    )!;
+    expect(current.sequence).toBe(3);
+    expect(current.stageCode).toBe("2");
+    const content = (await repo.read(successor.notePath))!.content;
+    expect(content).toContain('helix-stage-code: "2"');
+    expect(content).toContain("# 阶段 2 · 后继阶段");
+    expect(repo.json(CANVAS).helixStageCodes["project-1"]).toEqual(["1", "2"]);
   });
 
   it("rejects a competing inherited code before conversion without overwriting it", async () => {

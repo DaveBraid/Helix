@@ -169,6 +169,14 @@ export function coordinateStageFocusBridge(input: {
   }
 
   if (!sourceChanged && !derivedBodyChanged) {
+    const normalizedSpacing = normalizeExistingEnvelopeSpacing(input.targetMarkdown, parsed);
+    if (normalizedSpacing !== input.targetMarkdown) {
+      return {
+        action: "update-derived",
+        sourceId: block.sourceId,
+        targetMarkdown: normalizedSpacing,
+      };
+    }
     return { action: "noop", sourceId: block.sourceId };
   }
   if (sourceChanged && !derivedBodyChanged) {
@@ -462,17 +470,57 @@ export function replaceFocusBridgeEnvelope(markdown: string, envelope: string | 
   const document = markdownDocument(markdown);
   const replacement = envelope?.replace(/\r\n?/g, "\n").split("\n") ?? [];
   if (parsed.kind === "present") {
+    const before = document.lines.slice(parsed.target.bodyStartLine, parsed.startLine);
+    const after = document.lines.slice(parsed.endLine + 1, parsed.target.bodyEndLine);
+    const normalizedBefore = trimTrailingBlankLines(before);
+    const normalizedAfter = trimLeadingBlankLines(after);
+    const body = envelope
+      ? [...normalizedBefore, "", ...replacement, "", ...normalizedAfter]
+      : [...normalizedBefore, ...normalizedAfter];
     document.lines.splice(
-      parsed.startLine,
-      parsed.endLine - parsed.startLine + 1,
-      ...replacement,
+      parsed.target.bodyStartLine,
+      parsed.target.bodyEndLine - parsed.target.bodyStartLine,
+      ...body,
     );
     return document.lines.join(document.eol);
   }
   if (!envelope) return markdown;
-  const insertAt = parsed.target.bodyEndLine;
-  document.lines.splice(insertAt, 0, ...replacement);
+  const body = document.lines.slice(parsed.target.bodyStartLine, parsed.target.bodyEndLine);
+  // 新阶段模板的聚焦小节通常只含占位空行。自动派生时收敛这些空行，
+  // 但若用户已经写了正文，只整理紧邻受管块的尾部空白，不改正文内容。
+  const normalizedBody = trimTrailingBlankLines(body);
+  document.lines.splice(
+    parsed.target.bodyStartLine,
+    parsed.target.bodyEndLine - parsed.target.bodyStartLine,
+    ...normalizedBody,
+    "",
+    ...replacement,
+    "",
+  );
   return document.lines.join(document.eol);
+}
+
+function normalizeExistingEnvelopeSpacing(
+  markdown: string,
+  parsed: Extract<ParsedFocusEnvelope, { kind: "present" }>,
+): string {
+  const document = markdownDocument(markdown);
+  const envelope = document.lines
+    .slice(parsed.startLine, parsed.endLine + 1)
+    .join("\n");
+  return replaceFocusBridgeEnvelope(markdown, envelope);
+}
+
+function trimLeadingBlankLines(lines: readonly string[]): string[] {
+  let index = 0;
+  while (index < lines.length && lines[index]!.trim() === "") index += 1;
+  return lines.slice(index);
+}
+
+function trimTrailingBlankLines(lines: readonly string[]): string[] {
+  let index = lines.length;
+  while (index > 0 && lines[index - 1]!.trim() === "") index -= 1;
+  return lines.slice(0, index);
 }
 
 function replaceFocusBridgeBlock(

@@ -101,8 +101,8 @@
 - 只有已取得远端 ID 且保存前实时复读确认的任务可以建立关联；`local-*` 临时任务禁止成为关联真值。普通任务关联不依赖项目滴答投影或清单映射，任务移动清单、完成或暂时不在同步覆盖范围内时均保留关联；远端删除不级联删除关联。任务被人工重建成新 ID 时，只允许用户明确核验后重绑，禁止按标题或时间猜测，并再次核对远端返回身份一致。
 - 关联保存必须用弹窗打开时的关联 UUID 与 Markdown revision 做比较；文件在提交前变化、同一任务出现多份关联、关联 UUID 重复或结构损坏时停止写入。项目/阶段删除或阶段改属其他项目时保留原 ID 并显示断链，用户可以明确重新绑定或解除，不静默清理。
 - 项目与阶段状态编辑只允许在对应 Markdown revision 未变化时更新 `helix-status` 与 `helix-updated`；阶段进入 `completed/terminated` 才写 `helix-closed`。旧项目 `archived`、旧阶段 `planned/closed` 仅兼容读取为 `terminated/idea/completed`，绝不批量回写；未知值明确诊断。不得重写用户正文、未知 frontmatter 或用 Canvas 摘要反向覆盖 Markdown。
-- 新阶段文件使用 `Stage-XX.md`；一级标题为 `阶段 X · 自拟标题`，并写入 `helix-stage-code` 字符串和整数 `helix-sequence`。前者赋值后稳定（继承转分支时在同一受控事务改为 `.1` 是唯一例外），后者只作路径和高水位兼容键；缺少 code 回退 sequence，存在但非法则拒绝操作。
-- 为保证删除后的展示编号不复用，Canvas 可保存经严格校验的 `helixStageCodes` 已发放编号账本；它只记录已发放 code，绝不反推或承载阶段关系、状态、身份或正文真值。当前活动的项目／阶段笔记以公开状态栏入口显示中文状态；未知手工值仅诊断、零写入，编辑仍复用同一 Markdown CAS 与状态候选控件。
+- 新阶段文件使用 `Stage-XX.md`；一级标题为 `阶段 X · 自拟标题`，并写入 `helix-stage-code` 字符串和整数 `helix-sequence`。`sequence` 只作稳定文件路径和单调高水位，绝不因删除而复用；用户可见 `stage-code` 则按当前继承／分支／合并图维护，删除后在同一原子事务中紧凑重算受影响编号、标题与聚焦引用。缺少 code 回退 sequence，存在但非法则拒绝操作。
+- Canvas 的 `helixStageCodes` 仅是当前展示编号索引，可由 Markdown 与关系图重建，绝不反推或承载阶段关系、状态、身份或正文真值。当前活动的项目／阶段笔记以公开状态栏入口显示中文状态；未知手工值仅诊断、零写入，编辑仍复用同一 Markdown CAS 与状态候选控件。
 - 项目页纯读取只报告 `canvasRepairRequired` 与中文原因，绝不为缺失节点、摘要、编号账本或关系正规化写入 Canvas。只有用户明确点击“修复 Canvas”时，才在恢复模式写入闸门后使用连续稳定快照、受管 Markdown 最终修订复核与 Canvas CAS 应用同一修复计划；任一竞争均保持 Canvas 零写入。
 - 专用 Canvas 是项目/阶段节点布局和阶段关系的唯一事实；`data.json` 不保存项目、阶段、关系或布局副本。
 - 托管项目节点必须包含 `helixManaged=true`、`helixNodeKind=project`、`helixProjectId`；新托管阶段节点使用 `helixNodeKind=stage`、`helixStageId` 和所属 `helixProjectId`。旧 `helix-kind: helix-cycle`、`helixNodeKind=cycle`、`helixCycleId` 与 `Cycle-XX.md` 仅兼容读取，不静默改名。身份必须与对应 Markdown 唯一匹配。

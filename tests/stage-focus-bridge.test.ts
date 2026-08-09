@@ -97,6 +97,19 @@ describe("阶段聚焦桥接纯领域协议", () => {
     expect(next).toContain("# 计划行动\r\n- [ ] x");
   });
 
+  it("collapses template padding to one blank line around the managed quote", () => {
+    const padded = "# 本阶段问题聚焦\n\n\n\n# 计划行动\n- [ ] x\n";
+    const next = replaceFocusBridgeEnvelope(
+      padded,
+      renderFocusBridgeEnvelope([source("a", "继承内容")]),
+    );
+    expect(next).toContain(
+      "# 本阶段问题聚焦\n\n<!-- helix-focus-bridge:start version=1 -->",
+    );
+    expect(next).toMatch(/<!-- helix-focus-bridge:end -->\n\n# 计划行动/);
+    expect(next).not.toContain("# 本阶段问题聚焦\n\n\n");
+  });
+
   it("preserves a leading BOM while scanning and replacing", () => {
     const original = `\uFEFF${target("手工内容")}`;
     const next = replaceFocusBridgeEnvelope(original, renderFocusBridgeEnvelope([source("a", "A")]));
@@ -216,6 +229,24 @@ describe("阶段聚焦桥接纯领域协议", () => {
         targetMarkdown: pair.targetMarkdown,
         baseContent: "Base",
       })).toEqual({ action: "noop", sourceId: "a" });
+    });
+
+    it("silently normalizes legacy padding around an unchanged derived quote", () => {
+      const pair = syncedPair();
+      const padded = pair.targetMarkdown
+        .replace("# 本阶段问题聚焦\n\n", "# 本阶段问题聚焦\n\n\n\n")
+        .replace("<!-- helix-focus-bridge:end -->\n\n", "<!-- helix-focus-bridge:end -->\n\n\n\n");
+      const result = coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: padded,
+        baseContent: "Base",
+      });
+      expect(result.action).toBe("update-derived");
+      if (result.action !== "update-derived") throw new Error("unexpected action");
+      expect(result.targetMarkdown).toContain(
+        "用户前言\n\n<!-- helix-focus-bridge:start version=1 -->",
+      );
+      expect(result.targetMarkdown).toMatch(/<!-- helix-focus-bridge:end -->\n\n# 计划行动/);
     });
 
     it("accepts only the Obsidian-equivalent .md WikiLink form as canonical", () => {

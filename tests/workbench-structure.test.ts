@@ -79,6 +79,17 @@ describe("workbench layout and navigation structure", () => {
     expect(linkedTasks).not.toMatch(/didaProjectId|projection/i);
   });
 
+  it("revalidates stale focus-bridge recovery locks before freezing startup", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(main).toMatch(/staleFocusBridgeIssues[\s\S]*projectWorkspace\.snapshot\(\)[\s\S]*resolveRecoveryIssuesAfterValidation/);
+    expect(main.indexOf("resolveRecoveryIssuesAfterValidation"))
+      .toBeLessThan(main.indexOf("this.recoveryMode = data.recoveryIssues.length > 0"));
+  });
+
+  it("keeps an empty quick-property suggestion menu out of layout", () => {
+    expect(css).toMatch(/\.helix-task-quick-suggestions\[hidden\]\s*\{\s*display: none;/);
+  });
+
   it("keeps shell, sidebar and header fixed while only main content scrolls", () => {
     expect(css).toMatch(/\.helix-root \{[\s\S]*height: 100%;[\s\S]*overflow: hidden !important;/);
     expect(css).toMatch(/\.helix-shell \{[\s\S]*height: 100%;[\s\S]*overflow: hidden !important;/);

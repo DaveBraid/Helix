@@ -65,6 +65,31 @@ export class HelixDataStore implements SnapshotRepository, ConflictRepository {
     await this.writeChain;
   }
 
+  /** 仅供调用方完成独立权威复核后精确解除旧恢复锁；其他问题必须原样保留。 */
+  async resolveRecoveryIssuesAfterValidation(issues: readonly string[]): Promise<void> {
+    const expected = new Set(issues);
+    if (expected.size === 0) return;
+    this.writeChain = this.writeChain.catch(() => undefined).then(async () => {
+      this.assertActive();
+      if (!this.data) this.data = hydrateData(await this.plugin.loadData());
+      const present = this.data.recoveryIssues.filter((issue) => expected.has(issue));
+      if (present.length !== expected.size) {
+        throw new Error("恢复问题在复核提交前已经变化，未解除恢复锁");
+      }
+      const next = cloneValue(this.data);
+      next.recoveryIssues = next.recoveryIssues.filter((issue) => !expected.has(issue));
+      this.assertActive();
+      if (this.generation) {
+        await saveInDataGeneration(this.generation, () => this.plugin.saveData(next));
+      } else {
+        await this.plugin.saveData(next);
+      }
+      this.assertActive();
+      this.data = next;
+    });
+    await this.writeChain;
+  }
+
   async getBase<T>(kind: EntityKind, entityId: string): Promise<EntitySnapshot<T> | null> {
     const data = await this.load();
     return (cloneValue(data.baseSnapshots[keyOf(kind, entityId)]) as EntitySnapshot<T>) ?? null;

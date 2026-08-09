@@ -1803,6 +1803,10 @@
   box-shadow: var(--shadow-s);
 }
 
+.helix-task-quick-suggestions[hidden] {
+  display: none;
+}
+
 .helix-task-quick-suggestion {
   display: flex;
   align-items: center;

@@ -22,6 +22,21 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("HelixDataStore serialization", () => {
+  it("removes only independently validated recovery issues while preserving other locks", async () => {
+    let persisted = createDefaultData();
+    persisted.recoveryIssues = ["聚焦桥接旧锁", "其他恢复锁"];
+    const store = new HelixDataStore({
+      loadData: async () => persisted,
+      saveData: async (data) => { persisted = data as typeof persisted; },
+    });
+
+    await store.resolveRecoveryIssuesAfterValidation(["聚焦桥接旧锁"]);
+    expect((await store.snapshot()).recoveryIssues).toEqual(["其他恢复锁"]);
+    await expect(store.resolveRecoveryIssuesAfterValidation(["不存在的锁"]))
+      .rejects.toThrow(/已经变化/);
+    expect(persisted.recoveryIssues).toEqual(["其他恢复锁"]);
+  });
+
   it("hydrates validated remote board caches and rejects malformed column identity", () => {
     const valid = hydrateData({
       schemaVersion: 2,

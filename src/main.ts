@@ -86,6 +86,7 @@ import {
   type ProjectionPersistentState,
   type ProjectionSyncSummary,
 } from "./services/dida-project-projection";
+
 import type {
   DidaProjectionTarget,
   ProjectionActivationPreview,
@@ -109,6 +110,8 @@ import {
   PROJECT_DIDA_PROJECTION_AVAILABLE,
   assertProjectDidaProjectionAvailable,
 } from "./release-capabilities";
+
+const FOCUS_BRIDGE_RECOVERY_PREFIX = "Helix 阶段聚焦桥接需要人工检查：";
 
 export default class HelixPlugin extends Plugin {
   settings: HelixSettings = {
@@ -177,6 +180,19 @@ export default class HelixPlugin extends Plugin {
       this.projectWorkspace,
       () => this.settings.rootFolder,
     );
+    const staleFocusBridgeIssues = data.recoveryIssues.filter((issue) =>
+      issue.startsWith(FOCUS_BRIDGE_RECOVERY_PREFIX));
+    if (staleFocusBridgeIssues.length > 0) {
+      try {
+        // 只读权威 Markdown/Canvas 快照已恢复一致时，旧启动失败记录不应永久锁死插件。
+        await this.projectWorkspace.snapshot();
+        await this.store.resolveRecoveryIssuesAfterValidation(staleFocusBridgeIssues);
+        data.recoveryIssues = data.recoveryIssues.filter((issue) =>
+          !staleFocusBridgeIssues.includes(issue));
+      } catch {
+        // 当前结构仍不可读或恢复记录发生竞争：保持原恢复锁，禁止猜测清理。
+      }
+    }
     this.recoveryMode = data.recoveryIssues.length > 0;
     if (this.recoveryMode) {
       this.projectWorkspace.freezePendingStageDeletion(

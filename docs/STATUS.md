@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-10
-当前基线提交：`9e01860 fix: separate inline status options`
+当前基线提交：`370fd8e fix: retain focus when opening project notes`
 工作树状态：工作树干净。
-当前阶段：Canvas 身份提示、项目边框与任务日期完成实机收口；项目滴答投影保持关闭。
+当前阶段：本地项目与 Stage 编辑体验收口；项目滴答投影保持关闭。
 
 ## 本轮目标
 
@@ -30,7 +30,7 @@
 ## 本轮改动
 
 - `project-lineage-workbench.ts`、`styles.css`：原生 `select` 改为文档层 Helix 状态菜单；恢复阶段状态原来的右上角图标文字按钮，支持外部点击、Escape 和键盘移动。
-- `workbench-structure.test.ts`、`design-qa.md`：锁定菜单生命周期、原卡片布局及实机并排证据。
+- `main.ts`、`project-lineage-workbench.ts`：卡片点击结束后显式激活并聚焦新 Markdown 叶子，避免 Stage 编辑光标被原按钮夺回。
 
 ## 相关约束
 
@@ -42,9 +42,10 @@
 
 ## 当前验证
 
-- 完整门禁：69 个测试文件、954 项测试，以及 `typecheck`、`build`、`release:check`、`git diff --check` 全部通过。
-- Obsidian CLI：重载后 `recoveryMode=false`、`recoveryIssues=[]`、工作区身份错误为空，所有窗口可见身份警告为 0；月历渲染 42 日并实测选择 `08月15日` 后自动收起，控制台无错误。
+- 完整门禁：69 个测试文件、955 项测试，以及 `typecheck`、`build`、`release:check`、`git diff --check` 全部通过。
+- Obsidian CLI：恢复问题为空；月历 42 日点选后收起；控制台无错误。
 - Obsidian CLI：状态菜单跨独立事件持续打开，五项齐全、无模态；阶段状态 `idea → paused → idea` 往返写入并恢复，控制台无错误。
+- Stage 编辑验收：卡片打开目标 Markdown；测试字符写入并撤销后 SHA-256 不变，未进入恢复模式。
 - 视觉 QA：原卡片与菜单打开态完成同屏并排，右上角状态位置和卡片尺寸保持；`design-qa.md` 结果为 `passed`。
 - 本轮未访问滴答远端；测试 Vault 滴答缓存仍为空，`autoSync=false`，API 口令保留。
 

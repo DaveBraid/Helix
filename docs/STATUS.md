@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-09
-当前基线提交：`2c2980c docs: record project release regression baseline`
-工作树状态：`0.1.5` 复盘摘要刷新改动待提交。
-当前阶段：`0.1.5` 复盘自动摘要刷新待提交。
+当前基线提交：`ed24512 feat: refresh managed review summaries on open`
+工作树状态：工作树干净（本状态快照提交后）。
+当前阶段：`0.1.5` 个人预览发布就绪。
 
 ## 本轮目标
 

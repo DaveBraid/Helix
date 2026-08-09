@@ -4956,16 +4956,97 @@ class LocalProjectTaskEditModal extends Modal {
     priority.addEventListener("change", () => {
       this.priority = Number(priority.value) as 0 | 1 | 3 | 5;
     });
-    const dateField = property("日期", "calendar-days");
-    const date = dateField.createEl("input", {
-      type: "date",
-      value: this.scheduleDate,
-      attr: { "aria-label": "任务日期" },
+    const dateField = property("日期", "calendar-days", "is-date");
+    const datePicker = dateField.createEl("details", { cls: "helix-task-editor-date-picker" });
+    const dateSummary = datePicker.createEl("summary", { attr: { "aria-label": "选择任务日期" } });
+    const dateValue = dateSummary.createSpan({ cls: "helix-task-editor-date-value" });
+    const dateChevron = dateSummary.createSpan({ cls: "helix-task-editor-date-chevron" });
+    setIcon(dateChevron, "chevron-down");
+    const calendar = datePicker.createDiv({ cls: "helix-task-editor-calendar-popover" });
+    let calendarMonth = this.scheduleDate
+      ? new Date(`${this.scheduleDate}T12:00:00`)
+      : new Date();
+    const localDateValue = (value: Date): string => {
+      const year = value.getFullYear();
+      const month = String(value.getMonth() + 1).padStart(2, "0");
+      const day = String(value.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    };
+    const syncDateValue = (): void => {
+      dateValue.setText(this.scheduleDate
+        ? this.scheduleDate.slice(5).replace("-", "月") + "日"
+        : "选择日期");
+    };
+    const renderCalendar = (): void => {
+      calendar.empty();
+      const header = calendar.createDiv({ cls: "helix-task-editor-calendar-header" });
+      const previous = header.createEl("button", { attr: { "aria-label": "上个月" } });
+      setIcon(previous, "chevron-left");
+      header.createEl("strong", { text: `${calendarMonth.getFullYear()} 年 ${calendarMonth.getMonth() + 1} 月` });
+      const next = header.createEl("button", { attr: { "aria-label": "下个月" } });
+      setIcon(next, "chevron-right");
+      const weekdays = calendar.createDiv({ cls: "helix-task-editor-calendar-weekdays" });
+      for (const weekday of ["一", "二", "三", "四", "五", "六", "日"]) {
+        weekdays.createSpan({ text: weekday });
+      }
+      const grid = calendar.createDiv({ cls: "helix-task-editor-calendar-grid" });
+      const first = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1, 12);
+      const mondayOffset = (first.getDay() + 6) % 7;
+      const startDay = new Date(first);
+      startDay.setDate(first.getDate() - mondayOffset);
+      const today = localDateValue(new Date());
+      for (let index = 0; index < 42; index += 1) {
+        const day = new Date(startDay);
+        day.setDate(startDay.getDate() + index);
+        const value = localDateValue(day);
+        const button = grid.createEl("button", {
+          cls: `helix-task-editor-calendar-day${day.getMonth() === calendarMonth.getMonth() ? "" : " is-outside"}${value === today ? " is-today" : ""}${value === this.scheduleDate ? " is-selected" : ""}`,
+          text: String(day.getDate()),
+          attr: { "aria-label": value, "aria-pressed": String(value === this.scheduleDate) },
+        });
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          this.scheduleDate = value;
+          this.scheduleDirty = true;
+          calendarMonth = day;
+          syncDateValue();
+          datePicker.open = false;
+        });
+      }
+      const footer = calendar.createDiv({ cls: "helix-task-editor-calendar-footer" });
+      const clear = footer.createEl("button", { text: "清除" });
+      clear.addEventListener("click", (event) => {
+        event.preventDefault();
+        this.scheduleDate = "";
+        this.scheduleDirty = true;
+        syncDateValue();
+        datePicker.open = false;
+      });
+      const todayButton = footer.createEl("button", { text: "今天" });
+      todayButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        const value = new Date();
+        this.scheduleDate = localDateValue(value);
+        this.scheduleDirty = true;
+        calendarMonth = value;
+        syncDateValue();
+        datePicker.open = false;
+      });
+      previous.addEventListener("click", (event) => {
+        event.preventDefault();
+        calendarMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1, 12);
+        renderCalendar();
+      });
+      next.addEventListener("click", (event) => {
+        event.preventDefault();
+        calendarMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1, 12);
+        renderCalendar();
+      });
+    };
+    datePicker.addEventListener("toggle", () => {
+      if (datePicker.open) renderCalendar();
     });
-    date.addEventListener("input", () => {
-      this.scheduleDate = date.value;
-      this.scheduleDirty = true;
-    });
+    syncDateValue();
     const timeField = property("时间", "clock-3", "is-time");
     const timeMode = timeField.createEl("select", { attr: { "aria-label": "时间类型" } });
     timeMode.createEl("option", { value: "none", text: "无时间" });
@@ -5184,7 +5265,7 @@ class LocalProjectTaskEditModal extends Modal {
         }
       } catch (error) {
         new Notice(messageOf(error));
-        date.focus();
+        dateSummary.focus();
         return;
       }
       if (startDate && dueDate && Date.parse(startDate) > Date.parse(dueDate)) {

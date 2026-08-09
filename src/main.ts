@@ -153,6 +153,7 @@ export default class HelixPlugin extends Plugin {
   private readonly settingsMutationRunner = new SerializedRunner();
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
   private projectStatusItem: HTMLElement | null = null;
+  private readonly persistentNotices = new Set<Notice>();
 
   async onload(): Promise<void> {
     this.unloaded = false;
@@ -161,6 +162,7 @@ export default class HelixPlugin extends Plugin {
     this.store = new HelixDataStore(this, this.dataGeneration);
     this.secrets = new HelixSecretStore(this.app);
     const data = await this.store.load();
+    this.dismissResolvedRecoveryNotices(data.recoveryIssues);
     this.settings = data.settings;
     const transactionRoot = normalizePath(`${this.settings.rootFolder}/.transactions`);
     this.vaultRepository = new HelixVaultRepository(this.app.vault, [
@@ -230,7 +232,7 @@ export default class HelixPlugin extends Plugin {
           }`;
         this.projectWorkspace.freezePendingStageDeletion(message);
         this.recoveryMode = true;
-        new Notice(message, 0);
+        this.showPersistentNotice(message);
       }
       if (templateStartupAction(this.recoveryMode, this.settings.templateSetupCompleted) === "ensure-existing") {
         try {
@@ -247,7 +249,7 @@ export default class HelixPlugin extends Plugin {
         const message = `Helix 阶段聚焦桥接需要人工检查：${
           error instanceof Error ? error.message : String(error)}`;
         await this.enterProjectRecoveryMode(message);
-        new Notice(message, 0);
+        this.showPersistentNotice(message);
       }
     }
     this.service = new HelixService(this.store, this.secrets);
@@ -602,6 +604,8 @@ export default class HelixPlugin extends Plugin {
 
   onunload(): void {
     this.unloaded = true;
+    for (const notice of this.persistentNotices) notice.hide();
+    this.persistentNotices.clear();
     this.didaWriteContractSettingsConfirmation.disarm();
     this.didaContractAdoptConfirmation.disarm();
     this.didaWriteContractCommands?.dispose();
@@ -1382,7 +1386,8 @@ export default class HelixPlugin extends Plugin {
         if (recoveryIssue) {
           await this.enterProjectRecoveryMode(`Helix 项目工作区需要人工检查：${recoveryIssue}`);
         }
-        new Notice(message, recoveryIssue ? 0 : 8_000);
+        if (recoveryIssue) this.showPersistentNotice(message);
+        else new Notice(message, 8_000);
       });
     }, 200);
   }
@@ -1496,8 +1501,29 @@ export default class HelixPlugin extends Plugin {
       });
       this.service?.reportRecoveryIssue(message);
     } catch (persistError) {
-      new Notice(`Helix 无法持久化恢复问题：${
-        persistError instanceof Error ? persistError.message : String(persistError)}`, 0);
+      this.showPersistentNotice(`Helix 无法持久化恢复问题：${
+        persistError instanceof Error ? persistError.message : String(persistError)}`);
+    }
+  }
+
+  private showPersistentNotice(message: string): void {
+    const notice = new Notice(message, 0);
+    notice.noticeEl.addClass("helix-persistent-notice");
+    this.persistentNotices.add(notice);
+  }
+
+  private dismissResolvedRecoveryNotices(activeIssues: readonly string[]): void {
+    const documents = new Set<Document>([document]);
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      documents.add(leaf.view.containerEl.ownerDocument);
+    });
+    for (const ownerDocument of documents) {
+      for (const notice of ownerDocument.querySelectorAll<HTMLElement>(".notice")) {
+        const message = notice.textContent?.trim() ?? "";
+        if (!message.startsWith("Helix ") || !message.includes("需要人工检查")) continue;
+        if (activeIssues.some((issue) => message.includes(issue) || issue.includes(message))) continue;
+        notice.remove();
+      }
     }
   }
 

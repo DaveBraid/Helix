@@ -115,6 +115,8 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
     expect(localEditor).toMatch(/helix-task-editor-title-row[\s\S]*helix-task-editor-properties/);
     expect(localEditor).toMatch(/timeMode[\s\S]*"none"[\s\S]*"point"[\s\S]*"range"/);
+    expect(localEditor).toMatch(/helix-task-editor-date-picker[\s\S]*上个月[\s\S]*下个月[\s\S]*helix-task-editor-calendar-grid/);
+    expect(localEditor).not.toContain('type: "date",\n      value: this.scheduleDate');
     expect(localEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
     expect(localEditor).toMatch(/helix-task-editor-subtask-grip[\s\S]*draggable: "true"[\s\S]*dragstart[\s\S]*drop/);
     expect(localEditor).not.toContain('placeholder: "添加备注…"');
@@ -130,6 +132,8 @@ describe("workbench layout and navigation structure", () => {
     expect(lineage).toMatch(/helix-lineage-card-top[\s\S]*helix-lineage-status-button/);
     expect(lineage).toMatch(/helix-lineage-card-actions[\s\S]*新增[\s\S]*连接[\s\S]*折叠[\s\S]*删除/);
     expect(css).toMatch(/阶段卡片：项目色统一[\s\S]*background: var\(--background-primary\)/);
+    expect(css).toMatch(/\.helix-lineage-project-container \{[\s\S]*border: 1px solid[\s\S]*box-shadow: 0 2px 10px/);
+    expect(css).toMatch(/\.helix-lineage-card::before \{[\s\S]*inset: -1px -1px auto;[\s\S]*height: 4px/);
     expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
     expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
   });
@@ -137,6 +141,8 @@ describe("workbench layout and navigation structure", () => {
   it("revalidates stale focus-bridge recovery locks before freezing startup", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(main).toMatch(/staleFocusBridgeIssues[\s\S]*projectWorkspace\.snapshot\(\)[\s\S]*resolveRecoveryIssuesAfterValidation/);
+    expect(main).toMatch(/dismissResolvedRecoveryNotices\(data\.recoveryIssues\)/);
+    expect(main).toMatch(/showPersistentNotice[\s\S]*helix-persistent-notice/);
     expect(main.indexOf("resolveRecoveryIssuesAfterValidation"))
       .toBeLessThan(main.indexOf("this.recoveryMode = data.recoveryIssues.length > 0"));
   });

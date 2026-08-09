@@ -4500,11 +4500,7 @@
     var(--helix-project-color, #5870a8) 16%,
     transparent
   );
-  box-shadow: inset 3px 0 0 color-mix(
-    in srgb,
-    var(--helix-project-color, #5870a8) 46%,
-    transparent
-  );
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--helix-project-color, #5870a8) 7%, transparent);
   pointer-events: none;
   transition: border-color .12s, opacity .12s, box-shadow .12s;
 }
@@ -4515,9 +4511,7 @@
     var(--helix-project-color, #5870a8) 56%,
     var(--interactive-accent)
   );
-  box-shadow:
-    inset 3px 0 0 var(--helix-project-color, #5870a8),
-    0 0 0 2px color-mix(in srgb, var(--helix-project-color, #5870a8) 10%, transparent);
+  box-shadow: 0 3px 14px color-mix(in srgb, var(--helix-project-color, #5870a8) 12%, transparent);
 }
 
 .helix-lineage-project-container.is-other-project { opacity: .42; }
@@ -4897,10 +4891,145 @@
 }
 
 .helix-lineage-card::before {
-  height: 3px;
+  inset: -1px -1px auto;
+  z-index: 1;
+  width: auto;
+  height: 4px;
   border-radius: 9px 9px 0 0;
   background: var(--helix-project-color, #5870a8);
 }
+
+/* 日期使用紧凑的月历点选层，避免依赖各平台样式不一致的原生日期控件。 */
+.helix-task-editor-property.is-date {
+  position: relative;
+}
+
+.helix-task-editor-date-picker {
+  position: relative;
+  min-width: 0;
+}
+
+.helix-task-editor-date-picker > summary {
+  display: flex;
+  min-width: 0;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 6px;
+  color: var(--text-normal);
+  cursor: pointer;
+  list-style: none;
+  font-size: 14px;
+  font-weight: 580;
+}
+
+.helix-task-editor-date-picker > summary::-webkit-details-marker,
+.helix-task-editor-date-picker > summary::before {
+  display: none !important;
+  content: none !important;
+}
+
+.helix-task-editor-date-chevron {
+  display: inline-flex;
+  color: var(--text-muted);
+  transition: transform .14s ease;
+}
+
+.helix-task-editor-date-chevron svg { width: 15px; height: 15px; }
+.helix-task-editor-date-picker[open] .helix-task-editor-date-chevron { transform: rotate(180deg); }
+
+.helix-task-editor-calendar-popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: -12px;
+  z-index: var(--layer-popover);
+  width: 286px;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+  box-shadow: var(--shadow-l);
+}
+
+.helix-task-editor-calendar-header,
+.helix-task-editor-calendar-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.helix-task-editor-calendar-header { margin-bottom: 9px; }
+.helix-task-editor-calendar-header strong { font-size: 14px; }
+.helix-task-editor-calendar-header button,
+.helix-task-editor-calendar-footer button,
+.helix-task-editor-calendar-day {
+  display: grid;
+  place-items: center;
+  border: 0;
+  box-shadow: none;
+}
+
+.helix-task-editor-calendar-header button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.helix-task-editor-calendar-header button:hover { background: var(--background-modifier-hover); }
+.helix-task-editor-calendar-header svg { width: 16px; height: 16px; }
+
+.helix-task-editor-calendar-weekdays,
+.helix-task-editor-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+}
+
+.helix-task-editor-calendar-weekdays {
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+}
+
+.helix-task-editor-calendar-day {
+  width: 32px;
+  height: 30px;
+  padding: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-normal);
+  font-size: 12px;
+}
+
+.helix-task-editor-calendar-day:hover { background: var(--background-modifier-hover); }
+.helix-task-editor-calendar-day.is-outside { color: var(--text-faint); opacity: .58; }
+.helix-task-editor-calendar-day.is-today { box-shadow: inset 0 0 0 1px var(--interactive-accent); }
+.helix-task-editor-calendar-day.is-selected {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-weight: 700;
+}
+
+.helix-task-editor-calendar-footer {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.helix-task-editor-calendar-footer button {
+  min-height: 30px;
+  padding: 0 9px;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--interactive-accent);
+}
+
+.helix-task-editor-calendar-footer button:hover { background: var(--background-modifier-hover); }
 
 .helix-lineage-card:hover,
 .helix-lineage-card:focus-within {

@@ -34,6 +34,28 @@ const QUESTIONS: Record<JournalPeriod, Array<[string, string]>> = {
   ],
 };
 
+const SUMMARY_START = "<!-- helix:summary:start -->";
+const SUMMARY_END = "<!-- helix:summary:end -->";
+
+/** 只替换 Helix 明确管理的摘要块；缺失或重复标记时拒绝猜测。 */
+export function patchJournalSummary(markdown: string, summary: string): string {
+  const start = markdown.indexOf(SUMMARY_START);
+  const end = markdown.indexOf(SUMMARY_END);
+  if (
+    start < 0 || end < start ||
+    markdown.indexOf(SUMMARY_START, start + SUMMARY_START.length) >= 0 ||
+    markdown.indexOf(SUMMARY_END, end + SUMMARY_END.length) >= 0
+  ) {
+    throw new Error("复盘自动摘要标记缺失或重复，未修改正文");
+  }
+  const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
+  const normalized = summary.replace(/\r?\n/g, eol).trim();
+  const replacement = `${SUMMARY_START}${eol}${normalized}${eol}${SUMMARY_END}`;
+  const current = markdown.slice(start, end + SUMMARY_END.length);
+  if (current === replacement) return markdown;
+  return markdown.slice(0, start) + replacement + markdown.slice(end + SUMMARY_END.length);
+}
+
 export function journalTemplate(input: JournalTemplateInput, body?: string): string {
   const prompts = QUESTIONS[input.period]
     .map(([title, question]) => `> [!question] ${title}\n> ${question}\n`)

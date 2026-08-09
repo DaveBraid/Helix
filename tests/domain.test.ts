@@ -9,7 +9,7 @@ import {
   rotatingChallenges,
 } from "../src/domain/gamification";
 import { InProgressRegistry } from "../src/domain/in-progress";
-import { journalPath, journalTemplate } from "../src/domain/journals";
+import { journalPath, journalTemplate, patchJournalSummary } from "../src/domain/journals";
 import { localDateKeyFromInstant } from "../src/domain/local-date";
 import { stableHash, stableStringify } from "../src/domain/stable";
 import { createHash } from "node:crypto";
@@ -102,6 +102,27 @@ describe("journal templates", () => {
     expect(journalPath("Helix", "weekly", new Date(2024, 11, 30))).toBe(
       "Helix/Journals/Weekly/2025-W01.md",
     );
+  });
+
+  it("updates only the managed journal summary block", () => {
+    const markdown = journalTemplate({
+      period: "daily",
+      title: "复盘",
+      periodStart: "2026-08-09",
+      periodEnd: "2026-08-09",
+    }, "用户正文不得改变\n");
+    const updated = patchJournalSummary(markdown, "- 完成任务：3\n- 专注时长：50 分钟");
+    expect(updated).toContain("用户正文不得改变");
+    expect(updated).toContain("- 完成任务：3\n- 专注时长：50 分钟");
+    expect(patchJournalSummary(updated, "- 完成任务：3\n- 专注时长：50 分钟"))
+      .toBe(updated);
+  });
+
+  it("refuses ambiguous journal summary markers", () => {
+    expect(() => patchJournalSummary("普通正文", "摘要")).toThrow(/标记缺失或重复/);
+    const duplicate = "<!-- helix:summary:start -->\na\n<!-- helix:summary:end -->\n" +
+      "<!-- helix:summary:start -->\nb\n<!-- helix:summary:end -->";
+    expect(() => patchJournalSummary(duplicate, "摘要")).toThrow(/标记缺失或重复/);
   });
 });
 

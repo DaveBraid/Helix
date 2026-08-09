@@ -11,6 +11,7 @@ import {
 import {
   journalPath,
   journalPeriodBounds,
+  patchJournalSummary,
 } from "./domain/journals";
 import {
   CYCLE_RELATION_LABELS,
@@ -1138,6 +1139,18 @@ export default class HelixPlugin extends Plugin {
   private async openJournal(period: JournalPeriod): Promise<void> {
     const now = new Date();
     const path = journalPath(this.settings.rootFolder, period, now);
+    const bounds = journalPeriodBounds(period, now);
+    const state = this.service.snapshot();
+    const summary = aggregateAnalytics(state.events, {
+      from: bounds.start,
+      to: bounds.end,
+    });
+    const generatedSummary = [
+      `- 完成任务：${summary.totalTasks}`,
+      `- 习惯打卡：${summary.totalHabitCheckins}`,
+      `- 专注时长：${summary.totalFocusMinutes} 分钟`,
+      `- 活跃天数：${summary.activeDays}`,
+    ].join("\n");
     const existing = await this.vaultRepository.read(path);
     if (!existing) {
       this.assertWritable();
@@ -1147,18 +1160,6 @@ export default class HelixPlugin extends Plugin {
         monthly: `${now.getFullYear()} 年 ${now.getMonth() + 1} 月复盘`,
         yearly: `${now.getFullYear()} 年复盘`,
       };
-      const bounds = journalPeriodBounds(period, now);
-      const state = this.service.snapshot();
-      const summary = aggregateAnalytics(state.events, {
-        from: bounds.start,
-        to: bounds.end,
-      });
-      const generatedSummary = [
-        `- 完成任务：${summary.totalTasks}`,
-        `- 习惯打卡：${summary.totalHabitCheckins}`,
-        `- 专注时长：${summary.totalFocusMinutes} 分钟`,
-        `- 活跃天数：${summary.activeDays}`,
-      ].join("\n");
       const content = await createJournalDocument({
         period,
         title: names[period],
@@ -1171,6 +1172,26 @@ export default class HelixPlugin extends Plugin {
         path,
         content,
       );
+    } else {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      const frontmatter = file instanceof TFile
+        ? this.app.metadataCache.getFileCache(file)?.frontmatter
+        : undefined;
+      if (
+        frontmatter?.["helix-kind"] === "helix-journal" &&
+        frontmatter["helix-period"] === period
+      ) {
+        try {
+          const updated = patchJournalSummary(existing.content, generatedSummary);
+          if (updated !== existing.content) {
+            this.assertWritable();
+            await this.vaultRepository.compareAndWrite(existing, updated);
+          }
+        } catch (error) {
+          new Notice(`复盘已打开，但自动摘要未更新：${
+            error instanceof Error ? error.message : String(error)}`, 8_000);
+        }
+      }
     }
     await this.openFile(path);
   }

@@ -61,6 +61,14 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/renderAnalytics\(content: HTMLElement, includeTitle = true\)/);
   });
 
+  it("refreshes only the managed summary when an existing Helix journal opens", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(main).toMatch(
+      /openJournal\(period[\s\S]*helix-kind[\s\S]*helix-journal[\s\S]*patchJournalSummary\(existing\.content, generatedSummary\)[\s\S]*compareAndWrite\(existing, updated\)/,
+    );
+    expect(main).toContain("复盘已打开，但自动摘要未更新");
+  });
+
   it("keeps shell, sidebar and header fixed while only main content scrolls", () => {
     expect(css).toMatch(/\.helix-root \{[\s\S]*height: 100%;[\s\S]*overflow: hidden !important;/);
     expect(css).toMatch(/\.helix-shell \{[\s\S]*height: 100%;[\s\S]*overflow: hidden !important;/);

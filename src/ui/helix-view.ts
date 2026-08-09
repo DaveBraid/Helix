@@ -2554,46 +2554,24 @@ export class HelixView extends ItemView {
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
-      onEditProjectStatus: (projectId) => {
+      onEditProjectStatus: (projectId, status) => {
         const project = workspace.projects.find((candidate) => candidate.id === projectId);
-        if (!project) return;
+        if (!project || status === project.status) return;
         void this.actions.readProjectWorkspace(() =>
           this.actions.projectWorkspace.prepareProjectStatusUpdate(projectId))
-          .then((plan) => {
-            new WorkspaceStatusModal(
-              this.app,
-              "修改项目状态",
-              project.title,
-              plan.currentStatus,
-              PROJECT_STATUS_OPTIONS,
-              async (status) => {
-                await this.actions.updateProjectStatus(plan, status);
-                await this.render();
-              },
-            ).open();
+          .then(async (plan) => {
+            await this.actions.updateProjectStatus(plan, status);
+            await this.render();
           })
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
-      onEditCycleStatus: (cycleId) => {
+      onEditCycleStatus: (cycleId, status) => {
         const cycle = workspace.projects
           .flatMap((project) => project.cycles)
           .find((candidate) => candidate.id === cycleId);
-        if (!cycle) return;
-        void this.actions.readProjectWorkspace(() =>
-          this.actions.projectWorkspace.prepareCycleStatusUpdate(cycleId))
-          .then((plan) => {
-            new WorkspaceStatusModal(
-              this.app,
-              "修改阶段状态",
-              `阶段 ${cycle.stageCode} · ${cycle.title}`,
-              plan.currentStatus,
-              CYCLE_STATUS_OPTIONS,
-              async (status) => {
-                await this.requestCycleStatusChange(cycleId, plan.currentStatus, status);
-              },
-            ).open();
-          })
+        if (!cycle || status === cycle.status) return;
+        void this.requestCycleStatusChange(cycleId, cycle.status, status)
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
       },
@@ -5065,6 +5043,17 @@ class LocalProjectTaskEditModal extends Modal {
       value: this.endTime,
       attr: { "aria-label": "结束时间" },
     });
+    const openTimePicker = (input: HTMLInputElement): void => {
+      input.addEventListener("click", () => {
+        try {
+          input.showPicker();
+        } catch {
+          // 由平台继续处理键盘输入；隐藏原生图标不改变值语义。
+        }
+      });
+    };
+    openTimePicker(start);
+    openTimePicker(due);
     const syncTimeMode = (): void => {
       timeInputs.toggleClass("is-hidden", this.timeMode === "none");
       due.toggleClass("is-hidden", this.timeMode !== "range");

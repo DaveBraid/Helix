@@ -1071,7 +1071,17 @@
 }
 
 .is-local-task-editor .helix-task-editor-time-inputs input {
-  width: 82px;
+  width: 70px;
+  min-width: 70px;
+  padding: 0;
+  font-size: 13px;
+}
+
+.is-local-task-editor .helix-task-editor-time-inputs input::-webkit-calendar-picker-indicator {
+  width: 0;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
 }
 
 .helix-task-editor-time-inputs.is-hidden,
@@ -4748,6 +4758,23 @@
   font-size: inherit;
   line-height: 1.25;
 }
+.helix-lineage-status-control {
+  display: inline-flex;
+  margin-left: auto;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+}
+.helix-lineage-status-control .helix-lineage-status-button {
+  margin-left: 0;
+  padding-right: 16px;
+  color: inherit;
+  cursor: pointer;
+}
+.helix-lineage-status-control.is-active { color: var(--interactive-accent); }
+.helix-lineage-status-control.is-completed { color: var(--helix-success-ink); }
+.helix-lineage-status-control.is-paused { color: var(--helix-warning-ink); }
+.helix-lineage-status-control.is-terminated { color: var(--text-error); }
 .helix-lineage-status-icon,
 .helix-lineage-column-icon { display: inline-flex; align-items: center; }
 .helix-lineage-status-icon svg { width: 12px; height: 12px; }

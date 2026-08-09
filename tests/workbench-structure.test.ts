@@ -115,6 +115,8 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
     expect(localEditor).toMatch(/helix-task-editor-title-row[\s\S]*helix-task-editor-properties/);
     expect(localEditor).toMatch(/timeMode[\s\S]*"none"[\s\S]*"point"[\s\S]*"range"/);
+    expect(css).toMatch(/\.helix-task-editor-time-inputs input \{[\s\S]*width: 70px;[\s\S]*min-width: 70px;[\s\S]*padding: 0;/);
+    expect(localEditor).toMatch(/openTimePicker[\s\S]*showPicker\(\)/);
     expect(localEditor).toMatch(/helix-task-editor-date-picker[\s\S]*上个月[\s\S]*下个月[\s\S]*helix-task-editor-calendar-grid/);
     expect(localEditor).not.toContain('type: "date",\n      value: this.scheduleDate');
     expect(localEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
@@ -130,6 +132,7 @@ describe("workbench layout and navigation structure", () => {
       "utf8",
     );
     expect(lineage).toMatch(/helix-lineage-card-top[\s\S]*helix-lineage-status-button/);
+    expect(lineage).toMatch(/createEl\("select"[\s\S]*onEditProjectStatus[\s\S]*onEditCycleStatus/);
     expect(lineage).toMatch(/helix-lineage-card-actions[\s\S]*新增[\s\S]*连接[\s\S]*折叠[\s\S]*删除/);
     expect(css).toMatch(/阶段卡片：项目色统一[\s\S]*background: var\(--background-primary\)/);
     expect(css).toMatch(/\.helix-lineage-project-container \{[\s\S]*border: 1px solid[\s\S]*box-shadow: 0 2px 10px/);
@@ -173,7 +176,8 @@ describe("workbench layout and navigation structure", () => {
   it("routes all new status saves through a recovery-mode write gate", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(view).toMatch(/this\.actions\.updateProjectStatus\(plan, status\)/);
-    expect(view).toMatch(/this\.requestCycleStatusChange\(cycleId, plan\.currentStatus, status\)/);
+    expect(view).toMatch(/this\.requestCycleStatusChange\(cycleId, cycle\.status, status\)/);
+    expect(view).not.toMatch(/onEditProjectStatus:[\s\S]*new WorkspaceStatusModal/);
     expect(view).not.toMatch(/projectWorkspace\.updateProjectStatus\(plan, status\)/);
     expect(view).toMatch(/requestStageBoardStatusChange\(/);
     expect(main).toMatch(/updateProjectStatus: \(plan, status\) => this\.updateProjectStatus\(plan, status\)/);

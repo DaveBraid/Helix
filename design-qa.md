@@ -6,9 +6,14 @@
 - 项目实现图：`/private/tmp/helix-project-border-v4.png`
 - 项目聚焦并排图：`/private/tmp/helix-project-border-comparison.png`（左为源图，右为实现）
 - 日期月历实现图：`/private/tmp/helix-task-calendar.png`
+- 时间占位源图：`/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-126a2957-fbec-49e7-a78e-5c06e7706169.png`
+- 时间占位实现图：`/private/tmp/helix-inline-status-selects-v2.png`
+- 时间占位并排图：`/private/tmp/helix-time-placeholders-comparison.png`（左为修复前，右为修复后）
+- 原位状态选择实现图：`/private/tmp/helix-inline-status-selects-v4.png`
 - viewport：Obsidian 1.13.4 桌面端；项目实现 2790 × 1846 px，日期实现同一窗口；源图 914 × 586 px。
 - normalization：项目实现裁出 965 × 594 px 容器区域并等比缩放到 412 px 高；源图等比缩放到同高后左右并排，未拉伸。
 - state：深色主题；项目页显示单阶段项目；任务详情月历打开，42 个日期单元完整呈现。
+- time/state：任务时间段为空，两个 `--:--` 完整显示且未越过属性单元；项目与阶段状态均为 5 项原位 `select`，无状态模态。
 
 ## Findings
 
@@ -22,6 +27,8 @@
 2. P1：阶段卡片顶部色条受到旧 `inset: 0 auto 0 0; width: 4px` 规则影响，只剩左上短线。已显式覆盖为 `inset: -1px -1px auto; width: auto; height: 4px`，实现图显示整条项目色顶边。
 3. P1：任务日期依赖平台原生日期输入，不能稳定点选。已改为模态内月历弹层，支持上下月、42 日网格、今天、清除和单击选定后自动收起。
 4. P2：已经恢复的数据仍可能留下无限时长的旧身份警告 Notice。已在启动时跨 Obsidian 窗口清理不再对应当前 `recoveryIssues` 的提示，并统一跟踪、卸载时关闭新增长提示；重载后恢复模式关闭、问题数组为空、可见身份警告为 0。
+5. P1：两个原生时间输入的 `--:--` 被平台时钟图标裁断；单纯放宽会越过标签属性。已隐藏重复的原生指示器、保留点击唤起 `showPicker()`，将两个输入收紧到 70 px；并排图显示两组占位完整且不重叠。
+6. P2：项目与阶段状态原先点击后打开独立模态。已改为卡片／容器状态位置上的 5 项原位选择器；实测 `idea → paused → idea` 写入及恢复成功，未出现状态模态或控制台错误。
 
 ## 验收面
 
@@ -29,7 +36,7 @@
 - 间距与布局：容器四边 1 px；顶部色条 4 px；月历 286 px，7 列等距，未挤压属性矩阵。
 - 色彩与令牌：边框、阴影、月历背景和选中态全部使用 Obsidian／Helix 主题变量，明暗主题兼容。
 - 图像与资产：无位图或自绘 SVG；箭头、日历等图标复用 Obsidian 图标库。
-- 文案与行为：日期支持选择、跨月、今天、清除；选定后立即回填并收起，不写入滴答。
-- 交互与错误：Obsidian CLI 实测 42 个日期按钮；重载后 `recoveryMode=false`、`recoveryIssues=[]`、工作区身份错误为空。
+- 文案与行为：日期支持选择、跨月、今天、清除；时间段为空时稳定显示 `--:-- – --:--`；项目／阶段状态就地选择。
+- 交互与错误：Obsidian CLI 实测 42 个日期按钮、时间选择器点击入口及阶段状态往返保存；重载后 `recoveryMode=false`、`recoveryIssues=[]`、工作区身份错误为空，控制台无错误。
 
 final result: passed

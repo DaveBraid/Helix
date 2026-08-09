@@ -78,8 +78,14 @@ interface WorkbenchOptions {
     allowedTargetIds: string[],
   ) => void;
   onEditProjectColor: (projectId: string, color: string) => void;
-  onEditProjectStatus: (projectId: string) => void;
-  onEditCycleStatus: (cycleId: string) => void;
+  onEditProjectStatus: (
+    projectId: string,
+    status: ProjectWorkspaceProject["status"],
+  ) => void;
+  onEditCycleStatus: (
+    cycleId: string,
+    status: ProjectWorkspaceCycle["status"],
+  ) => void;
   requestCycleStatusChange: (
     cycleId: string,
     expectedStatus: ProjectWorkspaceCycle["status"],
@@ -106,6 +112,13 @@ const PROJECT_CONTAINER_BOTTOM_PADDING = 28;
 const VIRTUAL_MARGIN = 2400;
 const VIRTUAL_EXPAND = 1800;
 const VIEWPORT_SAFE_MARGIN = 400;
+const PROJECT_STATUS_ORDER: ReadonlyArray<ProjectWorkspaceProject["status"]> = [
+  "planned",
+  "active",
+  "completed",
+  "paused",
+  "terminated",
+];
 export const LINEAGE_ALL_PROJECTS_FOCUS_ID = "helix:all-projects";
 
 export function lineageGraphBox(
@@ -1145,9 +1158,8 @@ export class ProjectLineageWorkbench {
       open.createSpan({ cls: "helix-lineage-project-container-swatch" });
       open.createSpan({ text: project.title });
       open.addEventListener("click", () => this.options.onOpenNote(project.notePath));
-      const status = header.createEl("button", {
+      const status = header.createEl("select", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
-        text: PROJECT_STATUS_LABELS[project.status],
         attr: {
           "aria-label": `修改 ${project.title} 的项目状态，当前${
             PROJECT_STATUS_LABELS[project.status]
@@ -1155,7 +1167,17 @@ export class ProjectLineageWorkbench {
           title: "修改项目状态",
         },
       });
-      status.addEventListener("click", () => this.options.onEditProjectStatus(project.id));
+      for (const value of PROJECT_STATUS_ORDER) {
+        status.createEl("option", { value, text: PROJECT_STATUS_LABELS[value] });
+      }
+      status.value = project.status;
+      status.addEventListener("click", (event) => event.stopPropagation());
+      status.addEventListener("change", () => {
+        this.options.onEditProjectStatus(
+          project.id,
+          status.value as ProjectWorkspaceProject["status"],
+        );
+      });
       header.createSpan({
         cls: "helix-lineage-project-container-count",
         text: `${project.cycles.length} 阶段`,
@@ -1242,19 +1264,34 @@ export class ProjectLineageWorkbench {
       cycle = owner.cycles.find((item) => item.id === node.entityId);
       if (cycle) {
         const presentation = STAGE_STATUS_PRESENTATION[cycle.status];
-        const status = top.createEl("button", {
-          cls: `helix-lineage-status-button is-${cycle.status}`,
+        const statusControl = top.createDiv({
+          cls: `helix-lineage-status-control is-${cycle.status}`,
           attr: {
             "aria-label": `修改 ${cycle.title} 的阶段状态，当前${presentation.label}`,
             title: "修改阶段状态",
           },
         });
-        const statusIcon = status.createSpan({ cls: "helix-lineage-status-icon" });
+        const statusIcon = statusControl.createSpan({ cls: "helix-lineage-status-icon" });
         setIcon(statusIcon, presentation.icon);
-        status.createSpan({ text: presentation.label });
+        const status = statusControl.createEl("select", {
+          cls: `helix-lineage-status-button is-${cycle.status}`,
+        });
+        for (const value of STAGE_BOARD_COLUMNS) {
+          status.createEl("option", {
+            value,
+            text: STAGE_STATUS_PRESENTATION[value].label,
+          });
+        }
+        status.value = cycle.status;
         status.addEventListener("click", (event) => {
           event.stopPropagation();
-          this.options.onEditCycleStatus(cycle!.id);
+        });
+        status.addEventListener("change", (event) => {
+          event.stopPropagation();
+          this.options.onEditCycleStatus(
+            cycle!.id,
+            status.value as ProjectWorkspaceCycle["status"],
+          );
         });
       }
     }
@@ -1269,9 +1306,8 @@ export class ProjectLineageWorkbench {
     });
     const meta = card.createDiv({ cls: "helix-lineage-card-meta" });
     if (node.kind === "project") {
-      const status = meta.createEl("button", {
+      const status = meta.createEl("select", {
         cls: `helix-lineage-status-button is-project is-${owner.status}`,
-        text: PROJECT_STATUS_LABELS[owner.status],
         attr: {
           "aria-label": `修改 ${owner.title} 的项目状态，当前${
             PROJECT_STATUS_LABELS[owner.status]
@@ -1279,9 +1315,19 @@ export class ProjectLineageWorkbench {
           title: "修改项目状态",
         },
       });
+      for (const value of PROJECT_STATUS_ORDER) {
+        status.createEl("option", { value, text: PROJECT_STATUS_LABELS[value] });
+      }
+      status.value = owner.status;
       status.addEventListener("click", (event) => {
         event.stopPropagation();
-        this.options.onEditProjectStatus(owner.id);
+      });
+      status.addEventListener("change", (event) => {
+        event.stopPropagation();
+        this.options.onEditProjectStatus(
+          owner.id,
+          status.value as ProjectWorkspaceProject["status"],
+        );
       });
       meta.createSpan({ text: `${owner.cycles.length} 个阶段` });
     } else {

@@ -119,6 +119,19 @@ const PROJECT_STATUS_ORDER: ReadonlyArray<ProjectWorkspaceProject["status"]> = [
   "paused",
   "terminated",
 ];
+const PROJECT_STATUS_ICONS: Record<ProjectWorkspaceProject["status"], string> = {
+  planned: "circle-dashed",
+  active: "play-circle",
+  completed: "circle-check",
+  paused: "circle-pause",
+  terminated: "circle-x",
+};
+
+interface LineageStatusOption<T extends string> {
+  value: T;
+  label: string;
+  icon: string;
+}
 export const LINEAGE_ALL_PROJECTS_FOCUS_ID = "helix:all-projects";
 
 export function lineageGraphBox(
@@ -703,6 +716,10 @@ export class ProjectLineageWorkbench {
     sourceStatus: ProjectWorkspaceCycle["status"];
   } | null = null;
   private boardEscapeListener: ((event: KeyboardEvent) => void) | null = null;
+  private statusPopover: HTMLElement | null = null;
+  private statusPopoverAnchor: HTMLButtonElement | null = null;
+  private statusPopoverAbort: AbortController | null = null;
+  private statusPopoverListenerTimer: number | null = null;
 
   constructor(private readonly options: WorkbenchOptions) {
     const minimumX = Math.min(0, ...options.snapshot.canvasNodes.map((node) => node.x));
@@ -729,6 +746,7 @@ export class ProjectLineageWorkbench {
 
   destroy(): void {
     this.destroyed = true;
+    this.closeStatusPopover();
     this.boardDrag = null;
     this.clearBoardEscapeListener();
     this.moveVersion += 1;
@@ -762,6 +780,7 @@ export class ProjectLineageWorkbench {
   }
 
   render(parent: HTMLElement): void {
+    this.closeStatusPopover();
     parent.empty();
     parent.addClass("helix-lineage-shell");
     this.renderToolbar(parent);
@@ -1158,8 +1177,9 @@ export class ProjectLineageWorkbench {
       open.createSpan({ cls: "helix-lineage-project-container-swatch" });
       open.createSpan({ text: project.title });
       open.addEventListener("click", () => this.options.onOpenNote(project.notePath));
-      const status = header.createEl("select", {
+      const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
+        text: PROJECT_STATUS_LABELS[project.status],
         attr: {
           "aria-label": `修改 ${project.title} 的项目状态，当前${
             PROJECT_STATUS_LABELS[project.status]
@@ -1167,15 +1187,19 @@ export class ProjectLineageWorkbench {
           title: "修改项目状态",
         },
       });
-      for (const value of PROJECT_STATUS_ORDER) {
-        status.createEl("option", { value, text: PROJECT_STATUS_LABELS[value] });
-      }
-      status.value = project.status;
-      status.addEventListener("click", (event) => event.stopPropagation());
-      status.addEventListener("change", () => {
-        this.options.onEditProjectStatus(
-          project.id,
-          status.value as ProjectWorkspaceProject["status"],
+      status.addEventListener("pointerdown", (event) => event.stopPropagation());
+      status.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.openStatusPopover(
+          status,
+          PROJECT_STATUS_ORDER.map((value) => ({
+            value,
+            label: PROJECT_STATUS_LABELS[value],
+            icon: PROJECT_STATUS_ICONS[value],
+          })),
+          project.status,
+          (value) => this.options.onEditProjectStatus(project.id, value),
         );
       });
       header.createSpan({
@@ -1264,33 +1288,29 @@ export class ProjectLineageWorkbench {
       cycle = owner.cycles.find((item) => item.id === node.entityId);
       if (cycle) {
         const presentation = STAGE_STATUS_PRESENTATION[cycle.status];
-        const statusControl = top.createDiv({
-          cls: `helix-lineage-status-control is-${cycle.status}`,
+        const status = top.createEl("button", {
+          cls: `helix-lineage-status-button is-${cycle.status}`,
           attr: {
             "aria-label": `修改 ${cycle.title} 的阶段状态，当前${presentation.label}`,
             title: "修改阶段状态",
           },
         });
-        const statusIcon = statusControl.createSpan({ cls: "helix-lineage-status-icon" });
+        const statusIcon = status.createSpan({ cls: "helix-lineage-status-icon" });
         setIcon(statusIcon, presentation.icon);
-        const status = statusControl.createEl("select", {
-          cls: `helix-lineage-status-button is-${cycle.status}`,
-        });
-        for (const value of STAGE_BOARD_COLUMNS) {
-          status.createEl("option", {
-            value,
-            text: STAGE_STATUS_PRESENTATION[value].label,
-          });
-        }
-        status.value = cycle.status;
+        status.createSpan({ text: presentation.label });
+        status.addEventListener("pointerdown", (event) => event.stopPropagation());
         status.addEventListener("click", (event) => {
+          event.preventDefault();
           event.stopPropagation();
-        });
-        status.addEventListener("change", (event) => {
-          event.stopPropagation();
-          this.options.onEditCycleStatus(
-            cycle!.id,
-            status.value as ProjectWorkspaceCycle["status"],
+          this.openStatusPopover(
+            status,
+            STAGE_BOARD_COLUMNS.map((value) => ({
+              value,
+              label: STAGE_STATUS_PRESENTATION[value].label,
+              icon: STAGE_STATUS_PRESENTATION[value].icon,
+            })),
+            cycle!.status,
+            (value) => this.options.onEditCycleStatus(cycle!.id, value),
           );
         });
       }
@@ -1306,8 +1326,9 @@ export class ProjectLineageWorkbench {
     });
     const meta = card.createDiv({ cls: "helix-lineage-card-meta" });
     if (node.kind === "project") {
-      const status = meta.createEl("select", {
+      const status = meta.createEl("button", {
         cls: `helix-lineage-status-button is-project is-${owner.status}`,
+        text: PROJECT_STATUS_LABELS[owner.status],
         attr: {
           "aria-label": `修改 ${owner.title} 的项目状态，当前${
             PROJECT_STATUS_LABELS[owner.status]
@@ -1315,18 +1336,19 @@ export class ProjectLineageWorkbench {
           title: "修改项目状态",
         },
       });
-      for (const value of PROJECT_STATUS_ORDER) {
-        status.createEl("option", { value, text: PROJECT_STATUS_LABELS[value] });
-      }
-      status.value = owner.status;
+      status.addEventListener("pointerdown", (event) => event.stopPropagation());
       status.addEventListener("click", (event) => {
+        event.preventDefault();
         event.stopPropagation();
-      });
-      status.addEventListener("change", (event) => {
-        event.stopPropagation();
-        this.options.onEditProjectStatus(
-          owner.id,
-          status.value as ProjectWorkspaceProject["status"],
+        this.openStatusPopover(
+          status,
+          PROJECT_STATUS_ORDER.map((value) => ({
+            value,
+            label: PROJECT_STATUS_LABELS[value],
+            icon: PROJECT_STATUS_ICONS[value],
+          })),
+          owner.status,
+          (value) => this.options.onEditProjectStatus(owner.id, value),
         );
       });
       meta.createSpan({ text: `${owner.cycles.length} 个阶段` });
@@ -1360,6 +1382,112 @@ export class ProjectLineageWorkbench {
         this.options.onToggleCompletedCollapse(node.projectId, false);
       });
     }
+  }
+
+  private openStatusPopover<T extends string>(
+    anchor: HTMLButtonElement,
+    options: ReadonlyArray<LineageStatusOption<T>>,
+    current: T,
+    onSelect: (value: T) => void,
+  ): void {
+    if (this.statusPopoverAnchor === anchor && this.statusPopover) return;
+    this.closeStatusPopover();
+    const ownerDocument = anchor.ownerDocument;
+    const popover = ownerDocument.body.createDiv({
+      cls: "helix-lineage-status-popover",
+      attr: { role: "menu", "aria-label": "选择状态" },
+    });
+    this.statusPopover = popover;
+    this.statusPopoverAnchor = anchor;
+    anchor.setAttribute("aria-expanded", "true");
+    const abort = new AbortController();
+    this.statusPopoverAbort = abort;
+    const optionButtons: HTMLButtonElement[] = [];
+    for (const option of options) {
+      const button = popover.createEl("button", {
+        cls: `helix-lineage-status-popover-option is-${option.value}${
+          option.value === current ? " is-current" : ""
+        }`,
+        attr: {
+          role: "menuitemradio",
+          "aria-checked": String(option.value === current),
+        },
+      });
+      const icon = button.createSpan({ cls: "helix-lineage-status-popover-icon" });
+      setIcon(icon, option.icon);
+      button.createSpan({ text: option.label });
+      if (option.value === current) {
+        const check = button.createSpan({ cls: "helix-lineage-status-popover-check" });
+        setIcon(check, "check");
+      }
+      button.addEventListener("pointerdown", (event) => event.stopPropagation());
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeStatusPopover();
+        if (option.value !== current) onSelect(option.value);
+      });
+      optionButtons.push(button);
+    }
+    popover.addEventListener("pointerdown", (event) => event.stopPropagation());
+    popover.addEventListener("click", (event) => event.stopPropagation());
+    const anchorRect = anchor.getBoundingClientRect();
+    const menuRect = popover.getBoundingClientRect();
+    const viewportWidth = ownerDocument.documentElement.clientWidth;
+    const viewportHeight = ownerDocument.documentElement.clientHeight;
+    const left = Math.min(
+      Math.max(8, anchorRect.right - menuRect.width),
+      viewportWidth - menuRect.width - 8,
+    );
+    const belowTop = anchorRect.bottom + 6;
+    const top = belowTop + menuRect.height <= viewportHeight - 8
+      ? belowTop
+      : Math.max(8, anchorRect.top - menuRect.height - 6);
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.closeStatusPopover(true);
+        return;
+      }
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const focused = optionButtons.indexOf(ownerDocument.activeElement as HTMLButtonElement);
+      const next = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? optionButtons.length - 1
+          : event.key === "ArrowDown"
+            ? (focused + 1 + optionButtons.length) % optionButtons.length
+            : (focused - 1 + optionButtons.length) % optionButtons.length;
+      optionButtons[next]?.focus();
+    };
+    ownerDocument.addEventListener("keydown", onKeyDown, { signal: abort.signal });
+    this.statusPopoverListenerTimer = window.setTimeout(() => {
+      this.statusPopoverListenerTimer = null;
+      ownerDocument.addEventListener("pointerdown", (event) => {
+        if (popover.contains(event.target as Node) || anchor.contains(event.target as Node)) return;
+        this.closeStatusPopover();
+      }, { capture: true, signal: abort.signal });
+    }, 0);
+    (optionButtons.find((button) => button.classList.contains("is-current")) ??
+      optionButtons[0])?.focus({ preventScroll: true });
+  }
+
+  private closeStatusPopover(restoreFocus = false): void {
+    if (this.statusPopoverListenerTimer !== null) {
+      window.clearTimeout(this.statusPopoverListenerTimer);
+      this.statusPopoverListenerTimer = null;
+    }
+    this.statusPopoverAbort?.abort();
+    this.statusPopoverAbort = null;
+    this.statusPopover?.remove();
+    this.statusPopover = null;
+    const anchor = this.statusPopoverAnchor;
+    this.statusPopoverAnchor = null;
+    anchor?.setAttribute("aria-expanded", "false");
+    if (restoreFocus && anchor?.isConnected) anchor.focus({ preventScroll: true });
   }
 
   private renderCycleActions(

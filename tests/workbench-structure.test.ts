@@ -132,13 +132,16 @@ describe("workbench layout and navigation structure", () => {
       "utf8",
     );
     expect(lineage).toMatch(/helix-lineage-card-top[\s\S]*helix-lineage-status-button/);
-    expect(lineage).toMatch(/createEl\("select"[\s\S]*onEditProjectStatus[\s\S]*onEditCycleStatus/);
+    expect(lineage).not.toMatch(/helix-lineage-status-button[\s\S]{0,180}createEl\("select"/);
+    expect(lineage).toMatch(/openStatusPopover[\s\S]*onEditProjectStatus[\s\S]*onEditCycleStatus/);
+    expect(lineage).toMatch(/helix-lineage-status-popover[\s\S]*pointerdown[\s\S]*Escape/);
     expect(lineage).toMatch(/helix-lineage-card-actions[\s\S]*新增[\s\S]*连接[\s\S]*折叠[\s\S]*删除/);
     expect(css).toMatch(/阶段卡片：项目色统一[\s\S]*background: var\(--background-primary\)/);
     expect(css).toMatch(/\.helix-lineage-project-container \{[\s\S]*border: 1px solid[\s\S]*box-shadow: 0 2px 10px/);
     expect(css).toMatch(/\.helix-lineage-card::before \{[\s\S]*inset: -1px -1px auto;[\s\S]*height: 4px/);
     expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
     expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
+    expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000/);
   });
 
   it("revalidates stale focus-bridge recovery locks before freezing startup", () => {

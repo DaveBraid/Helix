@@ -4758,23 +4758,6 @@
   font-size: inherit;
   line-height: 1.25;
 }
-.helix-lineage-status-control {
-  display: inline-flex;
-  margin-left: auto;
-  align-items: center;
-  gap: 4px;
-  color: var(--text-muted);
-}
-.helix-lineage-status-control .helix-lineage-status-button {
-  margin-left: 0;
-  padding-right: 16px;
-  color: inherit;
-  cursor: pointer;
-}
-.helix-lineage-status-control.is-active { color: var(--interactive-accent); }
-.helix-lineage-status-control.is-completed { color: var(--helix-success-ink); }
-.helix-lineage-status-control.is-paused { color: var(--helix-warning-ink); }
-.helix-lineage-status-control.is-terminated { color: var(--text-error); }
 .helix-lineage-status-icon,
 .helix-lineage-column-icon { display: inline-flex; align-items: center; }
 .helix-lineage-status-icon svg { width: 12px; height: 12px; }
@@ -5131,6 +5114,53 @@
   background: color-mix(in srgb, currentColor 7%, transparent);
   color: inherit;
 }
+
+.helix-lineage-status-popover {
+  position: fixed;
+  z-index: 10000;
+  display: grid;
+  width: 148px;
+  padding: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-primary);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
+}
+
+.helix-lineage-status-popover-option {
+  display: grid;
+  width: 100%;
+  min-height: 34px;
+  grid-template-columns: 18px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.helix-lineage-status-popover-option:hover,
+.helix-lineage-status-popover-option:focus-visible,
+.helix-lineage-status-popover-option.is-current {
+  background: var(--background-modifier-hover);
+}
+
+.helix-lineage-status-popover-option.is-idea { color: #73839b; }
+.helix-lineage-status-popover-option.is-active { color: #6668d9; }
+.helix-lineage-status-popover-option.is-completed { color: #2f9b67; }
+.helix-lineage-status-popover-option.is-paused { color: #c48820; }
+.helix-lineage-status-popover-option.is-terminated { color: #b75c61; }
+.helix-lineage-status-popover-icon,
+.helix-lineage-status-popover-check { display: inline-flex; align-items: center; }
+.helix-lineage-status-popover-icon svg,
+.helix-lineage-status-popover-check svg { width: 14px; height: 14px; }
+.helix-lineage-status-popover-check { justify-self: end; }
 
 .helix-lineage-card-relations {
   min-height: 28px;

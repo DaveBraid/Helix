@@ -393,6 +393,23 @@ export class HelixView extends ItemView {
     if (this.section === "projects") {
       this.lineageCamera = this.projectWorkbench?.camera() ?? this.lineageCamera;
       if (this.projectWorkbench) this.lineageLayoutDraft = this.projectWorkbench.layoutDraft();
+      const previousWorkbench = this.projectWorkbench;
+      const shell = this.contentEl.ownerDocument.createElement("div");
+      shell.addClass("helix-shell");
+      this.renderSidebar(shell);
+      const main = shell.createDiv({ cls: "helix-main" });
+      this.renderHeader(main);
+      const content = main.createDiv({ cls: "helix-content" });
+      const nextWorkbench = await this.renderProjects(content, token);
+      if (token !== this.renderToken || this.closed) {
+        nextWorkbench?.destroy();
+        return;
+      }
+      previousWorkbench?.destroy();
+      this.projectWorkbench = nextWorkbench;
+      this.disposeCharts();
+      this.contentEl.replaceChildren(shell);
+      return;
     }
     this.projectWorkbench?.destroy();
     this.projectWorkbench = null;
@@ -405,7 +422,6 @@ export class HelixView extends ItemView {
     const content = main.createDiv({ cls: "helix-content" });
     if (this.section === "today") await this.renderToday(content, token);
     else if (this.section === "tasks") await this.renderTasks(content, token);
-    else if (this.section === "projects") await this.renderProjects(content, token);
     else if (this.section === "reviews") this.renderReviews(content);
     else if (this.section === "challenges") this.renderChallenges(content);
     else await this.renderConflicts(content, token);
@@ -2410,19 +2426,22 @@ export class HelixView extends ItemView {
     }
   }
 
-  private async renderProjects(content: HTMLElement, token: number): Promise<void> {
+  private async renderProjects(
+    content: HTMLElement,
+    token: number,
+  ): Promise<ProjectLineageWorkbench | null> {
     await this.refreshTaskReferenceSnapshot(token);
-    if (token !== this.renderToken) return;
+    if (token !== this.renderToken) return null;
     let workspace: ProjectWorkspaceSnapshot;
     try {
       workspace = await this.actions.readProjectWorkspace(() =>
         this.actions.projectWorkspace.loadStableWorkspace());
     } catch (error) {
-      if (token !== this.renderToken) return;
+      if (token !== this.renderToken) return null;
       this.renderProjectReadOnlyFallback(content, error);
-      return;
+      return null;
     }
-    if (token !== this.renderToken) return;
+    if (token !== this.renderToken) return null;
     this.lastGoodProjectWorkspace = workspace;
     if (workspace.migrationRequired) {
       const migration = content.createDiv({ cls: "helix-card helix-migration-card" });
@@ -2446,7 +2465,7 @@ export class HelixView extends ItemView {
         text: "逐项预览并确认",
       });
       review.addEventListener("click", () => this.actions.reviewLegacyMigration());
-      return;
+      return null;
     }
 
     if (workspace.canvasRepairRequired && !canSilentlyRepairProjectCanvas(workspace)) {
@@ -2481,7 +2500,7 @@ export class HelixView extends ItemView {
         text: "新建项目并加入 Canvas",
       });
       emptyAction.addEventListener("click", () => this.actions.createProject());
-      return;
+      return null;
     }
 
     if (
@@ -2504,7 +2523,8 @@ export class HelixView extends ItemView {
     const focusEntityId = this.currentLineageFocusId();
     const arrivalCycleId = this.pendingKanbanArrivalCycleId ?? undefined;
     this.pendingKanbanArrivalCycleId = null;
-    this.projectWorkbench = new ProjectLineageWorkbench({
+    let workbench: ProjectLineageWorkbench;
+    workbench = new ProjectLineageWorkbench({
       snapshot: workspace,
       selectedProjectId: this.selectedProjectId,
       mode: this.projectLineageMode,
@@ -2519,10 +2539,14 @@ export class HelixView extends ItemView {
       },
       onSelectProject: (projectId) => {
         this.selectedProjectId = projectId;
-        this.requestLineageFocus(
-          projectId ?? LINEAGE_ALL_PROJECTS_FOCUS_ID,
-          lifecycleGeneration,
+        workbench.selectProject(projectId);
+        const linkedHost = content.querySelector<HTMLElement>(
+          ".helix-project-linked-tasks-host",
         );
+        if (linkedHost) {
+          linkedHost.empty();
+          this.renderProjectLinkedTasks(linkedHost, workspace);
+        }
       },
       focusEntityId,
       onCreateProject: () => this.actions.createProject(
@@ -2555,7 +2579,7 @@ export class HelixView extends ItemView {
             workspace.canvasRevisionHash!,
             { recordHistory: false },
           ));
-        this.projectWorkbench?.markLayoutSaved();
+        workbench.markLayoutSaved();
         this.lineageLayoutDraft = undefined;
         new Notice("当前布局已保存");
         await this.render();
@@ -2632,8 +2656,10 @@ export class HelixView extends ItemView {
       onError: (error) =>
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
-    this.projectWorkbench.render(workbenchHost);
-    this.renderProjectLinkedTasks(content, workspace);
+    workbench.render(workbenchHost);
+    const linkedHost = content.createDiv({ cls: "helix-project-linked-tasks-host" });
+    this.renderProjectLinkedTasks(linkedHost, workspace);
+    return workbench;
   }
 
   private renderProjectLinkedTasks(

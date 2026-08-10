@@ -166,6 +166,18 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000;[\s\S]*gap: 4px/);
   });
 
+  it("keeps project focus incremental and swaps structural project renders atomically", () => {
+    const lineage = readFileSync(
+      resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"),
+      "utf8",
+    );
+    expect(lineage).toMatch(/selectProject\(projectId:[\s\S]*focusEntity\(projectId \?\?/);
+    expect(lineage).toMatch(/data-project-id[\s\S]*LINEAGE_ALL_PROJECTS_FOCUS_ID/);
+    expect(view).toMatch(/onSelectProject:[\s\S]*workbench\.selectProject\(projectId\)/);
+    expect(view).toMatch(/previousWorkbench[\s\S]*renderProjects\(content, token\)[\s\S]*replaceChildren\(shell\)/);
+    expect(view).not.toMatch(/onSelectProject:[\s\S]{0,220}requestLineageFocus/);
+  });
+
   it("waits for the complete Obsidian index before validating focus-bridge recovery", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(main).toMatch(/onLayoutReady[\s\S]*finishProjectStartup\(staleFocusBridgeIssues\)/);
@@ -296,8 +308,8 @@ describe("workbench layout and navigation structure", () => {
   it("keeps Canvas repair diagnostics beside the lineage workbench", () => {
     expect(view).toMatch(/Canvas 需要修复[\s\S]*const workbenchHost = content\.createDiv\(\{ cls: "helix-project-workbench-host" \}\)/);
     expect(view).toMatch(/workspace\.canvasRepairRequired && !canSilentlyRepairProjectCanvas\(workspace\)/);
-    expect(view).toMatch(/this\.projectWorkbench\.render\(workbenchHost\)/);
-    expect(view).not.toMatch(/this\.projectWorkbench\.render\(content\)/);
+    expect(view).toMatch(/workbench\.render\(workbenchHost\)/);
+    expect(view).not.toMatch(/workbench\.render\(content\)/);
   });
 
   it("offers structural focus repair without invalid content choices", () => {

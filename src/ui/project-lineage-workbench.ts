@@ -833,6 +833,7 @@ export function lineageStructuralEntityIds(
 }
 
 export class ProjectLineageWorkbench {
+  private root: HTMLElement | null = null;
   private readonly layout = new Map<string, LineagePoint>();
   private readonly nodeByEntity = new Map<string, ProjectWorkspaceCanvasNode>();
   private readonly selected = new Set<string>();
@@ -945,6 +946,7 @@ export class ProjectLineageWorkbench {
     this.clearBoardEscapeListener();
     this.moveVersion += 1;
     this.selected.clear();
+    this.root = null;
     this.lasso?.overlay.remove();
     this.lasso = null;
     if (this.programmaticScrollTimer !== null) {
@@ -994,8 +996,55 @@ export class ProjectLineageWorkbench {
     this.updateLayoutControls();
   }
 
+  selectProject(projectId: string | null): void {
+    this.options.selectedProjectId = projectId;
+    const root = this.root;
+    if (!root) return;
+    root.querySelectorAll<HTMLElement>(".helix-lineage-project-choice")
+      .forEach((choice) => {
+        const active = choice.dataset.projectId === (projectId ?? LINEAGE_ALL_PROJECTS_FOCUS_ID);
+        choice.toggleClass("is-active", active);
+        choice.querySelector("button")?.setAttribute("aria-pressed", String(active));
+      });
+    root.querySelectorAll<HTMLElement>("[data-project-id]")
+      .forEach((element) => {
+        if (element.hasClass("helix-lineage-project-choice")) return;
+        const current = element.dataset.projectId === projectId;
+        element.toggleClass("is-current-project", current);
+        element.toggleClass("is-other-project", projectId !== null && !current);
+      });
+    root.querySelectorAll<HTMLElement>(".helix-lineage-card[data-entity-id]")
+      .forEach((card) => {
+        const node = this.nodeByEntity.get(card.dataset.entityId ?? "");
+        const current = node?.projectId === projectId;
+        card.toggleClass("is-current-project", current);
+        card.toggleClass("is-other-project", projectId !== null && !current);
+      });
+    this.updateLayoutControls();
+    this.focusEntity(projectId ?? LINEAGE_ALL_PROJECTS_FOCUS_ID);
+  }
+
+  focusEntity(entityId: string): boolean {
+    if (this.options.mode !== "graph" || !this.viewport) return false;
+    if (entityId === LINEAGE_ALL_PROJECTS_FOCUS_ID) {
+      this.focusGraphBox(this.contentBounds());
+      return true;
+    }
+    const resolvedId = this.hiddenByCollapseHead.get(entityId) ?? entityId;
+    const node = this.nodeByEntity.get(resolvedId);
+    if (node?.kind === "cycle") {
+      this.focusGraphCard(node);
+      return true;
+    }
+    const projectBox = this.projectContainerBox(resolvedId);
+    if (!projectBox) return false;
+    this.focusGraphBox(projectBox);
+    return true;
+  }
+
   render(parent: HTMLElement): void {
     this.closeStatusPopover();
+    this.root = parent;
     parent.empty();
     parent.addClass("helix-lineage-shell");
     this.renderToolbar(parent);
@@ -1075,6 +1124,7 @@ export class ProjectLineageWorkbench {
       cls: `helix-lineage-project-choice is-all${
         this.options.selectedProjectId === null ? " is-active" : ""
       }`,
+      attr: { "data-project-id": LINEAGE_ALL_PROJECTS_FOCUS_ID },
     });
     const allSwatch = allChoice.createSpan({
       cls: "helix-lineage-project-all-swatch",
@@ -1097,6 +1147,7 @@ export class ProjectLineageWorkbench {
         cls: `helix-lineage-project-choice${
           project.id === this.options.selectedProjectId ? " is-active" : ""
         }`,
+        attr: { "data-project-id": project.id },
       });
       item.style.setProperty("--helix-project-color", this.projectColor(project));
       const palette = item.createSpan({
@@ -2824,6 +2875,18 @@ export class ProjectLineageWorkbench {
     );
     card?.addClass("is-operation-focus");
     if (card) window.setTimeout(() => card.removeClass("is-operation-focus"), 1_600);
+  }
+
+  private focusGraphBox(box: { x: number; y: number; width: number; height: number }): void {
+    const viewport = this.viewport;
+    if (!viewport) return;
+    const reducedMotion = typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    this.focusPlaneBox(
+      box,
+      lineageFocusScale(viewport.clientWidth, viewport.clientHeight, box.width, box.height),
+      lineageFocusBehavior(reducedMotion),
+    );
   }
 
   private centerPlanePoint(

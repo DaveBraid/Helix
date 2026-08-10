@@ -1779,7 +1779,7 @@ describe("ProjectWorkspaceService", () => {
       toNode: "cycle-2-node",
       helixManaged: true,
       helixRelation: "inherit",
-      label: "继承",
+      label: "推进",
       customArrowStyle: "keep",
     }));
     expect(repo.json(CANVAS).edges[0]).not.toHaveProperty("helixMergeGroupId");
@@ -1829,7 +1829,7 @@ describe("ProjectWorkspaceService", () => {
       id: "native-stage-edge",
       helixManaged: true,
       helixRelation: "inherit",
-      label: "继承",
+      label: "推进",
       customArrowStyle: "keep",
     }));
     expect((await service.snapshot()).nativeRelationCandidates).toEqual([]);
@@ -2750,7 +2750,7 @@ describe("ProjectWorkspaceService", () => {
         toNode: "cycle-4-node",
         helixManaged: true,
         helixRelation: "inherit",
-        label: "继承",
+        label: "推进",
       },
     );
     repo.set(CANVAS, JSON.stringify(canvas));
@@ -2772,7 +2772,7 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({
         id: "edge-px",
         helixRelation: "inherit",
-        label: "继承",
+        label: "推进",
       }),
     ]);
   });
@@ -2862,7 +2862,7 @@ describe("ProjectWorkspaceService", () => {
         id: "merge-a",
         fromNode: "cycle-node",
         toNode: "cycle-3-node",
-        label: "继承",
+        label: "推进",
         helixRelation: "inherit",
       }),
     ]);
@@ -3534,7 +3534,7 @@ describe("ProjectWorkspaceService", () => {
     expect(repo.json(CANVAS).edges).toEqual([
       expect.objectContaining({
         id: "branch-b",
-        label: "继承",
+        label: "推进",
         helixRelation: "inherit",
       }),
     ]);
@@ -3543,7 +3543,7 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({
         fromNode: "cycle-2-node",
         toNode: "cycle-3-node",
-        label: "继承",
+        label: "推进",
         helixRelation: "inherit",
       }),
     ]);

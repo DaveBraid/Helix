@@ -8,7 +8,7 @@ export interface CycleRelation {
 }
 
 export const CYCLE_RELATION_LABELS: Record<CycleRelationKind, string> = {
-  inherit: "继承",
+  inherit: "推进",
   branch: "分支",
   merge: "合并",
 };
@@ -61,7 +61,7 @@ export function cycleRelationKindFromLabel(
   if (label === "inherit" || label === "branch" || label === "merge") {
     return label;
   }
-  if (label === "继承") return "inherit";
+  if (label === "继承" || label === "推进") return "inherit";
   if (label === "分支") return "branch";
   if (label === "合并") return "merge";
   return null;

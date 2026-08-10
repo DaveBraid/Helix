@@ -116,6 +116,8 @@ const MAX_ZOOM = 1.2;
 const MIN_FIT_ZOOM = 0.0001;
 const GRAPH_CARD_WIDTH = 292;
 const GRAPH_CARD_HEIGHT = 144;
+const GRAPH_COLUMN_GAP = 116;
+const GRAPH_ROW_GAP = 56;
 const PROJECT_CONTAINER_SIDE_PADDING = 28;
 const PROJECT_CONTAINER_TOP_PADDING = 58;
 const PROJECT_CONTAINER_BOTTOM_PADDING = 28;
@@ -419,7 +421,7 @@ export interface LineageLassoSelectionState {
 }
 
 export type LineagePointerSurface =
-  "blank" | "card" | "project-header" | "edge" | "button";
+  "blank" | "card" | "project-container" | "project-header" | "edge" | "button";
 
 export function lineageViewportPointerIntent(
   button: number,
@@ -431,6 +433,131 @@ export function lineageViewportPointerIntent(
     return surface === "button" || surface === "edge" ? "defer" : "pan";
   }
   return button === 0 && surface === "blank" ? "lasso" : "defer";
+}
+
+export function lineageAnchoredSelectionLayout(
+  selectedEntityIds: readonly string[],
+  currentStages: ReadonlyArray<Pick<ProjectWorkspaceCanvasNode,
+    "entityId" | "projectId" | "x" | "y">>,
+  plannedStages: ReadonlyArray<{ id: string; x: number; y: number }>,
+  edges: readonly ProjectGraphEdge[],
+): LineageLayoutSnapshot {
+  const selected = new Set(selectedEntityIds);
+  const currentById = new Map(currentStages.map((stage) => [stage.entityId, stage]));
+  const plannedById = new Map(plannedStages.map((stage) => [stage.id, stage]));
+  const remaining = new Set(selectedEntityIds.filter((id) => currentById.has(id)));
+  const components: string[][] = [];
+  while (remaining.size > 0) {
+    const start = remaining.values().next().value as string;
+    const component: string[] = [];
+    const queue = [start];
+    remaining.delete(start);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      component.push(id);
+      for (const edge of edges) {
+        if (!selected.has(edge.fromCycleId) || !selected.has(edge.toCycleId)) continue;
+        const other = edge.fromCycleId === id
+          ? edge.toCycleId
+          : edge.toCycleId === id
+            ? edge.fromCycleId
+            : null;
+        if (other && remaining.delete(other)) queue.push(other);
+      }
+    }
+    components.push(component);
+  }
+  const result: LineageLayoutSnapshot = {};
+  const occupied = currentStages
+    .filter((stage) => !selected.has(stage.entityId))
+    .map((stage) => ({
+      projectId: stage.projectId,
+      x: stage.x,
+      y: stage.y,
+      right: stage.x + GRAPH_CARD_WIDTH,
+      bottom: stage.y + GRAPH_CARD_HEIGHT,
+    }));
+  components.sort((left, right) => {
+    const a = left.map((id) => currentById.get(id)!)
+      .sort((first, second) => first.y - second.y || first.x - second.x ||
+        first.entityId.localeCompare(second.entityId))[0]!;
+    const b = right.map((id) => currentById.get(id)!)
+      .sort((first, second) => first.y - second.y || first.x - second.x ||
+        first.entityId.localeCompare(second.entityId))[0]!;
+    return a.y - b.y || a.x - b.x || a.entityId.localeCompare(b.entityId);
+  });
+  for (const component of components) {
+    const componentSet = new Set(component);
+    const roots = component
+      .filter((id) => !edges.some((edge) =>
+        edge.toCycleId === id && componentSet.has(edge.fromCycleId)))
+      .sort((left, right) => {
+        const a = currentById.get(left)!;
+        const b = currentById.get(right)!;
+        return a.y - b.y || a.x - b.x || left.localeCompare(right);
+      });
+    const rootId = roots[0] ?? component[0]!;
+    const root = currentById.get(rootId)!;
+    const plannedRoot = plannedById.get(rootId) ?? { id: rootId, x: root.x, y: root.y };
+    const parents = edges
+      .filter((edge) => edge.toCycleId === rootId && !componentSet.has(edge.fromCycleId))
+      .flatMap((edge) => {
+        const parent = currentById.get(edge.fromCycleId);
+        return parent ? [parent] : [];
+      });
+    const anchor = parents.length > 0
+      ? {
+          x: Math.max(...parents.map((parent) => parent.x)) +
+            GRAPH_CARD_WIDTH + GRAPH_COLUMN_GAP,
+          y: parents.reduce((sum, parent) => sum + parent.y, 0) / parents.length,
+        }
+      : { x: root.x, y: root.y };
+    const dx = anchor.x - plannedRoot.x;
+    const dy = anchor.y - plannedRoot.y;
+    const translated = component.map((id) => {
+      const current = currentById.get(id)!;
+      const planned = plannedById.get(id) ?? { id, x: current.x, y: current.y };
+      return {
+        id,
+        projectId: current.projectId,
+        x: planned.x + dx,
+        y: planned.y + dy,
+      };
+    });
+    let shiftY = 0;
+    for (;;) {
+      const conflicts = translated.flatMap((stage) => {
+        const box = {
+          x: stage.x,
+          y: stage.y + shiftY,
+          right: stage.x + GRAPH_CARD_WIDTH,
+          bottom: stage.y + shiftY + GRAPH_CARD_HEIGHT,
+        };
+        return occupied.filter((fixed) =>
+          fixed.projectId === stage.projectId &&
+          box.x < fixed.right && box.right > fixed.x &&
+          box.y < fixed.bottom && box.bottom > fixed.y);
+      });
+      if (conflicts.length === 0) break;
+      const componentTop = Math.min(...translated.map((stage) => stage.y));
+      shiftY = Math.max(
+        shiftY + GRAPH_CARD_HEIGHT + GRAPH_ROW_GAP,
+        ...conflicts.map((fixed) => fixed.bottom + GRAPH_ROW_GAP - componentTop),
+      );
+    }
+    for (const stage of translated) {
+      const point = { x: stage.x, y: stage.y + shiftY };
+      result[stage.id] = point;
+      occupied.push({
+        projectId: stage.projectId,
+        x: point.x,
+        y: point.y,
+        right: point.x + GRAPH_CARD_WIDTH,
+        bottom: point.y + GRAPH_CARD_HEIGHT,
+      });
+    }
+  }
+  return result;
 }
 
 export function lineageCardDragAllowed(
@@ -1220,6 +1347,13 @@ export class ProjectLineageWorkbench {
       });
       header.style.setProperty("--helix-project-color", this.projectColor(project));
       this.applyProjectHeaderBox(header, box);
+      header.addEventListener("dblclick", (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest("button")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.options.onSelectProject(project.id);
+      });
       const open = header.createEl("button", {
         cls: "helix-lineage-project-container-title",
         attr: { "aria-label": `打开项目 ${project.title}` },
@@ -2229,8 +2363,25 @@ export class ProjectLineageWorkbench {
     viewport.addEventListener("scroll", () => {
       if (!this.suppressVirtualExpansion) this.expandVirtualPlane();
     });
+    viewport.addEventListener("dblclick", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest(
+        "button, .helix-lineage-card, .helix-lineage-edge, " +
+          ".helix-lineage-edge-label, .helix-lineage-project-container-header",
+      )) return;
+      const projectId = this.projectIdAtPoint(
+        this.viewportLogicalPoint(event, viewport),
+      );
+      if (!projectId) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this.options.onSelectProject(projectId);
+    });
     viewport.addEventListener("pointerdown", (event) => {
       const target = event.target instanceof Element ? event.target : null;
+      const projectId = this.projectIdAtPoint(
+        this.viewportLogicalPoint(event, viewport),
+      );
       const surface: LineagePointerSurface = target?.closest("button")
         ? "button"
         : target?.closest(".helix-lineage-edge, .helix-lineage-edge-label")
@@ -2239,7 +2390,11 @@ export class ProjectLineageWorkbench {
             ? "card"
             : target?.closest(".helix-lineage-project-container-header")
               ? "project-header"
-              : "blank";
+              : target?.closest(".helix-lineage-project-container")
+                ? "project-container"
+                : projectId
+                  ? "project-container"
+                  : "blank";
       const intent = lineageViewportPointerIntent(
         event.button,
         this.spaceHeld,
@@ -2329,6 +2484,16 @@ export class ProjectLineageWorkbench {
       y: (viewport.scrollTop + event.clientY - rect.top) /
         Math.max(MIN_FIT_ZOOM, this.zoom),
     };
+  }
+
+  private projectIdAtPoint(point: LineagePoint): string | undefined {
+    return [...this.options.snapshot.projects]
+      .reverse()
+      .find((project) => {
+        const box = this.projectContainerBox(project.id);
+        return box && point.x >= box.x && point.x <= box.right &&
+          point.y >= box.y && point.y <= box.bottom;
+      })?.id;
   }
 
   private updateLasso(event: PointerEvent, viewport: HTMLElement): void {
@@ -2806,11 +2971,29 @@ export class ProjectLineageWorkbench {
       this.physicalEdges(),
       new Set(scope.entityIds),
     );
+    const arranged = scope.kind === "selection"
+      ? lineageAnchoredSelectionLayout(
+          scope.entityIds,
+          stages.map((stage) => ({
+            entityId: stage.id,
+            projectId: stage.projectId,
+            x: stage.x,
+            y: stage.y,
+          })),
+          planned.stages,
+          this.physicalEdges(),
+        )
+      : Object.fromEntries(planned.stages.map((stage) => [stage.id, {
+          x: stage.x,
+          y: stage.y,
+        }]));
     for (const stage of planned.stages) {
       if (!scope.entityIds.includes(stage.id)) continue;
+      const point = arranged[stage.id];
+      if (!point) continue;
       this.layout.set(stage.id, {
-        x: stage.x + this.canvasOffset.x,
-        y: stage.y + this.canvasOffset.y,
+        x: point.x + this.canvasOffset.x,
+        y: point.y + this.canvasOffset.y,
       });
     }
     this.recordLayoutChange(before);

@@ -160,7 +160,7 @@ describe("workbench layout and navigation structure", () => {
     expect(lineage).toMatch(/helix-lineage-card-actions[\s\S]*新增[\s\S]*连接[\s\S]*折叠[\s\S]*删除/);
     expect(css).toMatch(/阶段卡片：项目色统一[\s\S]*background: var\(--background-primary\)/);
     expect(css).toMatch(/\.helix-lineage-project-container \{[\s\S]*border: 1px solid[\s\S]*box-shadow: 0 2px 10px/);
-    expect(css).toMatch(/\.helix-lineage-card::before \{[\s\S]*inset: -1px -1px auto;[\s\S]*height: 4px/);
+    expect(css).toMatch(/\.helix-lineage-card::before \{[\s\S]*inset: 0 0 auto;[\s\S]*height: 4px/);
     expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
     expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
     expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000;[\s\S]*gap: 4px/);
@@ -201,6 +201,8 @@ describe("workbench layout and navigation structure", () => {
     expect(lineage).toMatch(/lineageArrangeScope[\s\S]*reason: "cross-project"/);
     expect(lineage).toMatch(/lineageArrangeScope[\s\S]*reason: "empty"/);
     expect(lineage).toMatch(/container\.addEventListener\("dblclick"[\s\S]*onSelectProject\(project\.id\)/);
+    expect(lineage).toMatch(/closest\("\.helix-lineage-project-container"\)[\s\S]*"project-container"/);
+    expect(lineage).toMatch(/viewport\.addEventListener\("dblclick"[\s\S]*projectIdAtPoint[\s\S]*onSelectProject\(projectId\)/);
     expect(lineage).toMatch(/bindProjectTitleDrag[\s\S]*node\.projectId === project\.id[\s\S]*recordLayoutChange/);
     expect(view).toMatch(/moveCanvasNodes\([\s\S]*recordHistory: false/);
     expect(main).toContain('private static readonly CONFIRMATION = "我确认删除该项目。";');

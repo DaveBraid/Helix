@@ -17,6 +17,7 @@ import {
   lineageCenteredPointPlan,
   lineageConnectionTargetIds,
   lineageGraphBox,
+  lineageAnchoredSelectionLayout,
   lineageArrangeScope,
   lineageGraphEdgeAnchors,
   lineageMovePayload,
@@ -71,6 +72,60 @@ describe("Project Lineage arrange scope", () => {
       kind: "disabled",
       reason: "cross-project",
     });
+  });
+});
+
+describe("Project Lineage anchored partial arrange", () => {
+  it("keeps a selected descendant group anchored to its preceding parent", () => {
+    expect(lineageAnchoredSelectionLayout(
+      ["child", "grandchild"],
+      [
+        { entityId: "parent", projectId: "project", x: 100, y: 120 },
+        { entityId: "child", projectId: "project", x: 980, y: 740 },
+        { entityId: "grandchild", projectId: "project", x: 1280, y: 820 },
+      ],
+      [
+        { id: "parent", x: 0, y: 0 },
+        { id: "child", x: 408, y: 0 },
+        { id: "grandchild", x: 816, y: 0 },
+      ],
+      [
+        { id: "parent-child", fromCycleId: "parent", toCycleId: "child" },
+        { id: "child-grandchild", fromCycleId: "child", toCycleId: "grandchild" },
+      ],
+    )).toEqual({
+      child: { x: 508, y: 120 },
+      grandchild: { x: 916, y: 120 },
+    });
+  });
+
+  it("keeps a selected root anchored when it has no preceding parent", () => {
+    expect(lineageAnchoredSelectionLayout(
+      ["root"],
+      [{ entityId: "root", projectId: "project", x: 320, y: 460 }],
+      [{ id: "root", x: 408, y: 0 }],
+      [],
+    )).toEqual({ root: { x: 320, y: 460 } });
+  });
+
+  it("places another selected branch below an existing sibling", () => {
+    expect(lineageAnchoredSelectionLayout(
+      ["second"],
+      [
+        { entityId: "parent", projectId: "project", x: 100, y: 120 },
+        { entityId: "first", projectId: "project", x: 508, y: 120 },
+        { entityId: "second", projectId: "project", x: 900, y: 800 },
+      ],
+      [
+        { id: "parent", x: 0, y: 0 },
+        { id: "first", x: 408, y: 0 },
+        { id: "second", x: 408, y: 200 },
+      ],
+      [
+        { id: "parent-first", fromCycleId: "parent", toCycleId: "first" },
+        { id: "parent-second", fromCycleId: "parent", toCycleId: "second" },
+      ],
+    )).toEqual({ second: { x: 508, y: 320 } });
   });
 });
 
@@ -332,6 +387,7 @@ describe("Project Lineage card-plus intent", () => {
     expect(lineageViewportPointerIntent(0, true, "button")).toBe("defer");
     expect(lineageViewportPointerIntent(1, false, "edge")).toBe("defer");
     expect(lineageViewportPointerIntent(0, false, "project-header")).toBe("defer");
+    expect(lineageViewportPointerIntent(0, false, "project-container")).toBe("defer");
     expect(lineageCardDragAllowed(0, false, false, false)).toBe(true);
     expect(lineageCardDragAllowed(0, true, false, false)).toBe(false);
     expect(lineageCardDragAllowed(1, false, false, false)).toBe(false);

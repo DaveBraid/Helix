@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  CYCLE_RELATION_LABELS,
   assertCycleRelationInput,
+  cycleRelationKindFromLabel,
   stageCreationIntent,
   validateCycleGraph,
   type CycleRelation,
 } from "../src/domain/cycle-graph";
 
 describe("Cycle graph", () => {
+  it("presents inheritance as progression while reading legacy labels", () => {
+    expect(CYCLE_RELATION_LABELS.inherit).toBe("推进");
+    expect(cycleRelationKindFromLabel("推进")).toBe("inherit");
+    expect(cycleRelationKindFromLabel("继承")).toBe("inherit");
+  });
+
   it("accepts inherit, branch, merge and cross-project identities in one DAG", () => {
     const relations: CycleRelation[] = [
       { id: "i", kind: "inherit", fromCycleIds: ["a"], toCycleId: "b" },

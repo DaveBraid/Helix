@@ -91,9 +91,14 @@ describe("workbench layout and navigation structure", () => {
     );
   });
 
-  it("shows task references on projects without enabling project projection", () => {
-    expect(view).toMatch(/renderProjects\(content[\s\S]*refreshTaskReferenceSnapshot\(token\)/);
-    expect(view).toMatch(/renderProjectLinkedTasks[\s\S]*关联任务[\s\S]*renderTaskRow/);
+  it("shows project task references only in the task view", () => {
+    expect(view).toMatch(/renderTasks\(content[\s\S]*renderProjectLinkedTasks\(content\)/);
+    expect(view).toMatch(/renderProjectLinkedTasks[\s\S]*项目关联任务[\s\S]*renderTaskRow/);
+    const projects = view.slice(
+      view.indexOf("private async renderProjects"),
+      view.indexOf("private renderProjectLinkedTasks"),
+    );
+    expect(projects).not.toContain("renderProjectLinkedTasks");
     const linkedTasks = view.slice(
       view.indexOf("private renderProjectLinkedTasks"),
       view.indexOf("private async requestCycleStatusChange"),

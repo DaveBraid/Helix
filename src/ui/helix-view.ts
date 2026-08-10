@@ -1589,6 +1589,7 @@ export class HelixView extends ItemView {
     } else {
       this.renderTaskCalendar(panel, visibleTasks, taskProjects, this.taskViewMode);
     }
+    this.renderProjectLinkedTasks(content);
   }
 
   private renderTaskBoard(
@@ -2540,13 +2541,6 @@ export class HelixView extends ItemView {
       onSelectProject: (projectId) => {
         this.selectedProjectId = projectId;
         workbench.selectProject(projectId);
-        const linkedHost = content.querySelector<HTMLElement>(
-          ".helix-project-linked-tasks-host",
-        );
-        if (linkedHost) {
-          linkedHost.empty();
-          this.renderProjectLinkedTasks(linkedHost, workspace);
-        }
       },
       focusEntityId,
       onCreateProject: () => this.actions.createProject(
@@ -2657,26 +2651,17 @@ export class HelixView extends ItemView {
         new Notice(error instanceof Error ? error.message : String(error), 8_000),
     });
     workbench.render(workbenchHost);
-    const linkedHost = content.createDiv({ cls: "helix-project-linked-tasks-host" });
-    this.renderProjectLinkedTasks(linkedHost, workspace);
     return workbench;
   }
 
-  private renderProjectLinkedTasks(
-    content: HTMLElement,
-    workspace: ProjectWorkspaceSnapshot,
-  ): void {
+  private renderProjectLinkedTasks(content: HTMLElement): void {
     const snapshot = this.taskReferenceSnapshot;
     if (!snapshot) return;
-    const projectIds = this.selectedProjectId
-      ? new Set([this.selectedProjectId])
-      : new Set(workspace.projects.map((project) => project.id));
-    const references = snapshot.references.filter((reference) =>
-      projectIds.has(reference.projectId));
+    const references = snapshot.references;
     const taskById = new Map((this.state?.tasks ?? []).map((task) => [task.id, task]));
     const card = content.createDiv({ cls: "helix-card helix-project-linked-tasks" });
     const header = card.createDiv({ cls: "helix-section-header" });
-    header.createEl("h3", { text: "关联任务" });
+    header.createEl("h3", { text: "项目关联任务" });
     header.createSpan({ cls: "helix-chip is-soft", text: String(references.length) });
     if (references.length === 0) {
       card.createDiv({ cls: "helix-empty", text: "暂无关联任务" });

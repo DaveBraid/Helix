@@ -366,8 +366,20 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
 
-  it("keeps project-to-Dida projection out of the 0.1.0 release UI", () => {
+  it("ships the 1.0.0 formal release in local-only mode", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    const capabilities = readFileSync(resolve(process.cwd(), "src/release-capabilities.ts"), "utf8");
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(capabilities).toContain("export const DIDA_SYNC_AVAILABLE = false");
+    expect(main).toContain("if (DIDA_SYNC_AVAILABLE) this.registerDidaCommands()");
+    expect(main).toMatch(/new HelixService[\s\S]*didaSyncAvailable: DIDA_SYNC_AVAILABLE/);
+    expect(main).toMatch(/refreshAutoSync[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return/);
+    expect(settings).toMatch(/if \(!DIDA_SYNC_AVAILABLE\)[\s\S]*本地正式版[\s\S]*renderTemplateSetting\(\)/);
+    expect(view).toMatch(/displayState[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return \{ projects: \[\], tasks: \[\] \}/);
+    expect(view).toMatch(/renderHeader[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return/);
+    expect(helixService).toMatch(/async sync\(\)[\s\S]*this\.assertDidaSyncAvailable\(\)/);
+    expect(helixService).toMatch(/applyConflict[\s\S]*this\.assertDidaSyncAvailable\(\)/);
+    expect(helixService).toMatch(/assertDidaSyncAvailable[\s\S]*本地正式版暂未开放滴答网络同步/);
     expect(view).not.toContain("renderProjectDidaMappingBar");
     expect(view).not.toContain("ProjectDidaMappingConfirmModal");
     expect(view).not.toContain("renderProjectProjectionPanel");

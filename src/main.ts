@@ -113,6 +113,7 @@ import {
   type LocalProjectTaskSnapshot,
 } from "./services/local-project-tasks";
 import {
+  DIDA_SYNC_AVAILABLE,
   PROJECT_DIDA_PROJECTION_AVAILABLE,
   assertProjectDidaProjectionAvailable,
 } from "./release-capabilities";
@@ -239,7 +240,9 @@ export default class HelixPlugin extends Plugin {
         }
       }
     }
-    this.service = new HelixService(this.store, this.secrets);
+    this.service = new HelixService(this.store, this.secrets, {
+      didaSyncAvailable: DIDA_SYNC_AVAILABLE,
+    });
     await this.service.initialize();
     this.projectProjection = new DidaProjectProjectionService(
       new VaultProjectionMarkdownAdapter(this.vaultRepository),
@@ -323,34 +326,7 @@ export default class HelixPlugin extends Plugin {
       name: "打开工作台",
       callback: () => void this.activateView(),
     });
-    this.addCommand({
-      id: "sync-now",
-      name: "立即同步滴答数据",
-      callback: () => void this.service.sync().catch((error) => this.service.notifySyncError(error)),
-    });
-    this.addCommand({
-      id: "show-dida-write-contract-status",
-      name: "显示滴答写入合同状态",
-      callback: () => this.didaWriteContractCommands.showStatus(),
-    });
-    this.addCommand({
-      id: "run-dida-write-contract-test",
-      name: "运行滴答写入合同测试",
-      callback: () => this.didaWriteContractCommands.requestRun(),
-    });
-    this.addCommand({
-      id: "strict-adopt-dida-contract-residual",
-      name: "严格检查并领养滴答合同残留",
-      callback: () => {
-        if (this.didaContractAdoptConfirmation.request() === "armed") {
-          new Notice("已武装：请在 15 秒内再次运行此命令，才会严格检查并领养唯一测试组。", 10_000);
-          return;
-        }
-        void this.service.adoptPendingContractRunFromRemote()
-          .then(() => new Notice("合同残留严格检查已完成；如已领养，请到冲突中心继续安全清理。", 10_000))
-          .catch(() => new Notice("安全操作未完成；对象保持冻结，请查看脱敏诊断", 8_000));
-      },
-    });
+    if (DIDA_SYNC_AVAILABLE) this.registerDidaCommands();
     this.addCommand({
       id: "create-project",
       name: "创建项目",
@@ -1015,6 +991,7 @@ export default class HelixPlugin extends Plugin {
       window.clearTimeout(this.immediateSyncTimerId);
       this.immediateSyncTimerId = null;
     }
+    if (!DIDA_SYNC_AVAILABLE) return;
     const plan = autoSyncPlan({
       recoveryMode: this.recoveryMode,
       tokenConfigured: Boolean(this.secrets.getDidaToken()),
@@ -1038,6 +1015,37 @@ export default class HelixPlugin extends Plugin {
       plan.intervalMs,
     );
     this.registerInterval(this.syncIntervalId);
+  }
+
+  private registerDidaCommands(): void {
+    this.addCommand({
+      id: "sync-now",
+      name: "立即同步滴答数据",
+      callback: () => void this.service.sync().catch((error) => this.service.notifySyncError(error)),
+    });
+    this.addCommand({
+      id: "show-dida-write-contract-status",
+      name: "显示滴答写入合同状态",
+      callback: () => this.didaWriteContractCommands.showStatus(),
+    });
+    this.addCommand({
+      id: "run-dida-write-contract-test",
+      name: "运行滴答写入合同测试",
+      callback: () => this.didaWriteContractCommands.requestRun(),
+    });
+    this.addCommand({
+      id: "strict-adopt-dida-contract-residual",
+      name: "严格检查并领养滴答合同残留",
+      callback: () => {
+        if (this.didaContractAdoptConfirmation.request() === "armed") {
+          new Notice("已武装：请在 15 秒内再次运行此命令，才会严格检查并领养唯一测试组。", 10_000);
+          return;
+        }
+        void this.service.adoptPendingContractRunFromRemote()
+          .then(() => new Notice("合同残留严格检查已完成；如已领养，请到冲突中心继续安全清理。", 10_000))
+          .catch(() => new Notice("安全操作未完成；对象保持冻结，请查看脱敏诊断", 8_000));
+      },
+    });
   }
 
   async activateView(): Promise<void> {

@@ -2378,7 +2378,7 @@ describe("HelixService runtime recovery", () => {
     });
 
     await expect(service.enqueueProjectionCreate(local, clientIdentity))
-      .rejects.toThrow(/个人预览版暂未开放/);
+      .rejects.toThrow(/正式版暂未开放/);
     expect(sends).toBe(0);
     expect(persisted.queue).toMatchObject([{
       id: "op-projection-restart",
@@ -2465,7 +2465,7 @@ describe("HelixService runtime recovery", () => {
       draft.queue[0]!.lastError = "historic projection failure";
     });
     await expect(service.retryFailedOperation("op-projection-disabled"))
-      .rejects.toThrow(/个人预览版暂未开放/);
+      .rejects.toThrow(/正式版暂未开放/);
     expect(persisted.queue[0]).toMatchObject({
       id: "op-projection-disabled",
       status: "failed",
@@ -2576,9 +2576,9 @@ describe("HelixService runtime recovery", () => {
     });
     const conflictId = persisted.conflicts[0]!.id;
     await expect(disabled.chooseConflict(conflictId, "items[owned].title", "local"))
-      .rejects.toThrow(/个人预览版暂未开放/);
+      .rejects.toThrow(/正式版暂未开放/);
     await expect(disabled.applyConflict(conflictId))
-      .rejects.toThrow(/个人预览版暂未开放/);
+      .rejects.toThrow(/正式版暂未开放/);
     expect(remoteCalls).toBe(0);
     expect(persisted.conflicts[0]).toMatchObject({ id: conflictId, status: "open" });
   });

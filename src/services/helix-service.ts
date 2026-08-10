@@ -100,9 +100,7 @@ import {
   claimConflictApplication,
   releaseConflictApplication,
 } from "./conflict-claim";
-import {
-  PROJECT_DIDA_PROJECTION_AVAILABLE,
-} from "../release-capabilities";
+import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -205,12 +203,17 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private secretMutationAuthorized = false;
   private disposed = false;
   private readonly projectDidaProjectionAvailable: boolean;
+  private readonly didaSyncAvailable: boolean;
 
   constructor(
     private readonly store: HelixDataStore,
     private readonly secrets: HelixSecretStore,
-    options: { projectDidaProjectionAvailable?: boolean } = {},
+    options: {
+      projectDidaProjectionAvailable?: boolean;
+      didaSyncAvailable?: boolean;
+    } = {},
   ) {
+    this.didaSyncAvailable = options.didaSyncAvailable ?? true;
     this.projectDidaProjectionAvailable =
       options.projectDidaProjectionAvailable ?? PROJECT_DIDA_PROJECTION_AVAILABLE;
     this.didaRequestGovernor = new DidaRequestGovernor({
@@ -535,6 +538,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async sync(): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     if (this.syncPromise) return this.syncPromise;
     const current = this.withAuthorizationLease(() => this.syncWithAuthorizationLease(false))
@@ -546,6 +550,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async pullOnlySync(): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     if (this.syncPromise) throw new Error("已有滴答同步正在进行，请完成后再执行只读拉取");
     const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答只读拉取");
@@ -792,6 +797,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async probeConnection(): Promise<DidaCapabilities> {
+    this.assertDidaSyncAvailable();
     this.assertActive();
     return this.withAuthorizationLease(() => this.probeConnectionWithAuthorizationLease());
   }
@@ -808,6 +814,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   async runDidaWriteContractTest(
     onProgress?: (progress: DidaWriteContractProgress) => void,
   ): Promise<DidaWriteContractReport> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     await this.didaRequestGovernor.assertContractAllowed();
     if (this.state.loading) throw new Error("同步正在进行，请完成后再运行写入合同测试");
@@ -978,6 +985,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async adoptPendingContractRunFromRemote(): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     if (this.state.loading) throw new Error("同步正在进行，请稍后再领养合同残留");
     const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答合同残留领养");
@@ -1002,6 +1010,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async recoverPendingDidaContractCleanup(): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     if (this.state.loading) throw new Error("同步正在进行，请稍后再清理合同残留");
     const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答合同残留清理");
@@ -1076,12 +1085,14 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async verifyRemoteTask(projectId: string, taskId: string): Promise<DidaTask> {
+    this.assertDidaSyncAvailable();
     this.assertActive();
     return this.withAuthorizationLease(() =>
       this.verifyRemoteTaskWithAuthorizationLease(projectId, taskId));
   }
 
   async verifyRemoteProject(projectId: string): Promise<DidaProject> {
+    this.assertDidaSyncAvailable();
     this.assertActive();
     return this.withAuthorizationLease(async () => {
       const project = normalizeProject(await this.api.getProject(projectId));
@@ -1396,6 +1407,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     projectId: string,
     attributes: Partial<Pick<DidaTask, "content" | "tags" | "priority">> = {},
   ): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     this.assertTaskCrudVerified();
     const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
@@ -1647,6 +1659,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async createDidaProject(name: string, color?: string): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     this.assertContractWriteVerified();
     const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
@@ -1697,6 +1710,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async setDidaProjectViewMode(projectId: string, viewMode: "list" | "kanban"): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     this.assertContractWriteVerified();
     const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
@@ -1766,6 +1780,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async completeTask(taskId: string): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     const task = this.state.tasks.find((candidate) => candidate.id === taskId);
     if (!task) throw new Error("找不到任务");
@@ -1781,6 +1796,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     operationType: "update" | "complete" = "update",
     writeFields: string[] = [],
   ): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     this.assertTaskCrudVerified();
     const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
@@ -1796,6 +1812,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     taskId: string,
     targetColumnId: string,
   ): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     this.assertContractWriteVerified();
     if (!this.state.boardPlacementVerified) {
@@ -2132,7 +2149,13 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   private assertProjectDidaProjectionAvailable(): void {
     if (!this.projectDidaProjectionAvailable) {
-      throw new Error("0.1.0 个人预览版暂未开放项目与滴答联动");
+      throw new Error("1.0.0 本地正式版暂未开放项目与滴答联动");
+    }
+  }
+
+  private assertDidaSyncAvailable(): void {
+    if (!this.didaSyncAvailable) {
+      throw new Error("1.0.0 本地正式版暂未开放滴答网络同步");
     }
   }
 
@@ -2192,6 +2215,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     resolution: "not-created" | "confirmed",
     remoteId?: string,
   ): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     await this.withAuthorizationLease(() =>
       this.resolveUnknownCreateWithAuthorizationLease(operationId, resolution, remoteId));
@@ -2264,6 +2288,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     operationId: string,
     resolution: "continue" | "adopt-remote",
   ): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     await this.withAuthorizationLease(() =>
       this.resolveUnknownWriteWithAuthorizationLease(operationId, resolution));
@@ -2330,6 +2355,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async retryFailedOperation(operationId: string): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     await this.withAuthorizationLease(() =>
       this.retryFailedOperationWithAuthorizationLease(operationId));
@@ -2369,6 +2395,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   applyConflict(conflictId: string): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     this.assertContractWriteVerified();
     const existing = this.conflictApplications.get(conflictId);
@@ -2389,6 +2416,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async adoptAppliedConflict(conflictId: string, remoteEntityId?: string): Promise<void> {
+    this.assertDidaSyncAvailable();
     this.assertWritable();
     await this.withAuthorizationLease(() =>
       this.adoptAppliedConflictWithAuthorizationLease(conflictId, remoteEntityId));

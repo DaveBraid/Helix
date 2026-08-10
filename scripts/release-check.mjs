@@ -3,6 +3,7 @@ import { access, readFile } from "node:fs/promises";
 const manifest = JSON.parse(await readFile("manifest.json", "utf8"));
 const versions = JSON.parse(await readFile("versions.json", "utf8"));
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+const releaseCapabilities = await readFile("src/release-capabilities.ts", "utf8");
 
 const requiredArtifacts = [
   "manifest.json",
@@ -41,6 +42,10 @@ if (versions[manifest.version] !== manifest.minAppVersion) {
 }
 if (!manifest.isDesktopOnly) {
   throw new Error("当前桌面阶段必须保持 isDesktopOnly=true");
+}
+if (manifest.version === "1.0.0" &&
+    !releaseCapabilities.includes("export const DIDA_SYNC_AVAILABLE = false")) {
+  throw new Error("1.0.0 本地正式版必须关闭滴答网络同步门禁");
 }
 
 console.log(`Helix ${manifest.version} 发布产物检查通过：${requiredArtifacts.join("、")}`);

@@ -20,7 +20,7 @@ npm run release:check
 
 ## 2. Git 工作流
 
-Helix 使用独立 Git 仓库，暂不配置远端。
+Helix 使用独立 Git 仓库，远端为 `DaveBraid/Helix`。
 
 - `main` 保持阶段验证通过的状态。
 - 开发可在短期功能分支进行；当前单人阶段允许直接在 `main` 工作，但提交前必须通过质量闸门。

@@ -2,19 +2,7 @@
 
 ## 证据
 
-- 项目源图：`/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-9308c234-99ce-447c-8dbc-9e3cd88f88bf.png`
-- 项目实现图：`/private/tmp/helix-project-border-v4.png`
-- 项目聚焦并排图：`/private/tmp/helix-project-border-comparison.png`（左为源图，右为实现）
-- 日期月历实现图：`/private/tmp/helix-task-calendar.png`
-- 时间占位源图：`/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-126a2957-fbec-49e7-a78e-5c06e7706169.png`
-- 时间占位实现图：`/private/tmp/helix-inline-status-selects-v2.png`
-- 时间占位并排图：`/private/tmp/helix-time-placeholders-comparison.png`（左为修复前，右为修复后）
-- 原位状态菜单实现图：`/private/tmp/helix-status-popover-fixed.png`
-- 原位状态聚焦图：`/private/tmp/helix-status-popover-focused.png`
-- 原位状态并排图：`/private/tmp/helix-status-popover-comparison.png`（左为原卡片外观，右为菜单打开状态）
-- 状态间距源图：`/var/folders/vv/5ssln5h12vz4y1b8gbp2x05c0000gn/T/codex-clipboard-47c13c4c-aa6e-4a55-ac91-2cab36278b8c.png`
-- 状态间距实现图：`/private/tmp/helix-status-popover-spaced.png`
-- 状态间距并排图：`/private/tmp/helix-status-popover-spacing-comparison.png`（左为选项相连，右为 4 px 等距）
+- 源图、实现截图与并排图只作为开发会话内的临时视觉证据，不在仓库记录本机路径。
 - viewport：Obsidian 1.13.4 桌面端；项目实现 2790 × 1846 px，日期实现同一窗口；源图 914 × 586 px。
 - normalization：项目实现裁出 965 × 594 px 容器区域并等比缩放到 412 px 高；源图等比缩放到同高后左右并排，未拉伸。
 - state：深色主题；项目页显示单阶段项目；任务详情月历打开，42 个日期单元完整呈现。

@@ -137,7 +137,10 @@ import {
   conflictCenterIsEmpty,
   loadProjectionConflictModels,
 } from "./project-projection-presenter";
-import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
+import {
+  DIDA_SYNC_AVAILABLE,
+  PROJECT_DIDA_PROJECTION_AVAILABLE,
+} from "../release-capabilities";
 
 echarts.use([
   LineChart,
@@ -451,12 +454,14 @@ export class HelixView extends ItemView {
         void this.render();
       });
     }
-    const showDemoSidebar = this.state?.demoMode &&
+    const showDemoSidebar = DIDA_SYNC_AVAILABLE && this.state?.demoMode &&
       (this.localProjectTaskSnapshot?.destinations.length ?? 0) === 0;
     const sidebarProjects = showDemoSidebar
       ? this.previewProjects
-      : (this.state?.projects ?? []);
-    const sidebarTasks = showDemoSidebar ? this.previewTasks : (this.state?.tasks ?? []);
+      : DIDA_SYNC_AVAILABLE ? (this.state?.projects ?? []) : [];
+    const sidebarTasks = showDemoSidebar
+      ? this.previewTasks
+      : DIDA_SYNC_AVAILABLE ? (this.state?.tasks ?? []) : [];
     const localOpenCount = this.localProjectTaskSnapshot?.roots.filter((task) =>
       task.state !== "completed" && task.state !== "terminated").length ?? 0;
     const projectSection = sidebar.createDiv({ cls: "helix-sidebar-lists" });
@@ -541,14 +546,16 @@ export class HelixView extends ItemView {
     header.createEl("h1", { text: title });
     const actions = header.createDiv({ cls: "helix-header-actions" });
     const status = actions.createDiv({
-      cls: `helix-sync-status ${this.state?.connected ? "is-online" : "is-offline"}`,
+      cls: `helix-sync-status ${DIDA_SYNC_AVAILABLE && this.state?.connected ? "is-online" : "is-offline"}`,
       attr: {
         title: this.state?.syncWarnings.join("；") || this.state?.error || "",
       },
     });
     status.createSpan();
     status.createSpan({
-      text: this.state?.loading
+      text: !DIDA_SYNC_AVAILABLE
+        ? "本地模式"
+        : this.state?.loading
         ? "正在同步"
         : this.state?.connected
         ? this.state.syncWarnings.length > 0
@@ -568,6 +575,7 @@ export class HelixView extends ItemView {
                 : "等待首次同步"
             : "未配置滴答",
     });
+    if (!DIDA_SYNC_AVAILABLE) return;
     const sync = actions.createEl("button", {
       cls: "helix-icon-button",
       attr: { "aria-label": "立即同步", title: "立即同步" },
@@ -2655,6 +2663,7 @@ export class HelixView extends ItemView {
   }
 
   private renderProjectLinkedTasks(content: HTMLElement): void {
+    if (!DIDA_SYNC_AVAILABLE) return;
     const snapshot = this.taskReferenceSnapshot;
     if (!snapshot) return;
     const references = snapshot.references;
@@ -4191,6 +4200,7 @@ export class HelixView extends ItemView {
   }
 
   private displayState(): { projects: DidaProject[]; tasks: DidaTask[] } {
+    if (!DIDA_SYNC_AVAILABLE) return { projects: [], tasks: [] };
     const projects = this.state?.demoMode ? this.previewProjects : this.state?.projects ?? [];
     const tasks = this.state?.demoMode ? this.previewTasks : this.state?.tasks ?? [];
     return { projects, tasks };

@@ -99,12 +99,12 @@ describe("project projection presenter", () => {
 
   it("degrades a rejected project workspace to a redacted read-only diagnostic", async () => {
     const result = await loadProjectionConflictModels(
-      async () => { throw new Error("failed /Users/test/private token_abcdefghijklmnop"); },
+      async () => { throw new Error("failed private-path token_abcdefghijklmnop"); },
       async () => baseModel(),
     );
     expect(result.models).toEqual([]);
     expect(result.diagnostic).toMatch(/路径已隐藏|标识已隐藏/);
-    expect(result.diagnostic).not.toMatch(/\/Users\/test|abcdefghijklmnop/);
+    expect(result.diagnostic).not.toMatch(/private-path|abcdefghijklmnop/);
   });
 
   it("never shows the conflict empty state over recovery, column unknown, or workspace diagnostics", () => {

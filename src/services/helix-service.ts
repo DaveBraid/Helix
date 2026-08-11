@@ -2149,13 +2149,13 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   private assertProjectDidaProjectionAvailable(): void {
     if (!this.projectDidaProjectionAvailable) {
-      throw new Error("1.0.0 本地正式版暂未开放项目与滴答联动");
+      throw new Error("当前本地正式版暂未开放项目与滴答联动");
     }
   }
 
   private assertDidaSyncAvailable(): void {
     if (!this.didaSyncAvailable) {
-      throw new Error("1.0.0 本地正式版暂未开放滴答网络同步");
+      throw new Error("当前本地正式版暂未开放滴答网络同步");
     }
   }
 

@@ -366,7 +366,7 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
 
-  it("ships the 1.0.0 formal release in local-only mode", () => {
+  it("ships the current formal release in local-only mode", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const capabilities = readFileSync(resolve(process.cwd(), "src/release-capabilities.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");

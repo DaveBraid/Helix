@@ -441,7 +441,9 @@ describe("workbench layout and navigation structure", () => {
     expect(settings).not.toContain("ProjectionUiActionCoordinator");
     expect(settings).not.toContain("confirmProjectProjection");
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
-    expect(modal).toMatch(/submit\(title, this\.color\)/);
+    expect(modal).toMatch(/submit\(title, initialStageTitle, this\.color\)/);
+    expect(modal).toMatch(/首阶段名称/);
+    expect(modal).toMatch(/class RenameEntityModal extends Modal/);
   });
 
   it("hides projection column creation while retaining safe unknown reconciliation", () => {

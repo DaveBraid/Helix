@@ -291,6 +291,10 @@ export default class HelixPlugin extends Plugin {
         deleteCycle: (cycleId, onDeleted) => this.showDeleteCycleModal(cycleId, onDeleted),
         deleteProject: (projectId, onDeleted) =>
           this.showDeleteProjectModal(projectId, onDeleted),
+        renameProject: (projectId, currentTitle, onRenamed) =>
+          this.showRenameProjectModal(projectId, currentTitle, onRenamed),
+        renameCycle: (cycleId, currentTitle, onRenamed) =>
+          this.showRenameCycleModal(cycleId, currentTitle, onRenamed),
         manageRelation: (relationId, onChanged) =>
           this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
@@ -1064,10 +1068,10 @@ export default class HelixPlugin extends Plugin {
     }
     new ProjectPromptModal(
       this.app,
-      async (title, color) => {
+      async (title, initialStageTitle, color) => {
         this.assertWritable();
         const created = await this.withWritableProjectMutation(() =>
-          this.projectWorkspace.createProject(title, undefined, color));
+          this.projectWorkspace.createProject(title, initialStageTitle, undefined, color));
         onCreated?.(created.id);
         await this.service.refreshPersistedEvents();
         new Notice("项目和阶段 1 已加入当前工作区");
@@ -1077,6 +1081,36 @@ export default class HelixPlugin extends Plugin {
 
   showCreateProjectModal(onCreated?: (projectId: string) => void): void {
     this.openProjectModal(onCreated);
+  }
+
+  private showRenameProjectModal(
+    projectId: string,
+    currentTitle: string,
+    onRenamed?: () => void,
+  ): void {
+    new RenameEntityModal(this.app, "项目", currentTitle, async (title) => {
+      this.assertWritable();
+      await this.withWritableProjectMutation(() =>
+        this.projectWorkspace.renameProject(projectId, title));
+      await this.service.refreshPersistedEvents();
+      onRenamed?.();
+      new Notice("项目名称已更新");
+    }).open();
+  }
+
+  private showRenameCycleModal(
+    cycleId: string,
+    currentTitle: string,
+    onRenamed?: () => void,
+  ): void {
+    new RenameEntityModal(this.app, "阶段", currentTitle, async (title) => {
+      this.assertWritable();
+      await this.withWritableProjectMutation(() =>
+        this.projectWorkspace.renameCycle(cycleId, title));
+      await this.service.refreshPersistedEvents();
+      onRenamed?.();
+      new Notice("阶段名称已更新");
+    }).open();
   }
 
   private showCreateCycleModal(
@@ -1675,12 +1709,14 @@ class TemplateFolderSetupModal extends Modal {
 
 class ProjectPromptModal extends Modal {
   private title = "";
+  private initialStageTitle = "";
   private color = "#5870A8";
 
   constructor(
     app: HelixPlugin["app"],
     private readonly submit: (
       title: string,
+      initialStageTitle: string,
       color?: string,
     ) => Promise<void>,
   ) {
@@ -1691,10 +1727,18 @@ class ProjectPromptModal extends Modal {
     this.setTitle("创建 Helix 项目");
     new Setting(this.contentEl)
       .setName("项目名称")
-      .setDesc("将创建稳定项目笔记和首个阶段。")
+      .setDesc("用于项目笔记和关系图容器。")
       .addText((text) =>
         text.setPlaceholder("例如：强化学习论文实验").onChange((value) => {
           this.title = value;
+        }),
+      );
+    new Setting(this.contentEl)
+      .setName("首阶段名称")
+      .setDesc("与项目同时创建，可在之后继续修改。")
+      .addText((text) =>
+        text.setPlaceholder("例如：确定实验方案").onChange((value) => {
+          this.initialStageTitle = value;
         }),
       );
     new Setting(this.contentEl)
@@ -1712,12 +1756,17 @@ class ProjectPromptModal extends Modal {
     const confirm = actions.createEl("button", { cls: "mod-cta", text: "创建项目与阶段 1" });
     confirm.addEventListener("click", () => {
       const title = this.title.trim();
+      const initialStageTitle = this.initialStageTitle.trim();
       if (!title) {
         new Notice("请输入项目名称");
         return;
       }
+      if (!initialStageTitle) {
+        new Notice("请输入首阶段名称");
+        return;
+      }
       confirm.disabled = true;
-      void this.submit(title, this.color)
+      void this.submit(title, initialStageTitle, this.color)
         .then(() => this.close())
         .catch((error) => {
           confirm.disabled = false;
@@ -1729,6 +1778,60 @@ class ProjectPromptModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+class RenameEntityModal extends Modal {
+  private title: string;
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly entityLabel: "项目" | "阶段",
+    currentTitle: string,
+    private readonly submit: (title: string) => Promise<void>,
+  ) {
+    super(app);
+    this.title = currentTitle;
+  }
+
+  onOpen(): void {
+    this.setTitle(`重命名${this.entityLabel}`);
+    let input: HTMLInputElement;
+    new Setting(this.contentEl)
+      .setName(`${this.entityLabel}名称`)
+      .addText((text) => {
+        input = text.inputEl;
+        text.setValue(this.title).onChange((value) => { this.title = value; });
+      });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { cls: "mod-cta", text: "保存" });
+    const submit = (): void => {
+      const title = this.title.trim();
+      if (!title) {
+        new Notice(`请输入${this.entityLabel}名称`);
+        return;
+      }
+      confirm.disabled = true;
+      void this.submit(title)
+        .then(() => this.close())
+        .catch((error) => {
+          confirm.disabled = false;
+          new Notice(error instanceof Error ? error.message : String(error), 8_000);
+        });
+    };
+    confirm.addEventListener("click", submit);
+    input!.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      submit();
+    });
+    window.setTimeout(() => {
+      input!.focus();
+      input!.select();
+    }, 0);
+  }
+
+  onClose(): void { this.contentEl.empty(); }
 }
 
 class DeleteProjectModal extends Modal {

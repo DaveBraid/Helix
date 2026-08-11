@@ -64,11 +64,11 @@ describe("ProjectWorkspaceService", () => {
       },
     );
 
-    const created = await service.createProject("模板项目");
+    const created = await service.createProject("模板项目", "验证模板入口");
     const project = await repo.read(created.notePath);
     const stage = await repo.read(created.cycles[0]!.notePath);
 
-    expect(calls).toEqual(["project:模板项目", "stage:项目启动"]);
+    expect(calls).toEqual(["project:模板项目", "stage:验证模板入口"]);
     expect(project?.content).toContain("helix-kind: helix-project");
     expect(project?.content).toContain("helix-status: planned");
     expect(project?.content).not.toContain("helix-updated:");
@@ -77,8 +77,67 @@ describe("ProjectWorkspaceService", () => {
     expect(stage?.content).toContain("helix-kind: helix-stage");
     expect(stage?.content).toContain('helix-stage-code: "1"');
     expect(stage?.content).toContain("helix-status: idea");
-    expect(stage?.content).toContain("# 阶段 1 · 项目启动");
+    expect(stage?.content).toContain("# 阶段 1 · 验证模板入口");
     expect(stage?.content).toContain("自定义阶段正文");
+  });
+
+  it("renames projects and stages through Markdown while preserving identity, body and Canvas summaries", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const projectPath = "Helix/Projects/Alpha/Project.md";
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(projectPath, `${(await repo.read(projectPath))!.content}\n\n用户项目正文`);
+    repo.set(stagePath, `${(await repo.read(stagePath))!.content}\n\n用户阶段正文`);
+
+    await service.renameProject("project-1", "新项目名称");
+    await service.renameCycle("cycle-1", "新阶段名称");
+
+    const projectContent = (await repo.read(projectPath))!.content;
+    const stageContent = (await repo.read(stagePath))!.content;
+    expect(projectContent).toContain("# 新项目名称");
+    expect(projectContent).toContain("helix-id: project-1");
+    expect(projectContent).toContain("用户项目正文");
+    expect(stageContent).toContain("# 阶段 1 · 新阶段名称");
+    expect(stageContent).toContain("helix-id: cycle-1");
+    expect(stageContent).toContain("用户阶段正文");
+    const canvas = repo.json(CANVAS);
+    expect(canvas.nodes.find((node: { id: string }) => node.id === "project-node").text)
+      .toContain("|新项目名称]]");
+    expect(canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").text)
+      .toContain("|新阶段名称]]");
+  });
+
+  it("reads project and stage names changed directly in Markdown", async () => {
+    const repo = baseRepository();
+    const projectPath = "Helix/Projects/Alpha/Project.md";
+    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(projectPath, (await repo.read(projectPath))!.content.replace("# Alpha", "# Markdown 项目名"));
+    repo.set(stagePath, (await repo.read(stagePath))!.content.replace(
+      "# 阶段 1 · 阶段标题 1",
+      "# 阶段 1 · Markdown 阶段名",
+    ));
+
+    const service = workspace(repo);
+    const snapshot = await service.snapshot();
+
+    expect(snapshot.projects[0]?.title).toBe("Markdown 项目名");
+    expect(snapshot.projects[0]?.cycles[0]?.title).toBe("Markdown 阶段名");
+    await service.ensureCanvas();
+    const canvas = repo.json(CANVAS);
+    expect(canvas.nodes.find((node: { id: string }) => node.id === "project-node").text)
+      .toContain("|Markdown 项目名]]");
+    expect(canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").text)
+      .toContain("|Markdown 阶段名]]");
+  });
+
+  it("requires an explicit initial stage name before creating a project", async () => {
+    const repo = baseRepository();
+    const beforePaths = repo.paths();
+
+    await expect(workspace(repo).createProject("新项目", "   "))
+      .rejects.toThrow("请输入首阶段名称");
+
+    expect(repo.paths()).toEqual(beforePaths);
   });
 
   it.each([
@@ -94,7 +153,7 @@ describe("ProjectWorkspaceService", () => {
       async () => { throw new Error(message); },
     );
 
-    await expect(service.createProject("不会落盘")).rejects.toThrow(message);
+    await expect(service.createProject("不会落盘", "首阶段")).rejects.toThrow(message);
     expect(repo.paths()).toEqual([]);
     await expect(repo.read(CANVAS)).resolves.toBeNull();
   });
@@ -2025,13 +2084,13 @@ describe("ProjectWorkspaceService", () => {
   it("rolls back project files on failure and rejects duplicate Dida mappings before writing", async () => {
     const repo = baseRepository("dida-existing");
     const service = workspace(repo);
-    await expect(service.createProject("重复映射", "dida-existing")).rejects.toThrow(/已映射/);
+    await expect(service.createProject("重复映射", "首阶段", "dida-existing")).rejects.toThrow(/已映射/);
     expect(repo.paths().some((path) => path.includes("重复映射"))).toBe(false);
 
     repo.failCreatePath = "Helix/Projects/事务失败/Stage-01.md";
-    await expect(service.createProject("事务失败")).rejects.toThrow(/废纸篓/);
+    await expect(service.createProject("事务失败", "首阶段")).rejects.toThrow(/废纸篓/);
     expect(repo.paths().some((path) => path.includes("事务失败"))).toBe(false);
-    await expect(service.createProject("临时映射", " local-project-pending "))
+    await expect(service.createProject("临时映射", "首阶段", " local-project-pending "))
       .rejects.toThrow(/本地临时清单/);
     expect(repo.paths().some((path) => path.includes("临时映射"))).toBe(false);
   });
@@ -2048,7 +2107,7 @@ describe("ProjectWorkspaceService", () => {
     await expect(service.updateProjectDidaMapping(plan, "dida-project-2"))
       .rejects.toThrow(/确认期间已经变化|映射确认期间已经变化/);
 
-    await service.createProject("映射竞争", "dida-project-2");
+    await service.createProject("映射竞争", "首阶段", "dida-project-2");
     const nextPlan = await service.prepareProjectDidaMappingUpdate("project-1");
     await expect(service.updateProjectDidaMapping(nextPlan, "dida-project-2"))
       .rejects.toThrow(/已映射到另一 Helix 项目/);
@@ -2059,12 +2118,12 @@ describe("ProjectWorkspaceService", () => {
   it("creates new stages with stage-only product metadata while keeping legacy nodes readable", async () => {
     const repo = baseRepository();
     const service = workspace(repo);
-    const created = await service.createProject("阶段元数据");
+    const created = await service.createProject("阶段元数据", "自定义首阶段");
     const stagePath = "Helix/Projects/阶段元数据/Stage-01.md";
     const stage = await repo.read(stagePath);
     expect(stage?.content).toContain("helix-kind: helix-stage");
     expect(stage?.content).not.toContain("helix-kind: helix-cycle");
-    expect(stage?.content).toContain("# 阶段 1 · 项目启动");
+    expect(stage?.content).toContain("# 阶段 1 · 自定义首阶段");
     const canvas = repo.json(CANVAS);
     expect(canvas.nodes).toContainEqual(expect.objectContaining({
       id: expect.stringMatching(/^helix-stage-/),
@@ -2086,7 +2145,7 @@ describe("ProjectWorkspaceService", () => {
       y: node.y,
     }));
 
-    const created = await workspace(repo).createProject("布局验证");
+    const created = await workspace(repo).createProject("布局验证", "首阶段");
     const nodes = repo.json(CANVAS).nodes;
 
     expect(nodes.filter((node: Record<string, unknown>) =>

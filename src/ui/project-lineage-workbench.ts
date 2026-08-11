@@ -83,6 +83,8 @@ interface WorkbenchOptions {
   onCreateCycle: (projectId: string, sourceCycleIds: string[]) => void;
   onDeleteCycle: (cycleId: string) => void;
   onDeleteProject: (projectId: string) => void;
+  onRenameProject: (projectId: string, currentTitle: string) => void;
+  onRenameCycle: (cycleId: string, currentTitle: string) => void;
   onOpenNote: (path: string) => void;
   onSaveLayout: (moves: ProjectWorkspaceNodeMove[]) => Promise<void>;
   onManageRelation: (relationId: string) => void;
@@ -1412,6 +1414,19 @@ export class ProjectLineageWorkbench {
       open.createSpan({ cls: "helix-lineage-project-container-swatch" });
       open.createSpan({ text: project.title });
       this.bindProjectTitleDrag(open, project);
+      const rename = header.createEl("button", {
+        cls: "helix-lineage-project-container-rename",
+        attr: {
+          "aria-label": `重命名项目 ${project.title}`,
+          title: "重命名项目",
+        },
+      });
+      setIcon(rename, "pencil");
+      rename.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.options.onRenameProject(project.id, project.title);
+      });
       const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
         text: PROJECT_STATUS_LABELS[project.status],
@@ -1639,7 +1654,8 @@ export class ProjectLineageWorkbench {
         });
       }
     }
-    const open = card.createEl("button", {
+    const titleRow = card.createDiv({ cls: "helix-lineage-card-title-row" });
+    const open = titleRow.createEl("button", {
       cls: "helix-lineage-card-title",
       text: node.title,
       attr: { "aria-label": `打开 ${node.title}` },
@@ -1649,6 +1665,21 @@ export class ProjectLineageWorkbench {
       event.stopPropagation();
       this.options.onOpenNote(node.notePath);
     });
+    if (cycle) {
+      const rename = titleRow.createEl("button", {
+        cls: "helix-lineage-card-rename",
+        attr: {
+          "aria-label": `重命名阶段 ${cycle.title}`,
+          title: "重命名阶段",
+        },
+      });
+      setIcon(rename, "pencil");
+      rename.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.options.onRenameCycle(cycle!.id, cycle!.title);
+      });
+    }
     const meta = card.createDiv({ cls: "helix-lineage-card-meta" });
     if (node.kind === "project") {
       const status = meta.createEl("button", {

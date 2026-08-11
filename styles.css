@@ -4560,13 +4560,40 @@
 }
 
 .helix-lineage-project-container-title,
-.helix-lineage-project-container-fold {
+.helix-lineage-project-container-fold,
+.helix-lineage-project-container-rename {
   display: inline-flex;
   align-items: center;
   border: 0;
   background: transparent;
   box-shadow: none;
 }
+
+.helix-lineage-project-container-rename,
+.helix-lineage-card-rename {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  opacity: .62;
+}
+
+.helix-lineage-project-container-rename:hover,
+.helix-lineage-project-container-rename:focus-visible,
+.helix-lineage-card-rename:hover,
+.helix-lineage-card-rename:focus-visible {
+  background: color-mix(in srgb, var(--helix-project-color, var(--interactive-accent)) 10%, transparent);
+  color: var(--text-normal);
+  opacity: 1;
+}
+
+.helix-lineage-project-container-rename svg,
+.helix-lineage-card-rename svg { width: 13px; height: 13px; }
 
 .helix-lineage-project-container-title {
   min-width: 0;
@@ -4777,6 +4804,25 @@
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.helix-lineage-card-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+
+.helix-lineage-card-title-row .helix-lineage-card-title { flex: 1 1 auto; }
+.helix-lineage-card-title-row .helix-lineage-card-rename {
+  opacity: 0;
+  pointer-events: none;
+}
+.helix-lineage-card:hover .helix-lineage-card-rename,
+.helix-lineage-card:focus-within .helix-lineage-card-rename,
+.helix-lineage-card.is-selected .helix-lineage-card-rename {
+  opacity: .72;
+  pointer-events: auto;
 }
 
 .helix-root .helix-lineage-card-title {

@@ -2445,6 +2445,57 @@ export class ProjectWorkspaceService {
     return this.snapshot();
   }
 
+  async renameProject(
+    projectId: string,
+    title: string,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) throw new Error("请输入项目名称");
+    assertSingleLineTitle(normalizedTitle, "项目名称");
+    const snapshot = await this.snapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+    if (!project) throw new Error("找不到需要重命名的项目");
+    if (project.title === normalizedTitle) return snapshot;
+    const revision = await this.repository.read(project.notePath);
+    if (!revision || revision.hash !== snapshot.managedMarkdownRevisionHashes[project.notePath]) {
+      throw new Error("项目 Markdown 在重命名期间已经变化，请重新操作");
+    }
+    assertManagedIdentity(revision.content, "helix-project", project.id);
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision || canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在项目重命名期间已经变化，请重新操作");
+    }
+    const afterContent = rewriteFirstHeading(
+      patchManagedFrontmatter(revision.content, {
+        "helix-updated": new Date().toISOString(),
+      }),
+      normalizedTitle,
+      "项目",
+    );
+    updateManagedNodeSummary(
+      canvas.document,
+      { kind: "project", entityId: project.id },
+      project.notePath,
+      normalizedTitle,
+      projectStatusText(project.status),
+    );
+    this.assertActive(generation);
+    return this.applyAtomicWorkspaceChange({
+      label: "重命名项目",
+      canvasBeforeHash: canvas.revision.hash,
+      canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+      markdownUpdates: [{
+        path: project.notePath,
+        kind: "project",
+        entityId: project.id,
+        projectId: project.id,
+        beforeHash: revision.hash,
+        afterContent,
+      }],
+    });
+  }
+
   async prepareCycleStatusUpdate(
     cycleId: string,
   ): Promise<ProjectWorkspaceCycleStatusUpdatePlan> {
@@ -2515,6 +2566,81 @@ export class ProjectWorkspaceService {
       () => this.assertActive(generation),
     );
     return this.snapshot();
+  }
+
+  async renameCycle(
+    cycleId: string,
+    title: string,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) throw new Error("请输入阶段名称");
+    assertSingleLineTitle(normalizedTitle, "阶段名称");
+    const snapshot = await this.snapshot();
+    const project = snapshot.projects.find((candidate) =>
+      candidate.cycles.some((cycle) => cycle.id === cycleId));
+    const cycle = project?.cycles.find((candidate) => candidate.id === cycleId);
+    if (!project || !cycle) throw new Error("找不到需要重命名的阶段");
+    if (cycle.title === normalizedTitle) return snapshot;
+    const revision = await this.repository.read(cycle.notePath);
+    if (!revision || revision.hash !== snapshot.managedMarkdownRevisionHashes[cycle.notePath]) {
+      throw new Error("阶段 Markdown 在重命名期间已经变化，请重新操作");
+    }
+    assertManagedStageIdentity(revision.content, cycle.id, project.id);
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision || canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在阶段重命名期间已经变化，请重新操作");
+    }
+    const afterContent = rewriteFirstHeading(
+      patchManagedFrontmatter(revision.content, {
+        "helix-updated": new Date().toISOString(),
+      }),
+      `阶段 ${cycle.stageCode} · ${normalizedTitle}`,
+      "阶段",
+    );
+    updateManagedNodeSummary(
+      canvas.document,
+      { kind: "cycle", entityId: cycle.id },
+      cycle.notePath,
+      normalizedTitle,
+      stageStatusText(cycle.status),
+    );
+    const renamedSnapshot: ProjectWorkspaceSnapshot = {
+      ...snapshot,
+      projects: snapshot.projects.map((candidate) =>
+        candidate.id === project.id
+          ? {
+              ...candidate,
+              cycles: candidate.cycles.map((item) =>
+                item.id === cycle.id ? { ...item, title: normalizedTitle } : item),
+            }
+          : candidate),
+    };
+    const downstreamIds = snapshot.relations
+      .filter((relation) => relation.fromCycleIds.includes(cycle.id))
+      .map((relation) => relation.toCycleId);
+    const focusUpdates = await this.focusMarkdownUpdates(
+      renamedSnapshot,
+      snapshot.relations,
+      downstreamIds,
+    );
+    this.assertActive(generation);
+    return this.applyAtomicWorkspaceChange({
+      label: "重命名阶段",
+      canvasBeforeHash: canvas.revision.hash,
+      canvasAfterContent: JSON.stringify(canvas.document, null, 2),
+      markdownUpdates: [
+        {
+          path: cycle.notePath,
+          kind: "stage",
+          entityId: cycle.id,
+          projectId: project.id,
+          beforeHash: revision.hash,
+          afterContent,
+        },
+        ...focusUpdates,
+      ],
+    });
   }
 
   async setCompletedProjectCollapsed(
@@ -4113,18 +4239,22 @@ export class ProjectWorkspaceService {
 
   async createProject(
     title: string,
+    initialStageTitle: string,
     didaProjectId?: string,
     color?: string,
   ): Promise<ProjectWorkspaceProject> {
     const generation = this.beginOperation();
     const normalizedTitle = title.trim();
+    const normalizedStageTitle = initialStageTitle.trim();
     const normalizedColor = normalizeProjectColor(color);
     const normalizedDidaProjectId = didaProjectId?.trim() || undefined;
     if (!normalizedTitle) throw new Error("请输入项目名称");
+    if (!normalizedStageTitle) throw new Error("请输入首阶段名称");
     if (normalizedDidaProjectId?.startsWith("local-project-")) {
       throw new Error("本地临时清单尚未取得稳定远端 ID，不能建立项目映射");
     }
     assertSingleLineTitle(normalizedTitle, "项目名称");
+    assertSingleLineTitle(normalizedStageTitle, "首阶段名称");
     const folderName = sanitizeFileName(normalizedTitle);
     const folder = normalizePath(`${this.rootFolder()}/Projects/${folderName}`);
     const projectPath = normalizePath(`${folder}/Project.md`);
@@ -4138,7 +4268,11 @@ export class ProjectWorkspaceService {
     // 模板不可用时不得为一次尚未创建的项目留下空 Canvas 或 Markdown。
     const [projectBody, stageBody] = await this.renderTemplateBodies([
       { kind: "project", values: { title: normalizedTitle, project: normalizedTitle } },
-      { kind: "stage", values: { title: "项目启动", project: normalizedTitle, stage: "项目启动" } },
+      { kind: "stage", values: {
+        title: normalizedStageTitle,
+        project: normalizedTitle,
+        stage: normalizedStageTitle,
+      } },
     ]);
     const before = await this.ensureCanvas();
     if (
@@ -4175,7 +4309,7 @@ export class ProjectWorkspaceService {
           stageCode: "1",
           startedAt: now,
           status: "idea",
-          stageTitle: "项目启动",
+          stageTitle: normalizedStageTitle,
         }, stageBody),
         () => this.assertActive(generation),
       ));
@@ -4188,7 +4322,7 @@ export class ProjectWorkspaceService {
         color: normalizedColor,
         cycles: [{
           id: cycleId,
-          title: "项目启动",
+          title: normalizedStageTitle,
           notePath: cyclePath,
           sequence: 1,
           stageCode: "1",
@@ -5427,6 +5561,67 @@ function managedNodePath(node: CanvasNode): string | undefined {
 function canvasCardText(path: string, title: string, status: string): string {
   const target = normalizePath(path).replace(/\.md$/i, "");
   return `[[${target}|${title}]]${status ? `\n\n${status}` : ""}`;
+}
+
+function assertManagedIdentity(
+  content: string,
+  kind: "helix-project",
+  entityId: string,
+): void {
+  const frontmatter = frontmatterFromContent(content);
+  if (frontmatter?.["helix-kind"] !== kind || frontmatter["helix-id"] !== entityId) {
+    throw new Error("项目 Markdown 身份已变化，请重新操作");
+  }
+}
+
+function assertManagedStageIdentity(
+  content: string,
+  entityId: string,
+  projectId: string,
+): void {
+  const frontmatter = frontmatterFromContent(content);
+  if (
+    (
+      frontmatter?.["helix-kind"] !== "helix-stage" &&
+      frontmatter?.["helix-kind"] !== "helix-cycle"
+    ) ||
+    frontmatter["helix-id"] !== entityId ||
+    frontmatter["helix-project-id"] !== projectId
+  ) {
+    throw new Error("阶段 Markdown 身份或所属项目已变化，请重新操作");
+  }
+}
+
+function rewriteFirstHeading(
+  content: string,
+  title: string,
+  entityLabel: "项目" | "阶段",
+): string {
+  if (!/^#\s+.+?\s*$/m.test(content)) {
+    throw new Error(`${entityLabel} Markdown 缺少一级标题，未执行重命名`);
+  }
+  return content.replace(/^#\s+.+?\s*$/m, `# ${title}`);
+}
+
+function updateManagedNodeSummary(
+  document: CanvasDocument,
+  identity: { kind: "project" | "cycle"; entityId: string },
+  path: string,
+  title: string,
+  status: string,
+): void {
+  const node = document.nodes.find((candidate) =>
+    candidate.helixManaged === true && (
+      identity.kind === "project"
+        ? candidate.helixNodeKind === "project" &&
+          candidate.helixProjectId === identity.entityId
+        : managedStageId(candidate) === identity.entityId
+    ));
+  if (!node) throw new Error("Canvas 中缺少对应的 Helix 管理节点");
+  node.type = "text";
+  node.helixFilePath = normalizePath(path);
+  node.text = canvasCardText(path, title, status);
+  delete node.file;
 }
 
 function stageTitleFromHeading(

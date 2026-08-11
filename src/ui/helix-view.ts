@@ -262,6 +262,16 @@ export class HelixView extends ItemView {
       ) => void;
       deleteCycle: (cycleId: string, onDeleted?: (focusEntityId: string) => void) => void;
       deleteProject: (projectId: string, onDeleted?: () => void) => void;
+      renameProject: (
+        projectId: string,
+        currentTitle: string,
+        onRenamed?: () => void,
+      ) => void;
+      renameCycle: (
+        cycleId: string,
+        currentTitle: string,
+        onRenamed?: () => void,
+      ) => void;
       manageRelation: (
         relationId: string,
         onChanged?: (focusEntityId: string) => void,
@@ -2570,6 +2580,10 @@ export class HelixView extends ItemView {
         this.selectedProjectId = workspace.projects.find((project) => project.id !== projectId)?.id ?? null;
         void this.render();
       }),
+      onRenameProject: (projectId, currentTitle) =>
+        this.actions.renameProject(projectId, currentTitle, () => void this.render()),
+      onRenameCycle: (cycleId, currentTitle) =>
+        this.actions.renameCycle(cycleId, currentTitle, () => void this.render()),
       onOpenNote: (path) => {
         void this.actions.openProjectFile(path);
       },

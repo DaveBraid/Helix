@@ -46,9 +46,11 @@ if (!manifest.isDesktopOnly) {
 if (!releaseCapabilities.includes("export const DIDA_READ_AVAILABLE = true")) {
   throw new Error("当前开发基线必须开放滴答只读门禁");
 }
+if (!releaseCapabilities.includes("export const DIDA_CONTRACT_TEST_AVAILABLE = true")) {
+  throw new Error("当前合同验证基线必须开放专用合同门禁");
+}
 for (const capability of [
   "DIDA_TASK_WRITE_AVAILABLE",
-  "DIDA_CONTRACT_TEST_AVAILABLE",
   "PROJECT_DIDA_PROJECTION_AVAILABLE",
 ]) {
   if (!releaseCapabilities.includes(`export const ${capability} = false`)) {

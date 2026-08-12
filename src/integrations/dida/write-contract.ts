@@ -570,7 +570,9 @@ export class DidaWriteContractRunner {
         await this.cleanupCheckpoint();
       } catch (error) {
         if (this.untrackedCreateOutcome) throw error;
-        if (isUnprovenRemoteOutcome(error)) throw error;
+        // items 是独立可选能力。即使写入结果未知，也不领养、不重发；只有按精确
+        // 任务身份安全删除并证明临时父任务已不存在后，才允许关闭本能力并继续用
+        // 全新测试对象验证其他能力。清理无法证明时 cleanupTask 会抛出并全局中止。
         await this.cleanupTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
         await this.cleanupCheckpoint();

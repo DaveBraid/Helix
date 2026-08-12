@@ -963,7 +963,7 @@ describe("DidaWriteContractRunner", () => {
     });
   });
 
-  it("does not adopt a replacement ID after an unknown sentinel write outcome", async () => {
+  it("does not adopt a replacement ID but safely isolates an unknown sentinel outcome", async () => {
     const api = new ContractApiFake();
     api.sentinelMutation = "id-not-preserved";
     api.parentUpdateOutcome = "applied-unknown";
@@ -971,11 +971,13 @@ describe("DidaWriteContractRunner", () => {
       api, () => "run-unknown-id-replacement", fixedNow,
     ).run();
     expect(report).toMatchObject({
-      status: "failed",
+      status: "passed",
       itemsRoundTripVerified: false,
       itemIdStableVerified: false,
+      boardPlacementVerified: true,
       remoteArtifactsRemaining: false,
     });
+    expect(report.capabilityFailures).toContain("检查项：未通过写入合同，保持只读");
   });
 
   it("checkpoints sent-unknown before every temporary task and project delete", async () => {
@@ -1219,7 +1221,7 @@ describe("DidaWriteContractRunner", () => {
     expect(settingsVisibleSummary).not.toContain(secret);
   });
 
-  it("globally fails and stops before board placement when a parent update outcome is unknown and unproven", async () => {
+  it("isolates an unknown parent update after safe task cleanup and continues other capabilities", async () => {
     const api = new ContractApiFake();
     api.parentUpdateOutcome = "not-applied-unknown";
 
@@ -1230,15 +1232,14 @@ describe("DidaWriteContractRunner", () => {
     ).run();
 
     expect(report).toMatchObject({
-      status: "failed",
+      status: "passed",
       itemsRoundTripVerified: false,
-      boardPlacementVerified: false,
+      boardPlacementVerified: true,
       remoteArtifactsRemaining: false,
       cleanupErrors: [],
     });
-    expect(report.failure).toMatch(/属性写入响应未知.*未重发/);
-    expect(api.updatePayloads.some((payload) => "columnId" in payload)).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-1"]);
+    expect(report.capabilityFailures).toContain("检查项：未通过写入合同，保持只读");
+    expect(api.updatePayloads.some((payload) => "columnId" in payload)).toBe(true);
     expect([...api.tasks]).toHaveLength(1);
   });
 

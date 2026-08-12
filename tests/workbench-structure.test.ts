@@ -366,14 +366,14 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
 
-  it("ships the current formal release in local-only mode", () => {
+  it("ships only the explicitly staged Dida capabilities", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const capabilities = readFileSync(resolve(process.cwd(), "src/release-capabilities.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(capabilities).toContain("export const DIDA_READ_AVAILABLE = true");
+    expect(capabilities).toContain("export const DIDA_CONTRACT_TEST_AVAILABLE = true");
     for (const capability of [
       "DIDA_TASK_WRITE_AVAILABLE",
-      "DIDA_CONTRACT_TEST_AVAILABLE",
       "PROJECT_DIDA_PROJECTION_AVAILABLE",
     ]) expect(capabilities).toContain(`export const ${capability} = false`);
     expect(main).toContain("if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands()");

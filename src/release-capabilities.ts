@@ -5,7 +5,7 @@ export const DIDA_READ_AVAILABLE = true;
 export const DIDA_TASK_WRITE_AVAILABLE = false;
 
 /** 会创建临时远端对象的专用写入合同测试。 */
-export const DIDA_CONTRACT_TEST_AVAILABLE = false;
+export const DIDA_CONTRACT_TEST_AVAILABLE = true;
 
 /** 当前本地正式版不开放项目到滴答的投影写入。 */
 export const PROJECT_DIDA_PROJECTION_AVAILABLE = false;

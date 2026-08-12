@@ -13,6 +13,33 @@ import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import { DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE } from "../src/integrations/dida/request-governor";
 
 describe("HelixService contract-test exclusivity", () => {
+  it("opens the isolated contract path without opening ordinary task writes", async () => {
+    const { service } = await serviceFixture({
+      didaReadAvailable: true,
+      didaTaskWriteAvailable: false,
+      didaContractTestAvailable: true,
+    });
+    const api = serviceApi(service);
+    let contractCreates = 0;
+    let ordinaryCreates = 0;
+    api.getProjects = async () => [];
+    api.createProject = async () => {
+      contractCreates += 1;
+      throw new Error("intentional contract boundary stop");
+    };
+    api.createTask = async () => {
+      ordinaryCreates += 1;
+      throw new Error("ordinary write must not run");
+    };
+
+    const report = await service.runDidaWriteContractTest();
+    expect(report.status).toBe("failed");
+    expect(contractCreates).toBe(1);
+    await expect(service.createTask("blocked", "project-a"))
+      .rejects.toThrow(/暂未开放滴答普通任务写入/);
+    expect(ordinaryCreates).toBe(0);
+  });
+
   it("preserves quick-entry task attributes through the normal create queue", async () => {
     const { service } = await serviceFixture();
     const api = serviceApi(service);
@@ -767,7 +794,11 @@ describe("HelixService contract-test exclusivity", () => {
   });
 });
 
-async function serviceFixture(): Promise<{
+async function serviceFixture(options: {
+  didaReadAvailable?: boolean;
+  didaTaskWriteAvailable?: boolean;
+  didaContractTestAvailable?: boolean;
+} = {}): Promise<{
   service: HelixService;
   secrets: HelixSecretStore;
   store: HelixDataStore;
@@ -803,14 +834,14 @@ async function serviceFixture(): Promise<{
   const secrets = new HelixSecretStore(app);
   secrets.setDidaToken("initial-contract-token");
   const store = new HelixDataStore(port);
-  const service = new HelixService(store, secrets);
+  const service = new HelixService(store, secrets, options);
   await service.initialize();
   return {
     service,
     secrets,
     store,
     async reload() {
-      const replacement = new HelixService(new HelixDataStore(port), secrets);
+      const replacement = new HelixService(new HelixDataStore(port), secrets, options);
       await replacement.initialize();
       return replacement;
     },

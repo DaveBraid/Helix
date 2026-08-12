@@ -224,6 +224,27 @@ describe("DidaTaskAdapter", () => {
     expect(taskCreatePayload(value)).not.toHaveProperty("columnName");
     expect(taskUpdatePayload(value)).not.toHaveProperty("columnName");
   });
+  it("emits parentId only behind the verified parenting capability", () => {
+    const child = { ...desiredTask(0), parentId: "parent-1" };
+    expect(taskCreatePayload(child)).not.toHaveProperty("parentId");
+    expect(taskCreatePayload(child, { taskParentingVerified: true })).toMatchObject({
+      parentId: "parent-1",
+    });
+    expect(taskUpdatePayload(child, {}, ["parentId"])).toEqual({
+      id: child.id,
+      projectId: child.projectId,
+    });
+    expect(taskUpdatePayload(child, { taskParentingVerified: true }, ["parentId"])).toEqual({
+      id: child.id,
+      projectId: child.projectId,
+      parentId: "parent-1",
+    });
+    expect(taskUpdatePayload(
+      { ...child, parentId: null },
+      { taskParentingVerified: true },
+      ["parentId"],
+    )).toEqual({ id: child.id, projectId: child.projectId, parentId: "" });
+  });
   it("emits minimal status=0 only for an explicitly selected verified reopen", () => {
     const open = desiredTask(0);
     expect(taskUpdatePayload(open, {}, ["status"])).toEqual({

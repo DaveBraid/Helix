@@ -3,7 +3,7 @@ import type { DidaTask } from "./entities";
 export type TaskScheduleMode = "unknown" | "point" | "duration";
 export type TaskScheduleEditorMode = "point" | "duration" | "locked-duration";
 /** 写入合同的唯一权威版本；版本变化必须使旧能力缓存失效为只读。 */
-export const DIDA_CONTRACT_PROBE_VERSION = 8;
+export const DIDA_CONTRACT_PROBE_VERSION = 9;
 
 export function validateTaskScheduleWrite(
   task: Pick<DidaTask, "startDate" | "dueDate" | "timeZone" | "isAllDay">,

@@ -494,7 +494,7 @@ describe("HelixService runtime recovery", () => {
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
     });
-    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 8.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 9.*本次插件运行尚未执行合同测试/);
     expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
   });
 

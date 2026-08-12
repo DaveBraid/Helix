@@ -105,6 +105,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     const verified = this.writeCapabilities();
     const writeFields = new Set(context?.writeFields ?? []);
     const changedCapabilities: DidaTaskWriteCapabilities = {
+      taskParentingVerified: verified.taskParentingVerified === true && writeFields.has("parentId"),
       reminderWriteVerified: verified.reminderWriteVerified === true && writeFields.has("reminders"),
       repeatWriteVerified: verified.repeatWriteVerified === true && writeFields.has("repeatFlag"),
       itemsRoundTripVerified: verified.itemsRoundTripVerified === true && writeFields.has("items"),
@@ -223,6 +224,7 @@ function isNotFound(error: unknown): boolean {
 
 export interface DidaTaskWriteCapabilities {
   taskCrudVerified?: boolean;
+  taskParentingVerified?: boolean;
   reminderWriteVerified?: boolean;
   repeatWriteVerified?: boolean;
   itemsRoundTripVerified?: boolean;
@@ -259,6 +261,9 @@ export function taskCreatePayload(
       : {}),
     ...(capabilities.boardPlacementVerified && Object.hasOwn(value, "columnId")
       ? { columnId: value.columnId }
+      : {}),
+    ...(capabilities.taskParentingVerified && typeof value.parentId === "string" && value.parentId
+      ? { parentId: value.parentId }
       : {}),
   };
 }
@@ -305,6 +310,9 @@ export function taskUpdatePayload(
       : {}),
     ...(writeFields.has("status") && capabilities.taskReopenVerified && value.status === 0
       ? { status: 0 }
+      : {}),
+    ...(writeFields.has("parentId") && capabilities.taskParentingVerified
+      ? { parentId: value.parentId ?? "" }
       : {}),
   };
 }

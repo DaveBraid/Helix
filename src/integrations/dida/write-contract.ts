@@ -64,6 +64,7 @@ export interface DidaWriteContractReport {
   boardPlacementVerified: boolean;
   columnCreateVerified: boolean;
   taskCrudVerified: boolean;
+  taskParentingVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   itemsRoundTripVerified: boolean;
@@ -142,6 +143,7 @@ export class DidaWriteContractRunner {
   private boardPlacementVerified = false;
   private columnCreateVerified = false;
   private taskCrudVerified = false;
+  private taskParentingVerified = false;
   private reminderWriteVerified = false;
   private repeatWriteVerified = false;
   private itemsRoundTripVerified = false;
@@ -175,6 +177,7 @@ export class DidaWriteContractRunner {
     this.boardPlacementVerified = false;
     this.columnCreateVerified = false;
     this.taskCrudVerified = false;
+    this.taskParentingVerified = false;
     this.reminderWriteVerified = false;
     this.repeatWriteVerified = false;
     this.itemsRoundTripVerified = false;
@@ -443,6 +446,75 @@ export class DidaWriteContractRunner {
       steps.push(this.repeatWriteVerified
         ? "独立写入并清空每日重复规则"
         : "当前账号未通过重复规则写入合同，保持生产只读");
+
+      this.beginStage("独立验证真实子任务父子关系");
+      try {
+        let createdChild: DidaTask;
+        try {
+          createdChild = normalizeTask(await this.api.createTask(taskCreatePayload({
+            id: "local-contract-child",
+            projectId: projectA.id,
+            parentId: created.id,
+            title: `${marker} 子任务能力任务`,
+            content: `${marker} parenting-probe`,
+            priority: 0,
+            status: 0,
+          }, { taskParentingVerified: true })));
+        } catch (error) {
+          if (isUnknownRemoteOutcome(error)) {
+            this.untrackedCreateOutcome = true;
+            await this.cleanupCheckpoint();
+          }
+          throw error;
+        }
+        childTask = {
+          id: createdChild.id,
+          projectId: projectA.id,
+          candidateProjectIds: [projectA.id],
+          state: "open",
+        };
+        await this.cleanupCheckpoint();
+        this.assertTaskIdentity(createdChild, createdChild.id, projectA.id, marker);
+        const attached = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
+        this.assertTaskIdentity(attached, createdChild.id, projectA.id, marker);
+        if (attached.parentId !== created.id) throw new Error("子任务创建后 parentId 未指向测试父任务");
+
+        const detached = await this.updateAndVerifyTaskProperties(
+          createdChild.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...attached, parentId: null }, { taskParentingVerified: true }, ["parentId"]),
+          (reread) => {
+            if (reread.parentId !== null || !sameDidaTaskExcept(attached, reread, ["parentId"])) {
+              throw new Error("解除父子关系后 parentId 或其他任务字段不一致");
+            }
+          },
+        );
+        await this.updateAndVerifyTaskProperties(
+          createdChild.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...detached, parentId: created.id }, { taskParentingVerified: true }, ["parentId"]),
+          (reread) => {
+            if (reread.parentId !== created.id || !sameDidaTaskExcept(detached, reread, ["parentId"])) {
+              throw new Error("重新挂接父任务后 parentId 或其他任务字段不一致");
+            }
+          },
+        );
+        this.taskParentingVerified = true;
+        steps.push("创建真实子任务并验证解除、重新挂接父任务");
+      } catch (error) {
+        if (this.untrackedCreateOutcome || isUnprovenRemoteOutcome(error)) throw error;
+        this.taskParentingVerified = false;
+        capabilityFailures.push(capabilityFailureSummary("taskParenting"));
+        steps.push("当前账号未通过真实子任务父子关系合同，项目行动投影保持关闭");
+      } finally {
+        if (childTask) {
+          await this.cleanupTask(childTask, marker);
+          childTask = null;
+          await this.cleanupCheckpoint();
+        }
+      }
 
       this.beginStage("验证父任务检查项往返与 ID 稳定性");
       const parentTask = await this.createCapabilityTask(
@@ -802,6 +874,7 @@ export class DidaWriteContractRunner {
       columnCreateVerified: this.columnCreateVerified &&
         cleanupErrors.length === 0 && !this.untrackedCreateOutcome,
       taskCrudVerified: this.taskCrudVerified,
+      taskParentingVerified: this.taskParentingVerified,
       reminderWriteVerified: this.reminderWriteVerified,
       repeatWriteVerified: this.repeatWriteVerified,
       itemsRoundTripVerified: this.itemsRoundTripVerified,
@@ -1634,7 +1707,7 @@ function isUnprovenRemoteOutcome(error: unknown): boolean {
 }
 
 function capabilityFailureSummary(
-  capability: "reminders" | "repeatFlag" | "items" | "boardPlacement" | "taskReopen",
+  capability: "reminders" | "repeatFlag" | "items" | "boardPlacement" | "taskReopen" | "taskParenting",
 ): string {
   const name = {
     reminders: "提醒",
@@ -1642,6 +1715,7 @@ function capabilityFailureSummary(
     items: "检查项",
     boardPlacement: "看板归栏",
     taskReopen: "任务重开",
+    taskParenting: "真实子任务",
   }[capability];
   return `${name}：未通过写入合同，保持只读`;
 }

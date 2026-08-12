@@ -126,6 +126,7 @@ export interface HelixPersistedData {
     boardPlacementVerified?: boolean;
     columnCreateVerified?: boolean;
     taskCrudVerified?: boolean;
+    taskParentingVerified?: boolean;
     reminderWriteVerified?: boolean;
     repeatWriteVerified?: boolean;
     itemsRoundTripVerified?: boolean;
@@ -374,6 +375,7 @@ function validateDidaContractCapabilities(
       "boardPlacementVerified",
       "columnCreateVerified",
       "taskCrudVerified",
+      "taskParentingVerified",
       "reminderWriteVerified",
       "repeatWriteVerified",
       "itemsRoundTripVerified",
@@ -391,6 +393,7 @@ function validateDidaContractCapabilities(
     boardPlacementVerified: record.boardPlacementVerified === true,
     columnCreateVerified: record.columnCreateVerified === true,
     taskCrudVerified: record.taskCrudVerified === true,
+    taskParentingVerified: record.taskParentingVerified === true,
     reminderWriteVerified: record.reminderWriteVerified === true,
     repeatWriteVerified: record.repeatWriteVerified === true,
     itemsRoundTripVerified: record.itemsRoundTripVerified === true,

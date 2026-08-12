@@ -682,6 +682,7 @@ describe("HelixDataStore serialization", () => {
       boardPlacementVerified: true,
       columnCreateVerified: false,
       taskCrudVerified: false,
+      taskParentingVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,

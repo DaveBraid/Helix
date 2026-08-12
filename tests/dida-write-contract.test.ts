@@ -62,6 +62,7 @@ class ContractApiFake {
   rejectRepeatWrites: false | string = false;
   advanceEtimestampOnUpdate = false;
   rejectParentCreate: false | string = false;
+  rejectParentingWrites: false | string = false;
   addChecklistServerDefaults = false;
   corruptSentinelStatus = false;
   sentinelMutation?: "parent-fields" | "kind" | "count" | "id-not-preserved" | "semantics";
@@ -323,8 +324,8 @@ class ContractApiFake {
   async createTask(
     value: Partial<DidaTask> & Pick<DidaTask, "title" | "projectId">,
   ): Promise<DidaTask> {
-    if (this.rejectParentCreate && value.parentId) {
-      throw new DidaHttpError("permanent", this.rejectParentCreate, 400);
+    if (this.rejectParentingWrites && value.parentId) {
+      throw new DidaHttpError("permanent", this.rejectParentingWrites, 400);
     }
     const task: DidaTask = {
       ...value,
@@ -738,9 +739,12 @@ describe("DidaWriteContractRunner", () => {
     }));
     expect(api.updatePayloads).toContainEqual(expect.objectContaining({ repeatFlag: null }));
     expect(api.updatePayloads.filter((payload) => Object.hasOwn(payload, "items"))).toHaveLength(5);
-    expect(api.updatePayloads.some((payload) => Object.hasOwn(payload, "parentId"))).toBe(false);
+    expect(api.updatePayloads.filter((payload) => Object.hasOwn(payload, "parentId"))).toEqual([
+      { id: "test-task-4", projectId: "test-project-1", parentId: "" },
+      { id: "test-task-4", projectId: "test-project-1", parentId: "test-task-1" },
+    ]);
     expect(api.updatePayloads.filter((payload) => Object.hasOwn(payload, "status"))).toEqual([{
-      id: "test-task-6",
+      id: "test-task-7",
       projectId: "test-project-1",
       status: 0,
     }]);
@@ -750,7 +754,7 @@ describe("DidaWriteContractRunner", () => {
     expect(api.projects.get("original-project")?.name).toBe("用户原有清单");
     expect(api.tasks.get("original-task")?.title).toBe("用户原有任务");
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
   });
@@ -1014,7 +1018,7 @@ describe("DidaWriteContractRunner", () => {
     expect(latest).toBeUndefined();
   });
 
-  it("keeps the successful contract at the recorded 110-call local-fake upper bound", async () => {
+  it("keeps the successful contract at the recorded 122-call local-fake upper bound", async () => {
     const api = new ContractApiFake();
     let calls = 0;
     const counted = new Proxy(api, {
@@ -1036,7 +1040,7 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report.status).toBe("passed");
     // 此数只记录无传输重试的本地合同假体调用；不推断真实服务的分钟配额。
-    expect(calls).toBeLessThanOrEqual(112);
+    expect(calls).toBeLessThanOrEqual(122);
   });
 
   it("creates and renames uniquely marked columns when a new board has none", async () => {
@@ -1191,7 +1195,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.taskCrudVerified).toBe(true);
     expect(report.capabilityFailures).toEqual(["检查项：未通过写入合同，保持只读"]);
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
   });
 
@@ -1199,6 +1203,7 @@ describe("DidaWriteContractRunner", () => {
     ["提醒", "提醒远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectReminderWrites = secret; }],
     ["重复规则", "重复规则远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectRepeatWrites = secret; }],
     ["检查项", "检查项远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectParentCreate = secret; }],
+    ["真实子任务", "子任务远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectParentingWrites = secret; }],
     ["看板归栏", "看板归栏远端秘密正文", (api: ContractApiFake, secret: string) => { api.rejectPlacementWrites = secret; }],
   ])("uses only a fixed settings-visible summary for a safely rejected %s capability", async (
     capability,
@@ -1261,7 +1266,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
   });
 
   it("classifies a server-collapsed schedule as point mode and completes the core contract", async () => {
@@ -1281,7 +1286,7 @@ describe("DidaWriteContractRunner", () => {
     });
     expect(report.steps.join(" ")).toMatch(/单点任务时间/);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
   });
 
   it("treats server-managed etimestamp changes as metadata across all field probes", async () => {
@@ -1319,7 +1324,7 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(report.steps.join(" ")).toMatch(/未重发.*精确复读已证明字段生效/);
-    expect(api.updateCalls).toBe(12);
+    expect(api.updateCalls).toBe(14);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 
@@ -1333,7 +1338,7 @@ describe("DidaWriteContractRunner", () => {
 
     expect(report.status).toBe("passed");
     expect(api.updatePayloads.find((payload) => "columnId" in payload)).toEqual({
-      id: "test-task-5",
+      id: "test-task-6",
       projectId: "test-project-1",
       columnId: "test-project-1-doing",
     });
@@ -1696,7 +1701,7 @@ describe("DidaWriteContractRunner", () => {
       "移动响应未知；未重发，目标清单精确复读且来源清单确认移出",
     );
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
     expect(api.sourceTombstoneReads).toBe(0);
@@ -1717,7 +1722,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.remoteArtifactsRemaining).toBe(true);
     expect(report.cleanupErrors.join(" ")).toMatch(/停止自动清理/);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6"]);
     expect(api.deletedProjects).toEqual([]);
     expect(report.manualCleanupRequired).toMatchObject({
       taskId: "test-task-1",
@@ -1740,7 +1745,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.remoteArtifactsRemaining).toBe(false);
     expect(report.manualCleanupRequired).toBeUndefined();
     expect(api.moveCalls).toBe(1);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("test-task-1")).toBe(false);
   });
@@ -1923,7 +1928,7 @@ describe("DidaWriteContractRunner", () => {
     expect(report.status).toBe("failed");
     expect(report.failure).toMatch(/complete unknown/);
     expect(report.remoteArtifactsRemaining).toBe(false);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1"]);
     expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
@@ -1986,7 +1991,7 @@ describe("DidaWriteContractRunner", () => {
     expect(api.projects.has("test-project-2")).toBe(true);
     expect(api.tasks.get("foreign-task")?.title).toBe("用户意外放入的任务");
     expect(api.deletedProjects).toEqual(["test-project-1"]);
-    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-1", "test-task-6"]);
+    expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
     expect(api.tasks.has("original-task")).toBe(true);
   });
 

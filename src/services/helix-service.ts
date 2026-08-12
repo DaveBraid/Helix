@@ -104,6 +104,8 @@ import {
 import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
+// v9 新增真实父子任务三步探针；本地确定性合同为 122 次调用，预留少量协议复读余量。
+const DIDA_CONTRACT_REQUEST_BUDGET = 140;
 
 export interface HelixRuntimeState {
   loading: boolean;
@@ -121,6 +123,7 @@ export interface HelixRuntimeState {
   boardPlacementVerified: boolean;
   columnCreateVerified: boolean;
   taskCrudVerified: boolean;
+  taskParentingVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   itemsRoundTripVerified: boolean;
@@ -173,6 +176,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   boardPlacementVerified: false,
   columnCreateVerified: false,
   taskCrudVerified: false,
+  taskParentingVerified: false,
   reminderWriteVerified: false,
   repeatWriteVerified: false,
   itemsRoundTripVerified: false,
@@ -376,6 +380,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         verifiedCapabilities?.boardPlacementVerified ?? false,
       columnCreateVerified: verifiedCapabilities?.columnCreateVerified ?? false,
       taskCrudVerified: verifiedCapabilities?.taskCrudVerified ?? false,
+      taskParentingVerified: verifiedCapabilities?.taskParentingVerified ?? false,
       reminderWriteVerified: verifiedCapabilities?.reminderWriteVerified ?? false,
       repeatWriteVerified: verifiedCapabilities?.repeatWriteVerified ?? false,
       itemsRoundTripVerified: verifiedCapabilities?.itemsRoundTripVerified ?? false,
@@ -527,6 +532,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         boardPlacementVerified: false,
         columnCreateVerified: false,
         taskCrudVerified: false,
+        taskParentingVerified: false,
         reminderWriteVerified: false,
         repeatWriteVerified: false,
         itemsRoundTripVerified: false,
@@ -868,7 +874,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       const contractApi = this.api.withRequestPolicy({
         timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
         maxAttempts: 1,
-        maxCalls: 120,
+        maxCalls: DIDA_CONTRACT_REQUEST_BUDGET,
       });
       const cleanupApi = this.api.withRequestPolicy({
         timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
@@ -946,6 +952,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         const contractArtifactsClean = !report.remoteArtifactsRemaining;
         const columnCreateVerified = report.columnCreateVerified && contractArtifactsClean;
         const taskCrudVerified = report.taskCrudVerified && contractArtifactsClean;
+        const taskParentingVerified = report.taskParentingVerified && contractArtifactsClean;
         const reminderWriteVerified = report.reminderWriteVerified && contractArtifactsClean;
         const repeatWriteVerified = report.repeatWriteVerified && contractArtifactsClean;
         const itemsRoundTripVerified = report.itemsRoundTripVerified && contractArtifactsClean;
@@ -959,6 +966,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
             boardPlacementVerified,
             columnCreateVerified,
             taskCrudVerified,
+            taskParentingVerified,
             reminderWriteVerified,
             repeatWriteVerified,
             itemsRoundTripVerified,
@@ -972,6 +980,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           boardPlacementVerified,
           columnCreateVerified,
           taskCrudVerified,
+          taskParentingVerified,
           reminderWriteVerified,
           repeatWriteVerified,
           itemsRoundTripVerified,
@@ -1069,6 +1078,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       boardPlacementVerified: false,
       columnCreateVerified: false,
       taskCrudVerified: false,
+      taskParentingVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
@@ -1086,6 +1096,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     return [
       `合同版本 ${DIDA_CONTRACT_PROBE_VERSION}`,
       capability("基础任务：", this.state.taskCrudVerified),
+      capability("真实子任务：", this.state.taskParentingVerified),
       capability("提醒：", this.state.reminderWriteVerified),
       capability("重复：", this.state.repeatWriteVerified),
       capability("检查项：", this.state.itemsRoundTripVerified),

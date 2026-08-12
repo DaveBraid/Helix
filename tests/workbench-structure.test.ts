@@ -370,8 +370,8 @@ describe("workbench layout and navigation structure", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const capabilities = readFileSync(resolve(process.cwd(), "src/release-capabilities.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(capabilities).toContain("export const DIDA_READ_AVAILABLE = true");
     for (const capability of [
-      "DIDA_READ_AVAILABLE",
       "DIDA_TASK_WRITE_AVAILABLE",
       "DIDA_CONTRACT_TEST_AVAILABLE",
       "PROJECT_DIDA_PROJECTION_AVAILABLE",

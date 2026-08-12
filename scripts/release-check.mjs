@@ -43,8 +43,10 @@ if (versions[manifest.version] !== manifest.minAppVersion) {
 if (!manifest.isDesktopOnly) {
   throw new Error("当前桌面阶段必须保持 isDesktopOnly=true");
 }
+if (!releaseCapabilities.includes("export const DIDA_READ_AVAILABLE = true")) {
+  throw new Error("当前开发基线必须开放滴答只读门禁");
+}
 for (const capability of [
-  "DIDA_READ_AVAILABLE",
   "DIDA_TASK_WRITE_AVAILABLE",
   "DIDA_CONTRACT_TEST_AVAILABLE",
   "PROJECT_DIDA_PROJECTION_AVAILABLE",

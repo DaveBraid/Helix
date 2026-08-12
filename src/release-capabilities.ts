@@ -1,5 +1,5 @@
 /** 滴答远端只读能力；独立于任何写入门禁。 */
-export const DIDA_READ_AVAILABLE = false;
+export const DIDA_READ_AVAILABLE = true;
 
 /** 普通滴答清单／任务写入；只读开放时仍可保持关闭。 */
 export const DIDA_TASK_WRITE_AVAILABLE = false;

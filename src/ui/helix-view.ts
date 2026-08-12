@@ -570,7 +570,7 @@ export class HelixView extends ItemView {
         ? "正在同步"
         : this.state?.connected
         ? this.state.syncWarnings.length > 0
-          ? "滴答已连接 · 部分数据待恢复"
+          ? "滴答已连接 · 部分数据暂不可用"
           : "滴答已连接"
         : (this.localProjectTaskSnapshot?.destinations.length ?? 0) > 0
           ? "本地模式"

@@ -2608,7 +2608,7 @@ describe("HelixService runtime recovery", () => {
     }]);
   });
 
-  it("keeps disabled projection operations untouched while draining ordinary tasks", async () => {
+  it("permanently quarantines legacy item projection while ordinary tasks keep draining", async () => {
     const data = createDefaultData("device-projection-single-flight");
     grantTaskCrud(data);
     data.didaContractCapabilities!.taskReopenVerified = true;
@@ -2630,7 +2630,7 @@ describe("HelixService runtime recovery", () => {
     };
     const projectionSnapshot = createSnapshot("task", projection.id, projection);
     data.queue = [{
-      id: "op-projection-disabled",
+      id: "op-projection-item-disabled",
       kind: "task",
       entityId: ordinary.id,
       projectId: projection.projectId,
@@ -2642,6 +2642,7 @@ describe("HelixService runtime recovery", () => {
       idempotencyFingerprint: "helix-action:project-a:stage-a:uuid-b",
       base: ordinarySnapshot,
       local: projectionSnapshot,
+      writeFields: ["items"],
     }, {
       id: "op-ordinary",
       kind: "task",
@@ -2677,7 +2678,7 @@ describe("HelixService runtime recovery", () => {
 
     expect(processed).toEqual(["op-ordinary"]);
     expect(persisted.queue).toEqual([expect.objectContaining({
-      id: "op-projection-disabled",
+      id: "op-projection-item-disabled",
       status: "pending",
       attempts: 0,
     })]);
@@ -2685,15 +2686,29 @@ describe("HelixService runtime recovery", () => {
       draft.queue[0]!.status = "failed";
       draft.queue[0]!.lastError = "historic projection failure";
     });
-    await expect(service.retryFailedOperation("op-projection-disabled"))
-      .rejects.toThrow(/正式版暂未开放/);
+    await expect(service.retryFailedOperation("op-projection-item-disabled"))
+      .rejects.toThrow(/旧版项目同步记录仅供查看/);
     expect(persisted.queue[0]).toMatchObject({
-      id: "op-projection-disabled",
+      id: "op-projection-item-disabled",
       status: "failed",
       attempts: 0,
       lastError: "historic projection failure",
     });
     expect(processed).toEqual(["op-ordinary"]);
+
+    await store.mutate((draft) => { draft.queue[0]!.status = "pending"; });
+    const enabled = new HelixService(store, { getDidaToken: () => "token" } as HelixSecretStore, {
+      projectDidaProjectionAvailable: true,
+    });
+    await enabled.initialize();
+    Object.defineProperty(enabled, "taskEngine", {
+      value: { async process(operation: SyncQueueOperation<DidaTask>) { processed.push(operation.id); } },
+    });
+    await (enabled as unknown as { drainQueue(): Promise<void> }).drainQueue();
+    expect(processed).toEqual(["op-ordinary"]);
+    expect(persisted.queue[0]).toMatchObject({
+      id: "op-projection-item-disabled", status: "pending", attempts: 0,
+    });
   });
 
   it("recovers a verified projection receipt only from a matching Base snapshot", async () => {

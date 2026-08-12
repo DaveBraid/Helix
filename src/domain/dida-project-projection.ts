@@ -111,8 +111,17 @@ export interface ProjectionLedgerEntry {
   targetProjectId: string;
   targetColumnId: string;
   remoteId?: string;
+  /** 缺失表示 1.0.1 及以前的历史 items 映射，只允许诊断，不得按 Task 写入。 */
+  remoteEntity?: "task" | "item";
   title: string;
   state: ProjectionActionState;
+  content?: string;
+  startDate?: string;
+  dueDate?: string;
+  timeZone?: string;
+  isAllDay?: boolean;
+  priority?: 0 | 1 | 3 | 5;
+  tags?: string[];
   sourceHash: string;
   tombstone?: boolean;
   frozen?: ProjectionFreezeReason;
@@ -160,10 +169,13 @@ export type ProjectionIntent =
   | { kind: "recover-action"; entry: ProjectionLedgerEntry }
   | { kind: "reconcile-delete"; entry: ProjectionLedgerEntry }
   | { kind: "freeze-action"; entry: ProjectionLedgerEntry; reason: ProjectionFreezeReason }
-  | { kind: "update-action"; entry: ProjectionLedgerEntry; writeFields: Array<"title" | "status"> }
+  | { kind: "update-action"; entry: ProjectionLedgerEntry; writeFields: ProjectionTaskWriteField[] }
   | { kind: "complete-action"; entry: ProjectionLedgerEntry }
   | { kind: "reopen-action"; entry: ProjectionLedgerEntry }
   | { kind: "delete-action"; entry: ProjectionLedgerEntry };
+
+export type ProjectionTaskWriteField =
+  | "title" | "status" | "desc" | "startDate" | "dueDate" | "timeZone" | "isAllDay" | "priority" | "tags";
 
 const ACTION_MARKER_V1 = /^<!-- helix-dida-action:v1 uuid=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
 const ACTION_MARKER_V2 = /^<!-- helix-dida-action:v2 uuid=([^ ]+) parent=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
@@ -462,7 +474,7 @@ export function patchManagedPlanAction(markdown: string, input: {
   title?: string;
   state?: ProjectionActionState;
   remoteId?: string | null;
-  content?: string;
+  content?: string | null;
   startDate?: string | null;
   dueDate?: string | null;
   timeZone?: string | null;
@@ -598,8 +610,16 @@ export function buildProjectionLedger(input: {
       targetProjectId: input.target.targetProjectId,
       targetColumnId: input.target.targetColumnId,
       remoteId: action.remoteId,
+      remoteEntity: "task",
       title: action.title,
       state: action.state,
+      content: action.content,
+      startDate: action.startDate,
+      dueDate: action.dueDate,
+      timeZone: action.timeZone,
+      isAllDay: action.isAllDay,
+      priority: action.priority,
+      tags: action.tags ? [...action.tags] : undefined,
       sourceHash: actionSourceHash(action),
     };
   });
@@ -630,7 +650,7 @@ export function planProjectionChanges(
       continue;
     }
     if (!entry.remoteId && old.remoteId) entry.remoteId = old.remoteId;
-    const writeFields: Array<"title" | "status"> = [];
+    const writeFields: ProjectionTaskWriteField[] = [];
     if (old.title !== entry.title) writeFields.push("title");
     if (old.state === "completed" && entry.state !== "completed") {
       if (!options.taskReopenVerified) {
@@ -640,6 +660,13 @@ export function planProjectionChanges(
       writeFields.push("status");
     }
     if (old.state !== "completed" && entry.state === "completed") writeFields.push("status");
+    if (old.content !== entry.content) writeFields.push("desc");
+    if (old.startDate !== entry.startDate) writeFields.push("startDate");
+    if (old.dueDate !== entry.dueDate) writeFields.push("dueDate");
+    if (old.timeZone !== entry.timeZone) writeFields.push("timeZone");
+    if (old.isAllDay !== entry.isAllDay) writeFields.push("isAllDay");
+    if (old.priority !== entry.priority) writeFields.push("priority");
+    if (stableHash(old.tags) !== stableHash(entry.tags)) writeFields.push("tags");
     if (writeFields.length > 0) intents.push({ kind: "update-action", entry, writeFields });
   }
   for (const [uuid, old] of before) {
@@ -655,16 +682,31 @@ export function verifyProjectedTask(
   task: DidaTask,
   entry: ProjectionLedgerEntry,
   marker: string,
-  options: { title?: boolean; state?: boolean } = {},
+  options: { title?: boolean; state?: boolean; attributes?: boolean } = {},
 ): void {
   const verifyTitle = options.title ?? true;
   const verifyState = options.state ?? true;
+  const verifyAttributes = options.attributes ?? true;
   if (!entry.remoteId || task.id !== entry.remoteId || task.projectId !== entry.targetProjectId ||
     task.parentId !== entry.parentTaskId || task.columnId !== entry.targetColumnId ||
     task.content !== marker || (verifyTitle && task.title !== entry.title) ||
-    (verifyState && (entry.state === "completed" ? task.status !== 2 : task.status === 2))) {
+    (verifyState && (entry.state === "completed" ? task.status !== 2 : task.status === 2)) ||
+    (verifyAttributes && !sameProjectionTaskAttributes(task, entry))) {
     throw new Error("远端任务身份、父级、清单、分栏、标题、状态或唯一标记复读不一致");
   }
+}
+
+function sameProjectionTaskAttributes(task: DidaTask, entry: ProjectionLedgerEntry): boolean {
+  const optional = (value: string | null | undefined) => value?.trim() || undefined;
+  const tags = (value: string[] | undefined) => [...new Set((value ?? [])
+    .map((tag) => tag.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+  return optional(task.desc) === optional(entry.content) &&
+    optional(task.startDate) === optional(entry.startDate) &&
+    optional(task.dueDate) === optional(entry.dueDate) &&
+    optional(task.timeZone) === optional(entry.timeZone) &&
+    Boolean(task.isAllDay) === Boolean(entry.isAllDay) &&
+    (task.priority ?? 0) === (entry.priority ?? 0) &&
+    stableHash(tags(task.tags)) === stableHash(tags(entry.tags));
 }
 
 /**
@@ -915,8 +957,9 @@ function decodeMarkerValue(value: string, label: string): string {
   } catch { throw new Error(`${label}编码无效`); }
 }
 
-function actionSourceHash(action: Pick<ManagedPlanAction, "uuid" | "title" | "state" | "remoteId">): string {
-  return stableHash({ uuid: action.uuid, title: action.title, state: action.state, remoteId: action.remoteId });
+function actionSourceHash(action: ManagedPlanAction): string {
+  const { line: _line, ...source } = action;
+  return stableHash(source);
 }
 
 function uniqueLedger(entries: ProjectionLedgerEntry[]): Map<string, ProjectionLedgerEntry> {
@@ -931,7 +974,7 @@ function uniqueLedger(entries: ProjectionLedgerEntry[]): Map<string, ProjectionL
 function sameProjectionIdentity(left: ProjectionLedgerEntry, right: ProjectionLedgerEntry): boolean {
   return left.projectId === right.projectId && left.stageId === right.stageId &&
     left.parentTaskId === right.parentTaskId && left.targetProjectId === right.targetProjectId &&
-    left.targetColumnId === right.targetColumnId &&
+    left.targetColumnId === right.targetColumnId && left.remoteEntity === right.remoteEntity &&
     (!left.remoteId || !right.remoteId || left.remoteId === right.remoteId);
 }
 

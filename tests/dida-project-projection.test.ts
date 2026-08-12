@@ -459,11 +459,9 @@ class MemoryDiagnostics implements ProjectionDiagnosticsPort {
         clientIdentity: "test-client",
         projectId: this.value.resolvedTask?.projectId ?? "list-1",
         operationId,
-        marker: resolvedIsParent
-          ? this.value.resolvedTask!.content!
-          : "helix-project-projection:project-1",
+        marker: this.value.resolvedTask?.content ?? "helix-project-projection:project-1",
         outcome: "unknown" as const,
-        remoteTaskId: resolvedIsParent ? this.value.resolvedTask?.id : "parent-1",
+        remoteTaskId: this.value.resolvedTask?.id ?? (resolvedIsParent ? undefined : "parent-1"),
         ...this.value.receiptOverride,
       },
       resolutionAudit: conflictId && this.value.resolvedTask ? {
@@ -547,6 +545,7 @@ class FakePipeline implements ProjectionTaskPipeline {
   stagedConflicts = 0;
   stagedBases: DidaTask[] = [];
   regenerateChecklistIdsEveryUpdate = false;
+  stripBoardFromReceipts = false;
   async createTask(task: DidaTask, clientIdentity: string): Promise<ProjectionWriteReceipt> {
     this.created.push(structuredClone(task));
     await this.onCreate?.(task);
@@ -558,10 +557,12 @@ class FakePipeline implements ProjectionTaskPipeline {
     }
     const remote = { ...task, id: `remote-${this.created.length}` };
     this.tasks.set(remote.id, remote);
+    const receiptTask = structuredClone(remote);
+    if (this.stripBoardFromReceipts) delete receiptTask.columnId;
     const receipt: ProjectionWriteReceipt = {
       operationId: `op-${++this.operationSequence}`,
       outcome: "verified",
-      task: structuredClone(remote),
+      task: receiptTask,
     };
     this.receipts.set(clientIdentity, receipt);
     this.afterCreate?.(structuredClone(remote));
@@ -607,7 +608,9 @@ class FakePipeline implements ProjectionTaskPipeline {
       return operationId ? { ...result, operationId } : result;
     }
     this.tasks.set(task.id, structuredClone(task));
-    return { operationId: operationId ?? `op-${++this.operationSequence}`, outcome: "verified", task: structuredClone(task) };
+    const receiptTask = structuredClone(task);
+    if (this.stripBoardFromReceipts) delete receiptTask.columnId;
+    return { operationId: operationId ?? `op-${++this.operationSequence}`, outcome: "verified", task: receiptTask };
   }
   async stageItemsConflict(_local: DidaTask, _remote: DidaTask, base: DidaTask, _operationId: string): Promise<ProjectionWriteReceipt> {
     this.stagedConflicts += 1;
@@ -689,6 +692,18 @@ describe("DidaProjectProjectionService with real child tasks", () => {
     });
   });
 
+  it("uses an exact post-write reread when ordinary task receipts omit board placement", async () => {
+    const harness = makeHarness(true);
+    harness.pipeline.stripBoardFromReceipts = true;
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ createdParents: 1, createdActions: 1, frozen: [] });
+    expect(harness.state.value.ledger[0]).toMatchObject({ remoteId: "remote-2", remoteEntity: "task" });
+    expect(harness.pipeline.rereads.get("remote-1")).toBeGreaterThan(0);
+    expect(harness.pipeline.rereads.get("remote-2")).toBeGreaterThan(0);
+  });
+
   it("updates title and completion through the shared task pipeline", async () => {
     const harness = makeHarness(true, false, true);
     await harness.service.synchronizeProject(input());
@@ -705,6 +720,73 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       parentId: "remote-1",
       content: projectionMarker("uuid-1"),
     });
+  });
+
+  it("projects note, schedule, priority and tags through ordinary task fields", async () => {
+    const harness = makeHarness(true);
+    harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), {
+      uuid: "uuid-1",
+      content: "验证数据处理流程",
+      startDate: "2026-08-15T09:30:00.000+08:00",
+      dueDate: "2026-08-15T16:00:00.000+08:00",
+      timeZone: "Asia/Shanghai",
+      priority: 5,
+      tags: ["科研", "论文"],
+    }));
+
+    await harness.service.synchronizeProject(input());
+
+    expect(harness.pipeline.tasks.get("remote-2")).toMatchObject({
+      content: projectionMarker("uuid-1"),
+      desc: "验证数据处理流程",
+      startDate: "2026-08-15T09:30:00.000+08:00",
+      dueDate: "2026-08-15T16:00:00.000+08:00",
+      timeZone: "Asia/Shanghai",
+      priority: 5,
+      tags: ["科研", "论文"],
+    });
+    expect(harness.state.value.ledger[0]).toMatchObject({
+      content: "验证数据处理流程", priority: 5, tags: ["科研", "论文"], remoteEntity: "task",
+    });
+  });
+
+  it("clears optional task attributes explicitly without changing the identity marker", async () => {
+    const harness = makeHarness(true);
+    harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), {
+      uuid: "uuid-1", content: "旧备注", priority: 3, tags: ["旧标签"],
+    }));
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), {
+      uuid: "uuid-1", content: null, priority: 0, tags: [],
+    }));
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ updatedActions: 1, frozen: [] });
+    expect(harness.pipeline.tasks.get("remote-2")).toMatchObject({
+      content: projectionMarker("uuid-1"),
+    });
+    expect(harness.pipeline.tasks.get("remote-2")?.priority ?? 0).toBe(0);
+    expect(harness.pipeline.tasks.get("remote-2")?.tags ?? []).toEqual([]);
+    expect(harness.pipeline.tasks.get("remote-2")?.desc).toBeUndefined();
+  });
+
+  it("stages metadata competition against the projection ledger Base", async () => {
+    const harness = makeHarness(true);
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", content: "原备注" },
+    ));
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.tasks.set("remote-2", { ...harness.pipeline.tasks.get("remote-2")!, desc: "远端备注" });
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", content: "本地备注" },
+    ));
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary.frozen).toContainEqual(expect.objectContaining({ uuid: "uuid-1", reason: "conflict" }));
+    expect(harness.pipeline.stagedBases[0]).toMatchObject({ desc: "原备注" });
+    expect(harness.pipeline.tasks.get("remote-2")?.desc).toBe("远端备注");
   });
 
   it("reopens a completed child only when the reopen contract is verified", async () => {
@@ -808,5 +890,99 @@ describe("DidaProjectProjectionService with real child tasks", () => {
     await harness.service.synchronizeProject(input());
 
     expect(harness.state.value.ledger.find((entry) => entry.uuid === "other")).toEqual(other);
+  });
+
+  it("freezes a legacy items mapping instead of treating its remote id as a task", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    delete harness.state.value.ledger[0]!.remoteEntity;
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", title: "不得写入" },
+    ));
+    const writes = harness.pipeline.updated.length;
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary.frozen).toContainEqual(expect.objectContaining({ uuid: "uuid-1", reason: "identity-mismatch" }));
+    expect(harness.pipeline.updated).toHaveLength(writes);
+  });
+
+  it("read-only reconciles an applied unknown child update without resending", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", title: "已在远端生效" },
+    ));
+    harness.pipeline.nextResult = { operationId: "op-child-update-unknown", outcome: "unknown", message: "timeout" };
+    await harness.service.synchronizeProject(input());
+    const frozen = harness.state.value.ledger[0]!;
+    harness.pipeline.tasks.set(frozen.remoteId!, {
+      ...harness.pipeline.tasks.get(frozen.remoteId!)!,
+      title: frozen.title,
+    });
+    const diagnostics = new MemoryDiagnostics({
+      operationId: frozen.operationId!,
+      blocked: false,
+      resolvedTask: harness.pipeline.tasks.get(frozen.remoteId!),
+    });
+    const writes = harness.pipeline.updated.length;
+    const recovered = projectionHarnessWithDiagnostics(harness.state, harness.pipeline, diagnostics);
+
+    await recovered.service.reconcileFrozen(reconcileAction(frozen));
+
+    expect(harness.pipeline.updated).toHaveLength(writes);
+    expect(harness.state.value.ledger[0]).toMatchObject({ title: "已在远端生效", remoteEntity: "task" });
+    expect(harness.state.value.ledger[0]).not.toHaveProperty("frozen");
+    expect(diagnostics.removed).toEqual([frozen.operationId]);
+  });
+
+  it("clears an unknown child deletion only after exact absence is proven", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", harness.markdown.content("Stage.md")
+      .split(/\r?\n/u).filter((line) => !line.includes("uuid=uuid-1 ")).join("\n"));
+    harness.pipeline.nextDeleteResult = {
+      operationId: "op-child-delete-unknown", outcome: "unknown", message: "timeout",
+    };
+    await harness.service.synchronizeProject(input());
+    const frozen = harness.state.value.ledger[0]!;
+    harness.pipeline.tasks.delete(frozen.remoteId!);
+    const diagnostics = new MemoryDiagnostics({
+      operationId: frozen.operationId!, blocked: false, receiptPresent: true,
+      receiptOverride: {
+        marker: projectionMarker(frozen.uuid),
+        remoteTaskId: frozen.remoteId,
+      },
+    });
+    const recovered = projectionHarnessWithDiagnostics(harness.state, harness.pipeline, diagnostics);
+
+    await recovered.service.reconcileFrozen(reconcileAction(frozen));
+
+    expect(harness.state.value.ledger).toEqual([]);
+    expect(diagnostics.removed).toEqual(["op-child-delete-unknown"]);
+  });
+
+  it("keeps a child freeze while its queue or field conflict is still open", async () => {
+    const entry = ledger({ remoteEntity: "task", frozen: "conflict", operationId: "op-blocked" });
+    const state = new MemoryState({
+      enabled: true,
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      confirmedPreviewHash: "confirmed",
+      ledger: [entry],
+      parentCheckpoints: [],
+    });
+    const pipeline = new FakePipeline();
+    pipeline.tasks.set(entry.remoteId!, {
+      id: entry.remoteId!, projectId: entry.targetProjectId, parentId: entry.parentTaskId,
+      columnId: entry.targetColumnId, title: entry.title, status: 0, content: projectionMarker(entry.uuid),
+    });
+    const diagnostics = new MemoryDiagnostics({
+      operationId: "op-blocked", blocked: true, resolvedTask: pipeline.tasks.get(entry.remoteId!),
+    });
+    const recovered = projectionHarnessWithDiagnostics(state, pipeline, diagnostics);
+
+    await expect(recovered.service.reconcileFrozen(reconcileAction(entry)))
+      .rejects.toThrow(/仍由队列或逐字段冲突持有/);
+    expect(state.value.ledger[0]).toMatchObject({ frozen: "conflict", operationId: "op-blocked" });
   });
 });

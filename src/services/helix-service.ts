@@ -2206,6 +2206,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   ): Promise<ProjectionWriteReceipt> {
     const release = this.remoteWriteGate.enterShared();
     try {
+      if (writeFields.includes("items")) {
+        throw new Error("旧版项目同步记录已停止写入；项目行动必须使用真实子任务");
+      }
       this.assertWritable();
       this.assertProjectionCapabilities(
         operationType === "update" && writeFields.includes("status") && task.status === 0,
@@ -2388,6 +2391,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     if (!operation || operation.status !== "reconciliation" || operation.operation !== "create") {
       throw new Error("该操作不在创建结果待核对状态");
     }
+    if (isLegacyProjectionItemsOperation(operation)) {
+      throw new Error("旧版项目同步记录仅供查看，禁止恢复写入");
+    }
     if (isProjectionQueueOperation(operation)) this.assertProjectDidaProjectionAvailable();
     if (resolution === "not-created") {
       throw new Error("远端结果未知时禁止自动重试；请在滴答 App 核对后绑定已生效记录");
@@ -2460,6 +2466,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     const operation = queue.list().find((candidate) => candidate.id === operationId);
     if (!operation || operation.status !== "reconciliation" || operation.operation === "create") {
       throw new Error("该操作不在非创建写入的待核对状态");
+    }
+    if (isLegacyProjectionItemsOperation(operation)) {
+      throw new Error("旧版项目同步记录仅供查看，禁止恢复写入");
     }
     if (isProjectionQueueOperation(operation)) this.assertProjectDidaProjectionAvailable();
     if (resolution === "continue") {
@@ -2543,6 +2552,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     operationId: string,
   ): Promise<void> {
     const operation = (await this.store.snapshot()).queue.find((item) => item.id === operationId);
+    if (operation && isLegacyProjectionItemsOperation(operation)) {
+      throw new Error("旧版项目同步记录仅供查看，禁止重试远端写入");
+    }
     if (operation && isProjectionQueueOperation(operation)) {
       this.assertProjectDidaProjectionAvailable();
     }
@@ -2561,6 +2573,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     const data = await this.store.snapshot();
     const conflict = data.conflicts.find((item) => item.id === conflictId);
     if (!conflict) throw new Error("冲突不存在或已经解决");
+    if (isLegacyProjectionConflict(conflict)) {
+      throw new Error("旧版项目同步冲突仅供查看，禁止继续写回");
+    }
     if (isProjectionConflict(data, conflict)) {
       this.assertProjectDidaProjectionAvailable();
     }
@@ -2609,6 +2624,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     if (!conflict || conflict.status !== "applying") {
       throw new Error("该冲突不在等待远端核对状态");
     }
+    if (isLegacyProjectionConflict(conflict)) {
+      throw new Error("旧版项目同步冲突仅供查看，禁止采纳写回");
+    }
     if (isProjectionConflict(data, conflict)) {
       this.assertProjectDidaProjectionAvailable();
     }
@@ -2632,6 +2650,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private async applyConflictOnce(conflictId: string): Promise<void> {
     const data = await this.store.snapshot();
     const conflict = data.conflicts.find((item) => item.id === conflictId);
+    if (conflict && isLegacyProjectionConflict(conflict)) {
+      throw new Error("旧版项目同步冲突仅供查看，禁止应用");
+    }
     if (conflict && isProjectionConflict(data, conflict)) {
       this.assertProjectDidaProjectionAvailable();
     }
@@ -2803,7 +2824,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         const claimed = claimNextQueueOperation(
           data.queue,
           (candidate) =>
-            this.projectDidaProjectionAvailable || !isProjectionQueueOperation(candidate),
+            !isLegacyProjectionItemsOperation(candidate) &&
+            (this.projectDidaProjectionAvailable || !isProjectionQueueOperation(candidate)),
         );
         data.queue = claimed.operations;
         operation = claimed.claimed;
@@ -3366,11 +3388,23 @@ export function isProjectionQueueOperation(operation: SyncQueueOperation): boole
     operation.idempotencyFingerprint.startsWith("helix-");
 }
 
+function isLegacyProjectionItemsOperation(operation: SyncQueueOperation): boolean {
+  return operation.kind === "task" && (
+    operation.conflictScope === "helix-projection-owned-items" ||
+    operation.id.startsWith("op-projection-item-") ||
+    operation.writeFields?.includes("items") === true
+  );
+}
+
 function isProjectionConflict(data: HelixPersistedData, conflict: SyncConflict): boolean {
   return conflict.scope === "helix-projection-owned-items" ||
     data.queue.some((operation) =>
       operation.conflictId === conflict.id && isProjectionQueueOperation(operation)) ||
     data.projectionOperationReceipts.some((receipt) => receipt.conflictId === conflict.id);
+}
+
+function isLegacyProjectionConflict(conflict: SyncConflict): boolean {
+  return conflict.scope === "helix-projection-owned-items";
 }
 
 function persistProjectionOperationReceipt(

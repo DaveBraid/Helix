@@ -16,7 +16,7 @@ describe("project projection presenter", () => {
       projects: [{ id: "list-1", name: "科研" }],
       columns: [{ id: "column-1", projectId: "list-1", name: "进行中" }],
       readiness: {
-        writable: true, queueEmpty: true, authorizationCurrent: true, itemsRoundTripVerified: true, itemIdStableVerified: true,
+        writable: true, queueEmpty: true, authorizationCurrent: true, taskParentingVerified: true, itemsRoundTripVerified: true, itemIdStableVerified: true,
         boardPlacementVerified: true, boardFresh: true, taskReopenVerified: true, unknownOutcomes: 0,
       },
     }])).toEqual([{

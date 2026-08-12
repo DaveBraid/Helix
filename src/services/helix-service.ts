@@ -151,11 +151,11 @@ export interface ProjectProjectionWriteReadiness {
 export function projectProjectionGlobalCapabilitiesReady(
   state: Pick<HelixRuntimeState,
     "connected" | "authorizationConfigured" | "taskCrudVerified" |
-    "itemsRoundTripVerified" | "boardPlacementVerified">,
+    "taskParentingVerified" | "boardPlacementVerified">,
 ): boolean {
   // 重开只在具体 reopen 操作门禁检查；不能阻止普通创建、更新或完成从队列阻塞中恢复。
   return state.connected && state.authorizationConfigured && state.taskCrudVerified &&
-    state.itemsRoundTripVerified && state.boardPlacementVerified;
+    state.taskParentingVerified && state.boardPlacementVerified;
 }
 
 export type StateListener = (state: HelixRuntimeState) => void;
@@ -1169,6 +1169,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           writable: !this.contractTestRunning && data.recoveryIssues.length === 0,
           queueEmpty: data.queue.length === 0,
           authorizationCurrent: Boolean(this.secrets.getDidaToken()) && this.state.taskCrudVerified,
+          taskParentingVerified: this.state.taskParentingVerified,
           itemsRoundTripVerified: this.state.itemsRoundTripVerified,
           itemIdStableVerified: this.state.itemIdStableVerified,
           boardPlacementVerified: this.state.boardPlacementVerified,
@@ -1580,6 +1581,69 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         });
       });
       return { operationId, outcome: "conflict", message: "owned item 进入逐子字段冲突", conflictId };
+    } finally {
+      release();
+    }
+  }
+
+  async stageProjectionTaskConflict(
+    local: DidaTask,
+    remote: DidaTask,
+    projectionBase: DidaTask,
+    operationId: string,
+    writeFields: string[],
+  ): Promise<ProjectionWriteReceipt> {
+    const release = this.remoteWriteGate.enterShared();
+    try {
+      this.assertWritable();
+      this.assertProjectionCapabilities(writeFields.includes("status") && local.status === 0);
+      const now = new Date().toISOString();
+      const base = createSnapshot("task", projectionBase.id, taskSyncValue(projectionBase), { capturedAt: now });
+      const localSnapshot = createSnapshot("task", local.id, taskSyncValue(local), { capturedAt: now });
+      const remoteSnapshot = createSnapshot("task", remote.id, taskSyncValue(remote), { capturedAt: now });
+      const conflictId = `conflict-${stableHash(["task", local.id, base.stamp.hash, remoteSnapshot.stamp.hash])}`;
+      const conflict: SyncConflict<DidaTask> = {
+        id: conflictId,
+        kind: "task",
+        entityId: local.id,
+        title: local.title,
+        createdAt: now,
+        updatedAt: now,
+        status: "open",
+        base,
+        local: localSnapshot,
+        remote: remoteSnapshot,
+        fields: buildConflictFields(base.value, localSnapshot.value, remoteSnapshot.value),
+        remoteRecheckCount: 0,
+        sourceDeviceId: (await this.store.snapshot()).deviceId,
+      };
+      const operation = buildTaskUpdateOperation(
+        localSnapshot.value,
+        base,
+        "update",
+        now,
+        operationId,
+        writeFields,
+      );
+      operation.status = "blocked";
+      operation.conflictId = conflictId;
+      operation.idempotencyFingerprint = `helix-write:${operationId}`;
+      await this.store.mutate((current) => {
+        current.conflicts = [...current.conflicts.filter((item) => item.id !== conflictId), conflict];
+        current.queue = [...current.queue.filter((item) => item.id !== operationId), operation];
+        current.localSnapshots[`task:${local.id}`] = localSnapshot as EntitySnapshot<unknown>;
+        upsertProjectionReceipt(current, {
+          clientIdentity: operation.idempotencyFingerprint!,
+          projectId: local.projectId,
+          operationId,
+          marker: local.content ?? "",
+          outcome: "conflict",
+          remoteTaskId: local.id,
+          conflictId,
+          message: "项目行动任务进入逐字段冲突",
+        });
+      });
+      return { operationId, outcome: "conflict", message: "项目行动任务进入逐字段冲突", conflictId };
     } finally {
       release();
     }
@@ -2143,7 +2207,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     const release = this.remoteWriteGate.enterShared();
     try {
       this.assertWritable();
-      this.assertProjectionCapabilities(operationType === "update" && writeFields.includes("status"));
+      this.assertProjectionCapabilities(
+        operationType === "update" && writeFields.includes("status") && task.status === 0,
+      );
       const writesItems = writeFields.includes("items");
       const desiredTask = writesItems ? { ...task, kind: "CHECKLIST" } : task;
       const effectiveWriteFields = writesItems
@@ -2214,8 +2280,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private assertProjectionCapabilities(reopen: boolean): void {
     this.assertProjectDidaProjectionAvailable();
     this.assertTaskCrudVerified();
-    if (!this.state.itemsRoundTripVerified || !this.state.boardPlacementVerified) {
-      throw new Error("当前授权尚未验证滴答项目同步所需的检查项往返与看板归栏能力");
+    if (!this.state.taskParentingVerified || !this.state.boardPlacementVerified) {
+      throw new Error("当前授权尚未验证滴答项目同步所需的真实子任务与看板归栏能力");
     }
     if (reopen && !this.state.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");

@@ -58,6 +58,7 @@ export interface ProjectionTaskPipeline {
   createTask(task: DidaTask, clientIdentity: string): Promise<ProjectionWriteReceipt>;
   recoverCreate(clientIdentity: string, projectId: string): Promise<ProjectionWriteReceipt | null>;
   updateTask(task: DidaTask, writeFields: string[], operationId?: string, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
+  stageTaskConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string, writeFields: string[]): Promise<ProjectionWriteReceipt>;
   stageItemsConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string): Promise<ProjectionWriteReceipt>;
   completeTask(task: DidaTask): Promise<ProjectionWriteReceipt>;
   reopenTask(task: DidaTask): Promise<ProjectionWriteReceipt>;
@@ -74,6 +75,7 @@ export interface ExistingHelixTaskQueuePort {
   enqueueProjectionCreate(task: DidaTask, clientIdentity: string): Promise<ProjectionWriteReceipt>;
   recoverProjectionCreate(clientIdentity: string, projectId: string): Promise<ProjectionWriteReceipt | null>;
   enqueueProjectionUpdate(task: DidaTask, writeFields: string[], operationId?: string, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
+  stageProjectionTaskConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string, writeFields: string[]): Promise<ProjectionWriteReceipt>;
   stageProjectionItemsConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string): Promise<ProjectionWriteReceipt>;
   enqueueProjectionComplete(task: DidaTask): Promise<ProjectionWriteReceipt>;
   enqueueProjectionReopen(task: DidaTask): Promise<ProjectionWriteReceipt>;
@@ -105,6 +107,10 @@ export class ExistingHelixTaskPipelineAdapter implements ProjectionTaskPipeline 
 
   async updateTask(task: DidaTask, writeFields: string[], operationId?: string, freshBase?: DidaTask): Promise<ProjectionWriteReceipt> {
     return this.operations.enqueueProjectionUpdate(task, writeFields, operationId, freshBase);
+  }
+
+  stageTaskConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string, writeFields: string[]): Promise<ProjectionWriteReceipt> {
+    return this.operations.stageProjectionTaskConflict(local, remote, base, operationId, writeFields);
   }
 
   stageItemsConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string): Promise<ProjectionWriteReceipt> {
@@ -1087,376 +1093,270 @@ export class DidaProjectProjectionService {
     working.push(...previous.filter((entry) => entry.frozen &&
       !working.some((item) => projectionLedgerIdentity(item) === projectionLedgerIdentity(entry))));
     const managedWorking = working.filter((entry) => presentStageIds.has(entry.stageId));
-    for (const intent of planProjectionChanges(managedPrevious, managedWorking, {
+    return this.synchronizeTaskActions({
+      input,
+      initialState,
+      projectId: projectIdentity.projectId,
+      parentTaskId,
+      stageRevisions,
+      managedPrevious,
+      managedWorking,
+      working,
+      summary,
       taskReopenVerified: readiness.taskReopenVerified,
+    });
+  }
+
+  private async synchronizeTaskActions(params: {
+    input: ProjectionProjectInput;
+    initialState: ProjectionPersistentState;
+    projectId: string;
+    parentTaskId: string;
+    stageRevisions: Map<string, ProjectionMarkdownRevision>;
+    managedPrevious: ProjectionLedgerEntry[];
+    managedWorking: ProjectionLedgerEntry[];
+    working: ProjectionLedgerEntry[];
+    summary: ProjectionSyncSummary;
+    taskReopenVerified: boolean;
+  }): Promise<ProjectionSyncSummary> {
+    let working = params.working;
+    const markerFor = (entry: ProjectionLedgerEntry) => projectionMarker(entry.uuid);
+    const replace = (entry: ProjectionLedgerEntry) => {
+      working = replaceEntry(working, entry);
+    };
+    const ledgerState = (current: ProjectionPersistentState): ProjectionPersistentState => ({
+      ...current,
+      ledger: [
+        ...current.ledger.filter((entry) => entry.projectId !== params.projectId),
+        ...working.filter((entry) => entry.projectId === params.projectId),
+      ],
+    });
+    const persist = async () => {
+      const current = await this.state.read();
+      await this.state.write(current, ledgerState(current));
+    };
+    const settle = async (
+      entry: ProjectionLedgerEntry | undefined,
+      receipt: { operationId: string; conflictId?: string },
+      remove = false,
+    ) => {
+      if (remove && entry) working = working.filter((candidate) => candidate.uuid !== entry.uuid);
+      else if (entry) replace(entry);
+      const current = await this.state.read();
+      const proof: ProjectionReceiptCleanupProof = {
+        kind: "action",
+        operationId: receipt.operationId,
+        conflictId: receipt.conflictId,
+        projectId: params.projectId,
+        stageId: entry!.stageId,
+        uuid: entry!.uuid,
+        targetProjectId: entry!.targetProjectId,
+        marker: markerFor(entry!),
+        remoteTaskId: entry!.remoteId!,
+      };
+      await this.settleReconciliation(current, ledgerState(current), proof);
+    };
+
+    for (const intent of planProjectionChanges(params.managedPrevious, params.managedWorking, {
+      taskReopenVerified: params.taskReopenVerified,
     })) {
       const entry = intent.entry;
       if (working.find((item) => projectionLedgerIdentity(item) === projectionLedgerIdentity(entry))?.frozen) continue;
-      const stageRevision = stageRevisions.get(entry.stageId);
-      if (!stageRevision && intent.kind !== "delete-action") throw new Error(`找不到行动所属阶段：${entry.stageId}`);
+      const stageRevision = params.stageRevisions.get(entry.stageId);
+      if (!stageRevision && intent.kind !== "delete-action" && intent.kind !== "reconcile-delete") {
+        throw new Error(`找不到行动所属阶段：${entry.stageId}`);
+      }
       if (intent.kind === "freeze-action") {
-        working = freezeEntry(working, entry, intent.reason, summary, "投影身份发生竞争，已持久冻结");
+        working = freezeEntry(working, entry, intent.reason, params.summary, "投影身份发生竞争，已持久冻结");
         continue;
       }
       if (intent.kind === "recover-action") {
-        const parent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
+        const remote = entry.remoteId
+          ? await this.pipeline.rereadTask(entry.targetProjectId, entry.remoteId)
+          : null;
         try {
-          if (!parent || !this.sameParentIdentity(parent, projectIdentity.projectId, entry.parentTaskId, initialState.target)) {
-            throw new Error("Markdown 已有检查项 ID，但父任务精确复读不一致");
-          }
-          verifyOwnedChecklistItem(parent, entry);
+          if (!remote) throw new Error("Markdown 已绑定的远端子任务不存在");
+          verifyProjectedTask(remote, entry, markerFor(entry));
+          replace(entry);
         } catch (error) {
-          working = freezeEntry(working, entry, "identity-mismatch", summary, message(error));
+          working = freezeEntry(working, entry, "identity-mismatch", params.summary, message(error));
         }
         continue;
       }
       if (intent.kind === "reconcile-delete") {
-        const parent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
-        if (parent && !findChecklistItem(parent, entry.remoteId!)) {
-          working = working.filter((item) => item.uuid !== entry.uuid);
-        } else {
-          working = freezeEntry(working, entry, "unknown-outcome", summary, "删除 tombstone 的检查项结果无法证明；禁止重发删除");
-        }
+        const remote = entry.remoteId
+          ? await this.pipeline.rereadTask(entry.targetProjectId, entry.remoteId)
+          : null;
+        if (!remote) working = working.filter((item) => item.uuid !== entry.uuid);
+        else working = freezeEntry(working, entry, "unknown-outcome", params.summary,
+          "删除结果仍未证明子任务不存在；禁止重发删除");
         continue;
       }
       if (intent.kind === "create-action") {
-        let parent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
-        if (!parent || !this.sameParentIdentity(parent, projectIdentity.projectId, entry.parentTaskId, initialState.target) ||
-          parent.title !== input.projectTitle || parent.status !== (input.projectStatus === "completed" ? 2 : 0)) {
-          working = freezeEntry(working, entry, "identity-mismatch", summary, "子任务创建前父任务精确复读不一致");
-          continue;
-        }
-        // 无远端 ID 的追加在持久 prepared 检查点前再做一次专用预检复读；
-        // 预检期间新增的普通 item 会进入新基线，而不是落入通用 items 冲突。
-        const preflightParent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
-        if (!preflightParent || !this.sameParentIdentity(
-          preflightParent, projectIdentity.projectId, entry.parentTaskId, initialState.target,
+        const parent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
+        if (!parent || !this.sameParentIdentity(
+          parent, params.projectId, params.parentTaskId, params.initialState.target!,
         )) {
-          working = freezeEntry(working, entry, "identity-mismatch", summary, "检查项追加预检时父任务身份变化");
+          working = freezeEntry(working, entry, "identity-mismatch", params.summary,
+            "真实子任务创建前父任务身份不一致");
           continue;
         }
-        parent = preflightParent;
-        let baseline = structuredClone(parent.items ?? []);
-        // 写前先落盘“结果未知”检查点；即使进程在远端接受写入后崩溃，下一轮也不会重复追加。
-        const createBaselineItemIds = strictChecklistIds(baseline, "写前基线");
-        const operationId = entry.operationId ?? `op-projection-item-create-${crypto.randomUUID()}`;
-        let draft: DidaChecklistItem;
-        try {
-          draft = createClientOwnedChecklistItem(baseline, entry, this.now());
-        } catch (error) {
-          working = freezeEntry(working, entry, "capability", summary, message(error));
-          continue;
-        }
-        const remapStagePaths = await this.buildVerifiedRemapStagePaths(
-          [...working, entry], entry.parentTaskId, stageRevisions,
-        );
-        let checkpointEntry: ProjectionLedgerEntry = {
-          ...entry,
-          frozen: "unknown-outcome",
-          operationId,
-          createBaselineItemIds,
-          createBaselineItemsHash: stableHash(baseline),
-          createBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
-          createBaselineSemanticHashes: baseline.map(checklistSemanticHash),
-          createItemId: draft.id,
-          createItemSortOrder: draft.sortOrder,
-          remapStagePaths,
+        const clientIdentity = actionCreateClientIdentity(entry);
+        const desired: DidaTask = {
+          id: `local-helix-action-${stableHash(clientIdentity).slice(0, 24)}`,
+          projectId: entry.targetProjectId,
+          parentId: entry.parentTaskId,
+          columnId: entry.targetColumnId,
+          title: entry.title,
+          content: markerFor(entry),
+          status: 0,
         };
-        working = replaceEntry(working, checkpointEntry);
-        await this.persistProjectLedger(projectIdentity.projectId, working);
-        let created: ProjectionWriteReceipt | undefined;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            created = await this.pipeline.updateTask({
-              ...parent,
-              items: [...baseline, checkpointChecklistItem(checkpointEntry)],
-            }, ["items"], operationId, parent);
-          } catch (error) {
-            working = freezeEntry(working, checkpointEntry, "unknown-outcome", summary, message(error));
-            break;
-          }
-          if (created.outcome !== "preflight-changed") break;
-          const nextParent = created.task;
-          if (!this.sameParentIdentity(
-            nextParent, projectIdentity.projectId, entry.parentTaskId, initialState.target,
-          ) || nextParent.title !== input.projectTitle ||
-            nextParent.status !== (input.projectStatus === "completed" ? 2 : 0)) {
-            working = freezeEntry(working, checkpointEntry, "identity-mismatch", summary,
-              "检查项追加重基线时父任务身份或受管字段变化");
-            created = undefined;
-            break;
-          }
-          parent = nextParent;
-          baseline = structuredClone(parent.items ?? []);
-          const rebasedIds = strictChecklistIds(baseline, "未发送重基线");
-          let rebasedDraft: DidaChecklistItem;
-          try {
-            rebasedDraft = createClientOwnedChecklistItem(
-              baseline, checkpointEntry, this.now(), checkpointEntry.createItemId,
-            );
-          } catch (error) {
-            working = freezeEntry(working, checkpointEntry, "identity-mismatch", summary, message(error));
-            created = undefined;
-            break;
-          }
-          checkpointEntry = {
-            ...checkpointEntry,
-            createBaselineItemIds: rebasedIds,
-            createBaselineItemsHash: stableHash(baseline),
-            createBaselineItemHashes: Object.fromEntries(baseline.map((item) => [item.id, stableHash(item)])),
-            createBaselineSemanticHashes: baseline.map(checklistSemanticHash),
-            createItemSortOrder: rebasedDraft.sortOrder,
-          };
-          working = replaceEntry(working, checkpointEntry);
-          await this.persistProjectLedger(projectIdentity.projectId, working);
-          created = undefined;
-        }
-        if (!created) {
-          if (working.find((candidate) => candidate.uuid === entry.uuid)?.frozen === "unknown-outcome") {
-            working = freezeEntry(working, checkpointEntry, "retryable", summary,
-              "检查项追加连续发生未发送预检竞争，请稍后基于最新父任务重试");
-          }
+        const result = await this.pipeline.recoverCreate(clientIdentity, entry.targetProjectId) ??
+          await this.pipeline.createTask(desired, clientIdentity);
+        if (result.outcome !== "verified") {
+          working = freezeEntry(working, entry, resultReason(result), params.summary, result.message, result);
           continue;
         }
-        if (created.outcome !== "verified") {
-          working = freezeEntry(working, checkpointEntry, resultReason(created), summary, created.message, created);
-          continue;
-        }
-        if (created.operationId !== operationId) {
-          working = freezeEntry(
-            working,
-            checkpointEntry,
-            "identity-mismatch",
-            summary,
-            "检查项创建返回了其他 operation ID，保持冻结",
-            created,
-          );
-          continue;
-        }
-        let proof: { ownedId: string; remap: Map<string, string> };
-        try {
-          proof = verifyClientOwnedCreatedChecklistItem(
-            baseline, created.task.items ?? [], checkpointEntry,
-          );
-        } catch (error) {
-          working = freezeEntry(working, checkpointEntry, "identity-mismatch", summary, message(error), created);
-          continue;
-        }
-        const verifiedEntry = {
+        const createdEntry: ProjectionLedgerEntry = {
           ...entry,
-          remoteId: proof.ownedId,
-          operationId: undefined,
-          conflictId: undefined,
-          createBaselineItemIds: undefined,
-          createBaselineItemsHash: undefined,
-          createBaselineItemHashes: undefined,
-          createBaselineSemanticHashes: undefined,
-          createItemId: undefined,
-          createItemSortOrder: undefined,
-          remapStagePaths: undefined,
+          remoteId: result.task.id,
+          state: entry.state === "completed" ? "active" : entry.state,
+          frozen: "markdown-race",
+          operationId: result.operationId,
+          conflictId: result.conflictId,
         };
         try {
-          working = await this.commitChecklistIdRemap({
-            projectId: projectIdentity.projectId,
-            parentTaskId: entry.parentTaskId,
-            entries: working,
-            remap: proof.remap,
-            current: verifiedEntry,
-            stagePaths: checkpointEntry.remapStagePaths ?? {},
-            stageRevisions,
-          });
-          summary.createdActions += 1;
-          if (verifiedEntry.state === "completed") summary.completedActions += 1;
+          verifyProjectedTask(result.task, createdEntry, markerFor(entry), { state: false });
+          replace(createdEntry);
+          await persist();
+          const latestStage = await this.requireRevision(stageRevision!.path);
+          assertProjectionStageIdentity(latestStage.content, entry.stageId);
+          const latestAction = parseManagedPlanActions(latestStage.content).actions
+            .find((candidate) => candidate.uuid === entry.uuid);
+          if (!latestAction || latestAction.remoteId || latestAction.title !== entry.title ||
+            latestAction.state !== entry.state) {
+            throw new Error("真实子任务创建后 Stage 行动发生竞争");
+          }
+          const after = await this.markdown.compareAndWrite(
+            latestStage,
+            patchManagedPlanAction(latestStage.content, { uuid: entry.uuid, remoteId: result.task.id }),
+          );
+          params.stageRevisions.set(entry.stageId, after);
+          const adopted = { ...createdEntry, frozen: undefined, operationId: undefined, conflictId: undefined };
+          await settle(adopted, result);
+          params.summary.createdActions += 1;
+          if (entry.state === "completed") {
+            const completeResult = await this.pipeline.completeTask({ ...result.task, status: 2 });
+            if (completeResult.outcome !== "verified") {
+              const frozen = { ...adopted, frozen: resultReason(completeResult), operationId: completeResult.operationId,
+                conflictId: completeResult.conflictId };
+              replace(frozen);
+              params.summary.frozen.push({ uuid: entry.uuid, reason: frozen.frozen!, message: completeResult.message });
+              continue;
+            }
+            const completed = { ...adopted, state: "completed" as const, remoteId: completeResult.task.id };
+            verifyProjectedTask(completeResult.task, completed, markerFor(entry));
+            await settle(completed, completeResult);
+            params.summary.completedActions += 1;
+          }
         } catch (error) {
-          working = freezeEntry(working, checkpointEntry, "markdown-race", summary, message(error), created);
+          working = freezeEntry(working, createdEntry, "markdown-race", params.summary, message(error), result);
         }
         continue;
       }
       if (!entry.remoteId) {
-        working = freezeEntry(working, entry, "identity-mismatch", summary, "既有投影行动缺少远端 ID");
+        working = freezeEntry(working, entry, "identity-mismatch", params.summary,
+          "既有投影行动缺少远端子任务 ID");
         continue;
       }
-      if (intent.kind === "update-action" || intent.kind === "complete-action" || intent.kind === "reopen-action") {
-        const parent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
-        const base = previousByIdentity.get(projectionLedgerIdentity(entry));
-        let updateCheckpoint: ProjectionLedgerEntry | undefined;
-        try {
-          if (!parent || !base) throw new Error("检查项更新缺少父任务或同步 Base");
-          const remoteOwned = requireOwnedChecklistItem(parent, entry.remoteId!);
-          const mergedOwned = mergeOwnedChecklistFields(base, entry, remoteOwned);
-          assertSafeProjectionActionTitle(mergedOwned.item.title);
-          const items = (parent.items ?? []).map((item) => item.id === entry.remoteId
-            ? mergedOwned.item
-            : item);
-          const operationId = entry.operationId ?? `op-projection-item-update-${crypto.randomUUID()}`;
-          const remapStagePaths = await this.buildVerifiedRemapStagePaths(
-            working, entry.parentTaskId, stageRevisions,
-          );
-          updateCheckpoint = {
-            ...entry,
-            frozen: "unknown-outcome",
-            operationId,
-            updateExpectedTitle: mergedOwned.item.title,
-            updateExpectedStatus: mergedOwned.item.status,
-            updateStageRevisionHash: stageRevision!.hash,
-            ...mutationBaselineCheckpoint(parent.items ?? [], entry.remoteId!, "update"),
-            remapStagePaths,
-          };
-          working = replaceEntry(working, updateCheckpoint);
-          await this.persistProjectLedger(projectIdentity.projectId, working);
-          if (mergedOwned.competitions.length > 0) {
-            const baseItems = (parent.items ?? []).map((item) => item.id === entry.remoteId
-              ? { ...item, title: base.title, status: checklistStatus(base.state) }
-              : item);
-            const conflict = await this.pipeline.stageItemsConflict(
-              { ...parent, items },
-              parent,
-              { ...parent, items: baseItems },
-              operationId,
-            );
-            working = freezeEntry(
-              working,
-              updateCheckpoint,
-              resultReason(conflict),
-              summary,
-              conflict.outcome === "verified" ? "竞争未形成冲突" : conflict.message,
-              conflict,
-            );
-            continue;
-          }
-          const result = await this.pipeline.updateTask({ ...parent, items }, ["items"], operationId, parent);
-          if (result.outcome !== "verified") {
-            working = freezeEntry(working, updateCheckpoint, resultReason(result), summary, result.message, result);
-            continue;
-          }
-          if (result.operationId !== operationId) {
-            working = freezeEntry(working, updateCheckpoint, "identity-mismatch", summary,
-              "检查项更新返回了其他 operation ID，保持冻结", result);
-            continue;
-          }
-          const remapProof = assertOnlyOwnedChecklistItemChanged(
-            parent.items ?? [],
-            result.task.items ?? [],
-            entry.remoteId!,
-            mergedOwned.item,
-            remoteOwned,
-          );
-          const reconciledEntry: ProjectionLedgerEntry = {
-            ...entry,
-            remoteId: remapProof.ownedId,
-            title: mergedOwned.item.title,
-            state: projectionStateForRemoteStatus(entry.state, mergedOwned.item.status),
-            operationId: undefined,
-            conflictId: undefined,
-            updateExpectedTitle: undefined,
-            updateExpectedStatus: undefined,
-            updateStageRevisionHash: undefined,
-            mutationKind: undefined,
-            mutationBaselineItemIds: undefined,
-            mutationBaselineItemsHash: undefined,
-            mutationBaselineItemHashes: undefined,
-            mutationOrdinarySemanticHashes: undefined,
-            mutationOwnedInvariantHash: undefined,
-            mutationBaselineOwnedStatus: undefined,
-            mutationBaselineOwnedCompletedTimeHash: undefined,
-            remapStagePaths: undefined,
-          };
-          verifyOwnedChecklistItem(result.task, reconciledEntry);
-          working = await this.commitChecklistIdRemap({
-            projectId: projectIdentity.projectId,
-            parentTaskId: entry.parentTaskId,
-            entries: working,
-            remap: remapProof.remap,
-            current: reconciledEntry,
-            stagePaths: updateCheckpoint.remapStagePaths ?? {},
-            stageRevisions,
-          });
-          if (intent.kind === "update-action") summary.updatedActions += 1;
-          if (intent.kind === "complete-action" || (base.state !== "completed" && entry.state === "completed")) {
-            summary.completedActions += 1;
-          }
-        } catch (error) {
-          working = freezeEntry(
-            working,
-            updateCheckpoint ?? entry,
-            message(error).includes("竞争") ? "conflict" : "identity-mismatch",
-            summary,
-            message(error),
-          );
-        }
-      } else {
-        const parent = await this.pipeline.rereadTask(entry.targetProjectId, entry.parentTaskId);
-        const owned = parent && findChecklistItem(parent, entry.remoteId!);
-        if (!parent || !owned || owned.title !== entry.title || owned.status !== checklistStatus(entry.state)) {
-          working = freezeEntry(working, entry, "conflict", summary, "删除前 owned 检查项相对 Base 已竞争；未执行删除");
-          continue;
-        }
-        const baseline = structuredClone(parent.items ?? []);
-        const operationId = entry.operationId ?? `op-projection-item-delete-${crypto.randomUUID()}`;
-        const remapStagePaths = await this.buildVerifiedRemapStagePaths(
-          [...working, entry], entry.parentTaskId, stageRevisions,
-        );
-        const deleteCheckpoint: ProjectionLedgerEntry = {
+      if (intent.kind === "delete-action") {
+        const checkpoint: ProjectionLedgerEntry = {
           ...entry,
           tombstone: true,
           frozen: "unknown-outcome",
-          operationId,
-          ...mutationBaselineCheckpoint(baseline, entry.remoteId, "delete"),
-          remapStagePaths,
+          operationId: `op-projection-task-delete-${crypto.randomUUID()}`,
         };
-        working = working.some((item) => item.uuid === entry.uuid)
-          ? replaceEntry(working, deleteCheckpoint)
-          : [...working, deleteCheckpoint];
-        await this.persistProjectLedger(projectIdentity.projectId, working);
-        let deletion: ProjectionWriteReceipt;
-        try {
-          deletion = await this.pipeline.updateTask({
-            ...parent,
-            items: baseline.filter((item) => item.id !== entry.remoteId),
-          }, ["items"], operationId, parent);
-        } catch (error) {
-          working = freezeEntry(working, deleteCheckpoint, "unknown-outcome", summary, message(error));
-          continue;
-        }
-        if (deletion.outcome !== "verified") {
-          const frozen = {
-            ...deleteCheckpoint,
-            frozen: resultReason(deletion),
-            conflictId: deletion.conflictId,
-          };
-          working = replaceEntry(working, frozen);
-          summary.frozen.push({ uuid: entry.uuid, reason: frozen.frozen!, message: deletion.message });
-        } else if (deletion.operationId !== operationId) {
-          working = freezeEntry(working, deleteCheckpoint, "identity-mismatch", summary,
-            "检查项删除返回了其他 operation ID，保持冻结", deletion);
+        replace(checkpoint);
+        await persist();
+        const result = await this.pipeline.deleteTask({
+          taskId: entry.remoteId,
+          parentTaskId: entry.parentTaskId,
+          targetProjectId: entry.targetProjectId,
+          targetColumnId: entry.targetColumnId,
+          marker: markerFor(entry),
+        });
+        if (result.outcome === "verified-absent") {
+          await settle({ ...checkpoint, operationId: result.operationId }, result, true);
+          params.summary.deletedActions += 1;
         } else {
-          try {
-            const remap = assertOnlyOwnedChecklistItemDeleted(baseline, deletion.task.items ?? [], entry.remoteId);
-            working = await this.commitChecklistIdRemap({
-              projectId: projectIdentity.projectId,
-              parentTaskId: entry.parentTaskId,
-              entries: working,
-              remap,
-              removeUuid: entry.uuid,
-              stagePaths: deleteCheckpoint.remapStagePaths ?? {},
-              stageRevisions,
-            });
-            summary.deletedActions += 1;
-          } catch (error) {
-            working = freezeEntry(working, deleteCheckpoint, "identity-mismatch", summary, message(error), deletion);
-          }
+          const frozen = { ...checkpoint, frozen: resultReason(result), operationId: result.operationId,
+            conflictId: result.conflictId };
+          replace(frozen);
+          params.summary.frozen.push({ uuid: entry.uuid, reason: frozen.frozen!, message: result.message });
         }
+        continue;
       }
+
+      const previous = params.managedPrevious.find((candidate) =>
+        projectionLedgerIdentity(candidate) === projectionLedgerIdentity(entry));
+      const remote = await this.pipeline.rereadTask(entry.targetProjectId, entry.remoteId);
+      if (!previous || !remote) {
+        working = freezeEntry(working, entry, "identity-mismatch", params.summary,
+          "真实子任务更新缺少同步 Base 或远端对象");
+        continue;
+      }
+      try {
+        verifyProjectedTask(remote, entry, markerFor(entry), { title: false, state: false });
+      } catch (error) {
+        working = freezeEntry(working, entry, "identity-mismatch", params.summary, message(error));
+        continue;
+      }
+      const desiredStatus = entry.state === "completed" ? 2 : 0;
+      const baseStatus = previous.state === "completed" ? 2 : 0;
+      const titleCompetition = previous.title !== entry.title && remote.title !== previous.title && remote.title !== entry.title;
+      const statusCompetition = baseStatus !== desiredStatus && remote.status !== baseStatus && remote.status !== desiredStatus;
+      const fields = intent.kind === "update-action" ? intent.writeFields :
+        intent.kind === "complete-action" || intent.kind === "reopen-action" ? ["status"] : [];
+      const operationId = `op-projection-task-update-${crypto.randomUUID()}`;
+      const desired = { ...remote, title: entry.title, status: desiredStatus,
+        completedTime: desiredStatus === 0 ? null : remote.completedTime };
+      const checkpoint = { ...entry, frozen: "unknown-outcome" as const, operationId };
+      replace(checkpoint);
+      await persist();
+      let result: ProjectionWriteReceipt;
+      if (titleCompetition || statusCompetition) {
+        const base = { ...remote, title: previous.title, status: baseStatus };
+        result = await this.pipeline.stageTaskConflict(desired, remote, base, operationId, fields);
+      } else if (remote.title === entry.title && remote.status === desiredStatus) {
+        const settled = { ...entry, frozen: undefined, operationId: undefined, conflictId: undefined };
+        replace(settled);
+        await persist();
+        continue;
+      } else {
+        result = await this.pipeline.updateTask(desired, fields, operationId, remote);
+      }
+      if (result.outcome !== "verified") {
+        const frozen = { ...checkpoint, frozen: resultReason(result), operationId: result.operationId,
+          conflictId: result.conflictId };
+        replace(frozen);
+        params.summary.frozen.push({ uuid: entry.uuid, reason: frozen.frozen!, message: result.message });
+        continue;
+      }
+      const latestStage = await this.requireRevision(stageRevision!.path);
+      if (latestStage.hash !== stageRevision!.hash) {
+        working = freezeEntry(working, checkpoint, "markdown-race", params.summary,
+          "真实子任务写入后 Stage Markdown 已变化", result);
+        continue;
+      }
+      const settled = { ...entry, remoteId: result.task.id, frozen: undefined,
+        operationId: undefined, conflictId: undefined };
+      verifyProjectedTask(result.task, settled, markerFor(entry));
+      await settle(settled, result);
+      params.summary.updatedActions += fields.includes("title") ? 1 : 0;
+      params.summary.completedActions += previous.state !== "completed" && entry.state === "completed" ? 1 : 0;
     }
-    const latest = await this.state.read();
-    await this.state.write(latest, {
-      ...latest,
-      ledger: [
-        ...latest.ledger.filter((entry) => entry.projectId !== projectIdentity.projectId),
-        ...working,
-      ],
-    });
-    return summary;
+    await persist();
+    return params.summary;
   }
 
   private async ensureParent(

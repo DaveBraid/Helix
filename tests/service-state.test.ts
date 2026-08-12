@@ -41,6 +41,7 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
     connected: true,
     authorizationConfigured: true,
     taskCrudVerified: true,
+    taskParentingVerified: true,
     itemsRoundTripVerified: true, itemIdStableVerified: true,
     boardPlacementVerified: true,
     taskReopenVerified: false,
@@ -2751,13 +2752,15 @@ describe("HelixService runtime recovery", () => {
     )).resolves.toMatchObject({ outcome: "conflict" });
   });
 
-  it("stages item conflicts from the projection ledger Base even when ordinary sync Base already absorbed remote edits", async () => {
+  it("stages child-task conflicts from the projection ledger Base even when ordinary sync Base absorbed remote edits", async () => {
     const data = createDefaultData("device-projection-owned-base");
     grantTaskCrud(data);
+    data.didaContractCapabilities!.taskParentingVerified = true;
+    data.didaContractCapabilities!.boardPlacementVerified = true;
     const remote: DidaTask = {
-      id: "parent-owned-base", projectId: "target-list", title: "Parent", status: 0,
-      content: "helix-project-projection:project-a",
-      items: [{ id: "owned", title: "远端改名", status: 0 }],
+      id: "child-owned-base", projectId: "target-list", parentId: "parent-a",
+      columnId: "column-a", title: "远端改名", status: 0,
+      content: "helix-projection:uuid-owned",
     };
     data.baseSnapshots[`task:${remote.id}`] = createSnapshot("task", remote.id, remote);
     let persisted = structuredClone(data);
@@ -2770,19 +2773,28 @@ describe("HelixService runtime recovery", () => {
     await service.initialize();
     const projectionBase: DidaTask = {
       ...remote,
-      items: [{ id: "owned", title: "投影账本旧标题", status: 0 }],
+      title: "投影账本旧标题",
     };
     const local: DidaTask = {
       ...remote,
-      items: [{ id: "owned", title: "本地改名", status: 0 }],
+      title: "本地改名",
     };
 
-    const receipt = await service.stageProjectionItemsConflict(local, remote, projectionBase, "op-owned-base");
+    const receipt = await service.stageProjectionTaskConflict(
+      local, remote, projectionBase, "op-owned-base", ["title"],
+    );
 
     expect(receipt.outcome).toBe("conflict");
-    expect(persisted.conflicts[0]?.base.value).toEqual(projectionBase);
+    expect(persisted.conflicts[0]?.base.value).toMatchObject({
+      id: projectionBase.id,
+      projectId: projectionBase.projectId,
+      parentId: projectionBase.parentId,
+      content: projectionBase.content,
+      title: projectionBase.title,
+      status: projectionBase.status,
+    });
     expect(persisted.conflicts[0]?.fields).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: "items[owned].title", sameResult: false }),
+      expect.objectContaining({ path: "title", sameResult: false }),
     ]));
 
     const disabled = new HelixService(new HelixDataStore({
@@ -2795,7 +2807,7 @@ describe("HelixService runtime recovery", () => {
       value: { async process() { remoteCalls += 1; throw new Error("must not run"); } },
     });
     const conflictId = persisted.conflicts[0]!.id;
-    await expect(disabled.chooseConflict(conflictId, "items[owned].title", "local"))
+    await expect(disabled.chooseConflict(conflictId, "title", "local"))
       .rejects.toThrow(/暂未开放/);
     await expect(disabled.applyConflict(conflictId))
       .rejects.toThrow(/暂未开放/);
@@ -2806,6 +2818,8 @@ describe("HelixService runtime recovery", () => {
   it("blocks projection reopen before queue or network when reopen was not verified", async () => {
     const data = createDefaultData("device-projection-reopen-gate");
     grantTaskCrud(data);
+    data.didaContractCapabilities!.taskParentingVerified = true;
+    data.didaContractCapabilities!.boardPlacementVerified = true;
     data.didaContractCapabilities!.taskReopenVerified = false;
     const task: DidaTask = {
       id: "task-completed",

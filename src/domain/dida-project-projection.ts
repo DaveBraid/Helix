@@ -29,6 +29,7 @@ export interface ProjectionReadiness {
   writable: boolean;
   queueEmpty: boolean;
   authorizationCurrent: boolean;
+  taskParentingVerified: boolean;
   itemsRoundTripVerified: boolean;
   itemIdStableVerified: boolean;
   boardPlacementVerified: boolean;
@@ -735,7 +736,7 @@ function readinessBlockers(value: ProjectionReadiness, project: DidaProject): st
     !value.writable ? "当前处于只读或恢复模式" : undefined,
     !value.queueEmpty ? "现有任务队列非空" : undefined,
     !value.authorizationCurrent ? "滴答授权合同缺失或过期" : undefined,
-    !value.itemsRoundTripVerified ? "检查项往返能力尚未验证" : undefined,
+    !value.taskParentingVerified ? "真实子任务父子关系尚未验证" : undefined,
     !value.boardPlacementVerified ? "看板归栏能力尚未验证" : undefined,
     !value.boardFresh ? "目标看板快照已过期" : undefined,
     value.unknownOutcomes > 0 ? "仍有远端结果未知对象" : undefined,

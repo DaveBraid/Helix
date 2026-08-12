@@ -999,7 +999,7 @@ function isQueueOperation(value: unknown): value is SyncQueueOperation {
     ["pending", "blocked", "running", "failed", "reconciliation"].includes(String(value.status)) &&
     typeof value.createdAt === "string" && typeof value.updatedAt === "string" &&
     typeof value.attempts === "number" && Number.isInteger(value.attempts) && value.attempts >= 0 &&
-    isSnapshot(value.local, false, false))) return false;
+    isSnapshot(value.local, value.operation === "delete", false))) return false;
   if (!Number.isFinite(Date.parse(value.createdAt)) ||
     !Number.isFinite(Date.parse(value.updatedAt)) ||
     !optionalString(value.projectId) || !optionalString(value.conflictId) ||

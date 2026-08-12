@@ -49,10 +49,10 @@ if (!releaseCapabilities.includes("export const DIDA_READ_AVAILABLE = true")) {
 if (!releaseCapabilities.includes("export const DIDA_CONTRACT_TEST_AVAILABLE = true")) {
   throw new Error("当前合同验证基线必须开放专用合同门禁");
 }
-for (const capability of [
-  "DIDA_TASK_WRITE_AVAILABLE",
-  "PROJECT_DIDA_PROJECTION_AVAILABLE",
-]) {
+if (!releaseCapabilities.includes("export const DIDA_TASK_WRITE_AVAILABLE = true")) {
+  throw new Error("当前开发基线必须开放滴答普通任务写入门禁");
+}
+for (const capability of ["PROJECT_DIDA_PROJECTION_AVAILABLE"]) {
   if (!releaseCapabilities.includes(`export const ${capability} = false`)) {
     throw new Error(`当前本地正式版必须关闭 ${capability} 门禁`);
   }

@@ -2,7 +2,7 @@
 export const DIDA_READ_AVAILABLE = true;
 
 /** 普通滴答清单／任务写入；只读开放时仍可保持关闭。 */
-export const DIDA_TASK_WRITE_AVAILABLE = false;
+export const DIDA_TASK_WRITE_AVAILABLE = true;
 
 /** 会创建临时远端对象的专用写入合同测试。 */
 export const DIDA_CONTRACT_TEST_AVAILABLE = true;

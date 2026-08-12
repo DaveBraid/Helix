@@ -70,6 +70,8 @@ export interface SyncQueueOperation<T = unknown> {
 export interface RemoteWriteContext {
   projectId?: string;
   writeFields?: string[];
+  /** 删除请求已发送后的权威集合复核；不得依赖可能滞后的单任务详情缓存。 */
+  verifyDeletion?: boolean;
 }
 
 export interface ResolutionAuditEntry {

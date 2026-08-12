@@ -36,6 +36,8 @@ class FakeTaskApi {
   };
   failMoveAfterApply = false;
   failCompleteAfterApply = false;
+  missingTaskAsEmptyArray = false;
+  missingTaskAsEmptyResponse = false;
   lastUpdate: DidaTaskUpdateWirePayload | null = null;
   lastCreate: Partial<DidaTask> | null = null;
 
@@ -48,6 +50,8 @@ class FakeTaskApi {
   async getTask(projectId: string): Promise<DidaTask> {
     this.calls.push(`get:${projectId}`);
     if (projectId !== this.location) {
+      if (this.missingTaskAsEmptyResponse) return undefined as unknown as DidaTask;
+      if (this.missingTaskAsEmptyArray) return [] as unknown as DidaTask;
       throw new DidaHttpError("permanent", "not found", 404);
     }
     return { ...this.task, projectId: this.location };
@@ -118,6 +122,31 @@ function desiredTask(status: number): DidaTask {
 }
 
 describe("DidaTaskAdapter", () => {
+  it("treats an empty-array lookup as absent and still verifies a cross-list move", async () => {
+    const api = new FakeTaskApi();
+    api.missingTaskAsEmptyArray = true;
+
+    await expect(verifiedTaskAdapter(api).update(
+      "task-1",
+      desiredTask(0),
+      { projectId: "project-old", writeFields: [] },
+    )).resolves.toMatchObject({ projectId: "project-new" });
+
+    expect(api.calls).toContain("move");
+    expect(api.location).toBe("project-new");
+  });
+  it("treats an empty-body lookup as absent and still verifies a cross-list move", async () => {
+    const api = new FakeTaskApi();
+    api.missingTaskAsEmptyResponse = true;
+
+    await expect(verifiedTaskAdapter(api).update(
+      "task-1",
+      desiredTask(0),
+      { projectId: "project-old", writeFields: [] },
+    )).resolves.toMatchObject({ projectId: "project-new" });
+
+    expect(api.calls).toContain("move");
+  });
   it("does not select an untouched whitespace title, but selects a deliberate title edit", () => {
     const before = { title: "  保留原样  " };
     expect(taskEditWriteFields(before, { title: "  保留原样  " }, {
@@ -229,6 +258,12 @@ describe("DidaTaskAdapter", () => {
       modifiedTime: "2026-08-03T00:00:00.000Z",
       etimestamp: 11,
     })).not.toHaveProperty("etimestamp");
+  });
+  it("canonicalizes task tags as an unordered set before three-way snapshots", () => {
+    expect(taskSyncProjection({
+      ...desiredTask(0),
+      tags: ["zeta", "alpha", "zeta"],
+    }).tags).toEqual(["alpha", "zeta"]);
   });
   it("migrates an in-progress marker when an unknown create is bound to a remote id", () => {
     expect(migrateInProgressTaskId([

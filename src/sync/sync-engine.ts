@@ -111,10 +111,20 @@ export class SyncEngine<T extends RemoteEntity> {
         projectId: operation.projectId,
         writeFields: operation.writeFields,
       });
-      const verified = await this.dependencies.adapter.get(operation.entityId, {
-        projectId: operation.projectId,
-      });
-      if (verified !== null) throw new Error("删除后验证失败：远端记录仍然存在");
+      let verified: T | null;
+      try {
+        verified = await this.dependencies.adapter.get(operation.entityId, {
+          projectId: operation.projectId,
+          verifyDeletion: true,
+        });
+      } catch (error) {
+        throw unknownRemoteOutcome(
+          `删除请求已发送，但复读失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (verified !== null) {
+        throw unknownRemoteOutcome("删除请求已发送，但权威集合仍可见该记录，必须人工核对");
+      }
       return { outcome: "deleted" };
     }
 

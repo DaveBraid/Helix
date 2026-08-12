@@ -74,6 +74,7 @@ import { HelixDataStore } from "../storage/data-store";
 import type { HelixPersistedData } from "../storage/model";
 import { HelixSecretStore } from "../storage/secrets";
 import {
+  buildTaskDeleteOperation,
   buildTaskUpdateOperation,
   migrateInProgressTaskId,
 } from "./task-operations";
@@ -1803,6 +1804,57 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     );
   }
 
+  async reopenTask(taskId: string): Promise<void> {
+    this.assertDidaTaskWriteAvailable();
+    this.assertWritable();
+    this.assertTaskCrudVerified();
+    if (!this.state.taskReopenVerified) {
+      throw new Error("当前滴答账号尚未通过任务重开合同测试");
+    }
+    const task = this.state.tasks.find((candidate) => candidate.id === taskId);
+    if (!task) throw new Error("找不到任务");
+    if (task.status !== 2) return;
+    await this.queueTaskUpdate(
+      { ...task, status: 0, completedTime: null },
+      "update",
+      ["status"],
+    );
+  }
+
+  async deleteTask(taskId: string): Promise<void> {
+    this.assertDidaTaskWriteAvailable();
+    this.assertWritable();
+    this.assertTaskCrudVerified();
+    const releaseAuthorizationLease = this.remoteWriteGate.enterShared();
+    try {
+      const task = this.state.tasks.find((candidate) => candidate.id === taskId);
+      if (!task) throw new Error("找不到任务");
+      if (task.id.startsWith("local-")) {
+        throw new Error("该任务尚未完成远端创建核对，暂不能删除");
+      }
+      const data = await this.store.snapshot();
+      const base = data.baseSnapshots[`task:${task.id}`] as EntitySnapshot<DidaTask> | undefined;
+      if (!base) throw new Error("任务缺少同步基线，请先完成一次同步");
+      const operation = buildTaskDeleteOperation(
+        taskSyncValue(task),
+        base,
+        new Date().toISOString(),
+        `op-${crypto.randomUUID()}`,
+      );
+      await this.store.mutate((draft) => {
+        const queue = new OfflineQueue(draft.queue);
+        queue.enqueue(operation);
+        draft.queue = queue.list();
+      });
+      await this.drainQueue();
+      await this.throwIfOperationNeedsAttention(operation.id);
+      const latest = await this.store.snapshot();
+      this.patch({ tasks: cachedTaskValues(latest), inProgress: latest.inProgress });
+    } finally {
+      releaseAuthorizationLease();
+    }
+  }
+
   async queueTaskUpdate(
     task: DidaTask,
     operationType: "update" | "complete" = "update",
@@ -2343,7 +2395,28 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         () => this.state.taskScheduleMode,
         () => this.state,
       );
-      const desiredProjectId = (operation.local.value as Partial<DidaTask>).projectId;
+      const desiredProjectId = (operation.local.value as Partial<DidaTask> | null)?.projectId;
+      if (operation.operation === "delete") {
+        const absent = await adapter.get(operation.entityId, {
+          projectId: operation.projectId,
+          verifyDeletion: true,
+        });
+        if (absent) {
+          throw new Error("权威任务集合仍可见该记录，队列继续冻结");
+        }
+        await this.store.mutate((draft) => {
+          const latest = new OfflineQueue(draft.queue);
+          latest.resolveReconciliation(operationId, "confirmed");
+          draft.queue = latest.list();
+          delete draft.baseSnapshots[`task:${operation.entityId}`];
+          delete draft.localSnapshots[`task:${operation.entityId}`];
+          draft.inProgress = draft.inProgress.filter((entry) => entry.taskId !== operation.entityId);
+        });
+        const resolved = await this.store.snapshot();
+        this.patch({ tasks: cachedTaskValues(resolved), inProgress: resolved.inProgress });
+        await this.sync();
+        return;
+      }
       const remoteAtTarget = desiredProjectId
         ? await adapter.get(operation.entityId, { projectId: desiredProjectId })
         : null;
@@ -2676,6 +2749,17 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           data.queue = latest.list();
           persistProjectionOperationReceipt(data, claimedOperation, result);
           if (
+            claimedOperation.kind === "task" &&
+            claimedOperation.operation === "delete" &&
+            result.outcome === "deleted"
+          ) {
+            delete data.baseSnapshots[`task:${claimedOperation.entityId}`];
+            delete data.localSnapshots[`task:${claimedOperation.entityId}`];
+            data.inProgress = data.inProgress.filter(
+              (entry) => entry.taskId !== claimedOperation.entityId,
+            );
+          }
+          if (
             claimedOperation.operation === "create" &&
             result.outcome === "pushed" &&
             result.snapshot.entityId !== claimedOperation.entityId &&
@@ -2716,6 +2800,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         });
         const latestData = await this.store.snapshot();
         this.patch({
+          tasks: cachedTaskValues(latestData),
           inProgress: latestData.inProgress,
           events: latestData.events.filter(isHelixEvent),
         });

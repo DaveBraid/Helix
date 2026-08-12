@@ -32,6 +32,28 @@ function operation(
 }
 
 describe("OfflineQueue", () => {
+  it("quarantines legacy post-delete verification failures instead of retrying", () => {
+    const legacy = operation("op-legacy-delete", "delete", {
+      status: "failed",
+      attempts: 1,
+      lastError: "删除后验证失败：远端记录仍然存在",
+    });
+    const [recovered] = new OfflineQueue([legacy], { recoverInterrupted: true }).list();
+    expect(recovered).toMatchObject({
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+    });
+    expect(new OfflineQueue([recovered!]).nextRunnable()).toBeNull();
+  });
+  it("hydrates a delete operation whose local snapshot is the null deletion intent", () => {
+    const queued = operation("op-delete-null-1", "delete", {
+      local: createSnapshot("task", "task-1", null) as unknown as SyncQueueOperation<DidaTask>["local"],
+    });
+    const hydrated = hydrateData({ schemaVersion: 2, queue: [queued] });
+    expect(hydrated.queue).toHaveLength(1);
+    expect(hydrated.queue[0]).toMatchObject({ operation: "delete", local: { value: null } });
+    expect(hydrated.recoveryIssues).toEqual([]);
+  });
   it("never merges exact projection operations and blocks a competing same-entity operation", () => {
     const queue = new OfflineQueue();
     const first = operation("op-exact-a", "update");

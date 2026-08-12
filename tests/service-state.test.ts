@@ -31,6 +31,7 @@ function grantTaskCrud(
     reminderWriteVerified: true,
     repeatWriteVerified: true,
     itemsRoundTripVerified: true, itemIdStableVerified: true,
+    taskReopenVerified: true,
     verifiedAt: "2026-08-03T00:00:00.000Z",
   };
 }
@@ -2018,6 +2019,132 @@ describe("HelixService runtime recovery", () => {
       },
     ]);
     expect(service.snapshot().events).toHaveLength(1);
+  });
+
+  it("reopens a completed task only through the verified status field", async () => {
+    const data = createDefaultData("device-reopen");
+    grantTaskCrud(data);
+    const task: DidaTask = {
+      id: "task-reopen",
+      projectId: "project-1",
+      title: "Reopen",
+      status: 2,
+      completedTime: "2026-08-13T00:00:00.000Z",
+    };
+    const base = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`task:${task.id}`] = base;
+    data.localSnapshots[`task:${task.id}`] = base;
+    let persisted = structuredClone(data);
+    let captured: SyncQueueOperation<DidaTask> | undefined;
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "taskEngine", {
+      value: {
+        async process(operation: SyncQueueOperation<DidaTask>) {
+          captured = structuredClone(operation);
+          return { outcome: "pushed", snapshot: operation.local };
+        },
+      },
+    });
+
+    await service.reopenTask(task.id);
+
+    expect(captured).toMatchObject({ operation: "update", writeFields: ["status"] });
+    expect(captured?.local.value).toMatchObject({ status: 0, completedTime: null });
+  });
+
+  it("removes local task state only after verified remote deletion", async () => {
+    const data = createDefaultData("device-delete");
+    grantTaskCrud(data);
+    const task: DidaTask = {
+      id: "task-delete",
+      projectId: "project-1",
+      title: "Delete",
+      status: 0,
+    };
+    const base = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`task:${task.id}`] = base;
+    data.localSnapshots[`task:${task.id}`] = base;
+    data.inProgress = [{
+      taskId: task.id,
+      projectId: task.projectId,
+      markedAt: "2026-08-13T00:00:00.000Z",
+      lastTouchedAt: "2026-08-13T00:00:00.000Z",
+      activeFocus: false,
+    }];
+    let persisted = structuredClone(data);
+    let captured: SyncQueueOperation<DidaTask> | undefined;
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "taskEngine", {
+      value: {
+        async process(operation: SyncQueueOperation<DidaTask>) {
+          captured = structuredClone(operation);
+          return { outcome: "deleted" };
+        },
+      },
+    });
+
+    await service.deleteTask(task.id);
+
+    expect(captured).toMatchObject({
+      operation: "delete",
+      entityId: task.id,
+      projectId: task.projectId,
+      local: { value: null },
+    });
+    expect(persisted.baseSnapshots[`task:${task.id}`]).toBeUndefined();
+    expect(persisted.localSnapshots[`task:${task.id}`]).toBeUndefined();
+    expect(persisted.inProgress).toEqual([]);
+    expect(service.snapshot().tasks).toEqual([]);
+  });
+
+  it("keeps a task visible when remote deletion is not verified", async () => {
+    const data = createDefaultData("device-delete-failed");
+    grantTaskCrud(data);
+    const task: DidaTask = {
+      id: "task-delete-failed",
+      projectId: "project-1",
+      title: "Keep visible",
+      status: 0,
+    };
+    const base = createSnapshot("task", task.id, task);
+    data.baseSnapshots[`task:${task.id}`] = base;
+    data.localSnapshots[`task:${task.id}`] = base;
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+    );
+    await service.initialize();
+    Object.defineProperty(service, "taskEngine", {
+      value: {
+        async process() {
+          throw { category: "permanent", message: "rejected" };
+        },
+      },
+    });
+
+    await expect(service.deleteTask(task.id)).rejects.toThrow("rejected");
+
+    expect(persisted.localSnapshots[`task:${task.id}`]?.value).toEqual(task);
+    expect(service.snapshot().tasks).toEqual([task]);
+    expect(persisted.queue).toMatchObject([{ operation: "delete", status: "failed" }]);
   });
 
   it("locks field choices while applying and supports explicit verified recovery", async () => {

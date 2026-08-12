@@ -565,6 +565,37 @@ describe("SyncEngine safety gates", () => {
     expect(adapter.value?.title).toBe("remote-change");
   });
 
+  it("quarantines a delete when the post-write read still exposes the record", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = base;
+    let deleteSent = false;
+    const adapter: RemoteEntityAdapter<DidaTask> = {
+      kind: "task",
+      async get() { return task("base"); },
+      async create(value) { return value; },
+      async update(_id, value) { return value; },
+      async delete() { deleteSent = true; },
+    };
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+
+    await expect(engine.process({
+      ...operation(task("base"), base),
+      operation: "delete",
+      local: createSnapshot("task", "task-1", null as unknown as DidaTask),
+    })).rejects.toMatchObject({
+      category: "unknown-outcome",
+      remoteOutcomeUnknown: true,
+    });
+    expect(deleteSent).toBe(true);
+  });
+
   it("removes base and local caches after explicitly resolving to deletion", async () => {
     const base = createSnapshot("task", "task-1", task("base"));
     const repository = new MemoryRepository();

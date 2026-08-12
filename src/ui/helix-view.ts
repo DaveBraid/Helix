@@ -897,8 +897,10 @@ export class HelixView extends ItemView {
       check.addEventListener("click", () => {
         if (!DIDA_TASK_WRITE_AVAILABLE) return;
         check.disabled = true;
-        void this.service
-          .completeTask(task.id)
+        const request = task.status === 2
+          ? this.service.reopenTask(task.id)
+          : this.service.completeTask(task.id);
+        void request
           .then(() => this.render())
           .catch((error) => {
             new Notice(error instanceof Error ? error.message : String(error), 8_000);
@@ -952,11 +954,14 @@ export class HelixView extends ItemView {
             await this.render();
           },
           undefined,
+          undefined,
           true,
         ).open();
       });
     }
-    if (task.status === 2) check.disabled = true;
+    if (task.status === 2 && (localTask || task.id.startsWith("sample-") || !this.state?.taskReopenVerified)) {
+      check.disabled = true;
+    }
   }
 
   private startInlineTaskTitleEdit(container: HTMLElement, task: DidaTask): void {
@@ -1138,6 +1143,10 @@ export class HelixView extends ItemView {
       },
       async (updated, writeFields) => {
         await this.service.queueTaskUpdate(updated, "update", writeFields);
+        void this.render();
+      },
+      async () => {
+        await this.service.deleteTask(task.id);
         void this.render();
       },
       async (selection, expected) => {
@@ -2191,6 +2200,7 @@ export class HelixView extends ItemView {
         );
         await this.render();
       },
+      undefined,
       undefined,
       true,
     ).open();
@@ -5425,6 +5435,7 @@ class TaskEditModal extends Modal {
       repeatWriteVerified: boolean;
     },
     private readonly submitTask: (task: DidaTask, writeFields: string[]) => Promise<void>,
+    private readonly deleteTask?: () => Promise<void>,
     private readonly submitReference?: (
       selection: TaskReferenceSelection,
       expected: TaskReferenceExpectedRevision,
@@ -5710,6 +5721,37 @@ class TaskEditModal extends Modal {
       });
     if (!this.preview) this.renderReferenceEditor();
     const taskActions = this.contentEl.createDiv({ cls: "helix-task-editor-footer" });
+    if (this.deleteTask) {
+      const deleteTask = taskActions.createEl("button", {
+        cls: "helix-task-editor-delete",
+        text: "删除任务",
+        attr: { title: "删除远端任务" },
+      });
+      let armed = false;
+      deleteTask.addEventListener("click", () => {
+        if (!armed) {
+          armed = true;
+          deleteTask.setText("再次点击确认删除");
+          globalThis.setTimeout(() => {
+            armed = false;
+            if (deleteTask.isConnected) deleteTask.setText("删除任务");
+          }, 4_000);
+          return;
+        }
+        deleteTask.disabled = true;
+        void this.deleteTask!()
+          .then(() => {
+            new Notice("滴答任务已删除");
+            this.close();
+          })
+          .catch((error) => {
+            deleteTask.disabled = false;
+            armed = false;
+            deleteTask.setText("删除任务");
+            new Notice(error instanceof Error ? error.message : String(error), 8_000);
+          });
+      });
+    }
     taskActions.createDiv({ cls: "helix-task-editor-footer-spacer" });
     taskActions.createEl("button", { text: "取消" })
       .addEventListener("click", () => this.close());

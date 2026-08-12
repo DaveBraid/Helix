@@ -372,10 +372,8 @@ describe("workbench layout and navigation structure", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(capabilities).toContain("export const DIDA_READ_AVAILABLE = true");
     expect(capabilities).toContain("export const DIDA_CONTRACT_TEST_AVAILABLE = true");
-    for (const capability of [
-      "DIDA_TASK_WRITE_AVAILABLE",
-      "PROJECT_DIDA_PROJECTION_AVAILABLE",
-    ]) expect(capabilities).toContain(`export const ${capability} = false`);
+    expect(capabilities).toContain("export const DIDA_TASK_WRITE_AVAILABLE = true");
+    expect(capabilities).toContain("export const PROJECT_DIDA_PROJECTION_AVAILABLE = false");
     expect(main).toContain("if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands()");
     expect(main).toContain("if (DIDA_CONTRACT_TEST_AVAILABLE) this.registerDidaContractCommands()");
     expect(main).toMatch(/new HelixService[\s\S]*didaReadAvailable: DIDA_READ_AVAILABLE[\s\S]*didaTaskWriteAvailable: DIDA_TASK_WRITE_AVAILABLE[\s\S]*didaContractTestAvailable: DIDA_CONTRACT_TEST_AVAILABLE/);

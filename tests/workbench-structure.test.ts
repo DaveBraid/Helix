@@ -370,16 +370,24 @@ describe("workbench layout and navigation structure", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const capabilities = readFileSync(resolve(process.cwd(), "src/release-capabilities.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
-    expect(capabilities).toContain("export const DIDA_SYNC_AVAILABLE = false");
-    expect(main).toContain("if (DIDA_SYNC_AVAILABLE) this.registerDidaCommands()");
-    expect(main).toMatch(/new HelixService[\s\S]*didaSyncAvailable: DIDA_SYNC_AVAILABLE/);
-    expect(main).toMatch(/refreshAutoSync[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return/);
-    expect(settings).toMatch(/if \(!DIDA_SYNC_AVAILABLE\)[\s\S]*本地正式版[\s\S]*renderTemplateSetting\(\)/);
-    expect(view).toMatch(/displayState[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return \{ projects: \[\], tasks: \[\] \}/);
-    expect(view).toMatch(/renderHeader[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return/);
-    expect(helixService).toMatch(/async sync\(\)[\s\S]*this\.assertDidaSyncAvailable\(\)/);
-    expect(helixService).toMatch(/applyConflict[\s\S]*this\.assertDidaSyncAvailable\(\)/);
-    expect(helixService).toMatch(/assertDidaSyncAvailable[\s\S]*本地正式版暂未开放滴答网络同步/);
+    for (const capability of [
+      "DIDA_READ_AVAILABLE",
+      "DIDA_TASK_WRITE_AVAILABLE",
+      "DIDA_CONTRACT_TEST_AVAILABLE",
+      "PROJECT_DIDA_PROJECTION_AVAILABLE",
+    ]) expect(capabilities).toContain(`export const ${capability} = false`);
+    expect(main).toContain("if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands()");
+    expect(main).toContain("if (DIDA_CONTRACT_TEST_AVAILABLE) this.registerDidaContractCommands()");
+    expect(main).toMatch(/new HelixService[\s\S]*didaReadAvailable: DIDA_READ_AVAILABLE[\s\S]*didaTaskWriteAvailable: DIDA_TASK_WRITE_AVAILABLE[\s\S]*didaContractTestAvailable: DIDA_CONTRACT_TEST_AVAILABLE/);
+    expect(main).toMatch(/refreshAutoSync[\s\S]*if \(!DIDA_READ_AVAILABLE\) return/);
+    expect(settings).toMatch(/if \(!DIDA_READ_AVAILABLE\)[\s\S]*本地正式版[\s\S]*renderTemplateSetting\(\)/);
+    expect(settings).toContain("if (DIDA_CONTRACT_TEST_AVAILABLE) this.renderContractTests()");
+    expect(view).toMatch(/displayState[\s\S]*if \(!DIDA_READ_AVAILABLE\) return \{ projects: \[\], tasks: \[\] \}/);
+    expect(view).toMatch(/renderHeader[\s\S]*if \(!DIDA_READ_AVAILABLE\) return/);
+    expect(helixService).toMatch(/async sync\(\)[\s\S]*this\.assertDidaReadAvailable\(\)[\s\S]*syncWithAuthorizationLease\(!this\.didaTaskWriteAvailable\)/);
+    expect(helixService).toMatch(/runDidaWriteContractTest[\s\S]*this\.assertDidaContractTestAvailable\(\)/);
+    expect(helixService).toMatch(/applyConflict[\s\S]*this\.assertDidaTaskWriteAvailable\(\)/);
+    expect(helixService).toMatch(/assertDidaTaskWriteAvailable[\s\S]*当前版本暂未开放滴答普通任务写入/);
     expect(view).not.toContain("renderProjectDidaMappingBar");
     expect(view).not.toContain("ProjectDidaMappingConfirmModal");
     expect(view).not.toContain("renderProjectProjectionPanel");

@@ -12,7 +12,11 @@ import {
   HELIX_DEVELOPMENT_TESTS_LABEL,
   HELIX_DEVELOPMENT_TESTS_WARNING,
 } from "./settings-development-tests";
-import { DIDA_SYNC_AVAILABLE } from "../release-capabilities";
+import {
+  DIDA_CONTRACT_TEST_AVAILABLE,
+  DIDA_READ_AVAILABLE,
+  DIDA_TASK_WRITE_AVAILABLE,
+} from "../release-capabilities";
 
 export class HelixSettingTab extends PluginSettingTab {
   private writeTestResult: string | null = null;
@@ -23,7 +27,7 @@ export class HelixSettingTab extends PluginSettingTab {
   display(): void {
     this.containerEl.empty();
     this.containerEl.createEl("h2", { text: "Helix 设置" });
-    if (!DIDA_SYNC_AVAILABLE) {
+    if (!DIDA_READ_AVAILABLE) {
       new Setting(this.containerEl)
         .setName("本地正式版")
         .setDesc("当前版本专注项目、阶段、本地任务与复盘；滴答同步将在后续稳定版本开放。已保存的 API 口令仍安全保留在 SecretStorage 中。")
@@ -110,6 +114,34 @@ export class HelixSettingTab extends PluginSettingTab {
 
     // 写入合同和能力探测只服务开发验证；默认折叠，不干扰日常授权、拉取与同步配置。
     // 原生 details/summary 自带键盘可达和展开状态；展开仅限本次设置页会话，不作持久化。
+    if (DIDA_CONTRACT_TEST_AVAILABLE) this.renderContractTests();
+
+    new Setting(this.containerEl)
+      .setName("自动同步")
+      .setDesc(DIDA_TASK_WRITE_AVAILABLE
+        ? "桌面端定时执行；冲突只暂停对应对象。"
+        : "桌面端定时只读拉取；不会消费或发送待处理写入。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
+          this.plugin.settings.autoSync = value;
+          await this.plugin.saveSettings(value);
+        }),
+      );
+    new Setting(this.containerEl)
+      .setName("同步间隔")
+      .setDesc("建议 5–30 分钟。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({ "5": "5 分钟", "10": "10 分钟", "15": "15 分钟", "30": "30 分钟" })
+          .setValue(String(this.plugin.settings.syncIntervalMinutes))
+          .onChange(async (value) => {
+            this.plugin.settings.syncIntervalMinutes = Number(value);
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+
+  private renderContractTests(): void {
     const developmentTests = this.containerEl.createEl("details", {
       cls: "helix-settings-development-tests",
       attr: { "aria-label": HELIX_DEVELOPMENT_TESTS_LABEL },
@@ -168,27 +200,6 @@ export class HelixSettingTab extends PluginSettingTab {
       .setName("任务时间能力")
       .setDesc(this.scheduleModeDescription());
 
-    new Setting(this.containerEl)
-      .setName("自动同步")
-      .setDesc("桌面端定时执行；冲突只暂停对应对象。")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
-          this.plugin.settings.autoSync = value;
-          await this.plugin.saveSettings(value);
-        }),
-      );
-    new Setting(this.containerEl)
-      .setName("同步间隔")
-      .setDesc("建议 5–30 分钟。")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({ "5": "5 分钟", "10": "10 分钟", "15": "15 分钟", "30": "30 分钟" })
-          .setValue(String(this.plugin.settings.syncIntervalMinutes))
-          .onChange(async (value) => {
-            this.plugin.settings.syncIntervalMinutes = Number(value);
-            await this.plugin.saveSettings();
-          }),
-      );
   }
 
   private renderTemplateSetting(): void {

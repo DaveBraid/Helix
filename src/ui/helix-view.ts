@@ -138,7 +138,8 @@ import {
   loadProjectionConflictModels,
 } from "./project-projection-presenter";
 import {
-  DIDA_SYNC_AVAILABLE,
+  DIDA_READ_AVAILABLE,
+  DIDA_TASK_WRITE_AVAILABLE,
   PROJECT_DIDA_PROJECTION_AVAILABLE,
 } from "../release-capabilities";
 
@@ -464,14 +465,14 @@ export class HelixView extends ItemView {
         void this.render();
       });
     }
-    const showDemoSidebar = DIDA_SYNC_AVAILABLE && this.state?.demoMode &&
+    const showDemoSidebar = DIDA_READ_AVAILABLE && this.state?.demoMode &&
       (this.localProjectTaskSnapshot?.destinations.length ?? 0) === 0;
     const sidebarProjects = showDemoSidebar
       ? this.previewProjects
-      : DIDA_SYNC_AVAILABLE ? (this.state?.projects ?? []) : [];
+      : DIDA_READ_AVAILABLE ? (this.state?.projects ?? []) : [];
     const sidebarTasks = showDemoSidebar
       ? this.previewTasks
-      : DIDA_SYNC_AVAILABLE ? (this.state?.tasks ?? []) : [];
+      : DIDA_READ_AVAILABLE ? (this.state?.tasks ?? []) : [];
     const localOpenCount = this.localProjectTaskSnapshot?.roots.filter((task) =>
       task.state !== "completed" && task.state !== "terminated").length ?? 0;
     const projectSection = sidebar.createDiv({ cls: "helix-sidebar-lists" });
@@ -479,7 +480,7 @@ export class HelixView extends ItemView {
     projectHeading.createSpan({ text: "清单" });
     const listHeadActions = projectHeading.createDiv({ cls: "helix-sidebar-lists-actions" });
     listHeadActions.createSpan({ text: String(sidebarProjects.length) });
-    if (this.state?.connected || showDemoSidebar) {
+    if (DIDA_TASK_WRITE_AVAILABLE && (this.state?.connected || showDemoSidebar)) {
       const addList = listHeadActions.createEl("button", { attr: { "aria-label": "创建清单" } });
       setIcon(addList, "plus");
       addList.addEventListener("click", () => this.openCreateDidaProjectModal());
@@ -556,14 +557,14 @@ export class HelixView extends ItemView {
     header.createEl("h1", { text: title });
     const actions = header.createDiv({ cls: "helix-header-actions" });
     const status = actions.createDiv({
-      cls: `helix-sync-status ${DIDA_SYNC_AVAILABLE && this.state?.connected ? "is-online" : "is-offline"}`,
+      cls: `helix-sync-status ${DIDA_READ_AVAILABLE && this.state?.connected ? "is-online" : "is-offline"}`,
       attr: {
         title: this.state?.syncWarnings.join("；") || this.state?.error || "",
       },
     });
     status.createSpan();
     status.createSpan({
-      text: !DIDA_SYNC_AVAILABLE
+      text: !DIDA_READ_AVAILABLE
         ? "本地模式"
         : this.state?.loading
         ? "正在同步"
@@ -585,7 +586,7 @@ export class HelixView extends ItemView {
                 : "等待首次同步"
             : "未配置滴答",
     });
-    if (!DIDA_SYNC_AVAILABLE) return;
+    if (!DIDA_READ_AVAILABLE) return;
     const sync = actions.createEl("button", {
       cls: "helix-icon-button",
       attr: { "aria-label": "立即同步", title: "立即同步" },
@@ -599,6 +600,7 @@ export class HelixView extends ItemView {
   }
 
   private openCreateDidaProjectModal(): void {
+    if (!DIDA_TASK_WRITE_AVAILABLE) return;
     new DidaProjectCreateModal(this.app, async (name, color) => {
       if (this.state?.demoMode) {
         if (this.previewProjects.some((project) => project.name === name)) {
@@ -886,7 +888,14 @@ export class HelixView extends ItemView {
       });
       edit.addEventListener("click", () => this.openLocalProjectTaskEditor(localTask));
     } else if (!task.id.startsWith("sample-")) {
+      if (!DIDA_TASK_WRITE_AVAILABLE) {
+        check.disabled = true;
+        edit.disabled = true;
+        check.title = "当前阶段仅开放滴答读取";
+        edit.title = "当前阶段仅开放滴答读取";
+      }
       check.addEventListener("click", () => {
+        if (!DIDA_TASK_WRITE_AVAILABLE) return;
         check.disabled = true;
         void this.service
           .completeTask(task.id)
@@ -902,6 +911,7 @@ export class HelixView extends ItemView {
         });
       });
       edit.addEventListener("click", () => {
+        if (!DIDA_TASK_WRITE_AVAILABLE) return;
         void this.openTaskEditor(task, this.state?.projects ?? []);
       });
     } else {
@@ -1382,7 +1392,7 @@ export class HelixView extends ItemView {
       }
     }
     const localDestinations = this.localProjectTaskSnapshot?.destinations ?? [];
-    const canComposeRemote = writableProjects.length > 0 &&
+    const canComposeRemote = DIDA_TASK_WRITE_AVAILABLE && writableProjects.length > 0 &&
       (this.state?.connected || (this.state?.demoMode && !hasLocalWorkspace));
     const canCompose = canComposeRemote || localDestinations.some((destination) =>
       destination.stages.length > 0);
@@ -2015,6 +2025,7 @@ export class HelixView extends ItemView {
     project: DidaProject,
     mode: "list" | "kanban",
   ): void {
+    if (!DIDA_TASK_WRITE_AVAILABLE) return;
     const status = this.taskViewModeSyncStatus;
     const syncing = this.taskViewModeSyncingProjectId === project.id;
     const matchesRemote = project.viewMode === mode;
@@ -2677,7 +2688,7 @@ export class HelixView extends ItemView {
   }
 
   private renderProjectLinkedTasks(content: HTMLElement): void {
-    if (!DIDA_SYNC_AVAILABLE) return;
+    if (!DIDA_READ_AVAILABLE) return;
     const snapshot = this.taskReferenceSnapshot;
     if (!snapshot) return;
     const references = snapshot.references;
@@ -4214,7 +4225,7 @@ export class HelixView extends ItemView {
   }
 
   private displayState(): { projects: DidaProject[]; tasks: DidaTask[] } {
-    if (!DIDA_SYNC_AVAILABLE) return { projects: [], tasks: [] };
+    if (!DIDA_READ_AVAILABLE) return { projects: [], tasks: [] };
     const projects = this.state?.demoMode ? this.previewProjects : this.state?.projects ?? [];
     const tasks = this.state?.demoMode ? this.previewTasks : this.state?.tasks ?? [];
     return { projects, tasks };

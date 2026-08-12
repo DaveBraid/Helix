@@ -161,6 +161,98 @@ async function createBoardMoveHarness(): Promise<{
   return { service, project, task, control, persisted: () => structuredClone(persisted) };
 }
 
+describe("HelixService layered Dida release gates", () => {
+  it("blocks read, ordinary write and contract paths independently before remote access", async () => {
+    const data = createDefaultData("device-layered-gates");
+    grantTaskCrud(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(data); },
+        async saveData() {},
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+      {
+        didaReadAvailable: false,
+        didaTaskWriteAvailable: false,
+        didaContractTestAvailable: false,
+      },
+    );
+    await service.initialize();
+    let remoteCalls = 0;
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+      async getProjects() { remoteCalls += 1; return []; },
+      async createTask() { remoteCalls += 1; throw new Error("must not run"); },
+      async createProject() { remoteCalls += 1; throw new Error("must not run"); },
+    });
+
+    await expect(service.sync()).rejects.toThrow(/暂未开放滴答远端读取/);
+    await expect(service.createTask("blocked", "project-a")).rejects.toThrow(/暂未开放滴答普通任务写入/);
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/暂未开放滴答专用写入合同测试/);
+    expect(remoteCalls).toBe(0);
+  });
+
+  it("forces read-only sync when ordinary writes are closed and preserves queued writes", async () => {
+    const data = createDefaultData("device-read-only-gate");
+    grantTaskCrud(data);
+    const task: DidaTask = { id: "queued-task", projectId: "project-a", title: "Queued", status: 0 };
+    const snapshot = createSnapshot("task", task.id, task);
+    data.queue = [{
+      id: "queued-operation",
+      kind: "task",
+      entityId: task.id,
+      projectId: task.projectId,
+      operation: "update",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      attempts: 0,
+      status: "pending",
+      base: snapshot,
+      local: snapshot,
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(
+      new HelixDataStore({
+        async loadData() { return structuredClone(persisted); },
+        async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+      }),
+      { getDidaToken: () => "token" } as HelixSecretStore,
+      { didaReadAvailable: true, didaTaskWriteAvailable: false, didaContractTestAvailable: false },
+    );
+    await service.initialize();
+    let remoteWrites = 0;
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+      async getProjects() { return []; },
+      async filterTasks() { return []; },
+      async getCompletedTasks() { return []; },
+      async updateTask() { remoteWrites += 1; throw new Error("must not run"); },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", { value: { async list() { return []; } } });
+
+    await service.sync();
+
+    expect(remoteWrites).toBe(0);
+    expect(persisted.queue).toEqual([expect.objectContaining({
+      id: "queued-operation",
+      status: "pending",
+      attempts: 0,
+    })]);
+    await expect((service as unknown as { drainQueue(): Promise<void> }).drainQueue())
+      .rejects.toThrow(/暂未开放滴答普通任务写入/);
+  });
+
+  it("rejects project projection unless both read and ordinary write gates are open", () => {
+    const store = new HelixDataStore({ async loadData() { return null; }, async saveData() {} });
+    expect(() => new HelixService(
+      store,
+      { getDidaToken: () => "token" } as HelixSecretStore,
+      { projectDidaProjectionAvailable: true, didaReadAvailable: true, didaTaskWriteAvailable: false },
+    )).toThrow(/要求同时开放滴答读取与普通写入门禁/);
+  });
+});
+
 describe("HelixService runtime recovery", () => {
   it("blocks every ordinary remote request when persisted request control is invalid", async () => {
     let persisted: unknown = {
@@ -1239,6 +1331,7 @@ describe("HelixService runtime recovery", () => {
         async saveData() {},
       }),
       { getDidaToken: () => "token" } as HelixSecretStore,
+      { projectDidaProjectionAvailable: true },
     );
     await service.initialize();
     const project: DidaProject = {
@@ -2576,9 +2669,9 @@ describe("HelixService runtime recovery", () => {
     });
     const conflictId = persisted.conflicts[0]!.id;
     await expect(disabled.chooseConflict(conflictId, "items[owned].title", "local"))
-      .rejects.toThrow(/正式版暂未开放/);
+      .rejects.toThrow(/暂未开放/);
     await expect(disabled.applyConflict(conflictId))
-      .rejects.toThrow(/正式版暂未开放/);
+      .rejects.toThrow(/暂未开放/);
     expect(remoteCalls).toBe(0);
     expect(persisted.conflicts[0]).toMatchObject({ id: conflictId, status: "open" });
   });

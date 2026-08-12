@@ -113,7 +113,9 @@ import {
   type LocalProjectTaskSnapshot,
 } from "./services/local-project-tasks";
 import {
-  DIDA_SYNC_AVAILABLE,
+  DIDA_CONTRACT_TEST_AVAILABLE,
+  DIDA_READ_AVAILABLE,
+  DIDA_TASK_WRITE_AVAILABLE,
   PROJECT_DIDA_PROJECTION_AVAILABLE,
   assertProjectDidaProjectionAvailable,
 } from "./release-capabilities";
@@ -241,7 +243,10 @@ export default class HelixPlugin extends Plugin {
       }
     }
     this.service = new HelixService(this.store, this.secrets, {
-      didaSyncAvailable: DIDA_SYNC_AVAILABLE,
+      didaReadAvailable: DIDA_READ_AVAILABLE,
+      didaTaskWriteAvailable: DIDA_TASK_WRITE_AVAILABLE,
+      didaContractTestAvailable: DIDA_CONTRACT_TEST_AVAILABLE,
+      projectDidaProjectionAvailable: PROJECT_DIDA_PROJECTION_AVAILABLE,
     });
     await this.service.initialize();
     this.projectProjection = new DidaProjectProjectionService(
@@ -330,7 +335,8 @@ export default class HelixPlugin extends Plugin {
       name: "打开工作台",
       callback: () => void this.activateView(),
     });
-    if (DIDA_SYNC_AVAILABLE) this.registerDidaCommands();
+    if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands();
+    if (DIDA_CONTRACT_TEST_AVAILABLE) this.registerDidaContractCommands();
     this.addCommand({
       id: "create-project",
       name: "创建项目",
@@ -995,7 +1001,7 @@ export default class HelixPlugin extends Plugin {
       window.clearTimeout(this.immediateSyncTimerId);
       this.immediateSyncTimerId = null;
     }
-    if (!DIDA_SYNC_AVAILABLE) return;
+    if (!DIDA_READ_AVAILABLE) return;
     const plan = autoSyncPlan({
       recoveryMode: this.recoveryMode,
       tokenConfigured: Boolean(this.secrets.getDidaToken()),
@@ -1021,12 +1027,15 @@ export default class HelixPlugin extends Plugin {
     this.registerInterval(this.syncIntervalId);
   }
 
-  private registerDidaCommands(): void {
+  private registerDidaReadCommands(): void {
     this.addCommand({
       id: "sync-now",
       name: "立即同步滴答数据",
       callback: () => void this.service.sync().catch((error) => this.service.notifySyncError(error)),
     });
+  }
+
+  private registerDidaContractCommands(): void {
     this.addCommand({
       id: "show-dida-write-contract-status",
       name: "显示滴答写入合同状态",

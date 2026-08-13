@@ -1486,6 +1486,12 @@ export default class HelixPlugin extends Plugin {
           await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
         }
         if (!this.recoveryMode) await this.repairDerivedProjectCanvasCache();
+        if (!this.recoveryMode && markdownPaths.length > 0) {
+          await this.localProjectTasks.snapshot(
+            await this.projectWorkspace.loadStableWorkspace(),
+            { adoptUnmanaged: true },
+          );
+        }
         await this.service.refreshPersistedEvents();
         this.projectAutoSync.request();
       }).catch(async (error) => {

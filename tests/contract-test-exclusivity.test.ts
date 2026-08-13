@@ -18,6 +18,7 @@ describe("HelixService contract-test exclusivity", () => {
       didaReadAvailable: true,
       didaTaskWriteAvailable: false,
       didaContractTestAvailable: true,
+      projectDidaProjectionAvailable: false,
     });
     const api = serviceApi(service);
     let contractCreates = 0;
@@ -798,6 +799,7 @@ async function serviceFixture(options: {
   didaReadAvailable?: boolean;
   didaTaskWriteAvailable?: boolean;
   didaContractTestAvailable?: boolean;
+  projectDidaProjectionAvailable?: boolean;
 } = {}): Promise<{
   service: HelixService;
   secrets: HelixSecretStore;

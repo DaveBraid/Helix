@@ -340,6 +340,7 @@ describe("HelixService layered Dida release gates", () => {
         didaReadAvailable: false,
         didaTaskWriteAvailable: false,
         didaContractTestAvailable: false,
+        projectDidaProjectionAvailable: false,
       },
     );
     await service.initialize();
@@ -381,7 +382,8 @@ describe("HelixService layered Dida release gates", () => {
         async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
       }),
       { getDidaToken: () => "token" } as HelixSecretStore,
-      { didaReadAvailable: true, didaTaskWriteAvailable: false, didaContractTestAvailable: false },
+      { didaReadAvailable: true, didaTaskWriteAvailable: false, didaContractTestAvailable: false,
+        projectDidaProjectionAvailable: false },
     );
     await service.initialize();
     let remoteWrites = 0;
@@ -2754,7 +2756,9 @@ describe("HelixService runtime recovery", () => {
     const service = new HelixService(new HelixDataStore({
       async loadData() { return structuredClone(persisted); },
       async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
-    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    }), { getDidaToken: () => "token" } as HelixSecretStore, {
+      projectDidaProjectionAvailable: false,
+    });
     await service.initialize();
     let sends = 0;
     Object.defineProperty(service, "taskEngine", {
@@ -2979,7 +2983,9 @@ describe("HelixService runtime recovery", () => {
     const disabled = new HelixService(new HelixDataStore({
       async loadData() { return structuredClone(persisted); },
       async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
-    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    }), { getDidaToken: () => "token" } as HelixSecretStore, {
+      projectDidaProjectionAvailable: false,
+    });
     await disabled.initialize();
     let remoteCalls = 0;
     Object.defineProperty(disabled, "taskEngine", {

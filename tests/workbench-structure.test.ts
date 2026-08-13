@@ -373,7 +373,7 @@ describe("workbench layout and navigation structure", () => {
     expect(capabilities).toContain("export const DIDA_READ_AVAILABLE = true");
     expect(capabilities).toContain("export const DIDA_CONTRACT_TEST_AVAILABLE = true");
     expect(capabilities).toContain("export const DIDA_TASK_WRITE_AVAILABLE = true");
-    expect(capabilities).toContain("export const PROJECT_DIDA_PROJECTION_AVAILABLE = false");
+    expect(capabilities).toContain("export const PROJECT_DIDA_PROJECTION_AVAILABLE = true");
     expect(main).toContain("if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands()");
     expect(main).toContain("if (DIDA_CONTRACT_TEST_AVAILABLE) this.registerDidaContractCommands()");
     expect(main).toMatch(/new HelixService[\s\S]*didaReadAvailable: DIDA_READ_AVAILABLE[\s\S]*didaTaskWriteAvailable: DIDA_TASK_WRITE_AVAILABLE[\s\S]*didaContractTestAvailable: DIDA_CONTRACT_TEST_AVAILABLE/);
@@ -402,6 +402,7 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toContain("this.registerEditorExtension(helixMarkerVisibilityExtension)");
     expect(main).toMatch(/new ProjectAutoSyncCoordinator[\s\S]*scan: \(\) => this\.projectAutoSyncScan\(\)[\s\S]*synchronize: \(projectId\) => this\.syncProjectProjection\(projectId\)/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*localProjectTasks\.snapshot[\s\S]*adoptUnmanaged: true[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);
     expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && readiness\.ready/);
     expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE[\s\S]*candidates: \[\], failures: \[\]/);

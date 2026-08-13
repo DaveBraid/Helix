@@ -7,8 +7,8 @@ export const DIDA_TASK_WRITE_AVAILABLE = true;
 /** 会创建临时远端对象的专用写入合同测试。 */
 export const DIDA_CONTRACT_TEST_AVAILABLE = true;
 
-/** 当前本地正式版不开放项目到滴答的投影写入。 */
-export const PROJECT_DIDA_PROJECTION_AVAILABLE = false;
+/** dev 已开放项目到滴答的安全投影入口；持久状态仍默认关闭并要求当前版本二次确认。 */
+export const PROJECT_DIDA_PROJECTION_AVAILABLE = true;
 
 export function assertProjectDidaProjectionAvailable(): void {
   if (!PROJECT_DIDA_PROJECTION_AVAILABLE) {

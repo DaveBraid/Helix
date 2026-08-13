@@ -4,6 +4,8 @@ const manifest = JSON.parse(await readFile("manifest.json", "utf8"));
 const versions = JSON.parse(await readFile("versions.json", "utf8"));
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 const releaseCapabilities = await readFile("src/release-capabilities.ts", "utf8");
+const settingsUi = await readFile("src/ui/settings-tab.ts", "utf8");
+const projectionService = await readFile("src/services/dida-project-projection.ts", "utf8");
 
 const requiredArtifacts = [
   "manifest.json",
@@ -52,10 +54,16 @@ if (!releaseCapabilities.includes("export const DIDA_CONTRACT_TEST_AVAILABLE = t
 if (!releaseCapabilities.includes("export const DIDA_TASK_WRITE_AVAILABLE = true")) {
   throw new Error("当前开发基线必须开放滴答普通任务写入门禁");
 }
-for (const capability of ["PROJECT_DIDA_PROJECTION_AVAILABLE"]) {
-  if (!releaseCapabilities.includes(`export const ${capability} = false`)) {
-    throw new Error(`当前本地正式版必须关闭 ${capability} 门禁`);
-  }
+if (!releaseCapabilities.includes("export const PROJECT_DIDA_PROJECTION_AVAILABLE = true")) {
+  throw new Error("当前开发基线必须开放项目同步门禁");
+}
+if (!settingsUi.includes("projectionActivationConfirmation.request()") ||
+    !settingsUi.includes("confirmProjectProjection(")) {
+  throw new Error("项目同步入口缺少预览后二次确认");
+}
+if (!projectionService.includes("PROJECT_PROJECTION_ACTIVATION_VERSION") ||
+    !projectionService.includes("activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION")) {
+  throw new Error("项目同步入口缺少版本化激活凭证");
 }
 
 console.log(`Helix ${manifest.version} 发布产物检查通过：${requiredArtifacts.join("、")}`);

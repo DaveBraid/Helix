@@ -401,6 +401,7 @@ describe("workbench layout and navigation structure", () => {
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
     expect(main).toContain("this.registerEditorExtension(helixMarkerVisibilityExtension)");
     expect(main).toMatch(/new ProjectAutoSyncCoordinator[\s\S]*scan: \(\) => this\.projectAutoSyncScan\(\)[\s\S]*synchronize: \(projectId\) => this\.syncProjectProjection\(projectId\)/);
+    expect(main).toMatch(/runVaultProjectProjectionContractProbe[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(input\)[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(secondInput\)/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*localProjectTasks\.snapshot[\s\S]*adoptUnmanaged: true[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);

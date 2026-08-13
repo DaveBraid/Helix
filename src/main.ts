@@ -733,7 +733,10 @@ export default class HelixPlugin extends Plugin {
       await contractProjection.activate(preview, preview.previewHash);
       const input = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
         .find((project) => project.id === created!.id)!);
-      const first = await contractProjection.synchronizeProject(input);
+      // 投影会在远端请求之间回填 Project／Stage Markdown；整个同步必须加入自写批次，
+      // 否则前序 createTask 的延迟 Vault 事件可能在回填瞬间启动扫描并制造假 markdown-race。
+      const first = await this.withWritableProjectMutation(() =>
+        contractProjection.synchronizeProject(input));
       if (first.createdParents !== 1 || first.createdActions !== 1 || first.frozen.length > 0) {
         throw new Error("Vault 项目链路探针首次同步未完整收口");
       }
@@ -758,7 +761,8 @@ export default class HelixPlugin extends Plugin {
       });
       const secondInput = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
         .find((project) => project.id === created!.id)!);
-      const second = await contractProjection.synchronizeProject(secondInput);
+      const second = await this.withWritableProjectMutation(() =>
+        contractProjection.synchronizeProject(secondInput));
       if (second.updatedActions !== 1 || second.completedActions !== 1 || second.frozen.length > 0) {
         throw new Error("Vault 项目链路探针编辑与完成未完整收口");
       }

@@ -803,7 +803,13 @@ export class DidaProjectProjectionService {
     }
     if (!remote) throw new Error("无法精确复读真实子任务，保持冻结且不按标题领养");
     const recovered = { ...entry, remoteId: remote.id };
-    verifyProjectedTask(remote, recovered, projectionMarker(entry.uuid), { title: false, state: false });
+    // 结果未知的领养入口已通过远端详情精确核验目标分栏；普通同步快照有意不持久化
+    // 服务端派生的 columnId，因此冻结收口只复核其余身份与属性。
+    verifyProjectedTask(remote, recovered, projectionMarker(entry.uuid), {
+      title: false,
+      state: false,
+      column: false,
+    });
     const conflictResolved = Boolean(entry.conflictId && inspection?.resolutionAudit &&
       inspection.resolutionAudit.conflictId === entry.conflictId && inspection.resolvedTask &&
       stableHash(inspection.resolvedTask) === stableHash(remote));
@@ -905,6 +911,14 @@ export class DidaProjectProjectionService {
       projectCount: preview.projectCount,
       actionCount: preview.actionCount,
     });
+    await this.activateVerifiedPreview(fresh, confirmedHash);
+  }
+
+  /** 调用方已在同一排他租约内完成远端复读时，避免再次申请共享租约造成自锁。 */
+  async activateVerifiedPreview(
+    fresh: ProjectionActivationPreview,
+    confirmedHash: string,
+  ): Promise<void> {
     assertProjectionActivation(fresh, confirmedHash);
     const current = await this.state.read();
     if (current.target && (current.target.targetProjectId !== fresh.target.targetProjectId ||
@@ -1196,6 +1210,13 @@ export class DidaProjectProjectionService {
         const result = await this.pipeline.recoverCreate(clientIdentity, entry.targetProjectId) ??
           await this.pipeline.createTask(desired, clientIdentity);
         if (result.outcome !== "verified") {
+          if (result.outcome === "capability" && !result.conflictId) {
+            // 请求未发送即可确定的不兼容输入不形成持久身份冻结；用户修正 Markdown 后自然重试。
+            working = working.filter((candidate) =>
+              projectionLedgerIdentity(candidate) !== projectionLedgerIdentity(entry));
+            params.summary.frozen.push({ uuid: entry.uuid, reason: "capability", message: result.message });
+            continue;
+          }
           working = freezeEntry(working, entry, resultReason(result), params.summary, result.message, result);
           continue;
         }

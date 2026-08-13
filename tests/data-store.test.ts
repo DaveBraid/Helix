@@ -819,6 +819,13 @@ describe("HelixDataStore serialization", () => {
         remoteEntity: "task" as const,
         title: "Action",
         state: "active" as const,
+        content: "行动备注",
+        startDate: "2026-08-14T09:00:00+08:00",
+        dueDate: "2026-08-14T09:00:00+08:00",
+        timeZone: "Asia/Shanghai",
+        isAllDay: false,
+        priority: 5 as const,
+        tags: ["科研"],
         sourceHash: "b".repeat(64),
       }],
       parentCheckpoints: [{

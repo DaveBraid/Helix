@@ -309,6 +309,24 @@ describe("Dida project projection domain", () => {
     expect(() => verifyProjectedTask({ ...task, parentId: "foreign" }, entry, projectionMarker("uuid-1"))).toThrow(/复读不一致/);
   });
 
+  it("accepts Dida tag case normalization only when column identity has prior proof", () => {
+    const entry = ledger({ remoteId: "task-1", tags: ["Helix", "本地验收"] });
+    const task: DidaTask = {
+      id: "task-1",
+      projectId: "list-1",
+      parentId: "parent-1",
+      title: "行动",
+      content: projectionMarker("uuid-1"),
+      status: 0,
+      tags: ["helix", "本地验收"],
+    };
+
+    expect(() => verifyProjectedTask(task, entry, projectionMarker("uuid-1"), {
+      column: false,
+    })).not.toThrow();
+    expect(() => verifyProjectedTask(task, entry, projectionMarker("uuid-1"))).toThrow(/columnId/);
+  });
+
   it("ignores a server-default timezone when neither side has a schedule", () => {
     const entry = ledger({ remoteId: "task-1", timeZone: undefined });
     const task: DidaTask = {
@@ -728,6 +746,34 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       remoteId: "remote-2",
       parentTaskId: "remote-1",
     });
+  });
+
+  it("does not persist an unsent capability rejection and retries after local input is fixed", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    const withSecond = harness.markdown.content("Stage.md")
+      .replace("# 行动结果", "- [ ] 第二行动\n# 行动结果");
+    const line = parseManagedPlanActions(withSecond).unmanagedChecklistLines[0]!;
+    harness.markdown.set("Stage.md", adoptPlanAction(withSecond, line, "uuid-2"));
+    harness.pipeline.nextResult = {
+      operationId: "op-local-capability",
+      outcome: "capability",
+      message: "当前账号不支持该时间段",
+    };
+
+    const blocked = await harness.service.synchronizeProject(input());
+
+    expect(blocked.frozen).toContainEqual(expect.objectContaining({
+      uuid: "uuid-2", reason: "capability",
+    }));
+    expect(harness.state.value.ledger.some((entry) => entry.uuid === "uuid-2")).toBe(false);
+    expect(harness.markdown.content("Stage.md")).toContain("uuid=uuid-2 remoteId=-");
+
+    harness.pipeline.receipts.clear();
+    const retried = await harness.service.synchronizeProject(input());
+    expect(retried).toMatchObject({ createdActions: 1, frozen: [] });
+    expect(harness.state.value.ledger.find((entry) => entry.uuid === "uuid-2"))
+      .toMatchObject({ remoteId: "remote-4" });
   });
 
   it("retries a transient projection-state CAS without misreporting a Markdown race", async () => {

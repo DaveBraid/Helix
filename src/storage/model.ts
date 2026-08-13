@@ -594,6 +594,7 @@ function validateDidaProjectionState(
     if (!onlyKeys(row, [
       "uuid", "projectId", "stageId", "stagePath", "parentTaskId", "targetProjectId", "targetColumnId",
       "remoteId", "remoteEntity", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
+      "content", "startDate", "dueDate", "timeZone", "isAllDay", "priority", "tags",
       "createBaselineItemIds", "createBaselineItemsHash", "createBaselineItemHashes", "createBaselineSemanticHashes",
       "createItemId", "createItemSortOrder",
       "updateExpectedTitle", "updateExpectedStatus", "updateStageRevisionHash",
@@ -608,6 +609,13 @@ function validateDidaProjectionState(
       /^[a-f0-9]{64}$/u.test(String(row.sourceHash)) &&
       ["idea", "active", "completed", "paused", "terminated"].includes(String(row.state)) &&
       (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
+      (row.content === undefined || typeof row.content === "string") &&
+      (row.startDate === undefined || stableId(row.startDate)) &&
+      (row.dueDate === undefined || stableId(row.dueDate)) &&
+      (row.timeZone === undefined || stableId(row.timeZone)) &&
+      (row.isAllDay === undefined || typeof row.isAllDay === "boolean") &&
+      (row.priority === undefined || row.priority === 0 || row.priority === 1 || row.priority === 3 || row.priority === 5) &&
+      (row.tags === undefined || (Array.isArray(row.tags) && row.tags.every(stableId))) &&
       (row.remoteEntity === undefined || row.remoteEntity === "task" || row.remoteEntity === "item") &&
       (row.operationId === undefined || stableId(row.operationId)) &&
       (row.conflictId === undefined || stableId(row.conflictId)) &&

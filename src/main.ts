@@ -98,6 +98,7 @@ import {
 } from "./domain/dida-project-projection";
 import {
   confirmProjectionActivation,
+  confirmProjectionActivationWithLease,
   projectionCounts,
   projectionInputFromProject,
   projectionStageInProject,
@@ -508,7 +509,7 @@ export default class HelixPlugin extends Plugin {
       void this.finishProjectStartup(staleFocusBridgeIssues);
     });
     // 重启后从 Markdown/Canvas 权威源重扫；队列与写门仍由既有同步管线负责。
-    this.projectAutoSync.request();
+    this.projectAutoSync.invalidate();
   }
 
   private async finishProjectStartup(staleFocusBridgeIssues: readonly string[]): Promise<void> {
@@ -980,11 +981,17 @@ export default class HelixPlugin extends Plugin {
     confirmedHash: string,
   ): Promise<void> {
     this.assertProjectProjectionAvailable();
-    await this.service.withProjectProjectionActivationLease(() =>
+    await this.service.withProjectProjectionActivationLease((readCatalog) =>
       this.withWritableProjectMutation(async () => {
         const snapshot = await this.projectWorkspace.loadStableWorkspace();
         await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
-        await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
+        await confirmProjectionActivationWithLease(
+          snapshot,
+          this.projectProjection,
+          preview,
+          confirmedHash,
+          readCatalog,
+        );
       }));
     const readiness = await this.service.projectProjectionWriteReadiness();
     this.projectAutoSync.updateReadiness(
@@ -1031,7 +1038,7 @@ export default class HelixPlugin extends Plugin {
         line: input.line,
       });
     });
-    this.projectAutoSync.request();
+    this.projectAutoSync.invalidate(input.projectId);
   }
 
   async editProjectAction(input: {
@@ -1053,7 +1060,7 @@ export default class HelixPlugin extends Plugin {
         state: input.state,
       });
     });
-    this.projectAutoSync.request();
+    this.projectAutoSync.invalidate(input.projectId);
   }
 
   async reconcileProjectProjectionFrozen(input:

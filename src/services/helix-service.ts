@@ -508,7 +508,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       : { ready: true, reason: "隔离条件已满足；运行时只会操作唯一标记的专用测试对象" };
   }
 
-  async withProjectProjectionActivationLease<T>(activate: () => Promise<T>): Promise<T> {
+  async withProjectProjectionActivationLease<T>(
+    activate: (readCatalog: (projectId: string) => Promise<ProjectionCatalogSnapshot>) => Promise<T>,
+  ): Promise<T> {
     this.assertProjectDidaProjectionAvailable();
     this.assertWritable();
     const releaseExclusive = this.remoteWriteGate.enterExclusive("启用滴答项目同步");
@@ -520,7 +522,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         (data.didaProjectionState?.receiptCleanupPending?.length ?? 0) > 0) {
         throw new Error("仍有待处理写入、冲突或恢复操作，暂不能启用滴答项目同步");
       }
-      return await activate();
+      return await activate((projectId) => this.readProjectionCatalogWithLeaseHeld(projectId));
     } finally {
       releaseExclusive();
     }
@@ -1636,6 +1638,16 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     try {
       this.assertWritable();
       this.assertProjectionCapabilities(false);
+      // 纯本地能力校验必须发生在持久排队前；确定不兼容时零远端写、零重试、零队列残留。
+      try {
+        validateTaskScheduleWrite(task, this.state.taskScheduleMode);
+      } catch (error) {
+        return {
+          operationId: `op-projection-capability-${stableHash(clientIdentity).slice(0, 24)}`,
+          outcome: "capability",
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
       const existing = await this.recoverProjectionCreate(clientIdentity, task.projectId);
       if (existing) return existing;
       const now = new Date().toISOString();
@@ -2741,7 +2753,15 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       if (!operation.projectId) throw new Error("待核对任务缺少 projectId");
       const remote = normalizeTask(await this.api.getTask(operation.projectId, normalizedRemoteId));
       const local = operation.local.value as DidaTask;
-      if (!matchesCreatedTask(local, remote)) {
+      const projectionTarget = isProjectionQueueOperation(operation)
+        ? data.didaProjectionState?.target
+        : undefined;
+      const expectedColumnId = local.columnId ?? (
+        projectionTarget?.targetProjectId === local.projectId
+          ? projectionTarget.targetColumnId
+          : undefined
+      );
+      if (!matchesCreatedTask(local, remote, expectedColumnId)) {
         throw new Error("远端任务与待创建内容不匹配，拒绝自动绑定");
       }
       adopted = createSnapshot("task", remote.id, remote);
@@ -3700,12 +3720,22 @@ function sameColumns(left: DidaColumn[], right: DidaColumn[]): boolean {
   });
 }
 
-function matchesCreatedTask(local: DidaTask, remote: DidaTask): boolean {
+function matchesCreatedTask(
+  local: DidaTask,
+  remote: DidaTask,
+  expectedColumnId = local.columnId,
+): boolean {
   return (
     local.projectId === remote.projectId &&
+    (local.parentId ?? "") === (remote.parentId ?? "") &&
+    (expectedColumnId ?? "") === (remote.columnId ?? "") &&
     local.title === remote.title &&
     (local.content ?? "") === (remote.content ?? "") &&
     (local.desc ?? "") === (remote.desc ?? "") &&
+    sameOptionalTaskInstant(local.startDate, remote.startDate) &&
+    sameOptionalTaskInstant(local.dueDate, remote.dueDate) &&
+    (local.timeZone ?? "") === (remote.timeZone ?? "") &&
+    (local.isAllDay ?? false) === (remote.isAllDay ?? false) &&
     (local.priority ?? 0) === (remote.priority ?? 0) &&
     sameStringSet(local.tags, remote.tags) &&
     (local.status ?? 0) === (remote.status ?? 0)
@@ -3714,12 +3744,20 @@ function matchesCreatedTask(local: DidaTask, remote: DidaTask): boolean {
 
 function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
   const normalize = (values: string[] | undefined) =>
-    [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))]
+    [...new Set((values ?? []).map((value) => value.trim().toLocaleLowerCase()).filter(Boolean))]
       .sort((a, b) => a.localeCompare(b));
   const normalizedLeft = normalize(left);
   const normalizedRight = normalize(right);
   return normalizedLeft.length === normalizedRight.length &&
     normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function sameOptionalTaskInstant(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  return Number.isFinite(leftTime) && leftTime === rightTime;
 }
 
 function appendEarnedChallengeAwards(

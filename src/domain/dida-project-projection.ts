@@ -696,7 +696,7 @@ export function verifyProjectedTask(
   task: DidaTask,
   entry: ProjectionLedgerEntry,
   marker: string,
-  options: { title?: boolean; state?: boolean; attributes?: boolean } = {},
+  options: { title?: boolean; state?: boolean; attributes?: boolean; column?: boolean } = {},
 ): void {
   const verifyTitle = options.title ?? true;
   const verifyState = options.state ?? true;
@@ -706,7 +706,7 @@ export function verifyProjectedTask(
     remoteId: Boolean(entry.remoteId) && task.id === entry.remoteId,
     projectId: task.projectId === entry.targetProjectId,
     parentId: task.parentId === entry.parentTaskId,
-    columnId: task.columnId === entry.targetColumnId,
+    columnId: options.column === false || task.columnId === entry.targetColumnId,
     marker: task.content === marker,
     title: !verifyTitle || task.title === entry.title,
     state: !verifyState || (entry.state === "completed" ? task.status === 2 : task.status !== 2),
@@ -721,8 +721,10 @@ export function verifyProjectedTask(
 
 function projectionTaskAttributeMismatches(task: DidaTask, entry: ProjectionLedgerEntry): string[] {
   const optional = (value: string | null | undefined) => value?.trim() || undefined;
+  // 滴答会把标签规范化为小写；标签身份不区分大小写，但仍严格比较集合内容。
   const tags = (value: string[] | undefined) => [...new Set((value ?? [])
-    .map((tag) => tag.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+    .map((tag) => tag.trim().toLocaleLowerCase()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
   // 滴答会给无日期任务补上账户默认时区；没有开始/截止时间时该字段没有业务语义，
   // 不能把服务端默认值误判为项目行动写入失败。
   const scheduleExists = Boolean(task.startDate || task.dueDate || entry.startDate || entry.dueDate);

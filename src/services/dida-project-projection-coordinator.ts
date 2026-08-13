@@ -9,7 +9,9 @@ import type {
 import type {
   ProjectionProjectInput,
   ProjectionProjectReadModel,
+  ProjectionCatalogSnapshot,
 } from "./dida-project-projection";
+import { buildProjectionActivationPreview } from "../domain/dida-project-projection";
 
 export interface ProjectionApplicationPort {
   readProject(input: ProjectionProjectInput): Promise<ProjectionProjectReadModel>;
@@ -18,6 +20,31 @@ export interface ProjectionApplicationPort {
     counts: { projectCount: number; actionCount: number },
   ): Promise<ProjectionActivationPreview>;
   activate(preview: ProjectionActivationPreview, confirmedHash: string): Promise<void>;
+}
+
+/** 确认事务已经持有排他租约；远端目录必须通过该租约提供的读取函数获取。 */
+export async function confirmProjectionActivationWithLease(
+  snapshot: ProjectWorkspaceSnapshot,
+  projection: ProjectionApplicationPort & {
+    activateVerifiedPreview(preview: ProjectionActivationPreview, confirmedHash: string): Promise<void>;
+  },
+  preview: ProjectionActivationPreview,
+  confirmedHash: string,
+  readCatalog: (projectId: string) => Promise<ProjectionCatalogSnapshot>,
+): Promise<void> {
+  const counts = await projectionCounts(snapshot, projection);
+  const catalog = await readCatalog(preview.target.targetProjectId);
+  const fresh = buildProjectionActivationPreview({
+    target: preview.target,
+    projects: catalog.projects,
+    columns: catalog.columns,
+    readiness: catalog.readiness,
+    ...counts,
+  });
+  if (fresh.previewHash !== confirmedHash) {
+    throw new Error("同步项目、行动或远端目标已变化，请重新预览确认");
+  }
+  await projection.activateVerifiedPreview(fresh, confirmedHash);
 }
 
 export function projectionInputFromProject(project: ProjectWorkspaceProject): ProjectionProjectInput {

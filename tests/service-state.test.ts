@@ -1122,6 +1122,64 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.queue).toMatchObject([{ id: "op-pending-pull-only", status: "pending" }]);
   });
 
+  it("clears a converged ordinary task queue during sync without a redundant remote write", async () => {
+    const data = createDefaultData("device-converged-sync");
+    grantTaskCrud(data);
+    const baseTask = taskSyncProjection(normalizeTask({
+      id: "task-converged",
+      projectId: "project-1",
+      title: "Base",
+      status: 0,
+    }));
+    const desiredTask = { ...baseTask, title: "Same result" };
+    const base = createSnapshot("task", baseTask.id, baseTask);
+    const local = createSnapshot("task", desiredTask.id, desiredTask);
+    data.baseSnapshots[`task:${baseTask.id}`] = base;
+    data.localSnapshots[`task:${baseTask.id}`] = local;
+    data.queue = [{
+      id: "op-converged-sync",
+      kind: "task",
+      entityId: baseTask.id,
+      projectId: baseTask.projectId,
+      operation: "update",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      attempts: 0,
+      status: "pending",
+      base,
+      local,
+      writeFields: ["title"],
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    let remoteWrites = 0;
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+        async getProjects() { return [{ id: "project-1", name: "Remote list" }]; },
+        async getProjectData() {
+          return { project: { id: "project-1", name: "Remote list" }, columns: [], tasks: [desiredTask] };
+        },
+        async filterTasks() { return [desiredTask]; },
+        async getCompletedTasks() { return []; },
+        async getTask() { return desiredTask; },
+        async updateTask() { remoteWrites += 1; throw new Error("must not write"); },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", { value: { async list() { return []; } } });
+
+    await service.sync();
+
+    expect(remoteWrites).toBe(0);
+    expect(persisted.queue).toEqual([]);
+    expect(persisted.conflicts).toEqual([]);
+    expect(persisted.baseSnapshots[`task:${baseTask.id}`]?.value).toMatchObject({ title: "Same result" });
+  });
+
   it("clears only local Dida display caches without touching authorization or events", async () => {
     const data = createDefaultData("device-clear-cache");
     const project: DidaProject = { id: "project-cache", name: "Cached", viewMode: "list" };

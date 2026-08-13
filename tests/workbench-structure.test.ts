@@ -407,6 +407,7 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);
     expect(main).toMatch(/previewProjectProjection[\s\S]*localProjectTasks\.snapshot\(snapshot, \{ adoptUnmanaged: true \}\)[\s\S]*projectionCounts/);
     expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && readiness\.ready/);
+    expect(main).toMatch(/reportProjectAutoSync[\s\S]*report\.mutations > 0[\s\S]*滴答项目同步完成/);
     expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE[\s\S]*candidates: \[\], failures: \[\]/);
     const readiness = service.slice(
       service.indexOf("async projectProjectionWriteReadiness"),

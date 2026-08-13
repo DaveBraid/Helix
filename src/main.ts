@@ -1087,6 +1087,9 @@ export default class HelixPlugin extends Plugin {
       new Notice(`滴答项目同步暂缓 ${report.blocked} 项${frozen}；请查看冲突中心或同步设置`, 10_000);
       return;
     }
+    if (report.mutations > 0) {
+      new Notice(`滴答项目同步完成：${report.synchronized} 个项目，${report.mutations} 项变更`, 6_000);
+    }
   }
 
   private async projectionInput(projectId: string): Promise<ProjectionProjectInput> {

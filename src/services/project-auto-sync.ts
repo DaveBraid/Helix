@@ -14,6 +14,8 @@ export interface ProjectAutoSyncReport {
   blocked: number;
   failed: number;
   frozen: number;
+  synchronized: number;
+  mutations: number;
 }
 
 export interface ProjectAutoSyncSource {
@@ -86,7 +88,7 @@ export class ProjectAutoSyncCoordinator {
   }
 
   updateReadiness(ready: boolean): void {
-    if (this.readiness === false && ready) this.invalidate();
+    if (this.readiness !== true && ready) this.invalidate();
     this.readiness = ready;
   }
 
@@ -106,8 +108,13 @@ export class ProjectAutoSyncCoordinator {
       this.rerun = true;
       return;
     }
+    // readiness 未完成或明确不满足时连 scan 都不执行，避免禁用态、合同失效或
+    // 恢复锁期间读取项目后意外走到远端同步入口。false→true 会重新唤醒。
+    if (this.readiness !== true) return;
     this.running = true;
     const attempted = new Map<string, string>();
+    const mutatedProjects = new Set<string>();
+    const total = emptyReport();
     let pass = 0;
     try {
       do {
@@ -121,12 +128,12 @@ export class ProjectAutoSyncCoordinator {
         try {
           scan = await this.source.scan();
         } catch {
-          const report = { blocked: 0, failed: 0, frozen: 0 };
+          const report = emptyReport();
           this.reportIssue("__workspace__", "unavailable", "failed", report);
-          if (report.failed > 0) this.source.report(report);
+          mergeReport(total, report);
           break;
         }
-        const report = { blocked: 0, failed: 0, frozen: 0 };
+        const report = emptyReport();
         for (const failure of scan.failures) {
           this.reportIssue(failure.projectId, failure.fingerprint, "failed", report);
         }
@@ -146,6 +153,9 @@ export class ProjectAutoSyncCoordinator {
               this.reportIssue(candidate.projectId, candidate.fingerprint, "blocked", report, summary.frozen.length);
             } else {
               successful.set(candidate.projectId, candidate.fingerprint);
+              const mutations = projectionMutationCount(summary);
+              report.mutations += mutations;
+              if (mutations > 0) mutatedProjects.add(candidate.projectId);
               this.deferred.delete(candidate.projectId);
               this.reportedIssues.delete(candidate.projectId);
             }
@@ -181,15 +191,19 @@ export class ProjectAutoSyncCoordinator {
             }
           }
         }
-        if (report.blocked > 0 || report.failed > 0) this.source.report(report);
+        mergeReport(total, report);
       } while (this.rerun && !this.disposed && pass < 4);
       if (this.rerun && !this.disposed) {
-        const report = { blocked: 0, failed: 0, frozen: 0 };
+        const report = emptyReport();
         this.reportIssue("__convergence__", "limit", "failed", report);
-        if (report.failed > 0) this.source.report(report);
+        mergeReport(total, report);
       }
     } finally {
       this.running = false;
+    }
+    total.synchronized = mutatedProjects.size;
+    if (total.blocked > 0 || total.failed > 0 || total.mutations > 0) {
+      this.source.report(total);
     }
   }
 
@@ -206,4 +220,21 @@ export class ProjectAutoSyncCoordinator {
     report[kind] += 1;
     report.frozen += frozen;
   }
+}
+
+function emptyReport(): ProjectAutoSyncReport {
+  return { blocked: 0, failed: 0, frozen: 0, synchronized: 0, mutations: 0 };
+}
+
+function mergeReport(target: ProjectAutoSyncReport, source: ProjectAutoSyncReport): void {
+  target.blocked += source.blocked;
+  target.failed += source.failed;
+  target.frozen += source.frozen;
+  target.synchronized += source.synchronized;
+  target.mutations += source.mutations;
+}
+
+function projectionMutationCount(summary: ProjectionSyncSummary): number {
+  return summary.createdParents + summary.updatedParents + summary.completedParents +
+    summary.createdActions + summary.updatedActions + summary.completedActions + summary.deletedActions;
 }

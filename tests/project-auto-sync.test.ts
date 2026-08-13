@@ -30,6 +30,7 @@ describe("ProjectAutoSyncCoordinator", () => {
       synchronize,
       report,
     }, 100);
+    coordinator.updateReadiness(true);
     coordinator.request();
     coordinator.request();
     await vi.advanceTimersByTimeAsync(100);
@@ -49,16 +50,17 @@ describe("ProjectAutoSyncCoordinator", () => {
       synchronize,
       report: (value) => reports.push(value),
     });
+    coordinator.updateReadiness(true);
     await coordinator.flush();
     await coordinator.flush();
     expect(synchronize).toHaveBeenCalledTimes(1);
-    expect(reports).toEqual([{ blocked: 1, failed: 0, frozen: 1 }]);
+    expect(reports).toEqual([{ blocked: 1, failed: 0, frozen: 1, synchronized: 0, mutations: 0 }]);
     coordinator.invalidate("p1");
     await coordinator.flush();
     expect(synchronize).toHaveBeenCalledTimes(2);
     expect(reports).toEqual([
-      { blocked: 1, failed: 0, frozen: 1 },
-      { blocked: 1, failed: 0, frozen: 1 },
+      { blocked: 1, failed: 0, frozen: 1, synchronized: 0, mutations: 0 },
+      { blocked: 1, failed: 0, frozen: 1, synchronized: 0, mutations: 0 },
     ]);
   });
 
@@ -73,9 +75,10 @@ describe("ProjectAutoSyncCoordinator", () => {
       synchronize,
       report: (value) => reports.push(value),
     });
+    coordinator.updateReadiness(true);
     await coordinator.flush();
     expect(synchronize).toHaveBeenCalledTimes(2);
-    expect(reports).toEqual([{ blocked: 1, failed: 0, frozen: 1 }]);
+    expect(reports).toEqual([{ blocked: 1, failed: 0, frozen: 1, synchronized: 0, mutations: 0 }]);
   });
 
   it("isolates scan failures so healthy projects still synchronize", async () => {
@@ -89,9 +92,10 @@ describe("ProjectAutoSyncCoordinator", () => {
       synchronize,
       report: (value) => reports.push(value),
     });
+    coordinator.updateReadiness(true);
     await coordinator.flush();
     expect(synchronize).toHaveBeenCalledWith("healthy");
-    expect(reports).toEqual([{ blocked: 0, failed: 1, frozen: 0 }]);
+    expect(reports).toEqual([{ blocked: 0, failed: 1, frozen: 0, synchronized: 0, mutations: 0 }]);
     await coordinator.flush();
     expect(reports).toHaveLength(1);
   });
@@ -108,6 +112,7 @@ describe("ProjectAutoSyncCoordinator", () => {
       },
       report: (value) => reports.push(value),
     });
+    coordinator.updateReadiness(true);
     await coordinator.flush();
     await coordinator.flush();
     fingerprint = "two";
@@ -116,9 +121,9 @@ describe("ProjectAutoSyncCoordinator", () => {
     coordinator.invalidate("p1");
     await coordinator.flush();
     expect(reports).toEqual([
-      { blocked: 1, failed: 0, frozen: 0 },
-      { blocked: 1, failed: 0, frozen: 0 },
-      { blocked: 0, failed: 1, frozen: 0 },
+      { blocked: 1, failed: 0, frozen: 0, synchronized: 0, mutations: 0 },
+      { blocked: 1, failed: 0, frozen: 0, synchronized: 0, mutations: 0 },
+      { blocked: 0, failed: 1, frozen: 0, synchronized: 0, mutations: 0 },
     ]);
   });
 
@@ -135,6 +140,7 @@ describe("ProjectAutoSyncCoordinator", () => {
       synchronize,
       report: vi.fn(),
     });
+    coordinator.updateReadiness(true);
     await coordinator.flush();
     coordinator.invalidate("p1");
     await coordinator.flush();
@@ -154,18 +160,46 @@ describe("ProjectAutoSyncCoordinator", () => {
       report: vi.fn(),
     });
     await coordinator.flush();
-    coordinator.updateReadiness(false);
     const release = gate.enterShared();
     queue.pop();
     coordinator.updateReadiness(queue.length === 0 && gate.isIdle());
     await coordinator.flush();
-    expect(synchronize).toHaveBeenCalledTimes(1);
+    expect(synchronize).toHaveBeenCalledTimes(0);
     release();
     await coordinator.flush();
-    expect(synchronize).toHaveBeenCalledTimes(2);
+    expect(synchronize).toHaveBeenCalledTimes(1);
     coordinator.updateReadiness(true);
     await coordinator.flush();
-    expect(synchronize).toHaveBeenCalledTimes(2);
+    expect(synchronize).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not scan or synchronize until readiness becomes true", async () => {
+    const scan = vi.fn(async () => ({ candidates: [{ projectId: "p1", fingerprint: "one" }], failures: [] }));
+    const synchronize = vi.fn(async () => summary());
+    const coordinator = new ProjectAutoSyncCoordinator({ scan, synchronize, report: vi.fn() });
+    await coordinator.flush();
+    expect(scan).not.toHaveBeenCalled();
+    expect(synchronize).not.toHaveBeenCalled();
+    coordinator.updateReadiness(true);
+    await coordinator.flush();
+    expect(scan).toHaveBeenCalledTimes(2);
+    expect(synchronize).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports one successful batch only when remote mutations occurred", async () => {
+    const report = vi.fn();
+    const coordinator = new ProjectAutoSyncCoordinator({
+      scan: async () => ({ candidates: [{ projectId: "p1", fingerprint: "same" }], failures: [] }),
+      synchronize: async () => ({ ...summary(), createdParents: 1, createdActions: 2 }),
+      report,
+    });
+    coordinator.updateReadiness(true);
+    await coordinator.flush();
+    await coordinator.flush();
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report).toHaveBeenCalledWith({
+      blocked: 0, failed: 0, frozen: 0, synchronized: 1, mutations: 3,
+    });
   });
 
   it("stays silent while projection is disabled and cancels pending work on dispose", async () => {

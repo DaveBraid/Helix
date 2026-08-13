@@ -2818,6 +2818,53 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.queue).toMatchObject([{ id: "op-dispose", status: "running" }]);
   });
 
+  it("quarantines an interrupted ordinary task write after restart without resending it", async () => {
+    const data = createDefaultData("device-ordinary-restart");
+    grantTaskCrud(data);
+    const baseTask: DidaTask = {
+      id: "task-restart",
+      projectId: "project-1",
+      title: "Base",
+      status: 0,
+    };
+    const localTask = { ...baseTask, title: "Pending edit" };
+    data.baseSnapshots[`task:${baseTask.id}`] = createSnapshot("task", baseTask.id, baseTask);
+    data.localSnapshots[`task:${baseTask.id}`] = createSnapshot("task", baseTask.id, localTask);
+    data.queue = [{
+      id: "op-ordinary-restart",
+      kind: "task",
+      entityId: baseTask.id,
+      projectId: baseTask.projectId,
+      operation: "update",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      attempts: 0,
+      status: "running",
+      base: createSnapshot("task", baseTask.id, baseTask),
+      local: createSnapshot("task", baseTask.id, localTask),
+      writeFields: ["title"],
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    let sends = 0;
+    Object.defineProperty(service, "taskEngine", {
+      value: { async process() { sends += 1; throw new Error("must not resend"); } },
+    });
+
+    await (service as unknown as { drainQueue(): Promise<void> }).drainQueue();
+
+    expect(sends).toBe(0);
+    expect(persisted.queue).toMatchObject([{
+      id: "op-ordinary-restart",
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+    }]);
+  });
+
   it("recovers an interrupted projection create after restart without sending it again", async () => {
     const data = createDefaultData("device-projection-restart");
     grantTaskCrud(data);

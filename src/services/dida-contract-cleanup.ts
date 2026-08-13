@@ -167,8 +167,18 @@ export class DidaContractCleanupService {
       if (detail.id !== project.id || detail.name !== project.name) {
         throw new Error("合同清单详情身份发生竞争，拒绝补登记任务");
       }
-      for (const task of [...requireTaskArray(data.tasks, "合同清单开放任务列表"), ...completed]) {
-        if (task.projectId !== project.id || !isDidaContractTaskTitle(task.title, initial.plan.marker)) {
+      const visible = [...requireTaskArray(data.tasks, "合同清单开放任务列表"), ...completed];
+      const parentIds = new Set(visible.filter((task) =>
+        task.projectId === project.id && !task.parentId &&
+        typeof task.content === "string" && task.content.startsWith("helix-project-projection:") &&
+        task.columnId && project.expectedColumns.some((column) => column.id === task.columnId))
+        .map((task) => task.id));
+      for (const task of visible) {
+        const markerOwned = isDidaContractTaskTitle(task.title, initial.plan.marker) ||
+          (!task.parentId && parentIds.has(task.id)) ||
+          (Boolean(task.parentId) && parentIds.has(task.parentId!) &&
+            typeof task.content === "string" && task.content.startsWith("helix-projection:"));
+        if (task.projectId !== project.id || !markerOwned) {
           throw new Error("合同清单含非本轮任务，拒绝补登记");
         }
         if (adopted.has(task.id)) throw new Error("同一合同任务出现在多个清单，拒绝补登记");

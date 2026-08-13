@@ -1083,6 +1083,55 @@ describe("HelixService runtime recovery", () => {
     }]);
   });
 
+  it("keeps unknown task recovery frozen with zero remote access while confirmed offline", async () => {
+    const data = createDefaultData("device-offline-reconciliation");
+    grantTaskCrud(data);
+    const local = taskSyncProjection(normalizeTask({
+      id: "local-offline-reconciliation",
+      projectId: "project-1",
+      title: "Task",
+      status: 0,
+    }));
+    data.localSnapshots[`task:${local.id}`] = createSnapshot("task", local.id, local);
+    data.queue = [{
+      id: "op-offline-reconciliation",
+      kind: "task",
+      entityId: local.id,
+      projectId: local.projectId,
+      operation: "create",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      attempts: 1,
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+      local: createSnapshot("task", local.id, local),
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    (service as unknown as { remoteConnectivity: string }).remoteConnectivity = "offline";
+    let remoteCalls = 0;
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+      async getTask() { remoteCalls += 1; return { ...local, id: "remote" }; },
+    });
+
+    await expect(service.resolveUnknownCreate(
+      "op-offline-reconciliation",
+      "confirmed",
+      "remote",
+    )).rejects.toThrow(/已确认离线/);
+
+    expect(remoteCalls).toBe(0);
+    expect(persisted.queue).toMatchObject([{
+      id: "op-offline-reconciliation",
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+    }]);
+  });
+
   it("keeps a connection probe read-only even when a pending write exists", async () => {
     const data = createDefaultData("device-a");
     const local: DidaTask = {

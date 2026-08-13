@@ -2561,6 +2561,12 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     }
   }
 
+  private assertRemoteReadNotConfirmedOffline(): void {
+    if (this.remoteConnectivity === "offline") {
+      throw new Error("当前已确认离线；冻结状态保持不变，请联网同步成功后再核对远端结果");
+    }
+  }
+
   private assertContractWriteVerified(): void {
     if (!this.state.taskCrudVerified) {
       throw new Error("当前滴答授权未持有完整有效的写入合同，所有生产写入保持只读");
@@ -2613,6 +2619,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   ): Promise<void> {
     this.assertDidaTaskWriteAvailable();
     this.assertWritable();
+    this.assertRemoteReadNotConfirmedOffline();
     await this.withAuthorizationLease(() =>
       this.resolveUnknownCreateWithAuthorizationLease(operationId, resolution, remoteId));
   }
@@ -2689,6 +2696,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   ): Promise<void> {
     this.assertDidaTaskWriteAvailable();
     this.assertWritable();
+    this.assertRemoteReadNotConfirmedOffline();
     await this.withAuthorizationLease(() =>
       this.resolveUnknownWriteWithAuthorizationLease(operationId, resolution));
   }
@@ -2861,6 +2869,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   async adoptAppliedConflict(conflictId: string, remoteEntityId?: string): Promise<void> {
     this.assertDidaTaskWriteAvailable();
     this.assertWritable();
+    this.assertRemoteReadNotConfirmedOffline();
     await this.withAuthorizationLease(() =>
       this.adoptAppliedConflictWithAuthorizationLease(conflictId, remoteEntityId));
   }

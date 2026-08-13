@@ -107,8 +107,8 @@ import {
 import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
-// v12 覆盖生产 OfflineQueue 创建／更新／完成／重开／删除及收据闭环；预算只供本轮唯一合同对象。
-const DIDA_CONTRACT_REQUEST_BUDGET = 210;
+// v13 追加真实 Vault Project/Stage 主链路探针；预算只供本轮合同临时清单。
+const DIDA_CONTRACT_REQUEST_BUDGET = 250;
 
 export interface HelixRuntimeState {
   loading: boolean;
@@ -214,6 +214,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     (DidaTaskWriteCapabilities & { projectProjectionVerified: boolean }) | null = null;
   private contractProjectionQueueProbeScheduleMode: Exclude<TaskScheduleMode, "unknown"> | null = null;
   private contractProjectionQueueProbeApi: ContractApi | null = null;
+  private vaultProjectProjectionContractProbe?: (
+    context: import("../integrations/dida/write-contract").DidaProjectProjectionContractContext,
+  ) => Promise<void>;
   private lastDidaWriteContractReport: DidaWriteContractReport | null = null;
   private secretMutationAuthorized = false;
   private disposed = false;
@@ -418,6 +421,12 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   snapshot(): HelixRuntimeState {
     return structuredClone(this.state);
+  }
+
+  setVaultProjectProjectionContractProbe(probe: (
+    context: import("../integrations/dida/write-contract").DidaProjectProjectionContractContext,
+  ) => Promise<void>): void {
+    this.vaultProjectProjectionContractProbe = probe;
   }
 
   reportRecoveryIssue(issue: string): void {
@@ -973,7 +982,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         cleanupApi,
         async (context) => {
           await runDidaProjectProjectionContractProbe(context);
-          await this.runContractProjectionQueueProbe(context);
+          await this.runContractProjectionQueueProbe(context, this.vaultProjectProjectionContractProbe);
         },
       ).run();
       this.lastDidaWriteContractReport = report;
@@ -1769,6 +1778,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   private async runContractProjectionQueueProbe(
     context: import("../integrations/dida/write-contract").DidaProjectProjectionContractContext,
+    runVaultProbe?: (
+      context: import("../integrations/dida/write-contract").DidaProjectProjectionContractContext,
+    ) => Promise<void>,
   ): Promise<void> {
     if (!this.contractTestRunning || !this.remoteWriteGate.isExclusive()) {
       throw new Error("项目同步队列探针缺少合同排他保护");
@@ -1862,6 +1874,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
           receipt.clientIdentity !== clientIdentity && receipt.marker !== marker);
       });
+      await runVaultProbe?.(context);
     } finally {
       this.taskEngine = productionTaskEngine;
       this.contractProjectionQueueProbeRunning = false;

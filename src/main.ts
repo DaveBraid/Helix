@@ -22,6 +22,7 @@ import {
   type StageCreationIntent,
 } from "./domain/cycle-graph";
 import type { JournalPeriod } from "./domain/entities";
+import type { DidaProjectProjectionContractContext } from "./integrations/dida/write-contract";
 import {
   deterministicEventId,
 } from "./domain/events";
@@ -250,6 +251,8 @@ export default class HelixPlugin extends Plugin {
       projectDidaProjectionAvailable: PROJECT_DIDA_PROJECTION_AVAILABLE,
     });
     await this.service.initialize();
+    this.service.setVaultProjectProjectionContractProbe((context) =>
+      this.runVaultProjectProjectionContractProbe(context));
     this.projectProjection = new DidaProjectProjectionService(
       new VaultProjectionMarkdownAdapter(this.vaultRepository),
       new ExistingHelixTaskPipelineAdapter(this.service),
@@ -661,6 +664,166 @@ export default class HelixPlugin extends Plugin {
       });
     });
     this.refreshAutoSync(runImmediately);
+  }
+
+  /** 合同临时清单内运行真实 Vault→Markdown→投影→生产队列主链路。 */
+  private async runVaultProjectProjectionContractProbe(
+    context: DidaProjectProjectionContractContext,
+  ): Promise<void> {
+    const title = `Helix 合同项目 ${crypto.randomUUID()}`;
+    let created: ProjectWorkspaceProject | undefined;
+    const trackedRemoteIds = new Set<string>();
+    const unknownDeleteIds = new Set<string>();
+    const track = async (taskId: string) => {
+      if (trackedRemoteIds.has(taskId)) return;
+      await context.trackTask(await this.service.verifyRemoteTask(context.project.id, taskId));
+      trackedRemoteIds.add(taskId);
+    };
+    const untrack = async (taskId: string) => {
+      if (!trackedRemoteIds.delete(taskId)) return;
+      await context.untrackTask(taskId);
+    };
+    const markDeleteUnknown = async (taskId: string) => {
+      if (!trackedRemoteIds.has(taskId) || unknownDeleteIds.has(taskId)) return;
+      await context.markTaskDeleteUnknown(taskId);
+      unknownDeleteIds.add(taskId);
+    };
+    const previous = await this.projectProjection.readConfiguration();
+    const target = { targetProjectId: context.project.id, targetColumnId: context.column.id };
+    if (previous.enabled || previous.ledger.length > 0 || previous.parentCheckpoints.length > 0 ||
+      (previous.parentBases?.length ?? 0) > 0 || (previous.receiptCleanupPending?.length ?? 0) > 0) {
+      throw new Error("Vault 项目合同探针要求远端项目联动处于完全关闭且无历史绑定的纯净状态");
+    }
+    const contractProjection = new DidaProjectProjectionService(
+      new VaultProjectionMarkdownAdapter(this.vaultRepository),
+      new ExistingHelixTaskPipelineAdapter(this.service),
+      new PersistedProjectionStatePort(this.store),
+      { read: async () => ({
+        projects: [context.project],
+        columns: [context.column],
+        readiness: {
+          writable: true,
+          queueEmpty: true,
+          authorizationCurrent: true,
+          taskParentingVerified: true,
+          itemsRoundTripVerified: true,
+          itemIdStableVerified: true,
+          boardPlacementVerified: true,
+          boardFresh: true,
+          taskReopenVerified: true,
+          unknownOutcomes: 0,
+        },
+      }) },
+      () => new Date().toISOString(),
+      new PersistedProjectionDiagnosticsPort(this.store),
+    );
+    try {
+      created = await this.withWritableProjectMutation(() =>
+        this.projectWorkspace.createProject(title, "合同首阶段"));
+      const stage = created.cycles[0]!;
+      await this.withWritableProjectMutation(async () => {
+        await this.localProjectTasks.createTask(
+          await this.projectWorkspace.loadStableWorkspace(),
+          { projectId: created!.id, stageId: stage.id, title: `${context.marker} Vault 行动` },
+        );
+      });
+      const counts = { projectCount: 1, actionCount: 1 };
+      const preview = await contractProjection.previewActivation(target, counts);
+      if (preview.blockers.length > 0) throw new Error(`Vault 项目链路探针无法激活：${preview.blockers.join("；")}`);
+      await contractProjection.activate(preview, preview.previewHash);
+      const input = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
+        .find((project) => project.id === created!.id)!);
+      const first = await contractProjection.synchronizeProject(input);
+      if (first.createdParents !== 1 || first.createdActions !== 1 || first.frozen.length > 0) {
+        throw new Error("Vault 项目链路探针首次同步未完整收口");
+      }
+      const model = await contractProjection.readProject(input);
+      const parentId = model.project.parentTaskId;
+      const actionId = model.stages[0]?.managed[0]?.remoteId;
+      if (!parentId || !actionId) throw new Error("Vault 项目探针未回填远端稳定身份");
+      await track(parentId);
+      await track(actionId);
+      await this.withWritableProjectMutation(async () => {
+        const workspace = await this.projectWorkspace.loadStableWorkspace();
+        const task = (await this.localProjectTasks.snapshot(workspace)).tasks.find((item) =>
+          item.projectId === created!.id)!;
+        await this.localProjectTasks.updateTask(workspace, {
+          projectId: created!.id,
+          stageId: stage.id,
+          uuid: task.uuid,
+          expectedHash: task.revisionHash,
+          title: `${context.marker} Vault 行动已编辑`,
+          state: "completed",
+        });
+      });
+      const secondInput = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
+        .find((project) => project.id === created!.id)!);
+      const second = await contractProjection.synchronizeProject(secondInput);
+      if (second.updatedActions !== 1 || second.completedActions !== 1 || second.frozen.length > 0) {
+        throw new Error("Vault 项目链路探针编辑与完成未完整收口");
+      }
+      await contractProjection.deleteProject(secondInput);
+      await untrack(actionId);
+      await untrack(parentId);
+      await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
+      await contractProjection.finalizeProjectDeletion(created.id);
+      created = undefined;
+    } finally {
+      if (created) {
+        try {
+          const input = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
+            .find((project) => project.id === created!.id)!);
+          const model = await contractProjection.readProject(input);
+          if (model.project.parentTaskId) {
+            await track(model.project.parentTaskId);
+          }
+          for (const taskId of model.stages.flatMap((stage) => stage.managed.flatMap((action) => action.remoteId ? [action.remoteId] : []))) {
+            await track(taskId);
+          }
+          await contractProjection.deleteProject(input);
+          for (const taskId of [...trackedRemoteIds]) await untrack(taskId);
+          await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
+          await contractProjection.finalizeProjectDeletion(created.id);
+        } catch {
+          const state = await contractProjection.readConfiguration();
+          for (const entry of state.ledger.filter((item) => item.projectId === created!.id)) {
+            if (entry.remoteId) {
+              try { await track(entry.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
+              if (entry.tombstone && entry.frozen === "unknown-outcome") await markDeleteUnknown(entry.remoteId);
+            } else if (entry.frozen === "unknown-outcome") {
+              await context.markUntrackedCreate();
+            }
+          }
+          const parent = state.parentCheckpoints.find((item) => item.projectId === created!.id);
+          if (parent?.remoteId) {
+            try { await track(parent.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
+            if (parent.tombstone && parent.frozen === "unknown-outcome") await markDeleteUnknown(parent.remoteId);
+          } else if (parent?.frozen === "unknown-outcome") {
+            await context.markUntrackedCreate();
+          }
+          try {
+            const projectRevision = await this.vaultRepository.read(created.notePath);
+            const parentMatch = projectRevision?.content.match(/^helix-dida-parent-task-id:\s*(.+)$/mu)?.[1]?.trim();
+            if (parentMatch) await track(parentMatch);
+            const stageIds = (await this.projectWorkspace.snapshot()).projects
+              .find((project) => project.id === created!.id)?.cycles.flatMap((stage) => [stage.notePath]) ?? [];
+            for (const path of stageIds) {
+              const revision = await this.vaultRepository.read(path);
+              const ids = [...(revision?.content.matchAll(/remoteId=([^\s>]+)/gu) ?? [])]
+                .map((match) => decodeURIComponent(match[1]!))
+                .filter((id) => id !== "-");
+              for (const id of ids) await track(id);
+            }
+          } catch {
+            // 无法从本地回填身份时保持合同清理计划与恢复状态，不按标题猜测。
+          }
+        }
+      }
+      const current = await contractProjection.readConfiguration();
+      if (current.ledger.length === 0 && current.parentCheckpoints.length === 0) {
+        await new PersistedProjectionStatePort(this.store).write(current, previous);
+      }
+    }
   }
 
   async readProjectProjection(projectId: string): Promise<ProjectionProjectReadModel> {

@@ -58,6 +58,7 @@ import {
 import {
   DidaWriteContractRunner,
   verifiedBoardPlacementCapability,
+  type ContractApi,
   type DidaWriteContractProgress,
   type DidaWriteContractReport,
 } from "../integrations/dida/write-contract";
@@ -212,6 +213,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private contractProjectionQueueProbeCapabilities:
     (DidaTaskWriteCapabilities & { projectProjectionVerified: boolean }) | null = null;
   private contractProjectionQueueProbeScheduleMode: Exclude<TaskScheduleMode, "unknown"> | null = null;
+  private contractProjectionQueueProbeApi: ContractApi | null = null;
   private lastDidaWriteContractReport: DidaWriteContractReport | null = null;
   private secretMutationAuthorized = false;
   private disposed = false;
@@ -1391,7 +1393,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     projectId: string,
     taskId: string,
   ): Promise<DidaTask> {
-    const task = normalizeTask(await this.api.getTask(projectId, taskId));
+    const api = this.contractProjectionQueueProbeApi ?? this.api;
+    const task = normalizeTask(await api.getTask(projectId, taskId));
     if (task.id !== taskId || task.projectId !== projectId) {
       throw new Error("滴答复读返回的任务身份或清单与待绑定目标不一致");
     }
@@ -1732,6 +1735,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       taskReopenVerified: true,
     };
     this.contractProjectionQueueProbeScheduleMode = context.taskScheduleMode;
+    this.contractProjectionQueueProbeApi = context.api;
     this.contractProjectionQueueProbeRunning = true;
     const productionTaskEngine = this.taskEngine;
     this.taskEngine = new SyncEngine({
@@ -1790,6 +1794,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       this.contractProjectionQueueProbeRunning = false;
       this.contractProjectionQueueProbeCapabilities = null;
       this.contractProjectionQueueProbeScheduleMode = null;
+      this.contractProjectionQueueProbeApi = null;
     }
   }
 

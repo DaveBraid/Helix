@@ -69,7 +69,7 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
   const column = { id: "contract-column", projectId: project.id, name: "Contract" };
   const remote = new Map<string, DidaTask>();
   let sequence = 0;
-  Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+  const contractApi = {
     async createTask(task: DidaTask) {
       const created = { ...structuredClone(task), id: `remote-contract-${++sequence}`, status: task.status ?? 0 };
       remote.set(created.id, created);
@@ -88,10 +88,13 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
       return { project, columns: [column], tasks: [...remote.values()].filter((task) => task.projectId === projectId) };
     },
     async getCompletedTasks() { return []; },
+  } as unknown as DidaProjectProjectionContractContext["api"];
+  Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+    async getTask() { throw new Error("contract probe must not bypass its budgeted API"); },
   });
   const tracked: string[] = [];
   const context = {
-    api: (service as unknown as { api: DidaProjectProjectionContractContext["api"] }).api,
+    api: contractApi,
     marker: "[Helix 合同测试 queue]",
     project,
     column,
@@ -119,6 +122,96 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
   expect([...remote.values()]).toEqual([]);
   expect(persisted.queue).toEqual([]);
   expect(persisted.projectionOperationReceipts).toEqual([]);
+});
+
+it("quarantines an unknown contract projection create without resending it", async () => {
+  const data = createDefaultData("device-contract-projection-unknown");
+  grantTaskCrud(data, "point");
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  let persisted = structuredClone(data);
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+  }), { getDidaToken: () => "token" } as HelixSecretStore);
+  await service.initialize();
+  let sends = 0;
+  let untrackedCreates = 0;
+  const context = {
+    api: {
+      async createTask() {
+        sends += 1;
+        throw Object.assign(new Error("unknown after send"), {
+          category: "unknown-outcome",
+          remoteOutcomeUnknown: true,
+        });
+      },
+    } as unknown as DidaProjectProjectionContractContext["api"],
+    marker: "[Helix 合同测试 unknown]",
+    project: { id: "contract-list", name: "Contract", viewMode: "kanban" },
+    column: { id: "contract-column", projectId: "contract-list", name: "Contract" },
+    taskScheduleMode: "point" as const,
+    trackTask: async () => undefined,
+    untrackTask: async () => undefined,
+    markTaskDeleteUnknown: async () => undefined,
+    markUntrackedCreate: async () => { untrackedCreates += 1; },
+  } satisfies DidaProjectProjectionContractContext;
+  const internals = service as unknown as {
+    contractTestRunning: boolean;
+    remoteWriteGate: { enterExclusive(reason: string): () => void };
+    runContractProjectionQueueProbe(context: DidaProjectProjectionContractContext): Promise<void>;
+    runDrainQueue(): Promise<void>;
+  };
+  internals.contractTestRunning = true;
+  const release = internals.remoteWriteGate.enterExclusive("test contract");
+  try {
+    await expect(internals.runContractProjectionQueueProbe(context))
+      .rejects.toThrow(/未取得已验证收据/);
+  } finally {
+    release();
+    internals.contractTestRunning = false;
+  }
+
+  expect(sends).toBe(1);
+  expect(untrackedCreates).toBe(1);
+  expect(persisted.queue).toMatchObject([{ status: "reconciliation", remoteOutcomeUnknown: true }]);
+  expect(persisted.projectionOperationReceipts).toMatchObject([{ outcome: "unknown" }]);
+  await internals.runDrainQueue();
+  expect(sends).toBe(1);
+});
+
+it("stages a production projection queue conflict and never writes past it", async () => {
+  const data = createDefaultData("device-projection-queue-conflict");
+  grantTaskCrud(data, "point");
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  let persisted = structuredClone(data);
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+  }), { getDidaToken: () => "token" } as HelixSecretStore, {
+    projectDidaProjectionAvailable: true,
+  });
+  await service.initialize();
+  const base: DidaTask = {
+    id: "projection-conflict-task", projectId: "contract-list", parentId: "parent",
+    columnId: "contract-column", title: "Base", content: "helix-action-projection:conflict", status: 0,
+  };
+  const local = { ...base, title: "Local" };
+  const remote = { ...base, title: "Remote" };
+  let writes = 0;
+  Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+    async getTask() { return structuredClone(remote); },
+    async updateTask() { writes += 1; throw new Error("must not write through conflict"); },
+  });
+
+  await expect(service.enqueueProjectionUpdate(local, ["title"], "op-projection-conflict", base))
+    .resolves.toMatchObject({ outcome: "conflict" });
+  expect(writes).toBe(0);
+  expect(persisted.queue).toMatchObject([{ status: "blocked" }]);
+  expect(persisted.conflicts).toMatchObject([{ status: "open", entityId: base.id }]);
+  await (service as unknown as { runDrainQueue(): Promise<void> }).runDrainQueue();
+  expect(writes).toBe(0);
 });
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 

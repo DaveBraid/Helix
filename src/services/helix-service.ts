@@ -1096,7 +1096,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       const authorizationBinding = await didaAuthorizationBinding(token);
       await new DidaContractCleanupService(
         this.api.withRequestPolicy({
-          timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
+          timeoutMs: 30_000,
           maxAttempts: 1,
           cooldownProbe: true,
         }),
@@ -1127,6 +1127,31 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         }),
         this.store,
       ).recover(authorizationBinding);
+    } finally {
+      await this.refreshAttentionCountFromStore().catch(() => undefined);
+      releaseExclusive();
+      this.patch({ loading: false });
+    }
+  }
+
+  async adoptTasksIntoPendingContractCleanup(): Promise<void> {
+    this.assertDidaContractTestAvailable();
+    this.assertWritable();
+    if (this.state.loading) throw new Error("同步正在进行，请稍后再补登记合同任务");
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("滴答合同任务补登记");
+    this.patch({ loading: true, error: undefined });
+    try {
+      const token = this.secrets.getDidaToken();
+      if (!token) throw new Error("尚未配置滴答授权");
+      const authorizationBinding = await didaAuthorizationBinding(token);
+      await new DidaContractCleanupService(
+        this.api.withRequestPolicy({
+          timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,
+          maxAttempts: 1,
+          cooldownProbe: true,
+        }),
+        this.store,
+      ).adoptTasksIntoExistingPlan(authorizationBinding);
     } finally {
       await this.refreshAttentionCountFromStore().catch(() => undefined);
       releaseExclusive();

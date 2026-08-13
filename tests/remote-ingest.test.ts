@@ -34,6 +34,20 @@ describe("remote snapshot ingestion", () => {
     });
   });
 
+  it("advances Base when an independent remote edit converges to the local value", () => {
+    const data = createDefaultData("device-a");
+    data.baseSnapshots["task:task-1"] = createSnapshot("task", "task-1", task("base"));
+    data.localSnapshots["task:task-1"] = createSnapshot("task", "task-1", task("same result"));
+
+    ingestRemoteRecords(data, "task", [task("same result")], {
+      capturedAt: "2026-07-30T00:00:00Z",
+    });
+
+    expect(data.baseSnapshots["task:task-1"]?.value).toMatchObject({ title: "same result" });
+    expect(data.localSnapshots["task:task-1"]?.value).toMatchObject({ title: "same result" });
+    expect(data.conflicts).toEqual([]);
+  });
+
   it("accepts remote-only changes but requires a conflict for remote deletion versus local edit", () => {
     const data = createDefaultData("device-a");
     data.baseSnapshots["task:task-1"] = createSnapshot("task", "task-1", task("base"));

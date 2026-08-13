@@ -39,7 +39,7 @@ export function ingestRemoteRecords<T extends RemoteRecord>(
     }
     const localChanged = local.stamp.hash !== base.stamp.hash;
     const remoteChanged = remote.stamp.hash !== base.stamp.hash;
-    if (!localChanged) {
+    if (!localChanged || local.stamp.hash === remote.stamp.hash) {
       data.baseSnapshots[key] = remote;
       data.localSnapshots[key] = remote;
     } else if (remoteChanged && local.stamp.hash !== remote.stamp.hash) {

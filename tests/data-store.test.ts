@@ -299,6 +299,40 @@ describe("HelixDataStore serialization", () => {
     expect(data.recoveryIssues).toContainEqual(expect.stringMatching(/队列操作/));
   });
 
+  it("preserves a legacy unknown-result operation as frozen during schema migration", () => {
+    const task = {
+      id: "local-unknown",
+      projectId: "project-1",
+      title: "Unknown create",
+      status: 0,
+    };
+    const local = createSnapshot("task", task.id, task);
+    const data = hydrateData({
+      schemaVersion: 1,
+      queue: [{
+        id: "op-unknown",
+        kind: "task",
+        entityId: task.id,
+        projectId: task.projectId,
+        operation: "create",
+        status: "reconciliation",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:01:00.000Z",
+        attempts: 1,
+        remoteOutcomeUnknown: true,
+        local,
+      }],
+    });
+
+    expect(data.schemaVersion).toBe(2);
+    expect(data.queue).toMatchObject([{
+      id: "op-unknown",
+      status: "reconciliation",
+      attempts: 1,
+      remoteOutcomeUnknown: true,
+    }]);
+  });
+
   it("rejects projection owned scope and item IDs unless both are persisted together", () => {
     const baseValue = { id: "task-owned", projectId: "project-1", title: "Base", status: 0,
       items: [{ id: "owned", title: "Base item", status: 0 }] };

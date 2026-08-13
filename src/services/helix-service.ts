@@ -2827,6 +2827,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.assertDidaTaskWriteAvailable();
     this.assertWritable();
     this.assertContractWriteVerified();
+    if (this.remoteConnectivity === "offline") {
+      throw new Error("当前已确认离线；字段选择已保存，请联网同步成功后再应用冲突");
+    }
     const existing = this.conflictApplications.get(conflictId);
     if (existing) return existing;
     const operation = this.applyConflictOnce(conflictId).finally(() => {

@@ -1917,7 +1917,7 @@ describe("HelixService runtime recovery", () => {
       title: "Task",
       createdAt: "2026-07-30T00:00:00.000Z",
       updatedAt: "2026-07-30T00:00:00.000Z",
-      status: "staged",
+      status: "open",
       base,
       local: localConflict,
       remote: base,
@@ -2653,6 +2653,56 @@ describe("HelixService runtime recovery", () => {
     await expect(service.releaseApplyingConflict("conflict-applying"))
       .rejects.toThrow(/不得解锁重试/);
     expect(persisted.conflicts[0]?.status).toBe("applying");
+  });
+
+  it("keeps conflict choices intact and performs zero remote access while confirmed offline", async () => {
+    const data = createDefaultData("device-offline-conflict");
+    grantTaskCrud(data);
+    const baseTask = taskSyncProjection(normalizeTask({
+      id: "task-offline-conflict",
+      projectId: "project-1",
+      title: "Base",
+      status: 0,
+    }));
+    const base = createSnapshot("task", baseTask.id, baseTask);
+    const local = createSnapshot("task", baseTask.id, { ...baseTask, title: "Local" });
+    const remote = createSnapshot("task", baseTask.id, { ...baseTask, title: "Remote" });
+    data.conflicts = [{
+      id: "conflict-offline",
+      kind: "task",
+      entityId: baseTask.id,
+      title: baseTask.title,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      status: "open",
+      base,
+      local,
+      remote,
+      fields: buildConflictFields(base.value, local.value, remote.value),
+      remoteRecheckCount: 0,
+      sourceDeviceId: data.deviceId,
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    (service as unknown as { remoteConnectivity: string }).remoteConnectivity = "offline";
+    await service.chooseConflict("conflict-offline", "title", "local");
+    let remoteCalls = 0;
+    Object.defineProperty(service, "taskEngine", {
+      value: { async applyConflict() { remoteCalls += 1; throw new Error("must not run"); } },
+    });
+
+    expect(() => service.applyConflict("conflict-offline")).toThrow(/已确认离线/);
+
+    expect(remoteCalls).toBe(0);
+    expect(persisted.conflicts).toMatchObject([{
+      id: "conflict-offline",
+      status: "staged",
+      fields: [expect.objectContaining({ path: "title", choice: "local" })],
+    }]);
   });
 
   it("changes only the schedule field explicitly selected by the user", async () => {

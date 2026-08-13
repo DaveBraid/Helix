@@ -207,6 +207,13 @@ export interface ProjectionStatePort {
   write(expected: ProjectionPersistentState, next: ProjectionPersistentState): Promise<void>;
 }
 
+export class ProjectionStateConflictError extends Error {
+  constructor() {
+    super("滴答项目同步状态在写入前发生竞争");
+    this.name = "ProjectionStateConflictError";
+  }
+}
+
 export class PersistedProjectionStatePort implements ProjectionStatePort {
   constructor(private readonly store: Pick<HelixDataStore, "snapshot" | "mutate">) {}
 
@@ -226,7 +233,7 @@ export class PersistedProjectionStatePort implements ProjectionStatePort {
         parentCheckpoints: [],
       };
       if (stableHash(current) !== stableHash(expected)) {
-        throw new Error("滴答项目同步状态在写入前发生竞争");
+        throw new ProjectionStateConflictError();
       }
       data.didaProjectionState = structuredClone(next);
     });
@@ -722,6 +729,25 @@ export class DidaProjectProjectionService {
     await this.retryReceiptCleanup(proof.operationId);
   }
 
+  /**
+   * 投影账本与普通同步诊断共用 data.json；收据清理等并发状态提交可能令一次
+   * CAS 失效。只对明确的状态 CAS 竞争重读并重算，Markdown CAS 绝不重试。
+   */
+  private async writeLatestState(
+    update: (current: ProjectionPersistentState) => ProjectionPersistentState,
+    proof?: ProjectionReceiptCleanupProof,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.state.read();
+      try {
+        await this.settleReconciliation(current, update(current), proof);
+        return;
+      } catch (error) {
+        if (!(error instanceof ProjectionStateConflictError) || attempt === 2) throw error;
+      }
+    }
+  }
+
   private async reconcileFrozenTaskAction(
     input: { kind: "action"; projectId: string; stageId: string; stagePath: string; uuid: string },
     current: ProjectionPersistentState,
@@ -1083,8 +1109,7 @@ export class DidaProjectProjectionService {
       ],
     });
     const persist = async () => {
-      const current = await this.state.read();
-      await this.state.write(current, ledgerState(current));
+      await this.writeLatestState((current) => ledgerState(current));
     };
     const settle = async (
       entry: ProjectionLedgerEntry | undefined,
@@ -1093,7 +1118,6 @@ export class DidaProjectProjectionService {
     ) => {
       if (remove && entry) working = working.filter((candidate) => candidate.uuid !== entry.uuid);
       else if (entry) replace(entry);
-      const current = await this.state.read();
       const proof: ProjectionReceiptCleanupProof = {
         kind: "action",
         operationId: receipt.operationId,
@@ -1105,7 +1129,7 @@ export class DidaProjectProjectionService {
         marker: markerFor(entry!),
         remoteTaskId: entry!.remoteId!,
       };
-      await this.settleReconciliation(current, ledgerState(current), proof);
+      await this.writeLatestState((current) => ledgerState(current), proof);
     };
 
     for (const intent of planProjectionChanges(params.managedPrevious, params.managedWorking, {
@@ -1184,10 +1208,10 @@ export class DidaProjectProjectionService {
           operationId: result.operationId,
           conflictId: result.conflictId,
         };
+        verifyProjectedTask(createdTask, createdEntry, markerFor(entry), { state: false });
+        replace(createdEntry);
+        await persist();
         try {
-          verifyProjectedTask(createdTask, createdEntry, markerFor(entry), { state: false });
-          replace(createdEntry);
-          await persist();
           const latestStage = await this.requireRevision(stageRevision!.path);
           assertProjectionStageIdentity(latestStage.content, entry.stageId);
           const latestAction = parseManagedPlanActions(latestStage.content).actions
@@ -1201,26 +1225,27 @@ export class DidaProjectProjectionService {
             patchManagedPlanAction(latestStage.content, { uuid: entry.uuid, remoteId: createdTask.id }),
           );
           params.stageRevisions.set(entry.stageId, after);
-          const adopted = { ...createdEntry, frozen: undefined, operationId: undefined, conflictId: undefined };
-          await settle(adopted, result);
-          params.summary.createdActions += 1;
-          if (entry.state === "completed") {
-            const completeResult = await this.pipeline.completeTask({ ...createdTask, status: 2 });
-            if (completeResult.outcome !== "verified") {
-              const frozen = { ...adopted, frozen: resultReason(completeResult), operationId: completeResult.operationId,
-                conflictId: completeResult.conflictId };
-              replace(frozen);
-              params.summary.frozen.push({ uuid: entry.uuid, reason: frozen.frozen!, message: completeResult.message });
-              continue;
-            }
-            const completedTask = await this.exactVerifiedTask(completeResult, entry.targetProjectId);
-            const completed = { ...adopted, state: "completed" as const, remoteId: completedTask.id };
-            verifyProjectedTask(completedTask, completed, markerFor(entry));
-            await settle(completed, completeResult);
-            params.summary.completedActions += 1;
-          }
         } catch (error) {
           working = freezeEntry(working, createdEntry, "markdown-race", params.summary, message(error), result);
+          continue;
+        }
+        const adopted = { ...createdEntry, frozen: undefined, operationId: undefined, conflictId: undefined };
+        await settle(adopted, result);
+        params.summary.createdActions += 1;
+        if (entry.state === "completed") {
+          const completeResult = await this.pipeline.completeTask({ ...createdTask, status: 2 });
+          if (completeResult.outcome !== "verified") {
+            const frozen = { ...adopted, frozen: resultReason(completeResult), operationId: completeResult.operationId,
+              conflictId: completeResult.conflictId };
+            replace(frozen);
+            params.summary.frozen.push({ uuid: entry.uuid, reason: frozen.frozen!, message: completeResult.message });
+            continue;
+          }
+          const completedTask = await this.exactVerifiedTask(completeResult, entry.targetProjectId);
+          const completed = { ...adopted, state: "completed" as const, remoteId: completedTask.id };
+          verifyProjectedTask(completedTask, completed, markerFor(entry));
+          await settle(completed, completeResult);
+          params.summary.completedActions += 1;
         }
         continue;
       }

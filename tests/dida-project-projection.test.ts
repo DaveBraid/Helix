@@ -28,6 +28,7 @@ import {
   ExistingHelixTaskPipelineAdapter,
   PersistedProjectionDiagnosticsPort,
   PersistedProjectionStatePort,
+  ProjectionStateConflictError,
   actionCreateClientIdentity,
   parentCreateClientIdentity,
   type ProjectionCatalogPort,
@@ -414,6 +415,7 @@ function makeHarness(activate = false, failFirstCas = false, taskReopenVerified 
 
 class MemoryMarkdown implements ProjectionMarkdownPort {
   failNextCas = false;
+  afterWrite?: (path: string, content: string) => void;
   onRead?: (path: string, count: number) => void;
   private readonly readCounts = new Map<string, number>();
   constructor(private readonly files: Record<string, string>) {}
@@ -428,6 +430,7 @@ class MemoryMarkdown implements ProjectionMarkdownPort {
     if (this.failNextCas) { this.failNextCas = false; throw new Error("CAS conflict"); }
     if (stableHash(this.files[revision.path]) !== revision.hash) throw new Error("CAS conflict");
     this.files[revision.path] = content;
+    this.afterWrite?.(revision.path, content);
     return { path: revision.path, content, hash: stableHash(content) };
   }
   content(path: string) { return this.files[path]!; }
@@ -439,8 +442,8 @@ class MemoryState implements ProjectionStatePort {
   constructor(public value: ProjectionPersistentState) {}
   async read() { return structuredClone(this.value); }
   async write(expected: ProjectionPersistentState, next: ProjectionPersistentState) {
-    if (this.failNextCas) { this.failNextCas = false; throw new Error("state CAS conflict"); }
-    if (stableHash(expected) !== stableHash(this.value)) throw new Error("state CAS conflict");
+    if (this.failNextCas) { this.failNextCas = false; throw new ProjectionStateConflictError(); }
+    if (stableHash(expected) !== stableHash(this.value)) throw new ProjectionStateConflictError();
     this.value = structuredClone(next);
   }
 }
@@ -704,6 +707,25 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       remoteId: "remote-2",
       parentTaskId: "remote-1",
     });
+  });
+
+  it("retries a transient projection-state CAS without misreporting a Markdown race", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    const withSecond = harness.markdown.content("Stage.md")
+      .replace("# 行动结果", "- [ ] 第二行动\n# 行动结果");
+    const line = parseManagedPlanActions(withSecond).unmanagedChecklistLines[0]!;
+    harness.markdown.set("Stage.md", adoptPlanAction(withSecond, line, "uuid-2"));
+    harness.markdown.afterWrite = (_path, content) => {
+      if (content.includes("uuid=uuid-2 remoteId=remote-3")) harness.state.failNextCas = true;
+    };
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ createdActions: 1, frozen: [] });
+    expect(harness.markdown.content("Stage.md")).toContain("uuid=uuid-2 remoteId=remote-3");
+    expect(harness.state.value.ledger.find((entry) => entry.uuid === "uuid-2"))
+      .toMatchObject({ remoteId: "remote-3", frozen: undefined });
   });
 
   it("uses an exact post-write reread when ordinary task receipts omit board placement", async () => {

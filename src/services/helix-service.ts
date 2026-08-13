@@ -470,6 +470,54 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     await this.changeDidaAuthorization(null);
   }
 
+  /**
+   * 只清除可重新拉取的滴答展示缓存；绝不访问远端，也不清口令、合同能力或本地事件账本。
+   * 存在任何未收口写入时拒绝执行，避免丢失三方合并所需的 Base/Local。
+   */
+  async clearDidaDisplayCache(): Promise<void> {
+    this.assertWritable();
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("清除滴答本地缓存");
+    try {
+      const current = await this.store.snapshot();
+      const projection = current.didaProjectionState;
+      if (current.queue.length > 0 || current.conflicts.some((item) =>
+        item.status !== "resolved" && item.status !== "superseded") ||
+        current.pendingDidaContractCleanup ||
+        (projection?.receiptCleanupPending?.length ?? 0) > 0 ||
+        projection?.columnCreation || projection?.enabled) {
+        throw new Error("仍有待处理写入、冲突、清理票据或项目同步，请先完成或停用后再清缓存");
+      }
+      await this.store.mutate((data) => {
+        for (const kind of ["project", "task", "habit", "habit-checkin", "focus"] as const) {
+          for (const key of Object.keys(data.baseSnapshots)) {
+            if (key.startsWith(`${kind}:`)) delete data.baseSnapshots[key];
+          }
+          for (const key of Object.keys(data.localSnapshots)) {
+            if (key.startsWith(`${kind}:`)) delete data.localSnapshots[key];
+          }
+        }
+        data.boardSnapshots = {};
+        data.inProgress = [];
+        delete data.lastSyncAt;
+      });
+      this.patch({
+        connected: false,
+        projects: [],
+        tasks: [],
+        habits: [],
+        habitCheckins: [],
+        focus: [],
+        inProgress: [],
+        lastSyncAt: undefined,
+        syncWarnings: [],
+        error: undefined,
+        demoMode: !this.secrets.getDidaToken() && this.state.demoMode,
+      });
+    } finally {
+      releaseExclusive();
+    }
+  }
+
   private async changeDidaAuthorization(replacementToken: string | null): Promise<void> {
     this.assertActive();
     const releaseExclusive = this.remoteWriteGate.enterExclusive("API 口令切换");

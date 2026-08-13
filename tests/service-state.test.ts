@@ -1076,6 +1076,54 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.queue).toMatchObject([{ id: "op-pending-pull-only", status: "pending" }]);
   });
 
+  it("clears only local Dida display caches without touching authorization or events", async () => {
+    const data = createDefaultData("device-clear-cache");
+    const project: DidaProject = { id: "project-cache", name: "Cached", viewMode: "list" };
+    const task: DidaTask = { id: "task-cache", projectId: project.id, title: "Cached", status: 0 };
+    data.baseSnapshots[`project:${project.id}`] = createSnapshot("project", project.id, project);
+    data.localSnapshots[`project:${project.id}`] = createSnapshot("project", project.id, project);
+    data.baseSnapshots[`task:${task.id}`] = createSnapshot("task", task.id, task);
+    data.localSnapshots[`task:${task.id}`] = createSnapshot("task", task.id, task);
+    data.boardSnapshots[project.id] = {
+      projectId: project.id, columns: [], taskColumnIds: {}, capturedAt: new Date().toISOString(), stale: false,
+    };
+    data.inProgress = [{ taskId: task.id, projectId: project.id, markedAt: new Date().toISOString(), lastTouchedAt: new Date().toISOString(), activeFocus: false }];
+    const reviewEvent = { type: "review-closed" as const, entityId: "review", occurrenceKey: "review", occurredAt: "2026-08-13T00:00:00.000Z" };
+    data.events = [{ ...reviewEvent, id: deterministicEventId(reviewEvent) }];
+    data.lastSyncAt = "2026-08-13T00:00:00.000Z";
+    expect(hydrateData(data).recoveryIssues).toEqual([]);
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token-kept" } as HelixSecretStore);
+    await service.initialize();
+
+    await service.clearDidaDisplayCache();
+
+    expect(persisted.baseSnapshots).toEqual({});
+    expect(persisted.localSnapshots).toEqual({});
+    expect(persisted.boardSnapshots).toEqual({});
+    expect(persisted.inProgress).toEqual([]);
+    expect(persisted.events).toEqual(data.events);
+    expect(persisted.lastSyncAt).toBeUndefined();
+    expect(service.snapshot()).toMatchObject({ connected: false, projects: [], tasks: [], authorizationConfigured: true });
+  });
+
+  it("refuses to clear Dida caches while a write is pending", async () => {
+    const data = createDefaultData("device-clear-cache-blocked");
+    data.queue = [{
+      id: "op-pending", kind: "task", entityId: "task-1", projectId: "project-1", operation: "update",
+      createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z", attempts: 0,
+      status: "pending", local: createSnapshot("task", "task-1", { id: "task-1", projectId: "project-1", title: "Local", status: 0 }),
+    }];
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(data); }, async saveData() {},
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    await expect(service.clearDidaDisplayCache()).rejects.toThrow(/待处理写入/);
+  });
+
   it("shares one in-flight sync instead of publishing an early success", async () => {
     const data = createDefaultData("device-single-sync");
     const service = new HelixService(

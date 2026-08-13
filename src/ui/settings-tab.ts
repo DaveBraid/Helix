@@ -36,6 +36,7 @@ export class HelixSettingTab extends PluginSettingTab {
   private projectionColumnPreview: ProjectionColumnCreationPreview | null = null;
   private readonly projectionActivationConfirmation = new DidaWriteContractConfirmationGate();
   private readonly projectionColumnConfirmation = new DidaWriteContractConfirmationGate();
+  private readonly clearCacheConfirmation = new DidaWriteContractConfirmationGate();
   constructor(app: App, private readonly plugin: HelixPlugin) {
     super(app, plugin);
   }
@@ -157,6 +158,26 @@ export class HelixSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    new Setting(this.containerEl)
+      .setName("清除滴答本地缓存")
+      .setDesc("只移除 Helix 中可重新拉取的清单、任务、习惯与专注缓存；不会联网，不删除滴答数据，不清除 API 口令或历史统计。")
+      .addButton((button) => button
+        .setButtonText(this.clearCacheConfirmation.isArmed() ? "再次点击清除" : "清除缓存")
+        .setWarning()
+        .onClick(async () => {
+          if (this.clearCacheConfirmation.request(() => this.display()) === "armed") {
+            button.setButtonText("再次点击清除");
+            return;
+          }
+          try {
+            await this.plugin.service.clearDidaDisplayCache();
+            new Notice("滴答本地展示缓存已清除；远端数据和 API 口令未改动");
+            this.display();
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : String(error), 10_000);
+          }
+        }));
   }
 
   private renderProjectProjectionSettings(): void {

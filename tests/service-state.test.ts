@@ -55,6 +55,31 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
   expect(projectProjectionGlobalCapabilitiesReady(serverAssignedIds)).toBe(true);
 });
 
+it("reports a failed contract as safely cleaned after strict recovery proves no artifacts remain", async () => {
+  const data = createDefaultData("device-contract-clean-summary");
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(data); },
+    async saveData() {},
+  }), { getDidaToken: () => "token" } as HelixSecretStore);
+  await service.initialize();
+  const internals = service as unknown as {
+    lastDidaWriteContractReport: {
+      status: "failed";
+      remoteArtifactsRemaining: boolean;
+      cleanupPlan?: unknown;
+    };
+    lastDidaContractArtifactsClean: boolean;
+  };
+  internals.lastDidaWriteContractReport = {
+    status: "failed",
+    remoteArtifactsRemaining: true,
+  };
+  internals.lastDidaContractArtifactsClean = true;
+
+  expect(service.didaWriteContractRuntimeSummary()).toContain("最近运行未通过，测试对象已安全清理");
+  expect(service.didaContractCleanupRuntimeStatus()).toEqual({ pending: false, adoptionSuggested: false });
+});
+
 it("keeps project auto-sync readiness false until projection is explicitly versioned and enabled", async () => {
   const data = createDefaultData("device-projection-readiness");
   grantTaskCrud(data);

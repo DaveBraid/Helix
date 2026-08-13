@@ -227,6 +227,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     context: import("../integrations/dida/write-contract").DidaProjectProjectionContractContext,
   ) => Promise<void>;
   private lastDidaWriteContractReport: DidaWriteContractReport | null = null;
+  /** 本次进程内最后一次合同残留是否已由严格恢复流程证明归零。 */
+  private lastDidaContractArtifactsClean: boolean | null = null;
   private secretMutationAuthorized = false;
   private disposed = false;
   private readonly projectDidaProjectionAvailable: boolean;
@@ -1053,6 +1055,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         },
       ).run();
       this.lastDidaWriteContractReport = report;
+      this.lastDidaContractArtifactsClean = !report.remoteArtifactsRemaining;
       await this.store.mutate((data) => {
         if (report.cleanupPlan) {
           assertOwnedContractCleanupPlan(
@@ -1194,6 +1197,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         }),
         this.store,
       ).recover(authorizationBinding);
+      this.lastDidaContractArtifactsClean = true;
     } finally {
       await this.refreshAttentionCountFromStore().catch(() => undefined);
       releaseExclusive();
@@ -1230,6 +1234,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     return {
       pending: false,
       adoptionSuggested: !!this.lastDidaWriteContractReport?.remoteArtifactsRemaining &&
+        this.lastDidaContractArtifactsClean !== true &&
         !this.lastDidaWriteContractReport.cleanupPlan,
     };
   }
@@ -1263,7 +1268,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     const capability = (name: string, value: boolean) => `${name}${value ? "已验证" : "只读"}`;
     const recent = this.lastDidaWriteContractReport
       ? `最近运行${this.lastDidaWriteContractReport.status === "passed" ? "通过" : "未通过"}` +
-        `${this.lastDidaWriteContractReport.remoteArtifactsRemaining ? "，存在待人工核对对象" : "，测试对象已安全清理"}`
+        `${this.lastDidaWriteContractReport.remoteArtifactsRemaining &&
+          this.lastDidaContractArtifactsClean !== true
+          ? "，存在待人工核对对象"
+          : "，测试对象已安全清理"}`
       : "本次插件运行尚未执行合同测试";
     return [
       `合同版本 ${DIDA_CONTRACT_PROBE_VERSION}`,

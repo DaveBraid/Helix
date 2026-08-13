@@ -88,11 +88,12 @@ import {
   type ProjectionSyncSummary,
 } from "./services/dida-project-projection";
 
-import type {
-  DidaProjectionTarget,
-  ProjectionActivationPreview,
-  ProjectionActionState,
-  ProjectionColumnCreationPreview,
+import {
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
+  type DidaProjectionTarget,
+  type ProjectionActivationPreview,
+  type ProjectionActionState,
+  type ProjectionColumnCreationPreview,
 } from "./domain/dida-project-projection";
 import {
   confirmProjectionActivation,
@@ -735,11 +736,12 @@ export default class HelixPlugin extends Plugin {
     return this.withProjectWorkspaceRead(() => this.projectProjection.readConfiguration());
   }
 
-  async readProjectProjectionCatalog(): Promise<ProjectionCatalogSnapshot[]> {
-    const projectIds = [...new Set(this.service.snapshot().projects
-      .map((project) => project.id)
-      .filter((id) => !id.startsWith("local-project-")))];
-    return Promise.all(projectIds.map((projectId) => this.service.readProjectionCatalog(projectId)));
+  async readProjectProjectionCatalog(projectId: string): Promise<ProjectionCatalogSnapshot> {
+    if (!this.service.snapshot().projects.some((project) => project.id === projectId) ||
+      projectId.startsWith("local-project-")) {
+      throw new Error("请选择已同步且身份明确的滴答清单");
+    }
+    return this.service.readProjectionCatalog(projectId);
   }
 
   async previewProjectProjection(target: DidaProjectionTarget): Promise<ProjectionActivationPreview> {
@@ -873,7 +875,9 @@ export default class HelixPlugin extends Plugin {
     if (!PROJECT_DIDA_PROJECTION_AVAILABLE) return { candidates: [], failures: [] };
     return this.withProjectWorkspaceRead(async () => {
       const configuration = await this.projectProjection.readConfiguration();
-      if (!configuration.enabled || !configuration.target || !configuration.confirmedPreviewHash) {
+      if (!configuration.enabled ||
+        configuration.activationVersion !== PROJECT_PROJECTION_ACTIVATION_VERSION ||
+        !configuration.target || !configuration.confirmedPreviewHash) {
         return { candidates: [], failures: [] };
       }
       const snapshot = await this.projectWorkspace.snapshot();

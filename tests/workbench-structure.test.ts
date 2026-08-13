@@ -393,8 +393,7 @@ describe("workbench layout and navigation structure", () => {
     expect(view).not.toContain("editProjectAction");
     expect(view).not.toContain("同步此项目到滴答");
     expect(view).not.toContain("当前只写 Stage，尚未发送滴答");
-    expect(settings).not.toContain("滴答项目同步");
-    expect(settings).not.toContain("renderProjectProjectionSettings");
+    expect(settings).toMatch(/PROJECT_DIDA_PROJECTION_AVAILABLE\) this\.renderProjectProjectionSettings\(\)/);
   });
 
   it("registers Live Preview marker hiding and routes project changes through one background coordinator", () => {
@@ -445,7 +444,7 @@ describe("workbench layout and navigation structure", () => {
     const modal = main.slice(main.indexOf("class ProjectPromptModal"), main.indexOf("class CyclePromptModal"));
     expect(view).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
     expect(settings).not.toContain("ProjectionUiActionCoordinator");
-    expect(settings).not.toContain("confirmProjectProjection");
+    expect(settings).toMatch(/projectionActivationConfirmation\.request\(\)[\s\S]*confirmProjectProjection/);
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
     expect(modal).toMatch(/submit\(title, initialStageTitle, this\.color\)/);
     expect(modal).toMatch(/首阶段名称/);
@@ -459,8 +458,7 @@ describe("workbench layout and navigation structure", () => {
       service.indexOf("async confirmProjectionColumnCreation"),
       service.indexOf("async reconcileProjectionColumnCreation"),
     );
-    expect(settings).not.toContain("PROJECTION_COLUMN_NAME");
-    expect(settings).not.toContain("previewProjectProjectionColumn");
+    expect(settings).toMatch(/PROJECTION_COLUMN_NAME[\s\S]*previewProjectProjectionColumn[\s\S]*projectionColumnConfirmation\.request\(\)[\s\S]*confirmProjectProjectionColumn/);
     expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
     expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
     expect(confirm).toMatch(/enterExclusive\("滴答项目同步分栏创建"\)/);

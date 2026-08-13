@@ -99,6 +99,7 @@ export interface HelixPersistedData {
   };
   didaProjectionState?: {
     enabled: boolean;
+    activationVersion?: number;
     target?: DidaProjectionTarget;
     confirmedPreviewHash?: string;
     ledger: ProjectionLedgerEntry[];
@@ -567,7 +568,7 @@ function validateDidaProjectionState(
   const onlyKeys = (candidate: Record<string, unknown>, allowed: readonly string[]) =>
     Object.keys(candidate).every((key) => allowed.includes(key));
   if (!onlyKeys(record, [
-    "enabled", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
+    "enabled", "activationVersion", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
     "receiptCleanupPending", "columnCreation",
   ])) {
     issues.push("滴答项目同步状态含未知字段，已忽略并进入只读恢复模式");
@@ -719,7 +720,9 @@ function validateDidaProjectionState(
     }
     return stableHash(baseline) === row.baselineHash;
   })();
-  if (typeof record.enabled !== "boolean" || !validTarget || !validLedger || !validCheckpoints || !validBases ||
+  const validActivationVersion = record.activationVersion === undefined ||
+    (typeof record.activationVersion === "number" && Number.isSafeInteger(record.activationVersion));
+  if (typeof record.enabled !== "boolean" || !validActivationVersion || !validTarget || !validLedger || !validCheckpoints || !validBases ||
     !validCleanupPending || !validColumnCreation ||
     (record.enabled === true && (target === undefined || record.confirmedPreviewHash === undefined)) ||
     (record.confirmedPreviewHash !== undefined &&
@@ -782,11 +785,13 @@ function validateDidaProjectionState(
     }
   }
   const normalized: NonNullable<HelixPersistedData["didaProjectionState"]> = {
-    enabled: record.enabled as boolean,
+    // 旧版调试状态没有当前激活凭证；保留映射与诊断，但绝不在升级后自动写入。
+    enabled: record.enabled === true && record.activationVersion === 1,
     ledger: normalizedLedger.map((entry) => ({ ...entry })),
     parentCheckpoints: (checkpoints as NonNullable<HelixPersistedData["didaProjectionState"]>["parentCheckpoints"])
       .map((entry) => ({ ...entry })),
   };
+  if (record.activationVersion === 1) normalized.activationVersion = 1;
   if (normalizedTarget) normalized.target = { ...normalizedTarget };
   if (typeof record.confirmedPreviewHash === "string") {
     normalized.confirmedPreviewHash = record.confirmedPreviewHash;

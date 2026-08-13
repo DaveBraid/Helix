@@ -19,6 +19,7 @@ import {
   verifyProjectedTask,
   verifyClientChecklistAppendResult,
   PROJECTION_ACTION_EDITABLE_STATES,
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
   type ProjectionLedgerEntry,
   type ProjectionReadiness,
 } from "../src/domain/dida-project-projection";
@@ -397,7 +398,7 @@ function makeHarness(activate = false, failFirstCas = false, taskReopenVerified 
   const service = new DidaProjectProjectionService(markdown, pipeline, state, catalog, () => "2026-08-05T00:00:00.000Z");
   if (activate) {
     const preview = buildProjectionActivationPreview({ target: { targetProjectId: "list-1", targetColumnId: "column-1" }, projects: [project], columns: [column], readiness: ready, projectCount: 1, actionCount: 1 });
-    state.value = { enabled: true, target: preview.target, confirmedPreviewHash: preview.previewHash, ledger: [], parentCheckpoints: [] };
+    state.value = { enabled: true, activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION, target: preview.target, confirmedPreviewHash: preview.previewHash, ledger: [], parentCheckpoints: [] };
   }
   return { markdown, pipeline, state, service };
 }

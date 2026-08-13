@@ -18,6 +18,7 @@ import {
   restoreManagedPlanAction,
   verifyProjectedTask,
   PROJECTION_ACTION_EDITABLE_STATES,
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
   type DidaProjectionTarget,
   type ProjectionActivationPreview,
   type ProjectionColumnCreationCheckpoint,
@@ -176,6 +177,7 @@ export interface ProjectionRemoteIdentity {
 
 export interface ProjectionPersistentState {
   enabled: boolean;
+  activationVersion?: number;
   target?: DidaProjectionTarget;
   confirmedPreviewHash?: string;
   ledger: ProjectionLedgerEntry[];
@@ -748,6 +750,7 @@ export class DidaProjectProjectionService {
     await this.state.write(current, {
       ...current,
       enabled: true,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
       target: { ...fresh.target },
       confirmedPreviewHash: fresh.previewHash,
     });
@@ -755,7 +758,9 @@ export class DidaProjectProjectionService {
 
   async synchronizeProject(input: ProjectionProjectInput): Promise<ProjectionSyncSummary> {
     const initialState = await this.state.read();
-    if (!initialState.enabled || !initialState.target || !initialState.confirmedPreviewHash) {
+    if (!initialState.enabled ||
+      initialState.activationVersion !== PROJECT_PROJECTION_ACTIVATION_VERSION ||
+      !initialState.target || !initialState.confirmedPreviewHash) {
       throw new Error("Helix→滴答同步尚未显式预览并启用");
     }
     const catalog = await this.catalog.read(initialState.target.targetProjectId);

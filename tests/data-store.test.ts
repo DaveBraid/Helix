@@ -875,6 +875,23 @@ describe("HelixDataStore serialization", () => {
     expect(hydrateData(cleanupShadow).didaProjectionState).toBeUndefined();
   });
 
+  it("keeps legacy projection identities but disables an unversioned activation", () => {
+    const raw = createDefaultData("device-projection-legacy-activation");
+    raw.didaProjectionState = {
+      enabled: true,
+      target: { targetProjectId: "target-list", targetColumnId: "target-column" },
+      confirmedPreviewHash: "a".repeat(64),
+      ledger: [],
+      parentCheckpoints: [],
+    };
+
+    expect(hydrateData(raw).didaProjectionState).toMatchObject({
+      enabled: false,
+      target: raw.didaProjectionState.target,
+      confirmedPreviewHash: raw.didaProjectionState.confirmedPreviewHash,
+    });
+  });
+
   it("hydrates the persisted client checklist identity used by restart-safe append", () => {
     const raw = createDefaultData("projection-client-item-checkpoint");
     raw.didaProjectionState = {

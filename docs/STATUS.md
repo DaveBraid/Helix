@@ -1,7 +1,7 @@
 # 当前开发状态
 
 最后更新：2026-08-13
-当前基线提交：`ae0b243 docs: record sixth v13 contract evidence`（分支 `dev`）
+当前基线提交：`db90619 fix: prevent sparse projection false conflicts`（分支 `dev`；其后仅状态证据提交）
 工作树状态：工作树干净。
 当前阶段：v13 第六次合同已安全中止并清理；已修复稀疏 Local 快照假冲突与合法账本重启误报，等待后续最终复验。
 

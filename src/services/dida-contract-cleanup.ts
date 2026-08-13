@@ -236,7 +236,7 @@ export class DidaContractCleanupService {
     }
     if (matches.length !== 1) throw new Error("合同任务位置存在歧义，已保留清理计划");
     const match = matches[0]!;
-    if (!isDidaContractTaskTitle(match.task.title, pending.plan.marker)) {
+    if (!isOwnedCleanupTask(match.task, pending.plan)) {
       throw new Error("合同任务唯一标记不一致，拒绝删除");
     }
     if (task.deleteState === "sent-unknown") {
@@ -411,6 +411,19 @@ export class DidaContractCleanupService {
       }
     });
   }
+}
+
+function isOwnedCleanupTask(task: DidaTask, plan: DidaContractCleanupPlan): boolean {
+  if (isDidaContractTaskTitle(task.title, plan.marker)) return true;
+  const project = plan.projects.find((candidate) => candidate.id === task.projectId);
+  if (!project || !task.columnId || !project.expectedColumns.some((column) => column.id === task.columnId)) {
+    return false;
+  }
+  if (!task.parentId) {
+    return typeof task.content === "string" && task.content.startsWith("helix-project-projection:");
+  }
+  return plan.tasks.some((candidate) => candidate.id === task.parentId) &&
+    typeof task.content === "string" && task.content.startsWith("helix-projection:");
 }
 
 function requireTaskArray(value: unknown, label: string): DidaTask[] {

@@ -1216,6 +1216,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   async verifyRemoteTask(projectId: string, taskId: string): Promise<DidaTask> {
     this.assertDidaReadAvailable();
     this.assertActive();
+    if (this.contractProjectionQueueProbeRunning && this.remoteWriteGate.isExclusive()) {
+      return this.verifyRemoteTaskWithAuthorizationLease(projectId, taskId);
+    }
     return this.withAuthorizationLease(() =>
       this.verifyRemoteTaskWithAuthorizationLease(projectId, taskId));
   }

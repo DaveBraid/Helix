@@ -140,6 +140,35 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
   expect(persisted.projectionOperationReceipts).toEqual([]);
 });
 
+it("reuses the held contract API for projection rereads without requesting a shared lease", async () => {
+  const data = createDefaultData("device-contract-reread-lease");
+  grantTaskCrud(data, "point");
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  let persisted = structuredClone(data);
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(next: unknown) { persisted = structuredClone(next as typeof persisted); },
+  }), { getDidaToken: () => "token" } as HelixSecretStore, { projectDidaProjectionAvailable: true });
+  await service.initialize();
+  const task = { id: "remote", projectId: "project", title: "Task", status: 0 } as DidaTask;
+  const internals = service as unknown as {
+    contractProjectionQueueProbeRunning: boolean;
+    contractProjectionQueueProbeApi: { getTask(projectId: string, taskId: string): Promise<DidaTask> } | null;
+    remoteWriteGate: { enterExclusive(reason: string): () => void };
+  };
+  internals.contractProjectionQueueProbeRunning = true;
+  internals.contractProjectionQueueProbeApi = { getTask: async () => task };
+  const release = internals.remoteWriteGate.enterExclusive("test contract");
+  try {
+    await expect(service.verifyRemoteTask("project", "remote")).resolves.toMatchObject(task);
+  } finally {
+    release();
+    internals.contractProjectionQueueProbeRunning = false;
+    internals.contractProjectionQueueProbeApi = null;
+  }
+});
+
 it("quarantines an unknown contract projection create without resending it", async () => {
   const data = createDefaultData("device-contract-projection-unknown");
   grantTaskCrud(data, "point");

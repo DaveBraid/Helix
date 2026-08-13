@@ -17,6 +17,7 @@ import { taskSyncProjection } from "../src/integrations/dida/adapters";
 import { normalizeTask } from "../src/integrations/dida/normalization";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import type { DidaProjectProjectionContractContext } from "../src/integrations/dida/write-contract";
+import { DidaHttpError } from "../src/integrations/dida/http-contract";
 
 function grantTaskCrud(
   data: ReturnType<typeof createDefaultData>,
@@ -1242,6 +1243,54 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.conflicts).toHaveLength(1);
     expect(persisted.conflicts[0]?.fields).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "title", localValue: "Local edit", remoteValue: "Remote edit" }),
+    ]));
+  });
+
+  it("queues ordinary task writes after a confirmed offline read and drains them after reconnect", async () => {
+    const data = createDefaultData("device-offline-queue");
+    grantTaskCrud(data);
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    let createCalls = 0;
+    let created: DidaTask | undefined;
+    const api = (service as unknown as { api: Record<string, unknown> }).api;
+    Object.assign(api, {
+      async getProjects() { throw new DidaHttpError("transient", "offline"); },
+      async createTask(value: DidaTask) {
+        createCalls += 1;
+        created = taskSyncProjection(normalizeTask({ ...value, id: "remote-after-reconnect", status: 0 }));
+        return created;
+      },
+      async getTask() { return created; },
+    });
+    Object.defineProperty(service, "habitService", {
+      value: { async list() { return []; }, async checkins() { return []; } },
+    });
+    Object.defineProperty(service, "focusService", { value: { async list() { return []; } } });
+
+    await expect(service.pullOnlySync()).rejects.toThrow("offline");
+    await service.createTask("Offline task", "project-1");
+    expect(createCalls).toBe(0);
+    expect(persisted.queue).toMatchObject([{ operation: "create", status: "pending", attempts: 0 }]);
+
+    Object.assign(api, {
+      async getProjects() { return [{ id: "project-1", name: "Remote list" }]; },
+      async getProjectData() {
+        return { project: { id: "project-1", name: "Remote list" }, columns: [], tasks: [] };
+      },
+      async filterTasks() { return []; },
+      async getCompletedTasks() { return []; },
+    });
+    await service.sync();
+
+    expect(createCalls).toBe(1);
+    expect(persisted.queue).toEqual([]);
+    expect(service.snapshot().tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "remote-after-reconnect", title: "Offline task" }),
     ]));
   });
 

@@ -373,6 +373,15 @@ describe("DidaApi non-idempotent safety", () => {
     expect(transport.calls).toBe(3);
   });
 
+  it("classifies exhausted raw read transport failures as transient", async () => {
+    const transport = new ThrowingTransport();
+    const api = new DidaApi(transport, () => "test-token-long-enough")
+      .withRequestPolicy({ maxAttempts: 1 });
+
+    await expect(api.getProjects()).rejects.toMatchObject({ category: "transient" });
+    expect(transport.calls).toHaveLength(1);
+  });
+
   it("stops a derived contract client when its shared call budget is exhausted", async () => {
     const transport = new CapturingTransport();
     const api = new DidaApi(transport, () => "test-token-long-enough")

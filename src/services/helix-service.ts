@@ -50,6 +50,7 @@ import {
   type DidaTaskWriteCapabilities,
 } from "../integrations/dida/adapters";
 import { ObsidianHttpTransport } from "../integrations/dida/http";
+import { DidaHttpError } from "../integrations/dida/http-contract";
 import {
   normalizeColumns,
   normalizeProject,
@@ -208,6 +209,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   // 最后一份远端租约释放后必须重新发布状态，使后台写入条件能观察到 ready 转换。
   private readonly remoteWriteGate = new RemoteWriteGate(() => this.emit());
   private readonly boardPlacementWrites = new Map<string, Promise<void>>();
+  private remoteConnectivity: "unknown" | "online" | "offline" = "unknown";
   private contractTestRunning = false;
   private contractProjectionQueueProbeRunning = false;
   private contractProjectionQueueProbeCapabilities:
@@ -849,6 +851,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         data.lastSyncAt = capturedAt;
       });
       if (this.disposed) return;
+      this.remoteConnectivity = "online";
       if (!pullOnly) await this.drainQueue();
       if (this.disposed) return;
       const finalData = await this.store.snapshot();
@@ -881,6 +884,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (isTransientRemoteFailure(error)) this.remoteConnectivity = "offline";
       this.patch({ loading: false, connected: false, error: message });
       throw error;
     }
@@ -893,12 +897,18 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   private async probeConnectionWithAuthorizationLease(): Promise<DidaCapabilities> {
-    const capabilities = await this.api.probeCapabilities();
-    if (capabilities.projects !== "available" || capabilities.tasks !== "available") {
-      throw new Error(capabilities.errors.join("；") || "任务与项目接口不可用");
+    try {
+      const capabilities = await this.api.probeCapabilities();
+      if (capabilities.projects !== "available" || capabilities.tasks !== "available") {
+        throw new Error(capabilities.errors.join("；") || "任务与项目接口不可用");
+      }
+      this.remoteConnectivity = "online";
+      this.patch({ capabilities, connected: true, error: undefined });
+      return capabilities;
+    } catch (error) {
+      if (isTransientRemoteFailure(error)) this.remoteConnectivity = "offline";
+      throw error;
     }
-    this.patch({ capabilities, connected: true, error: undefined });
-    return capabilities;
   }
 
   async runDidaWriteContractTest(
@@ -3024,7 +3034,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private async drainQueue(): Promise<void> {
     this.assertDidaTaskWriteAvailable();
     // 合同失效时同步仍可读取，但不得认领或改变任何生产远端写入队列。
-    if (!this.state.taskCrudVerified) return;
+    if (!this.state.taskCrudVerified || this.remoteConnectivity === "offline") return;
     return this.queueDrain.run(() => this.runDrainQueue());
   }
 
@@ -3311,6 +3321,10 @@ function addUnlistedProjects(projects: DidaProject[], tasks: DidaTask[]): DidaPr
 function projectSyncValue(project: DidaProject): DidaProject {
   const { columns: _columns, boardCapturedAt: _boardCapturedAt, boardStale: _boardStale, ...value } = project;
   return value;
+}
+
+function isTransientRemoteFailure(error: unknown): boolean {
+  return error instanceof DidaHttpError && error.category === "transient";
 }
 
 function attachBoardSnapshots(

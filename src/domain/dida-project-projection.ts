@@ -245,6 +245,8 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     if (!checkbox) continue;
     const markerStart = line.indexOf("<!-- helix-dida-action:");
     if (markerStart < 0) {
+      // 模板用空复选框提示可填写位置；它不是任务，也不得进入纳管或预览计数。
+      if (!checkbox[3]!.trim()) continue;
       unmanagedChecklistLines.push(index + 1);
       continue;
     }

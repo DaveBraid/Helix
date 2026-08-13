@@ -132,6 +132,15 @@ describe("Dida project projection domain", () => {
     expect(adopted).toContain("- 普通列表\n- [ ] 用户未知项 <!-- helix-dida-action:v1 uuid=uuid-1 remoteId=- state=active -->");
   });
 
+  it("keeps an empty template checkbox out of unmanaged actions", () => {
+    const source = stage("- [ ] \n- [ ] 真实行动");
+    const parsed = parseManagedPlanActions(source);
+    expect(parsed.unmanagedChecklistLines).toEqual([11]);
+    expect(adoptAllPlanActions(source, () => "uuid-real")).toContain(
+      "- [ ] \n- [ ] 真实行动 <!-- helix-dida-action:v1 uuid=uuid-real remoteId=- state=idea -->",
+    );
+  });
+
   it("parses, edits and roundtrips a managed action", () => {
     const adopted = adoptPlanAction(stage("- [ ] 写论文"), 10, "uuid-1");
     const patched = patchManagedPlanAction(adopted, { uuid: "uuid-1", title: "修改论文", remoteId: "task-1", state: "completed" });

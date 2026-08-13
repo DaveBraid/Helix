@@ -746,8 +746,9 @@ export default class HelixPlugin extends Plugin {
 
   async previewProjectProjection(target: DidaProjectionTarget): Promise<ProjectionActivationPreview> {
     this.assertProjectProjectionAvailable();
-    return this.withProjectWorkspaceRead(async () => {
-      const snapshot = await this.projectWorkspace.snapshot();
+    return this.withWritableProjectMutation(async () => {
+      const snapshot = await this.projectWorkspace.loadStableWorkspace();
+      await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
       const counts = await projectionCounts(snapshot, this.projectProjection);
       return this.projectProjection.previewActivation(target, counts);
     });
@@ -759,7 +760,8 @@ export default class HelixPlugin extends Plugin {
   ): Promise<void> {
     this.assertProjectProjectionAvailable();
     await this.withWritableProjectMutation(async () => {
-      const snapshot = await this.projectWorkspace.snapshot();
+      const snapshot = await this.projectWorkspace.loadStableWorkspace();
+      await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
       await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
     });
     this.projectAutoSync.request(true);

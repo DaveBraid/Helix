@@ -148,6 +148,8 @@ interface CreatedTask {
   candidateProjectIds: string[];
   state: "open" | "completed" | "unknown";
   deleteState?: "sent-unknown";
+  /** 仅本次进程使用：集合未见但精确详情已证明存在，删除后还需详情 404 证明。 */
+  detailFallback?: boolean;
 }
 
 export class DidaWriteContractRunner {
@@ -1575,18 +1577,39 @@ export class DidaWriteContractRunner {
   }
 
   private async assertTaskPresentInObservableCollection(task: CreatedTask): Promise<void> {
-    await this.waitForConsistency(async () => {
-      const tasks = await this.readObservableTasks(task);
-      if (!tasks.some((candidate) => candidate.id === task.id)) {
-        throw new ConsistencyPendingError("删除前任务不在预期可观察集合，拒绝执行删除");
-      }
-    }, "等待任务进入可观察集合");
+    try {
+      await this.waitForConsistency(async () => {
+        const tasks = await this.readObservableTasks(task);
+        if (!tasks.some((candidate) => candidate.id === task.id)) {
+          throw new ConsistencyPendingError("删除前任务不在预期可观察集合，拒绝执行删除");
+        }
+      }, "等待任务进入可观察集合");
+      task.detailFallback = false;
+    } catch (error) {
+      if (!(error instanceof ConsistencyPendingError)) throw error;
+      const exact = normalizeTask(await this.api.getTask(task.projectId, task.id));
+      if (exact.id !== task.id || exact.projectId !== task.projectId) throw error;
+      // 调用方紧邻本方法前已校验本轮 marker；集合最终一致性滞后时，精确详情
+      // 足以证明“要删的仍是同一个对象”，不会扩大删除范围。
+      task.detailFallback = true;
+    }
   }
 
   private async assertTaskAbsentFromObservableCollection(task: CreatedTask): Promise<void> {
     const tasks = await this.readObservableTasks(task);
     if (tasks.some((candidate) => candidate.id === task.id)) {
       throw new ConsistencyPendingError("任务删除后仍存在于可观察任务集合");
+    }
+    if (!task.detailFallback) return;
+    try {
+      const exact = normalizeTask(await this.api.getTask(task.projectId, task.id));
+      if (exact.id === task.id && exact.projectId === task.projectId) {
+        throw new ConsistencyPendingError("任务删除后精确详情仍可读取");
+      }
+      throw new Error("任务删除后精确详情身份异常");
+    } catch (error) {
+      if (isNotFound(error)) return;
+      throw error;
     }
   }
 
@@ -1691,6 +1714,27 @@ export class DidaWriteContractRunner {
       }
     }
     if (ambiguous) throw new Error("测试任务同时存在于多个候选清单集合，拒绝猜测归属");
+    // 开放／已完成集合可能在创建后短暂漏项。只有集合与候选清单的精确详情端点
+    // 都证明不存在，才允许把任务从清理计划移除；详情仍可读时继续按 ID 删除。
+    const exactMatches: CreatedTask[] = [];
+    for (const projectId of task.candidateProjectIds) {
+      try {
+        const exact = normalizeTask(await this.api.getTask(projectId, task.id));
+        if (exact.id !== task.id || exact.projectId !== projectId) {
+          throw new Error("测试任务精确复读身份与候选清单不一致");
+        }
+        exactMatches.push({ ...task, projectId });
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+      }
+    }
+    if (exactMatches.length > 1) throw new Error("测试任务精确详情同时存在于多个候选清单，拒绝猜测归属");
+    if (exactMatches.length === 1) {
+      task.projectId = exactMatches[0]!.projectId;
+      task.detailFallback = true;
+      await this.cleanupCheckpoint?.();
+      return task;
+    }
     return null;
   }
 

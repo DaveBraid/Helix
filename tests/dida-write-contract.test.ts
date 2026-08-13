@@ -79,6 +79,7 @@ class ContractApiFake {
   rateLimitProjectCollectionAfterDeleteOnce = false;
   staleReadsAfterDelete = 0;
   completedVisibilityDelay = 0;
+  openVisibilityDelay = 0;
   throwCompletedReads = false;
   collapseScheduleToPoint = false;
   corruptSchedule = false;
@@ -263,7 +264,9 @@ class ContractApiFake {
     }
     const visibleTasks = isMoveCollection && forceNone
       ? tasks.filter((task) => task.id !== "test-task-1")
-      : tasks;
+      : this.openVisibilityDelay > 0
+        ? (this.openVisibilityDelay -= 1, tasks.filter((task) => !task.id.startsWith("test-task-")))
+        : tasks;
     return {
       project: this.moveProjectIdentityMismatch === "source" && isMoveCollection &&
           projectId === "test-project-1"
@@ -1618,6 +1621,24 @@ describe("DidaWriteContractRunner", () => {
       remoteArtifactsRemaining: false,
     });
     expect(sleep).toHaveBeenCalled();
+  });
+
+  it("falls back to exact task reads when a newly created open task never reaches the collection", async () => {
+    const api = new ContractApiFake();
+    api.openVisibilityDelay = 20;
+    const sleep = vi.fn(async () => undefined);
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-open-never-visible",
+      fixedNow,
+      sleep,
+    ).run();
+
+    expect(report.status).toBe("passed");
+    expect(report.remoteArtifactsRemaining).toBe(false);
+    expect(report.cleanupErrors).toEqual([]);
+    expect(api.deletedProjects).toEqual(["test-project-2", "test-project-1"]);
+    expect(api.tasks.has("original-task")).toBe(true);
   });
 
   it("does not multiply transport failures across consistency attempts", async () => {

@@ -723,11 +723,14 @@ function projectionTaskAttributeMismatches(task: DidaTask, entry: ProjectionLedg
   const optional = (value: string | null | undefined) => value?.trim() || undefined;
   const tags = (value: string[] | undefined) => [...new Set((value ?? [])
     .map((tag) => tag.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+  // 滴答会给无日期任务补上账户默认时区；没有开始/截止时间时该字段没有业务语义，
+  // 不能把服务端默认值误判为项目行动写入失败。
+  const scheduleExists = Boolean(task.startDate || task.dueDate || entry.startDate || entry.dueDate);
   return [
     optional(task.desc) === optional(entry.content) ? undefined : "desc",
     sameOptionalInstant(task.startDate, entry.startDate) ? undefined : "startDate",
     sameOptionalInstant(task.dueDate, entry.dueDate) ? undefined : "dueDate",
-    optional(task.timeZone) === optional(entry.timeZone) ? undefined : "timeZone",
+    !scheduleExists || optional(task.timeZone) === optional(entry.timeZone) ? undefined : "timeZone",
     Boolean(task.isAllDay) === Boolean(entry.isAllDay) ? undefined : "isAllDay",
     (task.priority ?? 0) === (entry.priority ?? 0) ? undefined : "priority",
     stableHash(tags(task.tags)) === stableHash(tags(entry.tags)) ? undefined : "tags",

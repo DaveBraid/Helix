@@ -309,6 +309,27 @@ describe("Dida project projection domain", () => {
     expect(() => verifyProjectedTask({ ...task, parentId: "foreign" }, entry, projectionMarker("uuid-1"))).toThrow(/复读不一致/);
   });
 
+  it("ignores a server-default timezone when neither side has a schedule", () => {
+    const entry = ledger({ remoteId: "task-1", timeZone: undefined });
+    const task: DidaTask = {
+      id: "task-1",
+      projectId: "list-1",
+      parentId: "parent-1",
+      columnId: "column-1",
+      title: "行动",
+      content: projectionMarker("uuid-1"),
+      status: 0,
+      timeZone: "Asia/Shanghai",
+    };
+
+    expect(() => verifyProjectedTask(task, entry, projectionMarker("uuid-1"))).not.toThrow();
+    expect(() => verifyProjectedTask(
+      { ...task, startDate: "2026-08-15T01:30:00.000Z", dueDate: "2026-08-15T01:30:00.000Z" },
+      { ...entry, startDate: "2026-08-15T01:30:00.000Z", dueDate: "2026-08-15T01:30:00.000Z", timeZone: "UTC" },
+      projectionMarker("uuid-1"),
+    )).toThrow(/attributes\.timeZone/);
+  });
+
   it("accepts a uniquely identified server-reordered checklist append without relaxing existing items", () => {
     const ordinaryA: DidaChecklistItem = { id: "ordinary-a", title: "用户 A", status: 0, sortOrder: 20 };
     const ordinaryB: DidaChecklistItem = { id: "ordinary-b", title: "用户 B", status: 2, sortOrder: 10 };

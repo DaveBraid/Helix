@@ -27,6 +27,16 @@ describe("Dida project projection contract probe", () => {
     expect([...harness.tasks.values()]).toEqual([]);
   });
 
+  it("accepts the server default timezone on an unscheduled Vault action", async () => {
+    const harness = createHarness();
+    harness.defaultUnscheduledTimeZone = "Asia/Shanghai";
+
+    await runDidaProjectProjectionContractProbe(harness.context);
+
+    expect(harness.tracked).toEqual([]);
+    expect([...harness.tasks.values()]).toEqual([]);
+  });
+
   it("marks an unknown create before refusing to continue", async () => {
     const harness = createHarness();
     harness.failNextCreateUnknown = true;
@@ -53,6 +63,7 @@ function createHarness() {
   let untrackedCreates = 0;
   let failNextCreateUnknown = false;
   let keepDeletedDetailGhost = false;
+  let defaultUnscheduledTimeZone: string | undefined;
   const deletedGhosts = new Map<string, DidaTask>();
   const api = {
     createTask: async (draft: Partial<DidaTask> & Pick<DidaTask, "title" | "projectId">) => {
@@ -66,6 +77,9 @@ function createHarness() {
         projectId: draft.projectId,
         title: draft.title,
         status: draft.status ?? 0,
+        ...(!draft.startDate && !draft.dueDate && defaultUnscheduledTimeZone
+          ? { timeZone: defaultUnscheduledTimeZone }
+          : {}),
       };
       tasks.set(task.id, task);
       return structuredClone(task);
@@ -128,5 +142,7 @@ function createHarness() {
     set failNextCreateUnknown(value: boolean) { failNextCreateUnknown = value; },
     get keepDeletedDetailGhost() { return keepDeletedDetailGhost; },
     set keepDeletedDetailGhost(value: boolean) { keepDeletedDetailGhost = value; },
+    get defaultUnscheduledTimeZone() { return defaultUnscheduledTimeZone; },
+    set defaultUnscheduledTimeZone(value: string | undefined) { defaultUnscheduledTimeZone = value; },
   };
 }

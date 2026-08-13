@@ -273,11 +273,37 @@ describe("HelixService contract-test exclusivity", () => {
       }];
     });
 
-    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/隔离状态/);
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/生产同步队列/);
     expect(getProjects).not.toHaveBeenCalled();
     expect((await store.snapshot()).didaContractCapabilities).toEqual(before);
     expect((await store.snapshot()).queue).toHaveLength(1);
     expect((await store.snapshot()).pendingDidaContractCleanup).toBeUndefined();
+  });
+
+  it("reports a redacted actionable preflight without contacting Dida", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+
+    await expect(service.didaWriteContractPreflight()).resolves.toEqual({
+      ready: true,
+      reason: "隔离条件已满足；运行时只会操作唯一标记的专用测试对象",
+    });
+    await store.mutate((data) => {
+      data.didaProjectionState = {
+        enabled: true,
+        activationVersion: 2,
+        confirmedPreviewHash: "preview",
+        target: { targetProjectId: "secret-list-id", targetColumnId: "secret-column-id" },
+        ledger: [],
+        parentCheckpoints: [],
+      };
+    });
+    const blocked = await service.didaWriteContractPreflight();
+    expect(blocked).toEqual({ ready: false, reason: "项目滴答同步仍处于启用状态，请先停用" });
+    expect(JSON.stringify(blocked)).not.toContain("secret-list-id");
+    expect(getProjects).not.toHaveBeenCalled();
   });
 
   it("persists an empty cleanup placeholder before the first remote create", async () => {

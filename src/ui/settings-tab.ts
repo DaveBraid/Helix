@@ -1,4 +1,4 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, ButtonComponent, Notice, PluginSettingTab, Setting } from "obsidian";
 import type HelixPlugin from "../main";
 import {
   DIDA_TOKEN_MENU_PATH,
@@ -29,6 +29,7 @@ import { DidaWriteContractConfirmationGate } from "./dida-write-contract-confirm
 
 export class HelixSettingTab extends PluginSettingTab {
   private writeTestResult: string | null = null;
+  private writeTestPreflight: string | null = null;
   private projectionProjectId = "";
   private projectionColumnId = "";
   private projectionCatalog: ProjectionCatalogSnapshot | null = null;
@@ -357,11 +358,12 @@ export class HelixSettingTab extends PluginSettingTab {
       cls: "helix-settings-development-content",
     });
     let scheduleModeSetting: Setting | null = null;
+    let writeTestButton: ButtonComponent | null = null;
     const writeTestSetting = new Setting(developmentContent)
       .setName("写入合同测试")
       .setDesc(this.writeTestDescription())
       .addButton((button) =>
-        button.setButtonText(this.plugin.didaWriteContractSettingsConfirmation.isArmed() ? "再次点击开始" : "运行专用测试").onClick(async () => {
+        (writeTestButton = button).setButtonText(this.plugin.didaWriteContractSettingsConfirmation.isArmed() ? "再次点击开始" : "运行专用测试").onClick(async () => {
           const confirmation = this.plugin.didaWriteContractSettingsConfirmation.request(() => {
             button.buttonEl.removeClass("mod-warning");
             button.setButtonText("运行专用测试");
@@ -393,10 +395,19 @@ export class HelixSettingTab extends PluginSettingTab {
             writeTestSetting.setDesc(this.writeTestDescription());
             scheduleModeSetting?.setDesc(this.scheduleModeDescription());
             button.buttonEl.removeClass("mod-warning");
-            button.setDisabled(false).setButtonText("运行专用测试");
+            const preflight = await this.plugin.service.didaWriteContractPreflight();
+            this.writeTestPreflight = preflight.reason;
+            writeTestSetting.setDesc(this.writeTestDescription());
+            button.setDisabled(!preflight.ready).setButtonText("运行专用测试");
           }
         }),
       );
+
+    void this.plugin.service.didaWriteContractPreflight().then((preflight) => {
+      this.writeTestPreflight = preflight.reason;
+      writeTestSetting.setDesc(this.writeTestDescription());
+      writeTestButton?.setDisabled(!preflight.ready);
+    });
 
     scheduleModeSetting = new Setting(developmentContent)
       .setName("任务时间能力")
@@ -426,7 +437,8 @@ export class HelixSettingTab extends PluginSettingTab {
 
   private writeTestDescription(): string {
     const scope = `${DIDA_WRITE_CONTRACT_VERSION_LABEL}。只创建带唯一标记的两个临时清单和按能力隔离的临时任务；逐项验证后按身份安全清理，绝不操作既有数据。`;
-    return this.writeTestResult ? `${scope} ${this.writeTestResult}` : scope;
+    const status = this.writeTestResult ?? (this.writeTestPreflight ? `启动条件：${this.writeTestPreflight}。` : null);
+    return status ? `${scope} ${status}` : scope;
   }
 
   private scheduleModeDescription(): string {

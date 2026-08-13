@@ -155,6 +155,11 @@ export interface ProjectProjectionWriteReadiness {
   unknownBlocked: boolean;
 }
 
+export interface DidaWriteContractPreflight {
+  ready: boolean;
+  reason: string;
+}
+
 export function projectProjectionGlobalCapabilitiesReady(
   state: Pick<HelixRuntimeState,
     "connected" | "authorizationConfigured" | "taskCrudVerified" |
@@ -475,6 +480,30 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       recoveryBlocked,
       unknownBlocked,
     };
+  }
+
+  async didaWriteContractPreflight(): Promise<DidaWriteContractPreflight> {
+    if (!this.didaContractTestAvailable || !this.didaReadAvailable) {
+      return { ready: false, reason: "当前版本未开放专用写入合同测试" };
+    }
+    if (!this.secrets.getDidaToken()) {
+      return { ready: false, reason: "尚未配置滴答 API 口令" };
+    }
+    if (this.contractTestRunning || this.state.loading || !this.remoteWriteGate.isIdle()) {
+      return { ready: false, reason: "另一个同步或远端事务正在进行" };
+    }
+    if (this.state.recoveryIssues.length > 0) {
+      return { ready: false, reason: "Helix 正处于只读恢复模式" };
+    }
+    try {
+      await this.didaRequestGovernor.assertContractAllowed();
+    } catch {
+      return { ready: false, reason: "滴答请求仍在冷却或请求治理状态需要恢复" };
+    }
+    const blocker = didaContractIsolationBlocker(await this.store.snapshot());
+    return blocker
+      ? { ready: false, reason: blocker }
+      : { ready: true, reason: "隔离条件已满足；运行时只会操作唯一标记的专用测试对象" };
   }
 
   async withProjectProjectionActivationLease<T>(activate: () => Promise<T>): Promise<T> {
@@ -951,20 +980,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.patch({ loading: true, error: undefined });
     try {
       const initialData = await this.store.snapshot();
-      if (initialData.pendingDidaContractCleanup) {
-        throw new Error("存在待安全清理的合同测试对象，已阻止开始新合同");
-      }
-      if (initialData.queue.length > 0 || initialData.conflicts.some((conflict) =>
-        conflict.status !== "resolved" && conflict.status !== "superseded")) {
-        throw new Error("存在待处理的生产同步队列或冲突；合同测试必须在隔离状态下运行");
-      }
-      if (initialData.didaProjectionState?.columnCreation ||
-        (initialData.didaProjectionState?.receiptCleanupPending?.length ?? 0) > 0) {
-        throw new Error("存在待恢复的项目同步操作；请先处理后再运行隔离写入合同测试");
-      }
-      if (initialData.didaProjectionState?.enabled) {
-        throw new Error("项目滴答同步仍处于启用状态；请先停用，再运行隔离写入合同测试");
-      }
+      const isolationBlocker = didaContractIsolationBlocker(initialData);
+      if (isolationBlocker) throw new Error(isolationBlocker);
       // 任何远端写入前先让旧能力缓存失效并发布只读；失败则绝不启动合同。
       try {
         await this.store.mutate((data) => {
@@ -3304,6 +3321,24 @@ function projectionStateOrDefault(
   data: HelixPersistedData,
 ): NonNullable<HelixPersistedData["didaProjectionState"]> {
   return data.didaProjectionState ?? { enabled: false, ledger: [], parentCheckpoints: [] };
+}
+
+function didaContractIsolationBlocker(data: HelixPersistedData): string | null {
+  if (data.pendingDidaContractCleanup) {
+    return "存在待安全清理的合同测试对象";
+  }
+  if (data.queue.length > 0 || data.conflicts.some((conflict) =>
+    conflict.status !== "resolved" && conflict.status !== "superseded")) {
+    return "存在待处理的生产同步队列或冲突";
+  }
+  if (data.didaProjectionState?.columnCreation ||
+    (data.didaProjectionState?.receiptCleanupPending?.length ?? 0) > 0) {
+    return "存在待恢复的项目同步操作";
+  }
+  if (data.didaProjectionState?.enabled) {
+    return "项目滴答同步仍处于启用状态，请先停用";
+  }
+  return null;
 }
 
 function projectionColumnBaseline(columns: DidaColumn[], projectId: string): ProjectionColumnBaseline[] {

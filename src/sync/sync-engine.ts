@@ -52,6 +52,12 @@ export interface SyncEngineDependencies<T extends RemoteEntity> {
     desired: EntitySnapshot<T>,
     actual: T,
   ) => boolean | undefined;
+  /** 仅供服务端派生字段不进入普通快照的专用创建；调用方仍须随后精确复读身份。 */
+  verifyCreateResult?: (
+    operation: SyncQueueOperation<T>,
+    desired: EntitySnapshot<T>,
+    actual: T,
+  ) => boolean | undefined;
 }
 
 export class SyncEngine<T extends RemoteEntity> {
@@ -323,7 +329,11 @@ export class SyncEngine<T extends RemoteEntity> {
         remoteOutcomeUnknown: true,
       };
     }
-    if (!verified || !equivalentForVerification(operation.local.value, verified, true)) {
+    const specializedVerification = verified
+      ? this.dependencies.verifyCreateResult?.(operation, operation.local, verified)
+      : undefined;
+    if (!verified || !(specializedVerification ??
+      equivalentForVerification(operation.local.value, verified, true))) {
       throw {
         category: "unknown-outcome",
         message: "远端创建结果无法通过复读验证，已转入待核对状态",

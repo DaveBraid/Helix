@@ -47,6 +47,7 @@ import {
   sameTaskBoardPlacementInvariant,
   taskBoardPlacementPayload,
   taskSyncProjection,
+  type DidaTaskWriteCapabilities,
 } from "../integrations/dida/adapters";
 import { ObsidianHttpTransport } from "../integrations/dida/http";
 import {
@@ -105,8 +106,8 @@ import {
 import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
-// v10 在 v9 基础上加入真实项目父任务／Stage 子任务投影闭环；预算只供本轮唯一合同对象。
-const DIDA_CONTRACT_REQUEST_BUDGET = 180;
+// v11 再加入生产 OfflineQueue 创建／删除及收据闭环；预算只供本轮唯一合同对象。
+const DIDA_CONTRACT_REQUEST_BUDGET = 190;
 
 export interface HelixRuntimeState {
   loading: boolean;
@@ -207,6 +208,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private readonly remoteWriteGate = new RemoteWriteGate(() => this.emit());
   private readonly boardPlacementWrites = new Map<string, Promise<void>>();
   private contractTestRunning = false;
+  private contractProjectionQueueProbeRunning = false;
+  private contractProjectionQueueProbeCapabilities:
+    (DidaTaskWriteCapabilities & { projectProjectionVerified: boolean }) | null = null;
+  private contractProjectionQueueProbeScheduleMode: Exclude<TaskScheduleMode, "unknown"> | null = null;
   private lastDidaWriteContractReport: DidaWriteContractReport | null = null;
   private secretMutationAuthorized = false;
   private disposed = false;
@@ -320,8 +325,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.taskEngine = new SyncEngine({
       adapter: new DidaTaskAdapter(
         this.api,
-        () => this.state.taskScheduleMode,
-        () => this.state,
+        () => this.contractProjectionQueueProbeScheduleMode ?? this.state.taskScheduleMode,
+        () => this.contractProjectionQueueProbeCapabilities ?? this.state,
       ),
       snapshots: this.store,
       conflicts: this.store,
@@ -337,6 +342,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       verifyWriteResult: (operation, base, desired, actual) =>
         isProjectionClientItemAppend(operation, base, desired)
           ? verifyClientChecklistAppendResult(base.value, desired.value, actual)
+          : undefined,
+      verifyCreateResult: (operation, desired, actual) =>
+        isProjectionQueueOperation(operation)
+          ? sameProjectionCreateSnapshot(desired.value, actual)
           : undefined,
     });
     this.projectEngine = new SyncEngine({
@@ -912,7 +921,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           });
         },
         cleanupApi,
-        runDidaProjectProjectionContractProbe,
+        async (context) => {
+          await runDidaProjectProjectionContractProbe(context);
+          await this.runContractProjectionQueueProbe(context);
+        },
       ).run();
       this.lastDidaWriteContractReport = report;
       await this.store.mutate((data) => {
@@ -1457,7 +1469,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     task: DidaTask,
     clientIdentity: string,
   ): Promise<ProjectionWriteReceipt> {
-    const release = this.remoteWriteGate.enterShared();
+    const release = this.enterProjectionWriteLease();
     try {
       this.assertWritable();
       this.assertProjectionCapabilities(false);
@@ -1668,7 +1680,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   async enqueueProjectionDelete(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt> {
-    const release = this.remoteWriteGate.enterShared();
+    const release = this.enterProjectionWriteLease();
     try {
       this.assertWritable();
       this.assertProjectionCapabilities(false);
@@ -1676,12 +1688,14 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         expected.targetProjectId,
         expected.taskId,
       );
-      if (remote.parentId !== expected.parentTaskId || remote.columnId !== expected.targetColumnId ||
+      if ((remote.parentId ?? "") !== (expected.parentTaskId ?? "") ||
+        remote.columnId !== expected.targetColumnId ||
         remote.content !== expected.marker) {
         return { operationId: `op-projection-delete-${crypto.randomUUID()}`, outcome: "conflict", message: "同步删除写前身份复读不一致" };
       }
       const now = new Date().toISOString();
-      const base = createSnapshot("task", remote.id, remote, { capturedAt: now });
+      // 分栏只参与本次删除的写前身份检查；普通三方快照不保存服务端派生的 columnId。
+      const base = createSnapshot("task", remote.id, taskSyncProjection(remote), { capturedAt: now });
       const operation: SyncQueueOperation<DidaTask> = {
         id: `op-projection-delete-${crypto.randomUUID()}`,
         kind: "task",
@@ -1699,6 +1713,83 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       return this.enqueueAndDrainProjectionOperation(operation, true) as Promise<ProjectionDeleteReceipt>;
     } finally {
       release();
+    }
+  }
+
+  private async runContractProjectionQueueProbe(
+    context: import("../integrations/dida/write-contract").DidaProjectProjectionContractContext,
+  ): Promise<void> {
+    if (!this.contractTestRunning || !this.remoteWriteGate.isExclusive()) {
+      throw new Error("项目同步队列探针缺少合同排他保护");
+    }
+    const clientIdentity = `helix-contract-queue:${crypto.randomUUID()}`;
+    const marker = `${context.marker} 项目队列探针`;
+    this.contractProjectionQueueProbeCapabilities = {
+      taskCrudVerified: true,
+      taskParentingVerified: true,
+      boardPlacementVerified: true,
+      projectProjectionVerified: true,
+      taskReopenVerified: true,
+    };
+    this.contractProjectionQueueProbeScheduleMode = context.taskScheduleMode;
+    this.contractProjectionQueueProbeRunning = true;
+    const productionTaskEngine = this.taskEngine;
+    this.taskEngine = new SyncEngine({
+      adapter: new DidaTaskAdapter(
+        context.api as DidaApi,
+        () => this.contractProjectionQueueProbeScheduleMode ?? this.state.taskScheduleMode,
+        () => this.contractProjectionQueueProbeCapabilities ?? this.state,
+      ),
+      snapshots: this.store,
+      conflicts: this.store,
+      deviceId: (await this.store.snapshot()).deviceId,
+      deferConflictFinalization: true,
+      validateWrite: (value, remoteBeforeWrite) =>
+        validateTaskScheduleWrite(
+          value,
+          this.contractProjectionQueueProbeScheduleMode ?? this.state.taskScheduleMode,
+          remoteBeforeWrite,
+        ),
+      verifyCreateResult: (operation, _desired, actual) =>
+        isProjectionQueueOperation(operation)
+          ? sameProjectionCreateSnapshot(operation.local.value as DidaTask, actual)
+          : undefined,
+    });
+    try {
+      const create = await this.enqueueProjectionCreate({
+        id: `local-contract-queue-${crypto.randomUUID()}`,
+        projectId: context.project.id,
+        columnId: context.column.id,
+        title: `${context.marker} 生产队列验证`,
+        content: marker,
+        status: 0,
+      }, clientIdentity);
+      if (create.outcome !== "verified" || !create.task) {
+        if (create.outcome === "unknown") await context.markUntrackedCreate();
+        throw new Error("项目同步生产队列创建未取得已验证收据");
+      }
+      await context.trackTask(create.task);
+      const deleted = await this.enqueueProjectionDelete({
+        taskId: create.task.id,
+        parentTaskId: create.task.parentId ?? "",
+        targetProjectId: context.project.id,
+        targetColumnId: context.column.id,
+        marker,
+      });
+      if (deleted.outcome !== "verified-absent") {
+        if (deleted.outcome === "unknown") await context.markTaskDeleteUnknown(create.task.id);
+        throw new Error("项目同步生产队列删除未取得不存在性收据");
+      }
+      await context.untrackTask(create.task.id);
+      await this.store.mutate((data) => {
+        data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
+          receipt.clientIdentity !== clientIdentity && receipt.marker !== marker);
+      });
+    } finally {
+      this.taskEngine = productionTaskEngine;
+      this.contractProjectionQueueProbeRunning = false;
+      this.contractProjectionQueueProbeCapabilities = null;
+      this.contractProjectionQueueProbeScheduleMode = null;
     }
   }
 
@@ -2214,7 +2305,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     requestedOperationId?: string,
     freshBase?: DidaTask,
   ): Promise<ProjectionWriteReceipt> {
-    const release = this.remoteWriteGate.enterShared();
+    const release = this.enterProjectionWriteLease();
     try {
       if (writeFields.includes("items")) {
         throw new Error("旧版项目同步记录已停止写入；项目行动必须使用真实子任务");
@@ -2291,13 +2382,14 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   }
 
   private assertProjectionCapabilities(reopen: boolean): void {
-    this.assertProjectDidaProjectionAvailable();
-    this.assertTaskCrudVerified();
-    if (!this.state.taskParentingVerified || !this.state.boardPlacementVerified ||
-      !this.state.projectProjectionVerified) {
+    if (!this.contractProjectionQueueProbeRunning) this.assertProjectDidaProjectionAvailable();
+    const capabilities = this.contractProjectionQueueProbeCapabilities ?? this.state;
+    if (!this.contractProjectionQueueProbeRunning) this.assertTaskCrudVerified();
+    if (!capabilities.taskCrudVerified || !capabilities.taskParentingVerified ||
+      !capabilities.boardPlacementVerified || !capabilities.projectProjectionVerified) {
       throw new Error("当前授权尚未验证滴答项目同步所需的真实子任务、看板归栏与完整闭环");
     }
-    if (reopen && !this.state.taskReopenVerified) {
+    if (reopen && !capabilities.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");
     }
   }
@@ -2836,7 +2928,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           data.queue,
           (candidate) =>
             !isLegacyProjectionItemsOperation(candidate) &&
-            (this.projectDidaProjectionAvailable || !isProjectionQueueOperation(candidate)),
+            (this.projectDidaProjectionAvailable || this.contractProjectionQueueProbeRunning ||
+              !isProjectionQueueOperation(candidate)),
         );
         data.queue = claimed.operations;
         operation = claimed.claimed;
@@ -2981,7 +3074,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
 
   private assertWritable(): void {
     this.assertActive();
-    if (this.contractTestRunning) {
+    if (this.contractTestRunning && !this.contractProjectionQueueProbeRunning) {
       throw new Error("滴答写入合同测试正在运行，其他写入已暂时冻结");
     }
     if (this.state.recoveryIssues.length > 0) {
@@ -2996,6 +3089,12 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     } finally {
       release();
     }
+  }
+
+  private enterProjectionWriteLease(): () => void {
+    return this.contractProjectionQueueProbeRunning
+      ? () => undefined
+      : this.remoteWriteGate.enterShared();
   }
 }
 
@@ -3486,6 +3585,16 @@ function projectionOperationMarker(operation: SyncQueueOperation): string {
   const local = operation.local.value as DidaTask | null;
   const base = operation.base?.value as DidaTask | null | undefined;
   return String(local?.content ?? base?.content ?? operation.idempotencyFingerprint ?? operation.id);
+}
+
+function sameProjectionCreateSnapshot(expected: DidaTask, actual: DidaTask): boolean {
+  const ignored = new Set(["id", "status", "completedTime", "columnId", "columnName",
+    "etag", "modifiedTime", "etimestamp", "createdTime"]);
+  return Object.entries(expected as unknown as Record<string, unknown>)
+    .filter(([key, value]) => !ignored.has(key) && value !== undefined)
+    .every(([key, value]) => stableHash(value) === stableHash(
+      (actual as unknown as Record<string, unknown>)[key],
+    ));
 }
 
 function projectionWriteReceipt(

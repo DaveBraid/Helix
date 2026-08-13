@@ -89,8 +89,10 @@ export interface DidaProjectProjectionContractContext {
   marker: string;
   project: DidaProject;
   column: DidaColumn;
+  taskScheduleMode: Exclude<TaskScheduleMode, "unknown">;
   trackTask(task: DidaTask): Promise<void>;
   untrackTask(taskId: string): Promise<void>;
+  markTaskDeleteUnknown(taskId: string): Promise<void>;
   markUntrackedCreate(): Promise<void>;
 }
 
@@ -729,6 +731,7 @@ export class DidaWriteContractRunner {
             marker,
             project: normalizeProject(await this.api.getProject(projectA.id)),
             column: createCapabilityColumn,
+            taskScheduleMode: this.taskScheduleMode as Exclude<TaskScheduleMode, "unknown">,
             trackTask: async (createdTask) => {
               const task = normalizeTask(createdTask);
               if (task.projectId !== projectA.id || !task.id ||
@@ -749,13 +752,20 @@ export class DidaWriteContractRunner {
               optionalTasks.splice(index, 1);
               await this.cleanupCheckpoint!();
             },
+            markTaskDeleteUnknown: async (taskId) => {
+              const tracked = optionalTasks.find((candidate) => candidate.id === taskId);
+              if (!tracked) throw new Error("项目同步队列探针标记了未登记任务的删除结果");
+              tracked.state = "unknown";
+              tracked.deleteState = "sent-unknown";
+              await this.cleanupCheckpoint!();
+            },
             markUntrackedCreate: async () => {
               this.untrackedCreateOutcome = true;
               await this.cleanupCheckpoint!();
             },
           });
           this.projectProjectionVerified = true;
-          steps.push("验证项目父任务与 Stage 行动真实子任务的创建、编辑、完成、重开和删除");
+          steps.push("验证项目父任务与 Stage 行动真实子任务的创建、编辑、完成、重开、删除及生产队列收据");
         } finally {
           await this.updateAndVerifyProjectViewMode(projectA, "list");
         }

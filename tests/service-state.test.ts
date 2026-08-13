@@ -16,6 +16,7 @@ import { stableHash } from "../src/domain/stable";
 import { taskSyncProjection } from "../src/integrations/dida/adapters";
 import { normalizeTask } from "../src/integrations/dida/normalization";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
+import type { DidaProjectProjectionContractContext } from "../src/integrations/dida/write-contract";
 
 function grantTaskCrud(
   data: ReturnType<typeof createDefaultData>,
@@ -51,6 +52,73 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
   expect(projectProjectionGlobalCapabilitiesReady({ ...state, projectProjectionVerified: false })).toBe(false);
   const serverAssignedIds = { ...state, itemIdStableVerified: false };
   expect(projectProjectionGlobalCapabilitiesReady(serverAssignedIds)).toBe(true);
+});
+
+it("runs the contract-only project probe through OfflineQueue and removes its receipts", async () => {
+  const data = createDefaultData("device-contract-projection-queue");
+  grantTaskCrud(data, "point");
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  let persisted = structuredClone(data);
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+  }), { getDidaToken: () => "token" } as HelixSecretStore);
+  await service.initialize();
+  const project: DidaProject = { id: "contract-list", name: "Contract", viewMode: "kanban" };
+  const column = { id: "contract-column", projectId: project.id, name: "Contract" };
+  const remote = new Map<string, DidaTask>();
+  let sequence = 0;
+  Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+    async createTask(task: DidaTask) {
+      const created = { ...structuredClone(task), id: `remote-contract-${++sequence}`, status: task.status ?? 0 };
+      remote.set(created.id, created);
+      return structuredClone(created);
+    },
+    async getTask(projectId: string, taskId: string) {
+      const task = remote.get(taskId);
+      if (!task || task.projectId !== projectId) return [];
+      return structuredClone(task);
+    },
+    async deleteTask(projectId: string, taskId: string) {
+      if (remote.get(taskId)?.projectId !== projectId) throw new Error("wrong project");
+      remote.delete(taskId);
+    },
+    async getProjectData(projectId: string) {
+      return { project, columns: [column], tasks: [...remote.values()].filter((task) => task.projectId === projectId) };
+    },
+    async getCompletedTasks() { return []; },
+  });
+  const tracked: string[] = [];
+  const context = {
+    api: (service as unknown as { api: DidaProjectProjectionContractContext["api"] }).api,
+    marker: "[Helix 合同测试 queue]",
+    project,
+    column,
+    taskScheduleMode: "point",
+    trackTask: async (task: DidaTask) => { tracked.push(task.id); },
+    untrackTask: async (taskId: string) => { tracked.splice(tracked.indexOf(taskId), 1); },
+    markTaskDeleteUnknown: async () => { throw new Error("unexpected unknown delete"); },
+    markUntrackedCreate: async () => { throw new Error("unexpected unknown create"); },
+  } satisfies DidaProjectProjectionContractContext;
+  const internals = service as unknown as {
+    contractTestRunning: boolean;
+    remoteWriteGate: { enterExclusive(reason: string): () => void };
+    runContractProjectionQueueProbe(context: DidaProjectProjectionContractContext): Promise<void>;
+  };
+  internals.contractTestRunning = true;
+  const release = internals.remoteWriteGate.enterExclusive("test contract");
+  try {
+    await internals.runContractProjectionQueueProbe(context);
+  } finally {
+    release();
+    internals.contractTestRunning = false;
+  }
+
+  expect(tracked).toEqual([]);
+  expect([...remote.values()]).toEqual([]);
+  expect(persisted.queue).toEqual([]);
+  expect(persisted.projectionOperationReceipts).toEqual([]);
 });
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 
@@ -497,7 +565,7 @@ describe("HelixService runtime recovery", () => {
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
     });
-    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 10.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 11.*本次插件运行尚未执行合同测试/);
     expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
   });
 

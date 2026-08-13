@@ -107,12 +107,14 @@ function createHarness() {
     marker: "[Helix 合同测试 unit]",
     project,
     column,
+    taskScheduleMode: "duration",
     trackTask: async (task) => { tracked.push(task.id); },
     untrackTask: async (taskId) => {
       const index = tracked.indexOf(taskId);
       if (index < 0) throw new Error("not tracked");
       tracked.splice(index, 1);
     },
+    markTaskDeleteUnknown: async () => undefined,
     markUntrackedCreate: async () => { untrackedCreates += 1; },
   };
   return {

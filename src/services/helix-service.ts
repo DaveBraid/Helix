@@ -32,6 +32,7 @@ import { challengeProgress, rotatingChallenges } from "../domain/gamification";
 import { stableHash } from "../domain/stable";
 import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import {
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
   PROJECTION_COLUMN_NAME,
   verifyClientChecklistAppendResult,
   type ProjectionColumnBaseline,
@@ -460,8 +461,11 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       operation.remoteOutcomeUnknown || operation.status === "reconciliation") ||
       data.projectionOperationReceipts.some((receipt) => receipt.outcome === "unknown");
     const capabilitiesReady = projectProjectionGlobalCapabilitiesReady(this.state);
+    const projectionActivated = data.didaProjectionState?.enabled === true &&
+      data.didaProjectionState.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION &&
+      Boolean(data.didaProjectionState.target && data.didaProjectionState.confirmedPreviewHash);
     return {
-      ready: capabilitiesReady && !queueBlocked && !conflictsBlocked && !inProgress &&
+      ready: projectionActivated && capabilitiesReady && !queueBlocked && !conflictsBlocked && !inProgress &&
         !recoveryBlocked && !unknownBlocked,
       queueBlocked,
       conflictsBlocked,

@@ -55,6 +55,34 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
   expect(projectProjectionGlobalCapabilitiesReady(serverAssignedIds)).toBe(true);
 });
 
+it("keeps project auto-sync readiness false until projection is explicitly versioned and enabled", async () => {
+  const data = createDefaultData("device-projection-readiness");
+  grantTaskCrud(data);
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  let persisted = structuredClone(data);
+  const store = new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+  });
+  const service = new HelixService(store, { getDidaToken: () => "token" } as HelixSecretStore);
+  await service.initialize();
+  (service as unknown as { state: { connected: boolean } }).state.connected = true;
+
+  await expect(service.projectProjectionWriteReadiness()).resolves.toMatchObject({ ready: false });
+  await store.mutate((draft) => {
+    draft.didaProjectionState = {
+      enabled: true,
+      activationVersion: 1,
+      target: { targetProjectId: "target-list", targetColumnId: "target-column" },
+      confirmedPreviewHash: "a".repeat(64),
+      ledger: [],
+      parentCheckpoints: [],
+    };
+  });
+  await expect(service.projectProjectionWriteReadiness()).resolves.toMatchObject({ ready: true });
+});
+
 it("runs the contract-only project probe through OfflineQueue and removes its receipts", async () => {
   const data = createDefaultData("device-contract-projection-queue");
   grantTaskCrud(data, "point");

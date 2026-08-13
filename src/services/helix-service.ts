@@ -932,8 +932,20 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     this.contractTestRunning = true;
     this.patch({ loading: true, error: undefined });
     try {
-      if ((await this.store.snapshot()).pendingDidaContractCleanup) {
+      const initialData = await this.store.snapshot();
+      if (initialData.pendingDidaContractCleanup) {
         throw new Error("存在待安全清理的合同测试对象，已阻止开始新合同");
+      }
+      if (initialData.queue.length > 0 || initialData.conflicts.some((conflict) =>
+        conflict.status !== "resolved" && conflict.status !== "superseded")) {
+        throw new Error("存在待处理的生产同步队列或冲突；合同测试必须在隔离状态下运行");
+      }
+      if (initialData.didaProjectionState?.columnCreation ||
+        (initialData.didaProjectionState?.receiptCleanupPending?.length ?? 0) > 0) {
+        throw new Error("存在待恢复的项目同步操作；请先处理后再运行隔离写入合同测试");
+      }
+      if (initialData.didaProjectionState?.enabled) {
+        throw new Error("项目滴答同步仍处于启用状态；请先停用，再运行隔离写入合同测试");
       }
       // 任何远端写入前先让旧能力缓存失效并发布只读；失败则绝不启动合同。
       try {

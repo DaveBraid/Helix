@@ -204,6 +204,60 @@ describe("HelixService contract-test exclusivity", () => {
     expect(getProjects).not.toHaveBeenCalled();
   });
 
+  it("blocks a new contract before invalidating capabilities when project projection is enabled", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    const before = (await store.snapshot()).didaContractCapabilities;
+    await store.mutate((data) => {
+      data.didaProjectionState = {
+        enabled: true,
+        activationVersion: 2,
+        confirmedPreviewHash: "preview",
+        target: { targetProjectId: "existing-list", targetColumnId: "existing-column" },
+        ledger: [],
+        parentCheckpoints: [],
+      };
+    });
+
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/先停用/);
+    expect(getProjects).not.toHaveBeenCalled();
+    expect((await store.snapshot()).didaContractCapabilities).toEqual(before);
+    expect((await store.snapshot()).pendingDidaContractCleanup).toBeUndefined();
+  });
+
+  it("blocks a new contract before any remote call when a production operation is queued", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    const before = (await store.snapshot()).didaContractCapabilities;
+    await store.mutate((data) => {
+      const now = "2026-08-13T00:00:00.000Z";
+      const value = { id: "task-existing", projectId: "project-a", title: "待同步", status: 0 } as DidaTask;
+      data.queue = [{
+        id: "op-existing",
+        kind: "task",
+        entityId: value.id,
+        projectId: value.projectId,
+        operation: "update",
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+        status: "pending",
+        base: createSnapshot("task", value.id, value, { capturedAt: now }),
+        local: createSnapshot("task", value.id, { ...value, title: "本地编辑" }, { capturedAt: now }),
+      }];
+    });
+
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/隔离状态/);
+    expect(getProjects).not.toHaveBeenCalled();
+    expect((await store.snapshot()).didaContractCapabilities).toEqual(before);
+    expect((await store.snapshot()).queue).toHaveLength(1);
+    expect((await store.snapshot()).pendingDidaContractCleanup).toBeUndefined();
+  });
+
   it("persists an empty cleanup placeholder before the first remote create", async () => {
     const { service, store } = await serviceFixture();
     const api = serviceApi(service);

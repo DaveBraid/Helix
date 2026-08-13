@@ -292,10 +292,10 @@ it("stages a production projection queue conflict and never writes past it", asy
     projectDidaProjectionAvailable: true,
   });
   await service.initialize();
-  const base: DidaTask = {
+  const base = {
     id: "projection-conflict-task", projectId: "contract-list", parentId: "parent",
     columnId: "contract-column", title: "Base", content: "helix-action-projection:conflict", status: 0,
-  };
+  } as DidaTask;
   const local = { ...base, title: "Local" };
   const remote = { ...base, title: "Remote" };
   let writes = 0;
@@ -311,6 +311,66 @@ it("stages a production projection queue conflict and never writes past it", asy
   expect(persisted.conflicts).toMatchObject([{ status: "open", entityId: base.id }]);
   await (service as unknown as { runDrainQueue(): Promise<void> }).runDrainQueue();
   expect(writes).toBe(0);
+});
+
+it("hydrates sparse projection updates from Base instead of inventing cleared fields", async () => {
+  const data = createDefaultData("device-projection-sparse-update");
+  grantTaskCrud(data, "point");
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  let persisted = structuredClone(data);
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+  }), { getDidaToken: () => "token" } as HelixSecretStore, {
+    projectDidaProjectionAvailable: true,
+  });
+  await service.initialize();
+  const base = {
+    id: "projection-sparse-task",
+    projectId: "contract-list",
+    parentId: "parent",
+    title: "Base",
+    content: "helix-projection:action",
+    status: 0,
+    desc: "",
+    startDate: null,
+    dueDate: null,
+    timeZone: "Asia/Shanghai",
+    isAllDay: false,
+    priority: 0,
+    tags: [],
+    isFloating: false,
+    kind: "TEXT",
+    completedTime: null,
+    reminders: [],
+    repeatFlag: null,
+    items: [],
+    childIds: [],
+  } as DidaTask;
+  let written: Partial<DidaTask> | undefined;
+  let remote = structuredClone(base);
+  Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+    async getTask() { return structuredClone(remote); },
+    async updateTask(_taskId: string, patch: Partial<DidaTask>) {
+      written = structuredClone(patch);
+      remote = { ...remote, ...structuredClone(patch) };
+      return structuredClone(remote);
+    },
+  });
+
+  await expect(service.enqueueProjectionUpdate({
+    id: base.id,
+    projectId: base.projectId,
+    parentId: base.parentId,
+    title: "Edited",
+    content: base.content,
+    status: 0,
+  }, ["title"], "op-projection-sparse", base)).resolves.toMatchObject({ outcome: "verified" });
+
+  expect(written).toMatchObject({ title: "Edited" });
+  expect(persisted.queue).toEqual([]);
+  expect(persisted.conflicts).toEqual([]);
 });
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 

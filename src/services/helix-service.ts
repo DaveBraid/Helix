@@ -1976,6 +1976,11 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       await this.store.mutate((data) => {
         data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
           receipt.clientIdentity !== clientIdentity && receipt.marker !== marker);
+        data.events = data.events.filter((event) =>
+          !event || typeof event !== "object" || Array.isArray(event) ||
+          (event as Record<string, unknown>).projectId !== context.project.id);
+        delete data.baseSnapshots[`task:${reopened.task!.id}`];
+        delete data.localSnapshots[`task:${reopened.task!.id}`];
       });
       await runVaultProbe?.(context);
     } finally {
@@ -2523,9 +2528,25 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         outcome: "conflict",
         message: "同步任务缺少现有 Base",
       };
+      const desiredProjection = taskSyncValue(desiredTask);
+      const explicitFields = new Set(effectiveWriteFields);
+      const localValue: DidaTask = { ...base.value };
+      for (const [field, value] of Object.entries(desiredProjection)) {
+        if (value !== undefined || explicitFields.has(field)) {
+          (localValue as unknown as Record<string, unknown>)[field] = value;
+        }
+      }
+      // 项目 Markdown 只会构造本次行动中有意义的稀疏任务。未写字段必须沿用
+      // 远端 Base；否则字段缺失会被三方合并误判为“本地清空”，制造假冲突。
+      // 反之，明确列入 writeFields 但未出现在稀疏对象中的字段仍表示清空。
+      for (const field of explicitFields) {
+        if (!Object.hasOwn(desiredProjection, field)) {
+          (localValue as unknown as Record<string, unknown>)[field] = undefined;
+        }
+      }
       const now = new Date().toISOString();
       const operation = buildTaskUpdateOperation(
-        taskSyncValue(desiredTask),
+        localValue,
         base,
         operationType,
         now,

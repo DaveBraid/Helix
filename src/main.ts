@@ -790,7 +790,8 @@ export default class HelixPlugin extends Plugin {
           await contractProjection.finalizeProjectDeletion(created.id);
         } catch {
           const state = await contractProjection.readConfiguration();
-          for (const entry of state.ledger.filter((item) => item.projectId === created!.id)) {
+          const ownedEntries = state.ledger.filter((item) => item.projectId === created!.id);
+          for (const entry of ownedEntries) {
             if (entry.remoteId) {
               try { await track(entry.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
               if (entry.tombstone && entry.frozen === "unknown-outcome") await markDeleteUnknown(entry.remoteId);
@@ -820,6 +821,55 @@ export default class HelixPlugin extends Plugin {
             }
           } catch {
             // 无法从本地回填身份时保持合同清理计划与恢复状态，不按标题猜测。
+          }
+          const ownedParentId = state.parentBases?.find((item) => item.projectId === created!.id)?.remoteId ??
+            state.parentCheckpoints.find((item) => item.projectId === created!.id)?.remoteId;
+          const ownedRemoteIds = [...new Set([
+            ...ownedEntries.flatMap((entry) => entry.remoteId ? [entry.remoteId] : []),
+            ...(ownedParentId ? [ownedParentId] : []),
+          ])];
+          const hasUntrackedIdentity = ownedEntries.some((entry) => !entry.remoteId) ||
+            (!ownedParentId && (ownedEntries.length > 0 ||
+              state.parentCheckpoints.some((item) => item.projectId === created!.id)));
+          if (!hasUntrackedIdentity && ownedRemoteIds.every((id) => trackedRemoteIds.has(id))) {
+            const operationIds = new Set(ownedEntries.flatMap((entry) =>
+              entry.operationId ? [entry.operationId] : []));
+            const conflictIds = new Set(ownedEntries.flatMap((entry) =>
+              entry.conflictId ? [entry.conflictId] : []));
+            // 先让用户可见的临时 Project／Stage／Canvas 完成原子删除；若随后派生状态
+            // 清理失败，只会留下可重试诊断，绝不出现文件仍在而身份账本先被抹掉。
+            await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
+            await this.store.mutate((data) => {
+              data.queue = data.queue.filter((operation) =>
+                !ownedRemoteIds.includes(operation.entityId) && !operationIds.has(operation.id));
+              data.conflicts = data.conflicts.filter((conflict) =>
+                !ownedRemoteIds.includes(conflict.entityId) && !conflictIds.has(conflict.id));
+              data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
+                !ownedRemoteIds.includes(receipt.remoteTaskId ?? "") &&
+                !operationIds.has(receipt.operationId));
+              data.events = data.events.filter((event) =>
+                !event || typeof event !== "object" || Array.isArray(event) ||
+                (event as Record<string, unknown>).projectId !== context.project.id);
+              for (const remoteId of ownedRemoteIds) {
+                delete data.baseSnapshots[`task:${remoteId}`];
+                delete data.localSnapshots[`task:${remoteId}`];
+              }
+              const projection = data.didaProjectionState;
+              if (projection) {
+                const next = {
+                  ...projection,
+                  ledger: projection.ledger.filter((entry) => entry.projectId !== created!.id),
+                  parentCheckpoints: projection.parentCheckpoints.filter((entry) => entry.projectId !== created!.id),
+                  parentBases: projection.parentBases?.filter((entry) => entry.projectId !== created!.id),
+                  receiptCleanupPending: projection.receiptCleanupPending?.filter((entry) =>
+                    entry.projectId !== created!.id),
+                };
+                const empty = next.ledger.length === 0 && next.parentCheckpoints.length === 0 &&
+                  (next.parentBases?.length ?? 0) === 0 && (next.receiptCleanupPending?.length ?? 0) === 0;
+                data.didaProjectionState = empty ? structuredClone(previous) : next;
+              }
+            });
+            created = undefined;
           }
         }
       }

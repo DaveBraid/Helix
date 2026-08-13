@@ -816,6 +816,7 @@ describe("HelixDataStore serialization", () => {
         targetProjectId: "target-list",
         targetColumnId: "target-column",
         remoteId: "remote-a",
+        remoteEntity: "task" as const,
         title: "Action",
         state: "active" as const,
         sourceHash: "b".repeat(64),
@@ -842,6 +843,7 @@ describe("HelixDataStore serialization", () => {
     expect(hydrateData(valid).didaProjectionState?.receiptCleanupPending).toEqual(
       validState.receiptCleanupPending,
     );
+    expect(hydrateData(valid).didaProjectionState?.ledger[0]?.remoteEntity).toBe("task");
 
     const deletionTombstone = createDefaultData("device-projection-delete-tombstone");
     deletionTombstone.didaProjectionState = {

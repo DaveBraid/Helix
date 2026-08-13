@@ -416,6 +416,15 @@ describe("workbench layout and navigation structure", () => {
     expect(view).not.toContain("syncProjectProjection:");
   });
 
+  it("deletes an owned remote project before local trash and finalizes only after local commit", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const deletion = main.slice(
+      main.indexOf("private showDeleteProjectModal"),
+      main.indexOf("private showManageRelationModal"),
+    );
+    expect(deletion).toMatch(/projectProjection\.deleteProject[\s\S]*projectWorkspace\.deleteProject[\s\S]*projectProjection\.finalizeProjectDeletion/);
+  });
+
   it("routes projection conflicts only through strict reconciliation and safe cleanup", () => {
     expect(view).toMatch(/renderProjectionConflicts[\s\S]*receiptCleanupPending/);
     expect(view).toMatch(/kind: "action", projectId: model\.project\.id, stageId, uuid/);

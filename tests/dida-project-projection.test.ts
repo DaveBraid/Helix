@@ -661,7 +661,7 @@ class FakePipeline implements ProjectionTaskPipeline {
       return result;
     }
     const task = this.tasks.get(expected.taskId);
-    if (!task || task.parentId !== expected.parentTaskId || task.projectId !== expected.targetProjectId || task.columnId !== expected.targetColumnId || task.content !== expected.marker) {
+    if (!task || (task.parentId ?? "") !== expected.parentTaskId || task.projectId !== expected.targetProjectId || task.columnId !== expected.targetColumnId || task.content !== expected.marker) {
       return { operationId: `op-${++this.operationSequence}`, outcome: "conflict" as const, message: "identity mismatch" };
     }
     this.tasks.delete(expected.taskId);
@@ -831,6 +831,87 @@ describe("DidaProjectProjectionService with real child tasks", () => {
     expect(harness.pipeline.deleted).toEqual(["remote-2"]);
     expect(harness.pipeline.tasks.has("remote-1")).toBe(true);
     expect(harness.state.value.ledger).toEqual([]);
+  });
+
+  it("deletes all exact children and the parent before local project removal", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+
+    const summary = await harness.service.deleteProject(input());
+
+    expect(summary).toEqual({ deletedActions: 1, deletedParent: true });
+    expect(harness.pipeline.deleted).toEqual(["remote-2", "remote-1"]);
+    expect(harness.pipeline.tasks.size).toBe(0);
+    expect(harness.state.value.ledger).toEqual([]);
+    expect(harness.state.value.parentBases).toEqual([]);
+    expect(harness.state.value.parentCheckpoints).toEqual([
+      expect.objectContaining({ projectId: "project-1", remoteId: "remote-1", tombstone: true }),
+    ]);
+    await expect(harness.service.synchronizeProject(input())).rejects.toThrow(/安全删除/);
+    expect(harness.pipeline.created).toHaveLength(2);
+
+    await harness.service.finalizeProjectDeletion("project-1");
+
+    expect(harness.state.value.parentCheckpoints).toEqual([]);
+  });
+
+  it("persists an unknown project child deletion and never resends it", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.nextDeleteResult = {
+      operationId: "op-project-child-delete-unknown",
+      outcome: "unknown",
+      message: "timeout",
+    };
+
+    await expect(harness.service.deleteProject(input())).rejects.toThrow(/未安全收口/);
+    const attempts = harness.pipeline.deleteAttempts;
+    await expect(harness.service.deleteProject(input())).rejects.toThrow(/禁止自动重发/);
+
+    expect(harness.pipeline.deleteAttempts).toBe(attempts);
+    expect(harness.state.value.ledger[0]).toMatchObject({
+      tombstone: true,
+      frozen: "unknown-outcome",
+      operationId: "op-project-child-delete-unknown",
+    });
+    expect(harness.pipeline.tasks.has("remote-1")).toBe(true);
+  });
+
+  it("keeps a completed parent tombstone until the local deletion commits", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    await harness.service.deleteProject(input());
+    const deletes = harness.pipeline.deleteAttempts;
+
+    const retry = await harness.service.deleteProject(input());
+
+    expect(retry).toEqual({ deletedActions: 0, deletedParent: true });
+    expect(harness.pipeline.deleteAttempts).toBe(deletes);
+    expect(harness.state.value.parentCheckpoints[0]).toMatchObject({ tombstone: true });
+  });
+
+  it("persists an unknown parent deletion and never resends it", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", harness.markdown.content("Stage.md")
+      .split(/\r?\n/u).filter((line) => !line.includes("uuid=uuid-1 ")).join("\n"));
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.nextDeleteResult = {
+      operationId: "op-project-parent-delete-unknown",
+      outcome: "unknown",
+      message: "timeout",
+    };
+
+    await expect(harness.service.deleteProject(input())).rejects.toThrow(/父任务远端删除未安全收口/);
+    const attempts = harness.pipeline.deleteAttempts;
+    await expect(harness.service.deleteProject(input())).rejects.toThrow(/禁止自动重发/);
+
+    expect(harness.pipeline.deleteAttempts).toBe(attempts);
+    expect(harness.state.value.parentCheckpoints[0]).toMatchObject({
+      tombstone: true,
+      frozen: "unknown-outcome",
+      operationId: "op-project-parent-delete-unknown",
+    });
   });
 
   it("freezes instead of deleting when the child identity changed", async () => {

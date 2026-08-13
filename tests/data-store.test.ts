@@ -809,6 +809,22 @@ describe("HelixDataStore serialization", () => {
       validState.receiptCleanupPending,
     );
 
+    const deletionTombstone = createDefaultData("device-projection-delete-tombstone");
+    deletionTombstone.didaProjectionState = {
+      ...structuredClone(validState),
+      ledger: [],
+      parentBases: [],
+      receiptCleanupPending: [],
+      parentCheckpoints: [{
+        projectId: "project-a",
+        remoteId: "parent-a",
+        marker: "helix-project-projection:project-a",
+        tombstone: true,
+      }],
+    };
+    expect(hydrateData(deletionTombstone).didaProjectionState?.parentCheckpoints[0])
+      .toMatchObject({ projectId: "project-a", remoteId: "parent-a", tombstone: true });
+
     const shadow = createDefaultData("device-projection-shadow-state");
     shadow.didaProjectionState = structuredClone(validState);
     (shadow.didaProjectionState!.ledger[0] as unknown as Record<string, unknown>).task = {

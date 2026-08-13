@@ -1254,8 +1254,11 @@ export default class HelixPlugin extends Plugin {
         if (!project) throw new Error("找不到需要删除的项目");
         new DeleteProjectModal(this.app, project, async () => {
           this.assertWritable();
-          await this.withWritableProjectMutation(() =>
-            this.projectWorkspace.deleteProject(projectId));
+          await this.withWritableProjectMutation(async () => {
+            await this.projectProjection.deleteProject(projectionInputFromProject(project));
+            await this.projectWorkspace.deleteProject(projectId);
+            await this.projectProjection.finalizeProjectDeletion(projectId);
+          });
           onDeleted?.();
           new Notice(`项目“${project.title}”及其 ${project.cycles.length} 个阶段已移入废纸篓`);
         }).open();

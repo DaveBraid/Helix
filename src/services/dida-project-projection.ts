@@ -185,6 +185,8 @@ export interface ProjectionPersistentState {
     projectId: string;
     remoteId?: string;
     marker: string;
+    /** 删除项目父任务时的持久检查点；存在时绝不自动重发删除。 */
+    tombstone?: boolean;
     frozen?: ProjectionFreezeReason;
     operationId?: string;
     conflictId?: string;
@@ -339,6 +341,11 @@ export interface ProjectionSyncSummary {
   completedActions: number;
   deletedActions: number;
   frozen: Array<{ uuid: string; reason: ProjectionFreezeReason; message: string }>;
+}
+
+export interface ProjectionProjectDeleteSummary {
+  deletedActions: number;
+  deletedParent: boolean;
 }
 
 export interface ProjectionProjectReadModel {
@@ -496,6 +503,141 @@ export class DidaProjectProjectionService {
     const current = await this.state.read();
     if (!current.enabled) return;
     await this.state.write(current, { ...current, enabled: false });
+  }
+
+  /**
+   * 在本地项目进入废纸篓前，精确删除 Helix 拥有的远端子任务与父任务。
+   * 每个删除都先持久化 tombstone；结果未知时保留检查点且禁止重发。
+   */
+  async deleteProject(input: ProjectionProjectInput): Promise<ProjectionProjectDeleteSummary> {
+    let state = await this.state.read();
+    const projectRevision = await this.requireRevision(input.projectPath);
+    const identity = readProjectProjectionIdentity(projectRevision.content);
+    if (identity.projectId !== input.projectId) throw new Error("项目 Markdown 身份与稳定工作区不一致");
+    const owned = state.ledger.filter((entry) => entry.projectId === input.projectId);
+    const existingParentCheckpoint = state.parentCheckpoints.find((item) => item.projectId === input.projectId);
+    const parentId = identity.parentTaskId ?? state.parentBases?.find((item) => item.projectId === input.projectId)?.remoteId ??
+      existingParentCheckpoint?.remoteId;
+    if (existingParentCheckpoint?.tombstone && !existingParentCheckpoint.frozen) {
+      return { deletedActions: 0, deletedParent: true };
+    }
+    if (!parentId && owned.length === 0) return { deletedActions: 0, deletedParent: false };
+    if (!state.enabled || state.activationVersion !== PROJECT_PROJECTION_ACTIVATION_VERSION || !state.target) {
+      throw new Error("该项目仍绑定滴答任务；请先启用项目同步并完成远端清理，再删除本地项目");
+    }
+    if (!parentId) throw new Error("项目同步账本存在，但父任务身份缺失；已拒绝删除");
+    let deletedActions = 0;
+    for (const entry of owned) {
+      if (!entry.remoteId || entry.remoteEntity !== "task") {
+        throw new Error("项目含无法精确验证的旧版行动绑定；已拒绝删除");
+      }
+      const remote = await this.pipeline.rereadTask(entry.targetProjectId, entry.remoteId);
+      if (entry.tombstone) {
+        if (remote) throw new Error("行动删除结果未知且远端对象仍存在；禁止自动重发");
+        await this.settleDeletedAction(entry);
+        deletedActions += 1;
+        continue;
+      }
+      if (entry.frozen) throw new Error("项目含尚未解决的冻结行动；请先在冲突中心处理");
+      if (!remote) {
+        await this.removeProjectLedgerEntry(entry);
+        continue;
+      }
+      verifyProjectedTask(remote, entry, projectionMarker(entry.uuid), { title: false, state: false, attributes: false });
+      const checkpoint: ProjectionLedgerEntry = {
+        ...entry,
+        tombstone: true,
+        frozen: "unknown-outcome",
+        operationId: `op-projection-task-delete-${crypto.randomUUID()}`,
+      };
+      await this.replaceProjectLedgerEntry(checkpoint);
+      const result = await this.pipeline.deleteTask({
+        taskId: entry.remoteId,
+        parentTaskId: entry.parentTaskId,
+        targetProjectId: entry.targetProjectId,
+        targetColumnId: entry.targetColumnId,
+        marker: projectionMarker(entry.uuid),
+      });
+      if (result.outcome !== "verified-absent") {
+        await this.replaceProjectLedgerEntry({
+          ...checkpoint,
+          frozen: resultReason(result),
+          operationId: result.operationId,
+          conflictId: result.conflictId,
+        });
+        throw new Error(`行动远端删除未安全收口：${result.message}`);
+      }
+      await this.settleDeletedAction({ ...checkpoint, operationId: result.operationId, conflictId: result.conflictId });
+      deletedActions += 1;
+    }
+    state = await this.state.read();
+    const parentCheckpoint = state.parentCheckpoints.find((item) => item.projectId === input.projectId);
+    const remoteParent = await this.pipeline.rereadTask(state.target!.targetProjectId, parentId);
+    if (parentCheckpoint?.tombstone) {
+      if (remoteParent) throw new Error("项目父任务删除结果未知且远端对象仍存在；禁止自动重发");
+      await this.settleDeletedParent(state, input.projectId, parentId, parentCheckpoint);
+      return { deletedActions, deletedParent: true };
+    }
+    if (parentCheckpoint?.frozen) throw new Error("项目父任务仍处于冻结状态；请先在冲突中心处理");
+    if (!remoteParent) {
+      await this.clearDeletedProjectState(state, input.projectId);
+      return { deletedActions, deletedParent: false };
+    }
+    if (!this.sameParentIdentity(remoteParent, input.projectId, parentId, state.target!)) {
+      throw new Error("项目父任务身份与远端不一致；已拒绝删除");
+    }
+    const marker = `helix-project-projection:${input.projectId}`;
+    const prepared = {
+      projectId: input.projectId,
+      remoteId: parentId,
+      marker,
+      tombstone: true,
+      frozen: "unknown-outcome" as const,
+      operationId: `op-projection-parent-delete-${crypto.randomUUID()}`,
+    };
+    await this.state.write(state, {
+      ...state,
+      parentCheckpoints: [...state.parentCheckpoints.filter((item) => item.projectId !== input.projectId), prepared],
+    });
+    const result = await this.pipeline.deleteTask({
+      taskId: parentId,
+      parentTaskId: "",
+      targetProjectId: state.target!.targetProjectId,
+      targetColumnId: state.target!.targetColumnId,
+      marker,
+    });
+    if (result.outcome !== "verified-absent") {
+      const latest = await this.state.read();
+      await this.state.write(latest, {
+        ...latest,
+        parentCheckpoints: [
+          ...latest.parentCheckpoints.filter((item) => item.projectId !== input.projectId),
+          { ...prepared, frozen: resultReason(result), operationId: result.operationId, conflictId: result.conflictId },
+        ],
+      });
+      throw new Error(`项目父任务远端删除未安全收口：${result.message}`);
+    }
+    await this.settleDeletedParent(await this.state.read(), input.projectId, parentId, {
+      ...prepared,
+      operationId: result.operationId,
+      conflictId: result.conflictId,
+    });
+    return { deletedActions, deletedParent: true };
+  }
+
+  /** 本地 Project/Stage/Canvas 已成功移入废纸篓后，才释放删除 tombstone。 */
+  async finalizeProjectDeletion(projectId: string): Promise<void> {
+    const state = await this.state.read();
+    const checkpoint = state.parentCheckpoints.find((item) => item.projectId === projectId);
+    if (!checkpoint?.tombstone || checkpoint.frozen || state.ledger.some((entry) => entry.projectId === projectId)) {
+      if (!checkpoint && !state.ledger.some((entry) => entry.projectId === projectId)) return;
+      throw new Error("项目远端删除尚未安全收口，禁止结束删除事务");
+    }
+    await this.state.write(state, {
+      ...state,
+      parentCheckpoints: state.parentCheckpoints.filter((item) => item.projectId !== projectId),
+      parentBases: state.parentBases?.filter((item) => item.projectId !== projectId),
+    });
   }
 
   async reconcileFrozen(input:
@@ -762,6 +904,9 @@ export class DidaProjectProjectionService {
       initialState.activationVersion !== PROJECT_PROJECTION_ACTIVATION_VERSION ||
       !initialState.target || !initialState.confirmedPreviewHash) {
       throw new Error("Helix→滴答同步尚未显式预览并启用");
+    }
+    if (initialState.parentCheckpoints.some((item) => item.projectId === input.projectId && item.tombstone)) {
+      throw new Error("项目正在执行安全删除，禁止后台同步重新创建远端对象");
     }
     const catalog = await this.catalog.read(initialState.target.targetProjectId);
     const readiness = catalog.readiness;
@@ -1184,6 +1329,83 @@ export class DidaProjectProjectionService {
     }
     await persist();
     return params.summary;
+  }
+
+  private async replaceProjectLedgerEntry(entry: ProjectionLedgerEntry): Promise<void> {
+    const current = await this.state.read();
+    await this.state.write(current, {
+      ...current,
+      ledger: replaceEntry(current.ledger, entry),
+    });
+  }
+
+  private async removeProjectLedgerEntry(entry: ProjectionLedgerEntry): Promise<void> {
+    const current = await this.state.read();
+    await this.state.write(current, {
+      ...current,
+      ledger: current.ledger.filter((candidate) =>
+        projectionLedgerIdentity(candidate) !== projectionLedgerIdentity(entry)),
+    });
+  }
+
+  private async settleDeletedAction(entry: ProjectionLedgerEntry): Promise<void> {
+    const current = await this.state.read();
+    const proof = entry.operationId && entry.remoteId ? {
+      kind: "action" as const,
+      operationId: entry.operationId,
+      conflictId: entry.conflictId,
+      projectId: entry.projectId,
+      stageId: entry.stageId,
+      uuid: entry.uuid,
+      targetProjectId: entry.targetProjectId,
+      marker: projectionMarker(entry.uuid),
+      remoteTaskId: entry.remoteId,
+    } : undefined;
+    await this.settleReconciliation(current, {
+      ...current,
+      ledger: current.ledger.filter((candidate) =>
+        projectionLedgerIdentity(candidate) !== projectionLedgerIdentity(entry)),
+    }, proof);
+  }
+
+  private async settleDeletedParent(
+    state: ProjectionPersistentState,
+    projectId: string,
+    remoteId: string,
+    checkpoint: ProjectionPersistentState["parentCheckpoints"][number],
+  ): Promise<void> {
+    const proof = checkpoint.operationId ? {
+      kind: "parent" as const,
+      operationId: checkpoint.operationId,
+      conflictId: checkpoint.conflictId,
+      projectId,
+      targetProjectId: state.target!.targetProjectId,
+      marker: `helix-project-projection:${projectId}`,
+      remoteTaskId: remoteId,
+    } : undefined;
+    await this.settleReconciliation(state, {
+      ...state,
+      ledger: state.ledger.filter((entry) => entry.projectId !== projectId),
+      parentCheckpoints: [
+        ...state.parentCheckpoints.filter((item) => item.projectId !== projectId),
+        {
+          projectId,
+          remoteId,
+          marker: `helix-project-projection:${projectId}`,
+          tombstone: true,
+        },
+      ],
+      parentBases: state.parentBases?.filter((item) => item.projectId !== projectId),
+    }, proof);
+  }
+
+  private async clearDeletedProjectState(state: ProjectionPersistentState, projectId: string): Promise<void> {
+    await this.state.write(state, {
+      ...state,
+      ledger: state.ledger.filter((entry) => entry.projectId !== projectId),
+      parentCheckpoints: state.parentCheckpoints.filter((item) => item.projectId !== projectId),
+      parentBases: state.parentBases?.filter((item) => item.projectId !== projectId),
+    });
   }
 
   private async ensureParent(

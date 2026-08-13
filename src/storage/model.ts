@@ -107,6 +107,7 @@ export interface HelixPersistedData {
       projectId: string;
       remoteId?: string;
       marker: string;
+      tombstone?: boolean;
       frozen?: ProjectionFreezeReason;
       operationId?: string;
       conflictId?: string;
@@ -661,11 +662,12 @@ function validateDidaProjectionState(
   const validCheckpoints = Array.isArray(checkpoints) && checkpoints.every((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const row = item as Record<string, unknown>;
-    if (!onlyKeys(row, ["projectId", "remoteId", "marker", "frozen", "operationId", "conflictId"])) {
+    if (!onlyKeys(row, ["projectId", "remoteId", "marker", "tombstone", "frozen", "operationId", "conflictId"])) {
       return false;
     }
     return stableId(row.projectId) && row.marker === `helix-project-projection:${row.projectId}` &&
       (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
+      (row.tombstone === undefined || typeof row.tombstone === "boolean") &&
       (row.operationId === undefined || stableId(row.operationId)) &&
       (row.conflictId === undefined || stableId(row.conflictId));
   });

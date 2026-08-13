@@ -1491,6 +1491,11 @@
   color: var(--helix-danger-ink);
 }
 
+.helix-chip.is-warning {
+  background: var(--helix-warning-soft);
+  color: var(--helix-warning-ink);
+}
+
 .helix-challenge-hero {
   position: relative;
   margin: 25px -20px 0;

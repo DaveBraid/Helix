@@ -112,12 +112,14 @@ describe("project projection presenter", () => {
       conflicts: 0, focusConflicts: 0, recoveryIssues: 0, reconciliation: 0,
       failed: 0, orphanedBlocked: 0, projectionIssues: 0,
       workspaceDiagnostic: false, lineageConflict: false, contractCleanup: false,
+      requestControlAttention: false,
     };
     expect(conflictCenterIsEmpty(empty)).toBe(true);
     expect(conflictCenterIsEmpty({ ...empty, recoveryIssues: 1 })).toBe(false);
     expect(conflictCenterIsEmpty({ ...empty, projectionIssues: 1 })).toBe(false);
     expect(conflictCenterIsEmpty({ ...empty, workspaceDiagnostic: true })).toBe(false);
     expect(conflictCenterIsEmpty({ ...empty, contractCleanup: true })).toBe(false);
+    expect(conflictCenterIsEmpty({ ...empty, requestControlAttention: true })).toBe(false);
   });
 });
 

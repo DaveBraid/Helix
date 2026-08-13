@@ -3207,6 +3207,24 @@ export class HelixView extends ItemView {
     );
     const cleanupPending = persisted.pendingDidaContractCleanup;
     const cleanupRuntime = this.service.didaContractCleanupRuntimeStatus();
+    const requestControl = persisted.didaRequestControl;
+    const cooldownUntil = requestControl?.cooldownUntil
+      ? Date.parse(requestControl.cooldownUntil)
+      : Number.NaN;
+    const requestControlAttention = Boolean(
+      requestControl?.recoveryReadPending ||
+      (Number.isFinite(cooldownUntil) && cooldownUntil > Date.now()),
+    );
+    if (requestControlAttention) {
+      const card = diagnostics.createDiv({ cls: "helix-card helix-reconciliation-card" });
+      card.createEl("span", { cls: "helix-chip is-warning", text: "滴答请求冷却" });
+      card.createEl("h3", { text: "远端写入保持暂停" });
+      card.createEl("p", {
+        text: Number.isFinite(cooldownUntil) && cooldownUntil > Date.now()
+          ? `冷却至 ${new Date(cooldownUntil).toLocaleString()}；到期后的下一次同步只进行一次受控读取。`
+          : "冷却已到期；下一次手动或计划同步将先进行一次受控读取，成功后才恢复队列写入。",
+      });
+    }
     const cleanupNeedsAdoption = Boolean(cleanupPending &&
       cleanupPending.plan.tasks.length === 0 && cleanupPending.plan.projects.length === 0);
     if (cleanupPending || cleanupRuntime.adoptionSuggested) {
@@ -3382,6 +3400,7 @@ export class HelixView extends ItemView {
       workspaceDiagnostic: Boolean(projectionLoad.diagnostic),
       lineageConflict: Boolean(persisted.lineageConflict),
       contractCleanup: Boolean(cleanupPending || cleanupRuntime.adoptionSuggested),
+      requestControlAttention,
     })) {
       const empty = diagnostics.createDiv({ cls: "helix-empty-state" });
       const icon = empty.createDiv();

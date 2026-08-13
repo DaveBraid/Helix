@@ -133,11 +133,12 @@ export function conflictCenterIsEmpty(input: {
   workspaceDiagnostic: boolean;
   lineageConflict: boolean;
   contractCleanup: boolean;
+  requestControlAttention: boolean;
 }): boolean {
   return input.conflicts === 0 && input.focusConflicts === 0 && input.recoveryIssues === 0 &&
     input.reconciliation === 0 && input.failed === 0 && input.orphanedBlocked === 0 &&
     input.projectionIssues === 0 && !input.workspaceDiagnostic && !input.lineageConflict &&
-    !input.contractCleanup;
+    !input.contractCleanup && !input.requestControlAttention;
 }
 
 export function projectWorkspaceReadDiagnostic(error: unknown): string {

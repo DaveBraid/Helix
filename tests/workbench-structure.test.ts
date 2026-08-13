@@ -480,7 +480,9 @@ describe("workbench layout and navigation structure", () => {
   it("keeps recovery and column-unknown diagnostics visible when the project workspace is unreadable", () => {
     expect(view).toMatch(/loadProjectionConflictModels[\s\S]*persisted\.didaProjectionState\?\.columnCreation/);
     expect(view).toMatch(/项目工作区只读[\s\S]*滴答项目同步诊断暂不可读[\s\S]*脱敏错误/);
-    expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)/);
+    expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)[\s\S]*requestControlAttention/);
+    expect(view).toMatch(/滴答请求冷却[\s\S]*远端写入保持暂停[\s\S]*一次受控读取/);
+    expect(css).toMatch(/\.helix-chip\.is-warning/);
   });
 
   it("uses a prioritized conflict table with inline three-step field resolution", () => {

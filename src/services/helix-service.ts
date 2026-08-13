@@ -2609,6 +2609,16 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       })),
       lineageConflict: data.lineageConflict,
       recoveryIssues: data.recoveryIssues,
+      requestControl: data.didaRequestControl
+        ? {
+          cooldownUntil: data.didaRequestControl.cooldownUntil,
+          queryLimitLevel: data.didaRequestControl.queryLimitLevel,
+          recoveryReadPending: data.didaRequestControl.recoveryReadPending,
+          rateLimitCount: data.didaRequestControl.rateLimitCount,
+          lastRateLimitedAt: data.didaRequestControl.lastRateLimitedAt,
+          lastRateLimitKind: data.didaRequestControl.lastRateLimitKind,
+        }
+        : undefined,
     };
   }
 

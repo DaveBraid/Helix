@@ -513,6 +513,25 @@ export class DidaProjectProjectionService {
   }
 
   /**
+   * 远端目标已由用户删除后清理停用配置。只允许在所有恢复身份均为空时执行，
+   * 避免清掉仍用于安全删除、结果未知或分栏恢复的唯一目标 ID。
+   */
+  async clearDisabledConfiguration(): Promise<void> {
+    const current = await this.state.read();
+    if (current.enabled) throw new Error("请先停用滴答项目同步");
+    if (current.ledger.length > 0 || current.parentCheckpoints.length > 0 ||
+      (current.parentBases?.length ?? 0) > 0 ||
+      (current.receiptCleanupPending?.length ?? 0) > 0 || current.columnCreation) {
+      throw new Error("滴答项目同步仍有恢复身份，禁止清除目标配置");
+    }
+    await this.state.write(current, {
+      enabled: false,
+      ledger: [],
+      parentCheckpoints: [],
+    });
+  }
+
+  /**
    * 在本地项目进入废纸篓前，精确删除 Helix 拥有的远端子任务与父任务。
    * 每个删除都先持久化 tombstone；结果未知时保留检查点且禁止重发。
    */

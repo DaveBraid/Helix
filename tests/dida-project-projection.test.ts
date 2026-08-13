@@ -302,6 +302,39 @@ describe("Dida project projection domain", () => {
     expect(planProjectionChanges([ledger({ frozen: "unknown-outcome" })], [ledger({ title: "new" })])).toEqual([]);
   });
 
+  it("clears a disabled empty target but preserves every recovery identity", async () => {
+    const clean = makeHarness();
+    clean.state.value = {
+      enabled: false,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
+      confirmedPreviewHash: "confirmed",
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      ledger: [],
+      parentCheckpoints: [],
+      parentBases: [],
+      receiptCleanupPending: [],
+    };
+    await clean.service.clearDisabledConfiguration();
+    expect(await clean.state.read()).toEqual({
+      enabled: false,
+      ledger: [],
+      parentCheckpoints: [],
+    });
+
+    const guarded = makeHarness();
+    guarded.state.value = {
+      enabled: false,
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+      ledger: [ledger({ remoteId: "task-1" })],
+      parentCheckpoints: [],
+    };
+    await expect(guarded.service.clearDisabledConfiguration()).rejects.toThrow(/恢复身份/);
+    expect((await guarded.state.read()).target).toEqual({
+      targetProjectId: "list-1",
+      targetColumnId: "column-1",
+    });
+  });
+
   it("verifies every remote identity field and unique marker", () => {
     const entry = ledger({ remoteId: "task-1" });
     const task: DidaTask = { id: "task-1", projectId: "list-1", parentId: "parent-1", columnId: "column-1", title: "行动", content: projectionMarker("uuid-1"), status: 0 };

@@ -189,24 +189,31 @@ export class HelixSettingTab extends PluginSettingTab {
     });
     section.createEl("summary", { text: "项目同步" });
     const content = section.createDiv();
+    const setupContent = content.createDiv({ cls: "helix-settings-project-projection-setup" });
     void this.plugin.readProjectProjectionConfiguration().then((configuration) => {
       new Setting(content)
         .setName("当前状态")
         .setDesc(projectionTargetText(configuration))
         .setDisabled(true);
       if (configuration.enabled) {
+        setupContent.empty();
+        setupContent.hide();
         new Setting(content)
           .setName("停止项目同步")
           .setDesc("停止后保留已有滴答任务与本地映射，不执行删除。")
           .addButton((button) => button.setButtonText("停用").setWarning().onClick(async () => {
-            await this.plugin.disableProjectProjection();
-            new Notice("项目同步已停用；已有远端任务保持不变");
-            this.display();
+            try {
+              await this.plugin.disableProjectProjection();
+              new Notice("项目同步已停用；已有远端任务保持不变");
+              this.display();
+            } catch (error) {
+              new Notice(error instanceof Error ? error.message : String(error), 10_000);
+            }
           }));
       }
     }).catch(() => undefined);
 
-    new Setting(content)
+    new Setting(setupContent)
       .setName("目标滴答清单")
       .setDesc("只读取你选择的清单；启用前会再次精确复读。")
       .addDropdown((dropdown) => {
@@ -241,7 +248,7 @@ export class HelixSettingTab extends PluginSettingTab {
 
     if (!this.projectionCatalog) return;
     const catalog = this.projectionCatalog;
-    new Setting(content)
+    new Setting(setupContent)
       .setName("目标看板分栏")
       .setDesc(`建议使用“${PROJECTION_COLUMN_NAME}”；不会修改其他分栏。`)
       .addDropdown((dropdown) => {
@@ -255,7 +262,7 @@ export class HelixSettingTab extends PluginSettingTab {
       });
 
     if (!catalog.columns.some((column) => column.name === PROJECTION_COLUMN_NAME)) {
-      new Setting(content)
+      new Setting(setupContent)
         .setName(`创建“${PROJECTION_COLUMN_NAME}”分栏`)
         .setDesc(this.projectionColumnPreview
           ? this.projectionColumnPreview.blockers.length > 0
@@ -294,7 +301,7 @@ export class HelixSettingTab extends PluginSettingTab {
     const previewDescription = this.projectionPreview
       ? projectionActivationText(this.projectionPreview).join("；")
       : "先生成只读预览；不会立即创建或修改任务。";
-    new Setting(content)
+    new Setting(setupContent)
       .setName("启用后台项目同步")
       .setDesc(previewDescription)
       .addButton((button) => button.setButtonText(this.projectionPreview ? "确认启用" : "生成预览").onClick(async () => {
@@ -322,7 +329,7 @@ export class HelixSettingTab extends PluginSettingTab {
             this.projectionPreview.previewHash,
           );
           this.projectionPreview = null;
-          new Notice("项目同步已启用；后续变更将在后台静默处理");
+          new Notice("项目同步已启用；后续变更会在后台自动同步并通知结果");
           this.display();
         } catch (error) {
           new Notice(error instanceof Error ? error.message : String(error), 10_000);

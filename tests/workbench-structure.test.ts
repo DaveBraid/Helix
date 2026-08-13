@@ -459,6 +459,9 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
     expect(settings).not.toContain("ProjectionUiActionCoordinator");
     expect(settings).toMatch(/projectionActivationConfirmation\.request\(\)[\s\S]*confirmProjectProjection/);
+    expect(settings).toMatch(/configuration\.enabled[\s\S]*setupContent\.empty\(\)[\s\S]*setupContent\.hide\(\)/);
+    expect(settings).toContain("后续变更会在后台自动同步并通知结果");
+    expect(settings).not.toContain("后台静默处理");
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
     expect(modal).toMatch(/submit\(title, initialStageTitle, this\.color\)/);
     expect(modal).toMatch(/首阶段名称/);

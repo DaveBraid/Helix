@@ -2739,12 +2739,23 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         await this.sync();
         return;
       }
+      const movedAcrossProjects = Boolean(
+        desiredProjectId && operation.projectId && desiredProjectId !== operation.projectId,
+      );
       const remoteAtTarget = desiredProjectId
         ? await adapter.get(operation.entityId, { projectId: desiredProjectId })
         : null;
-      const remote = remoteAtTarget ?? await adapter.get(operation.entityId, {
-        projectId: operation.projectId,
-      });
+      const remoteAtSource = movedAcrossProjects
+        ? await adapter.get(operation.entityId, { projectId: operation.projectId })
+        : remoteAtTarget ?? await adapter.get(operation.entityId, { projectId: operation.projectId });
+      if (movedAcrossProjects && Boolean(remoteAtTarget) === Boolean(remoteAtSource)) {
+        throw new Error(
+          remoteAtTarget
+            ? "来源与目标清单同时可见该任务，位置不唯一；队列继续冻结"
+            : "来源与目标清单均无法读取该任务，位置未知；队列继续冻结",
+        );
+      }
+      const remote = remoteAtTarget ?? remoteAtSource;
       if (remote) {
         adopted = createSnapshot("task", remote.id, remote);
       }
@@ -3575,8 +3586,21 @@ function matchesCreatedTask(local: DidaTask, remote: DidaTask): boolean {
     local.projectId === remote.projectId &&
     local.title === remote.title &&
     (local.content ?? "") === (remote.content ?? "") &&
-    (local.desc ?? "") === (remote.desc ?? "")
+    (local.desc ?? "") === (remote.desc ?? "") &&
+    (local.priority ?? 0) === (remote.priority ?? 0) &&
+    sameStringSet(local.tags, remote.tags) &&
+    (local.status ?? 0) === (remote.status ?? 0)
   );
+}
+
+function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
+  const normalize = (values: string[] | undefined) =>
+    [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b));
+  const normalizedLeft = normalize(left);
+  const normalizedRight = normalize(right);
+  return normalizedLeft.length === normalizedRight.length &&
+    normalizedLeft.every((value, index) => value === normalizedRight[index]);
 }
 
 function appendEarnedChallengeAwards(

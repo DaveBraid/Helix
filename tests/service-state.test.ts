@@ -983,6 +983,106 @@ describe("HelixService runtime recovery", () => {
     ]);
   });
 
+  it("rejects an unknown task create binding when explicit attributes do not match", async () => {
+    const data = createDefaultData("device-unknown-create-attributes");
+    grantTaskCrud(data);
+    const local = taskSyncProjection(normalizeTask({
+      id: "local-attributes",
+      projectId: "project-1",
+      title: "Task",
+      status: 0,
+      priority: 5,
+      tags: ["科研", "实验"],
+    }));
+    data.localSnapshots[`task:${local.id}`] = createSnapshot("task", local.id, local);
+    data.queue = [{
+      id: "op-unknown-attributes",
+      kind: "task",
+      entityId: local.id,
+      projectId: local.projectId,
+      operation: "create",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      attempts: 1,
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+      local: createSnapshot("task", local.id, local),
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+      async getTask() {
+        return { ...local, id: "remote-mismatch", priority: 3, tags: ["科研"] };
+      },
+    });
+
+    await expect(service.resolveUnknownCreate(
+      "op-unknown-attributes",
+      "confirmed",
+      "remote-mismatch",
+    )).rejects.toThrow(/不匹配/);
+
+    expect(persisted.queue).toMatchObject([{
+      id: "op-unknown-attributes",
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+    }]);
+  });
+
+  it("keeps an unknown cross-list move frozen when both source and target expose the task", async () => {
+    const data = createDefaultData("device-unknown-move-ambiguous");
+    grantTaskCrud(data);
+    const baseTask = taskSyncProjection(normalizeTask({
+      id: "task-ambiguous-move",
+      projectId: "project-a",
+      title: "Task",
+      status: 0,
+    }));
+    const movedTask = { ...baseTask, projectId: "project-b" };
+    const base = createSnapshot("task", baseTask.id, baseTask);
+    const local = createSnapshot("task", movedTask.id, movedTask);
+    data.baseSnapshots[`task:${baseTask.id}`] = base;
+    data.localSnapshots[`task:${baseTask.id}`] = local;
+    data.queue = [{
+      id: "op-unknown-move-ambiguous",
+      kind: "task",
+      entityId: baseTask.id,
+      projectId: baseTask.projectId,
+      operation: "update",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      attempts: 1,
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+      base,
+      local,
+    }];
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+      async getTask(projectId: string) { return { ...baseTask, projectId }; },
+    });
+
+    await expect(service.resolveUnknownWrite(
+      "op-unknown-move-ambiguous",
+      "adopt-remote",
+    )).rejects.toThrow(/同时可见.*位置不唯一/);
+
+    expect(persisted.queue).toMatchObject([{
+      id: "op-unknown-move-ambiguous",
+      status: "reconciliation",
+      remoteOutcomeUnknown: true,
+    }]);
+  });
+
   it("keeps a connection probe read-only even when a pending write exists", async () => {
     const data = createDefaultData("device-a");
     const local: DidaTask = {

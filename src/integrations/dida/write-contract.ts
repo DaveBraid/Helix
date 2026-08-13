@@ -23,7 +23,7 @@ import { DidaHttpError } from "./http-contract";
 import { normalizeColumns, normalizeProject, normalizeTask } from "./normalization";
 import { createDidaChecklistClientItem, serializeDidaDate } from "./serialization";
 
-type ContractApi = Pick<
+export type ContractApi = Pick<
   DidaApi,
   | "createProject"
   | "getProjects"
@@ -65,6 +65,7 @@ export interface DidaWriteContractReport {
   columnCreateVerified: boolean;
   taskCrudVerified: boolean;
   taskParentingVerified: boolean;
+  projectProjectionVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   itemsRoundTripVerified: boolean;
@@ -81,6 +82,16 @@ export interface DidaWriteContractReport {
   capabilityFailureCodes: string[];
   /** 仅供持久恢复使用；不得进入 Notice 或普通诊断。 */
   cleanupPlan?: DidaContractCleanupPlan;
+}
+
+export interface DidaProjectProjectionContractContext {
+  api: ContractApi;
+  marker: string;
+  project: DidaProject;
+  column: DidaColumn;
+  trackTask(task: DidaTask): Promise<void>;
+  untrackTask(taskId: string): Promise<void>;
+  markUntrackedCreate(): Promise<void>;
 }
 
 export type ItemsOwnedAppendFailureCode =
@@ -144,6 +155,7 @@ export class DidaWriteContractRunner {
   private columnCreateVerified = false;
   private taskCrudVerified = false;
   private taskParentingVerified = false;
+  private projectProjectionVerified = false;
   private reminderWriteVerified = false;
   private repeatWriteVerified = false;
   private itemsRoundTripVerified = false;
@@ -167,6 +179,9 @@ export class DidaWriteContractRunner {
       plan: DidaContractCleanupPlan | undefined,
     ) => Promise<void> = async () => undefined,
     private readonly cleanupApi: ContractApi = api,
+    private readonly runProjectProjectionProbe?: (
+      context: DidaProjectProjectionContractContext,
+    ) => Promise<void>,
   ) {
     this.api = api;
   }
@@ -178,6 +193,7 @@ export class DidaWriteContractRunner {
     this.columnCreateVerified = false;
     this.taskCrudVerified = false;
     this.taskParentingVerified = false;
+    this.projectProjectionVerified = false;
     this.reminderWriteVerified = false;
     this.repeatWriteVerified = false;
     this.itemsRoundTripVerified = false;
@@ -701,6 +717,50 @@ export class DidaWriteContractRunner {
       optionalTasks.splice(optionalTasks.indexOf(boardTask), 1);
       await this.cleanupCheckpoint();
 
+      if (this.runProjectProjectionProbe) {
+        if (!this.taskParentingVerified || !this.boardPlacementVerified || !this.columnCreateVerified) {
+          throw new Error("真实项目投影探针的父子任务、看板归栏或分栏能力前置条件未满足");
+        }
+        this.beginStage("验证项目父任务与 Stage 真实子任务投影");
+        await this.updateAndVerifyProjectViewMode(projectA, "kanban");
+        try {
+          await this.runProjectProjectionProbe({
+            api: this.api,
+            marker,
+            project: normalizeProject(await this.api.getProject(projectA.id)),
+            column: createCapabilityColumn,
+            trackTask: async (createdTask) => {
+              const task = normalizeTask(createdTask);
+              if (task.projectId !== projectA.id || !task.id ||
+                optionalTasks.some((candidate) => candidate.id === task.id)) {
+                throw new Error("项目投影探针试图登记无效或重复的测试任务");
+              }
+              optionalTasks.push({
+                id: task.id,
+                projectId: task.projectId,
+                candidateProjectIds: [projectA.id],
+                state: task.status === 2 ? "completed" : "open",
+              });
+              await this.cleanupCheckpoint!();
+            },
+            untrackTask: async (taskId) => {
+              const index = optionalTasks.findIndex((candidate) => candidate.id === taskId);
+              if (index < 0) throw new Error("项目投影探针清理了未登记的测试任务");
+              optionalTasks.splice(index, 1);
+              await this.cleanupCheckpoint!();
+            },
+            markUntrackedCreate: async () => {
+              this.untrackedCreateOutcome = true;
+              await this.cleanupCheckpoint!();
+            },
+          });
+          this.projectProjectionVerified = true;
+          steps.push("验证项目父任务与 Stage 行动真实子任务的创建、编辑、完成、重开和删除");
+        } finally {
+          await this.updateAndVerifyProjectViewMode(projectA, "list");
+        }
+      }
+
       this.beginStage("移动测试任务并核对来源清单");
       const beforeMove = normalizeTask(await this.api.getTask(projectA.id, created.id));
       this.assertTaskIdentity(beforeMove, created.id, projectA.id, marker);
@@ -875,6 +935,7 @@ export class DidaWriteContractRunner {
         cleanupErrors.length === 0 && !this.untrackedCreateOutcome,
       taskCrudVerified: this.taskCrudVerified,
       taskParentingVerified: this.taskParentingVerified,
+      projectProjectionVerified: this.projectProjectionVerified,
       reminderWriteVerified: this.reminderWriteVerified,
       repeatWriteVerified: this.repeatWriteVerified,
       itemsRoundTripVerified: this.itemsRoundTripVerified,

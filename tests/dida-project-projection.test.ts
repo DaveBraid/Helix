@@ -274,8 +274,12 @@ describe("Dida project projection domain", () => {
   it("plans create, title update, completion and persistent deletion tombstone", () => {
     const base = ledger({ remoteId: "task-1", title: "旧", state: "active" });
     const changed = ledger({ remoteId: "task-1", title: "新", state: "completed" });
-    expect(planProjectionChanges([base], [changed]).map((item) => item.kind)).toEqual(["update-action"]);
-    expect(planProjectionChanges([base], [changed])[0]).toMatchObject({ writeFields: ["title", "status"] });
+    expect(planProjectionChanges([base], [changed]).map((item) => item.kind))
+      .toEqual(["update-action", "complete-action"]);
+    expect(planProjectionChanges([base], [changed])[0]).toMatchObject({
+      writeFields: ["title"],
+      entry: { state: "active" },
+    });
     expect(planProjectionChanges([], [ledger({ remoteId: undefined })])[0]?.kind).toBe("create-action");
     const deletion = planProjectionChanges([base], [])[0];
     expect(deletion).toMatchObject({ kind: "delete-action", entry: { tombstone: true } });

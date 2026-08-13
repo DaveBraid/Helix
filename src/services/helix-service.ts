@@ -60,6 +60,7 @@ import {
   type DidaWriteContractProgress,
   type DidaWriteContractReport,
 } from "../integrations/dida/write-contract";
+import { runDidaProjectProjectionContractProbe } from "../integrations/dida/project-projection-contract";
 import { OfflineQueue } from "../sync/offline-queue";
 import { ingestRemoteRecords } from "../sync/remote-ingest";
 import { createSnapshot } from "../sync/snapshots";
@@ -104,8 +105,8 @@ import {
 import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
-// v9 新增真实父子任务三步探针；本地确定性合同为 122 次调用，预留少量协议复读余量。
-const DIDA_CONTRACT_REQUEST_BUDGET = 140;
+// v10 在 v9 基础上加入真实项目父任务／Stage 子任务投影闭环；预算只供本轮唯一合同对象。
+const DIDA_CONTRACT_REQUEST_BUDGET = 180;
 
 export interface HelixRuntimeState {
   loading: boolean;
@@ -124,6 +125,7 @@ export interface HelixRuntimeState {
   columnCreateVerified: boolean;
   taskCrudVerified: boolean;
   taskParentingVerified: boolean;
+  projectProjectionVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   itemsRoundTripVerified: boolean;
@@ -151,11 +153,11 @@ export interface ProjectProjectionWriteReadiness {
 export function projectProjectionGlobalCapabilitiesReady(
   state: Pick<HelixRuntimeState,
     "connected" | "authorizationConfigured" | "taskCrudVerified" |
-    "taskParentingVerified" | "boardPlacementVerified">,
+    "taskParentingVerified" | "boardPlacementVerified" | "projectProjectionVerified">,
 ): boolean {
   // 重开只在具体 reopen 操作门禁检查；不能阻止普通创建、更新或完成从队列阻塞中恢复。
   return state.connected && state.authorizationConfigured && state.taskCrudVerified &&
-    state.taskParentingVerified && state.boardPlacementVerified;
+    state.taskParentingVerified && state.boardPlacementVerified && state.projectProjectionVerified;
 }
 
 export type StateListener = (state: HelixRuntimeState) => void;
@@ -177,6 +179,7 @@ const EMPTY_STATE: HelixRuntimeState = {
   columnCreateVerified: false,
   taskCrudVerified: false,
   taskParentingVerified: false,
+  projectProjectionVerified: false,
   reminderWriteVerified: false,
   repeatWriteVerified: false,
   itemsRoundTripVerified: false,
@@ -381,6 +384,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       columnCreateVerified: verifiedCapabilities?.columnCreateVerified ?? false,
       taskCrudVerified: verifiedCapabilities?.taskCrudVerified ?? false,
       taskParentingVerified: verifiedCapabilities?.taskParentingVerified ?? false,
+      projectProjectionVerified: verifiedCapabilities?.projectProjectionVerified ?? false,
       reminderWriteVerified: verifiedCapabilities?.reminderWriteVerified ?? false,
       repeatWriteVerified: verifiedCapabilities?.repeatWriteVerified ?? false,
       itemsRoundTripVerified: verifiedCapabilities?.itemsRoundTripVerified ?? false,
@@ -908,6 +912,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           });
         },
         cleanupApi,
+        runDidaProjectProjectionContractProbe,
       ).run();
       this.lastDidaWriteContractReport = report;
       await this.store.mutate((data) => {
@@ -953,6 +958,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         const columnCreateVerified = report.columnCreateVerified && contractArtifactsClean;
         const taskCrudVerified = report.taskCrudVerified && contractArtifactsClean;
         const taskParentingVerified = report.taskParentingVerified && contractArtifactsClean;
+        const projectProjectionVerified = report.projectProjectionVerified && contractArtifactsClean;
         const reminderWriteVerified = report.reminderWriteVerified && contractArtifactsClean;
         const repeatWriteVerified = report.repeatWriteVerified && contractArtifactsClean;
         const itemsRoundTripVerified = report.itemsRoundTripVerified && contractArtifactsClean;
@@ -967,6 +973,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
             columnCreateVerified,
             taskCrudVerified,
             taskParentingVerified,
+            projectProjectionVerified,
             reminderWriteVerified,
             repeatWriteVerified,
             itemsRoundTripVerified,
@@ -981,6 +988,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           columnCreateVerified,
           taskCrudVerified,
           taskParentingVerified,
+          projectProjectionVerified,
           reminderWriteVerified,
           repeatWriteVerified,
           itemsRoundTripVerified,
@@ -1079,6 +1087,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       columnCreateVerified: false,
       taskCrudVerified: false,
       taskParentingVerified: false,
+      projectProjectionVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
@@ -1097,6 +1106,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       `合同版本 ${DIDA_CONTRACT_PROBE_VERSION}`,
       capability("基础任务：", this.state.taskCrudVerified),
       capability("真实子任务：", this.state.taskParentingVerified),
+      capability("项目投影：", this.state.projectProjectionVerified),
       capability("提醒：", this.state.reminderWriteVerified),
       capability("重复：", this.state.repeatWriteVerified),
       capability("检查项：", this.state.itemsRoundTripVerified),
@@ -2283,8 +2293,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
   private assertProjectionCapabilities(reopen: boolean): void {
     this.assertProjectDidaProjectionAvailable();
     this.assertTaskCrudVerified();
-    if (!this.state.taskParentingVerified || !this.state.boardPlacementVerified) {
-      throw new Error("当前授权尚未验证滴答项目同步所需的真实子任务与看板归栏能力");
+    if (!this.state.taskParentingVerified || !this.state.boardPlacementVerified ||
+      !this.state.projectProjectionVerified) {
+      throw new Error("当前授权尚未验证滴答项目同步所需的真实子任务、看板归栏与完整闭环");
     }
     if (reopen && !this.state.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");

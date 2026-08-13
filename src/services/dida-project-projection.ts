@@ -1150,7 +1150,11 @@ export class DidaProjectProjectionService {
         await persist();
         continue;
       } else {
-        result = await this.pipeline.updateTask(desired, fields, operationId, remote);
+        result = intent.kind === "complete-action"
+          ? await this.pipeline.completeTask(desired)
+          : intent.kind === "reopen-action"
+            ? await this.pipeline.reopenTask(desired)
+            : await this.pipeline.updateTask(desired, fields, operationId, remote);
       }
       if (result.outcome !== "verified") {
         const frozen = { ...checkpoint, frozen: resultReason(result), operationId: result.operationId,

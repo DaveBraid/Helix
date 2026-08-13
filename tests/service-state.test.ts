@@ -42,11 +42,13 @@ it("keeps ordinary project writes globally ready when only task reopen is unveri
     authorizationConfigured: true,
     taskCrudVerified: true,
     taskParentingVerified: true,
+    projectProjectionVerified: true,
     itemsRoundTripVerified: true, itemIdStableVerified: true,
     boardPlacementVerified: true,
     taskReopenVerified: false,
   };
   expect(projectProjectionGlobalCapabilitiesReady(state)).toBe(true);
+  expect(projectProjectionGlobalCapabilitiesReady({ ...state, projectProjectionVerified: false })).toBe(false);
   const serverAssignedIds = { ...state, itemIdStableVerified: false };
   expect(projectProjectionGlobalCapabilitiesReady(serverAssignedIds)).toBe(true);
 });
@@ -495,7 +497,7 @@ describe("HelixService runtime recovery", () => {
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
     });
-    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 9.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 10.*本次插件运行尚未执行合同测试/);
     expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
   });
 
@@ -2771,6 +2773,7 @@ describe("HelixService runtime recovery", () => {
     const data = createDefaultData("device-projection-owned-base");
     grantTaskCrud(data);
     data.didaContractCapabilities!.taskParentingVerified = true;
+    data.didaContractCapabilities!.projectProjectionVerified = true;
     data.didaContractCapabilities!.boardPlacementVerified = true;
     const remote: DidaTask = {
       id: "child-owned-base", projectId: "target-list", parentId: "parent-a",
@@ -2834,6 +2837,7 @@ describe("HelixService runtime recovery", () => {
     const data = createDefaultData("device-projection-reopen-gate");
     grantTaskCrud(data);
     data.didaContractCapabilities!.taskParentingVerified = true;
+    data.didaContractCapabilities!.projectProjectionVerified = true;
     data.didaContractCapabilities!.boardPlacementVerified = true;
     data.didaContractCapabilities!.taskReopenVerified = false;
     const task: DidaTask = {

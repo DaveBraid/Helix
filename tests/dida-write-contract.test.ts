@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { DidaColumn, DidaProject, DidaTask } from "../src/domain/entities";
 import type { DidaTaskUpdateWirePayload } from "../src/integrations/dida/api";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
+import { runDidaProjectProjectionContractProbe } from "../src/integrations/dida/project-projection-contract";
 import {
   assertOwnedChecklistAppend,
   assertSentinelChecklistCreate,
@@ -757,6 +758,31 @@ describe("DidaWriteContractRunner", () => {
     expect(api.deletedTasks).toEqual(["test-task-2", "test-task-3", "test-task-4", "test-task-5", "test-task-6", "test-task-1", "test-task-7"]);
     expect([...api.projects]).toHaveLength(1);
     expect([...api.tasks]).toHaveLength(1);
+  });
+
+  it("runs the real project projection probe inside the same tracked cleanup plan", async () => {
+    const api = new ContractApiFake();
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-project-projection",
+      fixedNow,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      api,
+      runDidaProjectProjectionContractProbe,
+    ).run();
+
+    expect(report.failure).toBeUndefined();
+    expect(report).toMatchObject({
+      status: "passed",
+      projectProjectionVerified: true,
+      remoteArtifactsRemaining: false,
+      cleanupErrors: [],
+    });
+    expect([...api.projects.keys()]).toEqual(["original-project"]);
+    expect([...api.tasks.keys()]).toEqual(["original-task"]);
   });
 
   it("accepts server defaults on a newly created checklist item and preserves them afterward", async () => {

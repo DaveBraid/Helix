@@ -652,14 +652,15 @@ export function planProjectionChanges(
     if (!entry.remoteId && old.remoteId) entry.remoteId = old.remoteId;
     const writeFields: ProjectionTaskWriteField[] = [];
     if (old.title !== entry.title) writeFields.push("title");
+    let statusIntent: "complete-action" | "reopen-action" | undefined;
     if (old.state === "completed" && entry.state !== "completed") {
       if (!options.taskReopenVerified) {
         intents.push({ kind: "freeze-action", entry: { ...entry, frozen: "capability" }, reason: "capability" });
         continue;
       }
-      writeFields.push("status");
+      statusIntent = "reopen-action";
     }
-    if (old.state !== "completed" && entry.state === "completed") writeFields.push("status");
+    if (old.state !== "completed" && entry.state === "completed") statusIntent = "complete-action";
     if (old.content !== entry.content) writeFields.push("desc");
     if (old.startDate !== entry.startDate) writeFields.push("startDate");
     if (old.dueDate !== entry.dueDate) writeFields.push("dueDate");
@@ -667,7 +668,16 @@ export function planProjectionChanges(
     if (old.isAllDay !== entry.isAllDay) writeFields.push("isAllDay");
     if (old.priority !== entry.priority) writeFields.push("priority");
     if (stableHash(old.tags) !== stableHash(entry.tags)) writeFields.push("tags");
-    if (writeFields.length > 0) intents.push({ kind: "update-action", entry, writeFields });
+    if (writeFields.length > 0) {
+      // 滴答完成／重开不是普通字段更新。先以旧状态写其他属性，再用专用端点
+      // 改状态，避免把 status=2 混入 update payload 后得到“成功但未完成”。
+      intents.push({
+        kind: "update-action",
+        entry: statusIntent ? { ...entry, state: old.state } : entry,
+        writeFields,
+      });
+    }
+    if (statusIntent) intents.push({ kind: statusIntent, entry });
   }
   for (const [uuid, old] of before) {
     if (after.has(uuid) || old.frozen) continue;
@@ -687,26 +697,46 @@ export function verifyProjectedTask(
   const verifyTitle = options.title ?? true;
   const verifyState = options.state ?? true;
   const verifyAttributes = options.attributes ?? true;
-  if (!entry.remoteId || task.id !== entry.remoteId || task.projectId !== entry.targetProjectId ||
-    task.parentId !== entry.parentTaskId || task.columnId !== entry.targetColumnId ||
-    task.content !== marker || (verifyTitle && task.title !== entry.title) ||
-    (verifyState && (entry.state === "completed" ? task.status !== 2 : task.status === 2)) ||
-    (verifyAttributes && !sameProjectionTaskAttributes(task, entry))) {
-    throw new Error("远端任务身份、父级、清单、分栏、标题、状态或唯一标记复读不一致");
+  const attributeFailures = verifyAttributes ? projectionTaskAttributeMismatches(task, entry) : [];
+  const checks = {
+    remoteId: Boolean(entry.remoteId) && task.id === entry.remoteId,
+    projectId: task.projectId === entry.targetProjectId,
+    parentId: task.parentId === entry.parentTaskId,
+    columnId: task.columnId === entry.targetColumnId,
+    marker: task.content === marker,
+    title: !verifyTitle || task.title === entry.title,
+    state: !verifyState || (entry.state === "completed" ? task.status === 2 : task.status !== 2),
+    attributes: attributeFailures.length === 0,
+  };
+  const failed = Object.entries(checks).filter(([, valid]) => !valid).map(([field]) => field)
+    .flatMap((field) => field === "attributes" ? attributeFailures.map((item) => `attributes.${item}`) : [field]);
+  if (failed.length > 0) {
+    throw new Error(`滴答项目同步任务复读不一致：${failed.join("、")}`);
   }
 }
 
-function sameProjectionTaskAttributes(task: DidaTask, entry: ProjectionLedgerEntry): boolean {
+function projectionTaskAttributeMismatches(task: DidaTask, entry: ProjectionLedgerEntry): string[] {
   const optional = (value: string | null | undefined) => value?.trim() || undefined;
   const tags = (value: string[] | undefined) => [...new Set((value ?? [])
     .map((tag) => tag.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
-  return optional(task.desc) === optional(entry.content) &&
-    optional(task.startDate) === optional(entry.startDate) &&
-    optional(task.dueDate) === optional(entry.dueDate) &&
-    optional(task.timeZone) === optional(entry.timeZone) &&
-    Boolean(task.isAllDay) === Boolean(entry.isAllDay) &&
-    (task.priority ?? 0) === (entry.priority ?? 0) &&
-    stableHash(tags(task.tags)) === stableHash(tags(entry.tags));
+  return [
+    optional(task.desc) === optional(entry.content) ? undefined : "desc",
+    sameOptionalInstant(task.startDate, entry.startDate) ? undefined : "startDate",
+    sameOptionalInstant(task.dueDate, entry.dueDate) ? undefined : "dueDate",
+    optional(task.timeZone) === optional(entry.timeZone) ? undefined : "timeZone",
+    Boolean(task.isAllDay) === Boolean(entry.isAllDay) ? undefined : "isAllDay",
+    (task.priority ?? 0) === (entry.priority ?? 0) ? undefined : "priority",
+    stableHash(tags(task.tags)) === stableHash(tags(entry.tags)) ? undefined : "tags",
+  ].filter((item): item is string => Boolean(item));
+}
+
+function sameOptionalInstant(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  const leftTime = Date.parse(left.replace(/([+-]\d{2})(\d{2})$/u, "$1:$2"));
+  const rightTime = Date.parse(right.replace(/([+-]\d{2})(\d{2})$/u, "$1:$2"));
+  return Number.isFinite(leftTime) && Number.isFinite(rightTime) &&
+    Math.trunc(leftTime / 1_000) === Math.trunc(rightTime / 1_000);
 }
 
 /**

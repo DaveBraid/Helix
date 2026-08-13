@@ -138,6 +138,28 @@ describe("SyncEngine safety gates", () => {
     expect((repository.local?.value as DidaTask).title).toBe("queued-rename");
   });
 
+  it("adopts an already matching remote result without sending a redundant update", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const desired = createSnapshot("task", "task-1", task("same result"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = desired;
+    const adapter = new TaskAdapter(task("same result"));
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+
+    const result = await engine.process(operation(task("same result"), base));
+
+    expect(result.outcome).toBe("pulled");
+    expect(adapter.updateCount).toBe(0);
+    expect((repository.base?.value as DidaTask).title).toBe("same result");
+    expect((repository.local?.value as DidaTask).title).toBe("same result");
+  });
+
   it("passes persisted explicit field intent from queue processing to the adapter", async () => {
     const baseTask = { ...task("base"), reminders: ["TRIGGER:CUSTOM"] };
     const localTask = { ...baseTask, reminders: ["TRIGGER:-PT10M"] };

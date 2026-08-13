@@ -147,6 +147,11 @@ export class SyncEngine<T extends RemoteEntity> {
 
     const localChanged = snapshotChanged(local, base);
     const remoteChanged = snapshotChanged(remoteSnapshot, base);
+    if (localChanged && remoteChanged && local.stamp.hash === remoteSnapshot.stamp.hash) {
+      await this.dependencies.snapshots.saveBase(remoteSnapshot);
+      await this.dependencies.snapshots.saveLocal(remoteSnapshot);
+      return { outcome: "pulled", snapshot: remoteSnapshot };
+    }
     if (localChanged && remoteChanged && local.stamp.hash !== remoteSnapshot.stamp.hash) {
       if (this.dependencies.allowUnsentRebaseline?.(operation, base, local, remoteSnapshot)) {
         await this.dependencies.snapshots.saveBase(remoteSnapshot);

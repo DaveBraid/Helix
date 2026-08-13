@@ -137,8 +137,8 @@ export class HelixSettingTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("自动同步")
       .setDesc(DIDA_TASK_WRITE_AVAILABLE
-        ? "桌面端定时执行；冲突只暂停对应对象。"
-        : "桌面端定时只读拉取；不会消费或发送待处理写入。")
+        ? "默认关闭；开启后立即同步并按间隔执行。关闭时保存口令也不会自动联网，冲突只暂停对应对象。"
+        : "默认关闭；开启后立即拉取并按间隔执行，不会消费或发送待处理写入。")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
           this.plugin.settings.autoSync = value;

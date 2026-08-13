@@ -55,7 +55,7 @@ export const DEFAULT_SETTINGS: HelixSettings = {
   rootFolder: "Helix",
   templateFolder: "Template",
   templateSetupCompleted: false,
-  autoSync: true,
+  autoSync: false,
   syncIntervalMinutes: 10,
   showSampleDataWhenDisconnected: true,
   lineageCanvasPath: "Helix/Project Lineage.canvas",

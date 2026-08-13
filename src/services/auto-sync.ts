@@ -12,13 +12,11 @@ export interface AutoSyncPlan {
 }
 
 export function autoSyncPlan(input: AutoSyncPlanInput): AutoSyncPlan {
-  if (input.recoveryMode || !input.tokenConfigured) {
+  if (input.recoveryMode || !input.tokenConfigured || !input.autoSync) {
     return { runImmediately: false, intervalMs: null };
   }
   return {
     runImmediately: input.runImmediately,
-    intervalMs: input.autoSync
-      ? Math.max(5, input.intervalMinutes) * 60_000
-      : null,
+    intervalMs: Math.max(5, input.intervalMinutes) * 60_000,
   };
 }

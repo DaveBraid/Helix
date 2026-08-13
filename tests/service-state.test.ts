@@ -1294,6 +1294,34 @@ describe("HelixService runtime recovery", () => {
     ]));
   });
 
+  it("does not treat an authentication failure as offline queue mode", async () => {
+    const data = createDefaultData("device-auth-not-offline");
+    grantTaskCrud(data);
+    let persisted = structuredClone(data);
+    const service = new HelixService(new HelixDataStore({
+      async loadData() { return structuredClone(persisted); },
+      async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+    }), { getDidaToken: () => "token" } as HelixSecretStore);
+    await service.initialize();
+    let createCalls = 0;
+    let created: DidaTask | undefined;
+    Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+      async getProjects() { throw new DidaHttpError("authentication", "expired", 401); },
+      async createTask(value: DidaTask) {
+        createCalls += 1;
+        created = taskSyncProjection(normalizeTask({ ...value, id: "remote-after-auth", status: 0 }));
+        return created;
+      },
+      async getTask() { return created; },
+    });
+
+    await expect(service.pullOnlySync()).rejects.toThrow("expired");
+    await service.createTask("Must attempt", "project-1");
+
+    expect(createCalls).toBe(1);
+    expect(persisted.queue).toEqual([]);
+  });
+
   it("clears only local Dida display caches without touching authorization or events", async () => {
     const data = createDefaultData("device-clear-cache");
     const project: DidaProject = { id: "project-cache", name: "Cached", viewMode: "list" };

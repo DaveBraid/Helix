@@ -884,7 +884,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (isTransientRemoteFailure(error)) this.remoteConnectivity = "offline";
+      if (error instanceof DidaHttpError) {
+        this.remoteConnectivity = isTransientRemoteFailure(error) ? "offline" : "online";
+      }
       this.patch({ loading: false, connected: false, error: message });
       throw error;
     }
@@ -906,7 +908,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       this.patch({ capabilities, connected: true, error: undefined });
       return capabilities;
     } catch (error) {
-      if (isTransientRemoteFailure(error)) this.remoteConnectivity = "offline";
+      if (error instanceof DidaHttpError) {
+        this.remoteConnectivity = isTransientRemoteFailure(error) ? "offline" : "online";
+      }
       throw error;
     }
   }

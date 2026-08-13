@@ -676,7 +676,7 @@ export default class HelixPlugin extends Plugin {
     const unknownDeleteIds = new Set<string>();
     const track = async (taskId: string) => {
       if (trackedRemoteIds.has(taskId)) return;
-      await context.trackTask(await this.service.verifyRemoteTask(context.project.id, taskId));
+      await context.trackTask(await context.api.getTask(context.project.id, taskId));
       trackedRemoteIds.add(taskId);
     };
     const untrack = async (taskId: string) => {

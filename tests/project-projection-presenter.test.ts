@@ -5,12 +5,32 @@ import {
   loadProjectionConflictModels,
   projectionActivationText,
   projectionCatalogChoices,
+  projectionPauseText,
   projectionProjectSummary,
   projectionSyncSummaryText,
 } from "../src/ui/project-projection-presenter";
 import type { ProjectionProjectReadModel } from "../src/services/dida-project-projection";
 
 describe("project projection presenter", () => {
+  it("summarizes every local reason that pauses background projection writes", () => {
+    expect(projectionPauseText({
+      capabilitiesBlocked: false,
+      queueBlocked: false,
+      conflictsBlocked: false,
+      inProgress: false,
+      recoveryBlocked: false,
+      unknownBlocked: false,
+    })).toBe("后台写入条件已就绪");
+    expect(projectionPauseText({
+      capabilitiesBlocked: true,
+      queueBlocked: true,
+      conflictsBlocked: true,
+      inProgress: true,
+      recoveryBlocked: true,
+      unknownBlocked: true,
+    })).toContain("连接或写入合同尚未就绪；普通任务队列尚未清空；存在未解决冲突；其他远端操作正在进行；存在恢复或清理锁；存在远端结果未知记录");
+  });
+
   it("shows exact names with stable IDs and never invents an empty column", () => {
     expect(projectionCatalogChoices([{
       projects: [{ id: "list-1", name: "科研" }],

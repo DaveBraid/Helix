@@ -147,6 +147,7 @@ export type DidaProjectViewModeSyncStatus = "synced" | "pending" | "conflict" | 
 
 export interface ProjectProjectionWriteReadiness {
   ready: boolean;
+  capabilitiesBlocked: boolean;
   queueBlocked: boolean;
   conflictsBlocked: boolean;
   inProgress: boolean;
@@ -467,6 +468,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     return {
       ready: projectionActivated && capabilitiesReady && !queueBlocked && !conflictsBlocked && !inProgress &&
         !recoveryBlocked && !unknownBlocked,
+      capabilitiesBlocked: !capabilitiesReady,
       queueBlocked,
       conflictsBlocked,
       inProgress,

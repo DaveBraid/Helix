@@ -24,7 +24,7 @@ import {
   type ProjectionColumnCreationPreview,
 } from "../domain/dida-project-projection";
 import type { ProjectionCatalogSnapshot } from "../services/dida-project-projection";
-import { projectionActivationText, projectionTargetText } from "./project-projection-presenter";
+import { projectionActivationText, projectionPauseText, projectionTargetText } from "./project-projection-presenter";
 import { DidaWriteContractConfirmationGate } from "./dida-write-contract-confirmation";
 
 export class HelixSettingTab extends PluginSettingTab {
@@ -198,6 +198,12 @@ export class HelixSettingTab extends PluginSettingTab {
       if (configuration.enabled) {
         setupContent.empty();
         setupContent.hide();
+        void this.plugin.readProjectProjectionWriteReadiness().then((readiness) => {
+          new Setting(content)
+            .setName("后台写入")
+            .setDesc(projectionPauseText(readiness))
+            .setDisabled(true);
+        }).catch(() => undefined);
         new Setting(content)
           .setName("停止项目同步")
           .setDesc("停止后保留已有滴答任务与本地映射，不执行删除。")

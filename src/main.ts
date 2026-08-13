@@ -903,6 +903,10 @@ export default class HelixPlugin extends Plugin {
     return this.withProjectWorkspaceRead(() => this.projectProjection.readConfiguration());
   }
 
+  readProjectProjectionWriteReadiness() {
+    return this.service.projectProjectionWriteReadiness();
+  }
+
   async readProjectProjectionCatalog(projectId: string): Promise<ProjectionCatalogSnapshot> {
     if (!this.service.snapshot().projects.some((project) => project.id === projectId) ||
       projectId.startsWith("local-project-")) {

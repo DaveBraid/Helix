@@ -930,11 +930,12 @@ export default class HelixPlugin extends Plugin {
     confirmedHash: string,
   ): Promise<void> {
     this.assertProjectProjectionAvailable();
-    await this.withWritableProjectMutation(async () => {
-      const snapshot = await this.projectWorkspace.loadStableWorkspace();
-      await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
-      await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
-    });
+    await this.service.withProjectProjectionActivationLease(() =>
+      this.withWritableProjectMutation(async () => {
+        const snapshot = await this.projectWorkspace.loadStableWorkspace();
+        await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
+        await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
+      }));
     const readiness = await this.service.projectProjectionWriteReadiness();
     this.projectAutoSync.updateReadiness(
       PROJECT_DIDA_PROJECTION_AVAILABLE && readiness.ready,

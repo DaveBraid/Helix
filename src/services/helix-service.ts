@@ -477,6 +477,24 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     };
   }
 
+  async withProjectProjectionActivationLease<T>(activate: () => Promise<T>): Promise<T> {
+    this.assertProjectDidaProjectionAvailable();
+    this.assertWritable();
+    const releaseExclusive = this.remoteWriteGate.enterExclusive("启用滴答项目同步");
+    try {
+      const data = await this.store.snapshot();
+      if (data.queue.length > 0 || data.conflicts.some((conflict) =>
+        conflict.status !== "resolved" && conflict.status !== "superseded") ||
+        data.pendingDidaContractCleanup || data.didaProjectionState?.columnCreation ||
+        (data.didaProjectionState?.receiptCleanupPending?.length ?? 0) > 0) {
+        throw new Error("仍有待处理写入、冲突或恢复操作，暂不能启用滴答项目同步");
+      }
+      return await activate();
+    } finally {
+      releaseExclusive();
+    }
+  }
+
   async replaceDidaToken(token: string): Promise<void> {
     const normalized = token.trim();
     if (normalized.length < 10) throw new Error("API 口令长度异常");

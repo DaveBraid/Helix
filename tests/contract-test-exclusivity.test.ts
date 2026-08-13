@@ -178,6 +178,28 @@ describe("HelixService contract-test exclusivity", () => {
     await ordinaryWrite;
   });
 
+  it("keeps project activation mutually exclusive with a running contract", async () => {
+    const { service } = await serviceFixture();
+    const api = serviceApi(service);
+    const contractCreateStarted = deferred<void>();
+    const allowContractCreate = deferred<void>();
+    api.getProjects = async () => [];
+    api.createProject = async () => {
+      contractCreateStarted.resolve();
+      await allowContractCreate.promise;
+      throw new Error("stop contract after exclusivity assertion");
+    };
+
+    const contract = service.runDidaWriteContractTest();
+    await contractCreateStarted.promise;
+    const activation = vi.fn(async () => undefined);
+    await expect(service.withProjectProjectionActivationLease(activation))
+      .rejects.toThrow(/合同测试正在运行|远端访问正在进行/);
+    expect(activation).not.toHaveBeenCalled();
+    allowContractCreate.resolve();
+    await contract;
+  });
+
   it("blocks a new contract before any remote call while cleanup is pending", async () => {
     const { service, store } = await serviceFixture();
     const api = serviceApi(service);

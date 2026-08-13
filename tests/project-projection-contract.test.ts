@@ -17,6 +17,16 @@ describe("Dida project projection contract probe", () => {
     expect([...harness.tasks.values()]).toEqual([]);
   });
 
+  it("accepts collection absence when the task detail endpoint still returns a deleted ghost", async () => {
+    const harness = createHarness();
+    harness.keepDeletedDetailGhost = true;
+
+    await runDidaProjectProjectionContractProbe(harness.context);
+
+    expect(harness.tracked).toEqual([]);
+    expect([...harness.tasks.values()]).toEqual([]);
+  });
+
   it("marks an unknown create before refusing to continue", async () => {
     const harness = createHarness();
     harness.failNextCreateUnknown = true;
@@ -42,6 +52,8 @@ function createHarness() {
   let counter = 0;
   let untrackedCreates = 0;
   let failNextCreateUnknown = false;
+  let keepDeletedDetailGhost = false;
+  const deletedGhosts = new Map<string, DidaTask>();
   const api = {
     createTask: async (draft: Partial<DidaTask> & Pick<DidaTask, "title" | "projectId">) => {
       if (failNextCreateUnknown) {
@@ -59,7 +71,7 @@ function createHarness() {
       return structuredClone(task);
     },
     getTask: async (projectId: string, taskId: string) => {
-      const task = tasks.get(taskId);
+      const task = tasks.get(taskId) ?? deletedGhosts.get(taskId);
       if (!task || task.projectId !== projectId) {
         throw new DidaHttpError("permanent", "not found", 404);
       }
@@ -81,7 +93,14 @@ function createHarness() {
       const current = tasks.get(taskId);
       if (!current || current.projectId !== projectId) throw new DidaHttpError("permanent", "not found", 404);
       tasks.delete(taskId);
+      if (keepDeletedDetailGhost) deletedGhosts.set(taskId, structuredClone(current));
     },
+    getProjectData: async (projectId: string) => ({
+      project: structuredClone(project),
+      tasks: [...tasks.values()].filter((task) => task.projectId === projectId)
+        .map((task) => structuredClone(task)),
+      columns: [structuredClone(column)],
+    }),
   } as unknown as ContractApi;
   const context: DidaProjectProjectionContractContext = {
     api,
@@ -105,5 +124,7 @@ function createHarness() {
     get untrackedCreates() { return untrackedCreates; },
     get failNextCreateUnknown() { return failNextCreateUnknown; },
     set failNextCreateUnknown(value: boolean) { failNextCreateUnknown = value; },
+    get keepDeletedDetailGhost() { return keepDeletedDetailGhost; },
+    set keepDeletedDetailGhost(value: boolean) { keepDeletedDetailGhost = value; },
   };
 }

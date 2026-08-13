@@ -145,9 +145,6 @@ export async function runDidaProjectProjectionContractProbe(
   if (removed.deletedActions !== 1 || removed.frozen.length > 0) {
     throw new Error("项目投影合同未唯一删除行动子任务");
   }
-  if (await pipeline.rereadTask(target.targetProjectId, action.remoteId)) {
-    throw new Error("项目投影合同删除后真实子任务仍存在");
-  }
   await pipeline.deleteParentTask(parentId, target, projectId);
 }
 
@@ -278,8 +275,9 @@ class ContractProjectionPipeline implements ProjectionTaskPipeline {
       if (!isUnknown(error)) throw error;
       unknown = error;
     }
-    const remaining = await this.rereadTask(expected.targetProjectId, expected.taskId);
-    if (remaining) {
+    // 滴答的精确详情端点在删除后可能短暂返回旧对象；生产删除同样以清单开放任务
+    // 集合为权威不存在性证明，避免把已成功删除误判为失败后要求人工处理。
+    if (!await this.absentFromOpenCollection(expected.targetProjectId, expected.taskId)) {
       return { operationId, outcome: unknown ? "unknown" : "retryable", message: "项目投影合同删除后任务仍存在" };
     }
     await this.context.untrackTask(expected.taskId);
@@ -312,10 +310,16 @@ class ContractProjectionPipeline implements ProjectionTaskPipeline {
       if (!isUnknown(error)) throw error;
       unknown = error;
     }
-    if (await this.rereadTask(target.targetProjectId, taskId)) {
+    if (!await this.absentFromOpenCollection(target.targetProjectId, taskId)) {
       throw unknown ?? new Error("项目投影合同父任务删除后仍存在");
     }
     await this.context.untrackTask(taskId);
+  }
+
+  private async absentFromOpenCollection(projectId: string, taskId: string): Promise<boolean> {
+    const data = await this.context.api.getProjectData(projectId);
+    if (!Array.isArray(data.tasks)) throw new Error("项目投影合同任务集合返回值无效");
+    return !data.tasks.map(normalizeTask).some((candidate) => candidate.id === taskId);
   }
 }
 

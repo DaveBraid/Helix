@@ -931,11 +931,16 @@ export default class HelixPlugin extends Plugin {
       await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
       await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
     });
+    const readiness = await this.service.projectProjectionWriteReadiness();
+    this.projectAutoSync.updateReadiness(
+      PROJECT_DIDA_PROJECTION_AVAILABLE && readiness.ready,
+    );
     this.projectAutoSync.request(true);
   }
 
   async disableProjectProjection(): Promise<void> {
     await this.withWritableProjectMutation(() => this.projectProjection.disable());
+    this.projectAutoSync.updateReadiness(false);
   }
 
   previewProjectProjectionColumn(projectId: string): Promise<ProjectionColumnCreationPreview> {

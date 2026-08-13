@@ -1,7 +1,7 @@
 # 当前开发状态
 
 最后更新：2026-08-13
-当前基线提交：`9c58afa fix: require active projection before auto sync`（分支 `dev`）
+当前基线提交：`4b032ec fix: refresh auto sync readiness on activation`（分支 `dev`）
 工作树状态：仅本状态快照待提交。
 当前阶段：普通任务恢复矩阵已收口；v13 第三次实测暴露并修复 Vault 自写监听竞态，等待后续最终复验。
 
@@ -33,7 +33,7 @@
 - 冲突应用与未知恢复在离线时零远端访问；冲突中心显示脱敏限流状态。
 - schema 1 未知写入迁移后仍保留 `reconciliation`、尝试次数和未知标记；旧未版本化项目投影保持禁用。
 - Vault 投影同步纳入自写 quiet-window，避免 Markdown 回填被自身监听误判为竞争。
-- 后台同步要求投影已版本化启用且 readiness=true；否则零扫描。成功按批次通知一次，回填扫描不重复提示。
+- 后台同步要求投影已版本化启用且 readiness=true；否则零扫描。启停即时刷新闸门；成功按批次通知一次。
 
 ## 相关约束
 

@@ -404,7 +404,8 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/runVaultProjectProjectionContractProbe[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(input\)[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(secondInput\)/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*localProjectTasks\.snapshot[\s\S]*adoptUnmanaged: true[\s\S]*projectAutoSync\.request\(\)/);
-    expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);
+    expect(main).toMatch(/confirmProjectProjection[\s\S]*projectProjectionWriteReadiness\(\)[\s\S]*projectAutoSync\.updateReadiness[\s\S]*projectAutoSync\.request\(true\)/);
+    expect(main).toMatch(/disableProjectProjection[\s\S]*projectProjection\.disable\(\)[\s\S]*projectAutoSync\.updateReadiness\(false\)/);
     expect(main).toMatch(/previewProjectProjection[\s\S]*localProjectTasks\.snapshot\(snapshot, \{ adoptUnmanaged: true \}\)[\s\S]*projectionCounts/);
     expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && readiness\.ready/);
     expect(main).toMatch(/reportProjectAutoSync[\s\S]*report\.mutations > 0[\s\S]*滴答项目同步完成/);

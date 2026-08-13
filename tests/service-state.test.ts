@@ -68,6 +68,7 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
   const project: DidaProject = { id: "contract-list", name: "Contract", viewMode: "kanban" };
   const column = { id: "contract-column", projectId: project.id, name: "Contract" };
   const remote = new Map<string, DidaTask>();
+  const lifecycle: string[] = [];
   let sequence = 0;
   const contractApi = {
     async createTask(task: DidaTask) {
@@ -79,6 +80,20 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
       const task = remote.get(taskId);
       if (!task || task.projectId !== projectId) return [];
       return structuredClone(task);
+    },
+    async updateTask(taskId: string, patch: Partial<DidaTask>) {
+      const task = remote.get(taskId);
+      if (!task) throw new Error("missing task");
+      const updated = { ...task, ...structuredClone(patch), id: task.id, projectId: task.projectId };
+      remote.set(taskId, updated);
+      lifecycle.push(patch.status === 0 ? "reopen" : "update");
+      return structuredClone(updated);
+    },
+    async completeTask(projectId: string, taskId: string) {
+      const task = remote.get(taskId);
+      if (!task || task.projectId !== projectId) throw new Error("missing task");
+      remote.set(taskId, { ...task, status: 2, completedTime: new Date().toISOString() });
+      lifecycle.push("complete");
     },
     async deleteTask(projectId: string, taskId: string) {
       if (remote.get(taskId)?.projectId !== projectId) throw new Error("wrong project");
@@ -120,6 +135,7 @@ it("runs the contract-only project probe through OfflineQueue and removes its re
 
   expect(tracked).toEqual([]);
   expect([...remote.values()]).toEqual([]);
+  expect(lifecycle).toEqual(["update", "complete", "reopen"]);
   expect(persisted.queue).toEqual([]);
   expect(persisted.projectionOperationReceipts).toEqual([]);
 });
@@ -660,7 +676,8 @@ describe("HelixService runtime recovery", () => {
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
     });
-    expect(service.didaWriteContractRuntimeSummary()).toMatch(/合同版本 11.*本次插件运行尚未执行合同测试/);
+    expect(service.didaWriteContractRuntimeSummary()).toContain(`合同版本 ${DIDA_CONTRACT_PROBE_VERSION}`);
+    expect(service.didaWriteContractRuntimeSummary()).toContain("本次插件运行尚未执行合同测试");
     expect(service.didaWriteContractRuntimeSummary()).not.toContain("token");
   });
 

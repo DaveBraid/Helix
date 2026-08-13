@@ -107,8 +107,8 @@ import {
 import { PROJECT_DIDA_PROJECTION_AVAILABLE } from "../release-capabilities";
 
 const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;
-// v11 再加入生产 OfflineQueue 创建／删除及收据闭环；预算只供本轮唯一合同对象。
-const DIDA_CONTRACT_REQUEST_BUDGET = 190;
+// v12 覆盖生产 OfflineQueue 创建／更新／完成／重开／删除及收据闭环；预算只供本轮唯一合同对象。
+const DIDA_CONTRACT_REQUEST_BUDGET = 210;
 
 export interface HelixRuntimeState {
   loading: boolean;
@@ -1821,18 +1821,43 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         throw new Error("项目同步生产队列创建未取得已验证收据");
       }
       await context.trackTask(create.task);
+      const updated = await this.enqueueProjectionUpdate({
+        ...create.task,
+        title: `${context.marker} 生产队列已编辑`,
+        priority: 3,
+      }, ["title", "priority"]);
+      if (updated.outcome !== "verified" || !updated.task ||
+        updated.task.title !== `${context.marker} 生产队列已编辑` || updated.task.priority !== 3) {
+        throw new Error("项目同步生产队列更新未取得已验证收据");
+      }
+      const completed = await this.enqueueProjectionComplete({
+        ...updated.task,
+        status: 2,
+        completedTime: new Date().toISOString(),
+      });
+      if (completed.outcome !== "verified" || !completed.task || completed.task.status !== 2) {
+        throw new Error("项目同步生产队列完成未取得已验证收据");
+      }
+      const reopened = await this.enqueueProjectionReopen({
+        ...completed.task,
+        status: 0,
+        completedTime: null,
+      });
+      if (reopened.outcome !== "verified" || !reopened.task || reopened.task.status === 2) {
+        throw new Error("项目同步生产队列重开未取得已验证收据");
+      }
       const deleted = await this.enqueueProjectionDelete({
-        taskId: create.task.id,
-        parentTaskId: create.task.parentId ?? "",
+        taskId: reopened.task.id,
+        parentTaskId: reopened.task.parentId ?? "",
         targetProjectId: context.project.id,
         targetColumnId: context.column.id,
         marker,
       });
       if (deleted.outcome !== "verified-absent") {
-        if (deleted.outcome === "unknown") await context.markTaskDeleteUnknown(create.task.id);
+        if (deleted.outcome === "unknown") await context.markTaskDeleteUnknown(reopened.task.id);
         throw new Error("项目同步生产队列删除未取得不存在性收据");
       }
-      await context.untrackTask(create.task.id);
+      await context.untrackTask(reopened.task.id);
       await this.store.mutate((data) => {
         data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
           receipt.clientIdentity !== clientIdentity && receipt.marker !== marker);

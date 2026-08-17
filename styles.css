@@ -4703,8 +4703,7 @@
   cursor: pointer;
 }
 .helix-lineage-edge.is-selected { stroke-width: 4; }
-.helix-lineage-edge.is-other-project,
-.helix-lineage-edge-label.is-other-project { opacity: .28; }
+.helix-lineage-edge.is-other-project { opacity: .28; }
 .helix-lineage-edge.is-inherit { stroke: var(--helix-relation-inherit); }
 .helix-lineage-edge.is-branch { stroke: var(--helix-relation-branch); }
 .helix-lineage-edge.is-merge { stroke: var(--helix-relation-merge); }
@@ -4717,22 +4716,6 @@
 .helix-lineage-edges marker[id$="inherit"] path { fill: var(--helix-relation-inherit); }
 .helix-lineage-edges marker[id$="branch"] path { fill: var(--helix-relation-branch); }
 .helix-lineage-edges marker[id$="merge"] path { fill: var(--helix-relation-merge); }
-
-.helix-lineage-edge-label {
-  stroke: var(--background-primary);
-  stroke-width: 6px;
-  paint-order: stroke fill;
-  font-size: 11px;
-  font-weight: 650;
-  text-anchor: middle;
-  pointer-events: auto;
-  cursor: pointer;
-}
-.helix-lineage-edge-label.is-selected { font-weight: 800; }
-
-.helix-lineage-edge-label.is-inherit { fill: var(--helix-relation-inherit); }
-.helix-lineage-edge-label.is-branch { fill: var(--helix-relation-branch); }
-.helix-lineage-edge-label.is-merge { fill: var(--helix-relation-merge); }
 
 .helix-lineage-edge-insert {
   opacity: 0;

@@ -2203,42 +2203,6 @@ export class ProjectLineageWorkbench {
           });
           this.svg.appendChild(insert);
         }
-        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        label.classList.add(
-          "helix-lineage-edge-label",
-          `is-${relation.kind}`,
-          ...(this.selectedRelationId === relation.id ? ["is-selected"] : []),
-          ...(this.isProjectedEdgeOutsideSelection(item.sourceId, item.targetId)
-            ? ["is-other-project"]
-            : []),
-        );
-        label.setAttribute("data-relation-id", item.aggregate ? "" : relation.id);
-        label.setAttribute("role", "button");
-        label.setAttribute("tabindex", "0");
-        label.setAttribute(
-          "aria-label",
-          item.aggregate
-            ? `展开后查看 ${item.count} 条聚合关系`
-            : `管理${CYCLE_RELATION_LABELS[relation.kind]}关系`,
-        );
-        label.setAttribute("x", String((start.x + end.x) / 2));
-        label.setAttribute("y", String((start.y + end.y) / 2 - 10));
-        label.textContent = `${CYCLE_RELATION_LABELS[relation.kind]}${
-          item.aggregate && item.count > 1 ? ` ×${item.count}` : ""
-        }`;
-        label.addEventListener("click", (event) => {
-          event.stopPropagation();
-          if (item.aggregate) this.expandProjectedRelation(item.foldedProjectIds);
-          else this.selectRelation(relation.id);
-        });
-        label.addEventListener("keydown", (event) => {
-          if (event.key !== "Enter" && event.key !== " ") return;
-          event.preventDefault();
-          event.stopPropagation();
-          if (item.aggregate) this.expandProjectedRelation(item.foldedProjectIds);
-          else this.selectRelation(relation.id);
-        });
-        this.svg.appendChild(label);
       }
     }
     if (this.connectionPreview) {
@@ -2538,7 +2502,7 @@ export class ProjectLineageWorkbench {
       const target = event.target instanceof Element ? event.target : null;
       if (target?.closest(
         "button, .helix-lineage-card, .helix-lineage-edge, " +
-          ".helix-lineage-edge-label, .helix-lineage-project-container-header",
+          ".helix-lineage-project-container-header",
       )) return;
       const projectId = this.projectIdAtPoint(
         this.viewportLogicalPoint(event, viewport),
@@ -2555,7 +2519,7 @@ export class ProjectLineageWorkbench {
       );
       const surface: LineagePointerSurface = target?.closest("button")
         ? "button"
-        : target?.closest(".helix-lineage-edge, .helix-lineage-edge-label")
+        : target?.closest(".helix-lineage-edge")
           ? "edge"
           : target?.closest(".helix-lineage-card")
             ? "card"

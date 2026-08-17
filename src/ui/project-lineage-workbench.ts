@@ -2146,18 +2146,24 @@ export class ProjectLineageWorkbench {
             ? `展开后查看 ${item.count} 条聚合关系`
             : `管理${CYCLE_RELATION_LABELS[relation.kind]}关系`,
         );
-        path.setAttribute(
-          "d",
-          `M ${start.x} ${start.y} C ${start.x + bend} ${start.y}, ${
-            end.x - bend
-          } ${end.y}, ${end.x} ${end.y}`,
-        );
+        const pathData = `M ${start.x} ${start.y} C ${start.x + bend} ${start.y}, ${
+          end.x - bend
+        } ${end.y}, ${end.x} ${end.y}`;
+        path.setAttribute("d", pathData);
         path.setAttribute("marker-end", `url(#${this.markerId}-${relation.kind})`);
-        path.addEventListener("click", (event) => {
+        const selectEdge = (event: Event): void => {
           event.stopPropagation();
           if (item.aggregate) this.expandProjectedRelation(item.foldedProjectIds);
           else this.selectRelation(relation.id);
-        });
+        };
+        if (!item.aggregate) {
+          const hitPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+          hitPath.classList.add("helix-lineage-edge-hit");
+          hitPath.setAttribute("d", pathData);
+          hitPath.addEventListener("click", selectEdge);
+          this.svg.appendChild(hitPath);
+        }
+        path.addEventListener("click", selectEdge);
         path.addEventListener("keydown", (event) => {
           if (event.key !== "Enter" && event.key !== " ") return;
           event.preventDefault();

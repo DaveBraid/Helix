@@ -4689,6 +4689,13 @@
 }
 
 .helix-lineage-project-container-fold svg { width: 13px; height: 13px; }
+.helix-lineage-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+  pointer-events: stroke;
+  cursor: pointer;
+}
 .helix-lineage-edge {
   fill: none;
   stroke-width: 2.2;
@@ -4733,6 +4740,7 @@
   cursor: pointer;
   transition: opacity .16s ease;
 }
+.helix-lineage-edge-hit:hover ~ .helix-lineage-edge-insert,
 .helix-lineage-edge:hover + .helix-lineage-edge-insert,
 .helix-lineage-edge:focus-visible + .helix-lineage-edge-insert,
 .helix-lineage-edge-insert:hover,
@@ -4741,13 +4749,13 @@
   pointer-events: all;
 }
 .helix-lineage-edge-insert circle {
-  fill: var(--background-primary);
-  stroke: var(--interactive-accent);
+  fill: color-mix(in srgb, var(--background-primary) 88%, var(--text-muted));
+  stroke: var(--text-faint);
   stroke-width: 1.5;
 }
 .helix-lineage-edge-insert > path {
   fill: none;
-  stroke: var(--interactive-accent);
+  stroke: var(--text-muted);
   stroke-linecap: round;
   stroke-width: 1.8;
 }

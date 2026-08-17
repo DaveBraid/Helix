@@ -83,4 +83,22 @@ describe("阶段展示编号", () => {
       { kind: "inherit", fromCycleIds: ["inserted"], toCycleId: "old-target" },
     ]))).toEqual({ root: "1", inserted: "2", "old-target": "3" });
   });
+
+  it("在分支边中插入时接管原目标的小编号", () => {
+    expect(Object.fromEntries(maintainedStageCodes([
+      { id: "root", sequence: 1, code: "1" },
+      { id: "old-left", sequence: 2, code: "2.1" },
+      { id: "right", sequence: 3, code: "2.2" },
+      { id: "inserted", sequence: 4, code: "2.3" },
+    ], [
+      { kind: "branch", fromCycleIds: ["root"], toCycleId: "inserted" },
+      { kind: "branch", fromCycleIds: ["root"], toCycleId: "right" },
+      { kind: "inherit", fromCycleIds: ["inserted"], toCycleId: "old-left" },
+    ], new Map([["inserted", 1]])))).toEqual({
+      root: "1",
+      inserted: "2.1",
+      right: "2.2",
+      "old-left": "3",
+    });
+  });
 });

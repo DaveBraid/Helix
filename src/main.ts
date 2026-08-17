@@ -70,7 +70,7 @@ import {
   PROJECT_STATUS_LABELS,
   STAGE_STATUS_LABELS,
 } from "./domain/project-status";
-import { maintainedStageCodes } from "./domain/stage-numbering";
+import { maintainedStageCodes, parseStageCode } from "./domain/stage-numbering";
 import { activeHelixStatusTarget, type ActiveHelixStatusTarget } from "./domain/active-project-status";
 import { HelixSettingTab } from "./ui/settings-tab";
 import { DidaWriteContractConfirmationGate } from "./ui/dida-write-contract-confirmation";
@@ -1256,7 +1256,11 @@ export default class HelixPlugin extends Plugin {
             relationId,
             nextPredecessors.length > 1 ? "merge" : "inherit",
             nextPredecessors,
-            { confirmCrossProject: true },
+            {
+              confirmCrossProject: true,
+              insertedPredecessorId: next.id,
+              insertedBranchRank: parseStageCode(target.stageCode)?.branch,
+            },
           );
           if (next.status !== target.status) {
             const plan = await this.projectWorkspace.prepareCycleStatusUpdate(next.id);

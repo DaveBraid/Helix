@@ -3046,7 +3046,11 @@ export class ProjectWorkspaceService {
     relationId: string,
     kind: CycleRelationKind,
     predecessorIds: string[],
-    options: { confirmCrossProject?: boolean } = {},
+    options: {
+      confirmCrossProject?: boolean;
+      insertedPredecessorId?: string;
+      insertedBranchRank?: number;
+    } = {},
   ): Promise<ProjectWorkspaceSnapshot> {
     return this.mutateRelation(
       relationId,
@@ -4025,7 +4029,11 @@ export class ProjectWorkspaceService {
       kind: CycleRelationKind;
       fromCycleIds: string[];
     } | null,
-    options: { confirmCrossProject?: boolean } = {},
+    options: {
+      confirmCrossProject?: boolean;
+      insertedPredecessorId?: string;
+      insertedBranchRank?: number;
+    } = {},
   ): Promise<ProjectWorkspaceSnapshot> {
     const generation = this.beginOperation();
     const snapshot = await this.ensureCanvas();
@@ -4141,7 +4149,17 @@ export class ProjectWorkspaceService {
     const targetOwner = snapshot.projects.find((project) =>
       project.cycles.some((cycle) => cycle.id === current.toCycleId));
     if (!targetOwner) throw new Error("找不到关系目标所属项目");
-    const maintainedCodes = maintainedStageCodes(targetOwner.cycles, normalized.relations);
+    const targetCycle = targetOwner.cycles.find((cycle) => cycle.id === current.toCycleId)!;
+    const preservedBranchRank = options.insertedBranchRank ??
+      parseStageCode(targetCycle.stageCode)?.branch;
+    const branchRankHints = options.insertedPredecessorId && preservedBranchRank
+      ? new Map([[options.insertedPredecessorId, preservedBranchRank]])
+      : new Map<string, number>();
+    const maintainedCodes = maintainedStageCodes(
+      targetOwner.cycles,
+      normalized.relations,
+      branchRankHints,
+    );
     canvas.document.helixStageCodes = replaceProjectStageCodes(
       canvas.document,
       targetOwner.id,

@@ -92,6 +92,7 @@ export function nextBranchStageCodes(
 export function maintainedStageCodes(
   stages: readonly MaintainedStageCodeCandidate[],
   relations: readonly StageCodeRelation[],
+  branchRankHints: ReadonlyMap<string, number> = new Map(),
 ): Map<string, string> {
   const sequenceOrdered = [...stages].sort((left, right) =>
     left.sequence - right.sequence || left.id.localeCompare(right.id));
@@ -152,8 +153,16 @@ export function maintainedStageCodes(
   }
   const sequenceById = new Map(sequenceOrdered.map((stage) => [stage.id, stage.sequence] as const));
   for (const targets of branchTargets.values()) {
-    targets.sort((left, right) =>
-      (sequenceById.get(left) ?? 0) - (sequenceById.get(right) ?? 0) || left.localeCompare(right));
+    targets.sort((left, right) => {
+      const leftStage = stageById.get(left);
+      const rightStage = stageById.get(right);
+      const leftRank = branchRankHints.get(left) ?? parseStageCode(leftStage?.code)?.branch;
+      const rightRank = branchRankHints.get(right) ?? parseStageCode(rightStage?.code)?.branch;
+      return (leftRank ?? Number.MAX_SAFE_INTEGER) -
+          (rightRank ?? Number.MAX_SAFE_INTEGER) ||
+        (sequenceById.get(left) ?? 0) - (sequenceById.get(right) ?? 0) ||
+        left.localeCompare(right);
+    });
   }
 
   const result = new Map<string, string>();

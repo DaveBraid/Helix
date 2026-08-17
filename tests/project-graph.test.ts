@@ -205,6 +205,21 @@ describe("project graph presentation", () => {
       });
   });
 
+  it("treats a fixed project container as one occupied unit", () => {
+    const layout = planProjectGraphLayout(
+      [{ id: "fixed", x: 0, y: 0 }, { id: "moving", x: 0, y: 0 }],
+      [
+        { id: "fixed-top", projectId: "fixed", sequence: 1, x: 408, y: 0 },
+        { id: "fixed-bottom", projectId: "fixed", sequence: 2, x: 408, y: 600 },
+        { id: "moving", projectId: "moving", sequence: 1, x: 408, y: 260 },
+      ],
+      [],
+      new Set(["moving"]),
+    );
+    expect(layout.stages.find((stage) => stage.id === "moving")!.y)
+      .toBeGreaterThan(728);
+  });
+
   it("orders visible project lanes from stage positions, never hidden project anchors", () => {
     const layout = planProjectGraphLayout(
       [

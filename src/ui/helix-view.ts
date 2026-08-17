@@ -260,11 +260,19 @@ export class HelixView extends ItemView {
         sourceCycleIds: string[],
         onCreated?: (cycleId: string) => void,
       ) => void;
+      insertCycle: (
+        relationId: string,
+        sourceCycleId: string,
+        targetCycleId: string,
+        projectId: string,
+        onCreated?: (cycleId: string) => void,
+      ) => void;
       deleteCycle: (cycleId: string, onDeleted?: (focusEntityId: string) => void) => void;
       deleteProject: (projectId: string, onDeleted?: () => void) => void;
       renameProject: (
         projectId: string,
         currentTitle: string,
+        currentColor: string,
         onRenamed?: () => void,
       ) => void;
       renameCycle: (
@@ -2580,8 +2588,8 @@ export class HelixView extends ItemView {
         this.selectedProjectId = workspace.projects.find((project) => project.id !== projectId)?.id ?? null;
         void this.render();
       }),
-      onRenameProject: (projectId, currentTitle) =>
-        this.actions.renameProject(projectId, currentTitle, () => void this.render()),
+      onRenameProject: (projectId, currentTitle, currentColor) =>
+        this.actions.renameProject(projectId, currentTitle, currentColor, () => void this.render()),
       onRenameCycle: (cycleId, currentTitle) =>
         this.actions.renameCycle(cycleId, currentTitle, () => void this.render()),
       onOpenNote: (path) => {
@@ -2605,6 +2613,14 @@ export class HelixView extends ItemView {
         (nextFocusEntityId) =>
           this.requestLineageFocus(nextFocusEntityId, lifecycleGeneration),
       ),
+      onInsertCycle: (relationId, sourceCycleId, targetCycleId, projectId) =>
+        this.actions.insertCycle(
+          relationId,
+          sourceCycleId,
+          targetCycleId,
+          projectId,
+          (cycleId) => this.requestLineageFocus(cycleId, lifecycleGeneration),
+        ),
       onConnectCycles: (sourceCycleId, targetCycleId) =>
         void this.openConnection(
           sourceCycleId,

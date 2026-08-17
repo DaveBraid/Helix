@@ -267,12 +267,19 @@ export function planProjectGraphLayout(
     return { ...project, x: 0, y: Math.round((top + bottom) / 2) };
   });
   if (scope) {
-    const occupied = nextStages
-      .filter((stage) => !effectiveScope?.has(stage.id))
-      .flatMap((stage) => {
-        const box = projectStageContainerBox([stage]);
-        return box ? [box] : [];
-      });
+    // Fixed projects are collision units. Treating every card as a separate
+    // obstacle allowed a moving project's padded container to wrap around or
+    // overlap another project even when no cards intersected.
+    const fixedByProject = new Map<string, StageLayoutNode[]>();
+    for (const stage of nextStages.filter((candidate) => !effectiveScope?.has(candidate.id))) {
+      const group = fixedByProject.get(stage.projectId) ?? [];
+      group.push(stage);
+      fixedByProject.set(stage.projectId, group);
+    }
+    const occupied = [...fixedByProject.values()].flatMap((projectStages) => {
+      const box = projectStageContainerBox(projectStages);
+      return box ? [box] : [];
+    });
     for (const project of projectOrder.filter((item) => movingProjectIds.has(item.id))) {
       const movingStages = nextStages.filter((stage) =>
         stage.projectId === project.id && effectiveScope?.has(stage.id));

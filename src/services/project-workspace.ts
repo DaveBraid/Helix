@@ -4138,16 +4138,63 @@ export class ProjectWorkspaceService {
       physicalManagedEdges(canvas.document),
     );
     applyNormalizedManagedEdges(canvas.document, normalized.edges);
+    const targetOwner = snapshot.projects.find((project) =>
+      project.cycles.some((cycle) => cycle.id === current.toCycleId));
+    if (!targetOwner) throw new Error("找不到关系目标所属项目");
+    const maintainedCodes = maintainedStageCodes(targetOwner.cycles, normalized.relations);
+    canvas.document.helixStageCodes = replaceProjectStageCodes(
+      canvas.document,
+      targetOwner.id,
+      targetOwner.cycles.map((cycle) => maintainedCodes.get(cycle.id) ?? cycle.stageCode),
+    );
+    const focusUpdates = await this.focusMarkdownUpdates(
+      snapshot,
+      normalized.relations,
+      [current.toCycleId],
+    );
+    const markdownUpdates = new Map(focusUpdates.map((update) =>
+      [normalizePath(update.path), update] as const));
+    for (const cycle of targetOwner.cycles) {
+      const nextCode = maintainedCodes.get(cycle.id) ?? cycle.stageCode;
+      if (nextCode === cycle.stageCode) continue;
+      const path = normalizePath(cycle.notePath);
+      const revision = await this.repository.read(path);
+      const existing = markdownUpdates.get(path);
+      if (!revision || (existing && existing.beforeHash !== revision.hash)) {
+        throw new Error(`阶段编号维护前 Markdown 已变化：${path}`);
+      }
+      const frontmatter = frontmatterFromContent(revision.content);
+      const currentCode = managedFrontmatterString(revision.content, "helix-stage-code");
+      if (
+        frontmatter?.["helix-id"] !== cycle.id ||
+        frontmatter["helix-project-id"] !== targetOwner.id ||
+        (currentCode.present
+          ? currentCode.value !== cycle.stageCode
+          : cycle.stageCode !== String(cycle.sequence))
+      ) {
+        throw new Error(`阶段编号维护前身份或展示编号已变化：${path}`);
+      }
+      markdownUpdates.set(path, {
+        path,
+        kind: "stage",
+        entityId: cycle.id,
+        projectId: targetOwner.id,
+        beforeHash: revision.hash,
+        afterContent: rewriteManagedStageHeading(
+          patchManagedFrontmatter(existing?.afterContent ?? revision.content, {
+            "helix-stage-code": nextCode,
+          }),
+          cycle.stageCode,
+          nextCode,
+        ),
+      });
+    }
     this.assertActive(generation);
     return this.applyAtomicWorkspaceChange({
       label: replacement ? "修改阶段关系" : "删除阶段关系",
       canvasBeforeHash: canvas.revision.hash,
       canvasAfterContent: JSON.stringify(canvas.document, null, 2),
-      markdownUpdates: await this.focusMarkdownUpdates(
-        snapshot,
-        normalized.relations,
-        [current.toCycleId],
-      ),
+      markdownUpdates: [...markdownUpdates.values()],
     });
   }
 

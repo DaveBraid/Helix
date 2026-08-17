@@ -93,9 +93,51 @@ export function maintainedStageCodes(
   stages: readonly MaintainedStageCodeCandidate[],
   relations: readonly StageCodeRelation[],
 ): Map<string, string> {
-  const ordered = [...stages].sort((left, right) =>
+  const sequenceOrdered = [...stages].sort((left, right) =>
     left.sequence - right.sequence || left.id.localeCompare(right.id));
-  const stageIds = new Set(ordered.map((stage) => stage.id));
+  const stageIds = new Set(sequenceOrdered.map((stage) => stage.id));
+  const stageById = new Map(sequenceOrdered.map((stage) => [stage.id, stage] as const));
+  const indegree = new Map<string, number>(
+    sequenceOrdered.map((stage) => [stage.id, 0]),
+  );
+  const outgoing = new Map<string, string[]>();
+  for (const relation of relations) {
+    if (!stageIds.has(relation.toCycleId)) continue;
+    for (const sourceId of relation.fromCycleIds) {
+      if (!stageIds.has(sourceId)) continue;
+      indegree.set(relation.toCycleId, (indegree.get(relation.toCycleId) ?? 0) + 1);
+      const targets = outgoing.get(sourceId) ?? [];
+      targets.push(relation.toCycleId);
+      outgoing.set(sourceId, targets);
+    }
+  }
+  const compareIds = (left: string, right: string): number => {
+    const a = stageById.get(left)!;
+    const b = stageById.get(right)!;
+    return a.sequence - b.sequence || a.id.localeCompare(b.id);
+  };
+  const queue = [...indegree].filter(([, count]) => count === 0)
+    .map(([id]) => id).sort(compareIds);
+  const ordered: MaintainedStageCodeCandidate[] = [];
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    ordered.push(stageById.get(id)!);
+    for (const target of outgoing.get(id) ?? []) {
+      const next = (indegree.get(target) ?? 0) - 1;
+      indegree.set(target, next);
+      if (next === 0) {
+        queue.push(target);
+        queue.sort(compareIds);
+      }
+    }
+  }
+  // Graph validation normally guarantees this cannot happen; keep numbering
+  // deterministic and non-destructive if called while recovery data is dirty.
+  if (ordered.length !== sequenceOrdered.length) {
+    for (const stage of sequenceOrdered) {
+      if (!ordered.some((candidate) => candidate.id === stage.id)) ordered.push(stage);
+    }
+  }
   const incoming = new Map(relations
     .filter((relation) => stageIds.has(relation.toCycleId))
     .map((relation) => [relation.toCycleId, relation] as const));
@@ -108,7 +150,7 @@ export function maintainedStageCodes(
     targets.push(relation.toCycleId);
     branchTargets.set(sourceId, targets);
   }
-  const sequenceById = new Map(ordered.map((stage) => [stage.id, stage.sequence] as const));
+  const sequenceById = new Map(sequenceOrdered.map((stage) => [stage.id, stage.sequence] as const));
   for (const targets of branchTargets.values()) {
     targets.sort((left, right) =>
       (sequenceById.get(left) ?? 0) - (sequenceById.get(right) ?? 0) || left.localeCompare(right));

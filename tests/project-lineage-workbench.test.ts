@@ -27,6 +27,7 @@ import {
   lineageLassoSelectionState,
   lineageSelectionBox,
   lineageShouldFocusOnDoubleClick,
+  lineageShiftAlignedPoint,
   lineageStructuralEntityIds,
   lineageViewportPointerIntent,
   lineageVirtualExpansionPlan,
@@ -72,6 +73,19 @@ describe("Project Lineage arrange scope", () => {
       kind: "disabled",
       reason: "cross-project",
     });
+  });
+});
+
+describe("Project Lineage Shift alignment", () => {
+  it("snaps position axes independently inside the threshold", () => {
+    expect(lineageShiftAlignedPoint(
+      { x: 108, y: 294 },
+      [{ x: 100, y: 300 }, { x: 500, y: 700 }],
+    )).toEqual({ x: 100, y: 300 });
+    expect(lineageShiftAlignedPoint(
+      { x: 120, y: 280 },
+      [{ x: 100, y: 300 }],
+    )).toEqual({ x: 120, y: 280 });
   });
 });
 

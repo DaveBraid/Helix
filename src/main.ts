@@ -70,6 +70,7 @@ import {
   PROJECT_STATUS_LABELS,
   STAGE_STATUS_LABELS,
 } from "./domain/project-status";
+import { maintainedStageCodes } from "./domain/stage-numbering";
 import { activeHelixStatusTarget, type ActiveHelixStatusTarget } from "./domain/active-project-status";
 import { HelixSettingTab } from "./ui/settings-tab";
 import { DidaWriteContractConfirmationGate } from "./ui/dida-write-contract-confirmation";
@@ -288,11 +289,19 @@ export default class HelixPlugin extends Plugin {
         createProject: (onCreated) => this.showCreateProjectModal(onCreated),
         createCycle: (projectId, sourceCycleIds, onCreated) =>
           this.showCreateCycleModal(projectId, sourceCycleIds, onCreated),
+        insertCycle: (relationId, sourceCycleId, targetCycleId, projectId, onCreated) =>
+          this.showInsertCycleModal(
+            relationId,
+            sourceCycleId,
+            targetCycleId,
+            projectId,
+            onCreated,
+          ),
         deleteCycle: (cycleId, onDeleted) => this.showDeleteCycleModal(cycleId, onDeleted),
         deleteProject: (projectId, onDeleted) =>
           this.showDeleteProjectModal(projectId, onDeleted),
-        renameProject: (projectId, currentTitle, onRenamed) =>
-          this.showRenameProjectModal(projectId, currentTitle, onRenamed),
+        renameProject: (projectId, currentTitle, currentColor, onRenamed) =>
+          this.showRenameProjectModal(projectId, currentTitle, currentColor, onRenamed),
         renameCycle: (cycleId, currentTitle, onRenamed) =>
           this.showRenameCycleModal(cycleId, currentTitle, onRenamed),
         manageRelation: (relationId, onChanged) =>
@@ -1086,15 +1095,18 @@ export default class HelixPlugin extends Plugin {
   private showRenameProjectModal(
     projectId: string,
     currentTitle: string,
+    currentColor: string,
     onRenamed?: () => void,
   ): void {
-    new RenameEntityModal(this.app, "项目", currentTitle, async (title) => {
+    new EditProjectModal(this.app, currentTitle, currentColor, async (title, color) => {
       this.assertWritable();
-      await this.withWritableProjectMutation(() =>
-        this.projectWorkspace.renameProject(projectId, title));
+      await this.withWritableProjectMutation(async () => {
+        if (title !== currentTitle) await this.projectWorkspace.renameProject(projectId, title);
+        if (color !== currentColor) await this.projectWorkspace.updateProjectColor(projectId, color);
+      });
       await this.service.refreshPersistedEvents();
       onRenamed?.();
-      new Notice("项目名称已更新");
+      new Notice("项目名称与颜色已更新");
     }).open();
   }
 
@@ -1136,13 +1148,40 @@ export default class HelixPlugin extends Plugin {
         });
         const crossProject = sourceCycles.some((source) =>
           source.project.id !== project.id);
+        const previewId = "helix-stage-preview";
+        const projectCycleIds = new Set(project.cycles.map((cycle) => cycle.id));
+        const relations = snapshot.relations
+          .filter((relation) =>
+            projectCycleIds.has(relation.toCycleId) &&
+            relation.fromCycleIds.every((id) => projectCycleIds.has(id)))
+          .map((relation) => intent.convertedInheritanceRelationIds.includes(relation.id)
+            ? { ...relation, kind: "branch" as const }
+            : relation);
+        relations.push({
+          id: "preview",
+          kind: intent.relation,
+          fromCycleIds: intent.predecessorIds,
+          toCycleId: previewId,
+        });
+        const previewCode = maintainedStageCodes([
+          ...project.cycles.map((cycle) => ({
+            id: cycle.id,
+            code: cycle.stageCode,
+            sequence: cycle.sequence,
+          })),
+          {
+            id: previewId,
+            code: String(snapshot.nextStageSequenceByProject[project.id]!),
+            sequence: snapshot.nextStageSequenceByProject[project.id]!,
+          },
+        ], relations).get(previewId) ?? String(snapshot.nextStageSequenceByProject[project.id]!);
         new CyclePromptModal(
           this.app,
           project,
           sourceCycles,
           intent,
           crossProject,
-          snapshot.nextStageSequenceByProject[project.id]!,
+          previewCode,
           async (stageTitle, crossProjectConfirmed) => {
             this.assertWritable();
             const created = await this.withWritableProjectMutation(() =>
@@ -1169,6 +1208,67 @@ export default class HelixPlugin extends Plugin {
       .catch((error) => {
         new Notice(error instanceof Error ? error.message : String(error), 8_000);
       });
+  }
+
+  private showInsertCycleModal(
+    relationId: string,
+    sourceCycleId: string,
+    targetCycleId: string,
+    projectId: string,
+    onCreated?: (cycleId: string) => void,
+  ): void {
+    if (this.recoveryMode) {
+      new Notice("Helix 当前处于只读恢复模式，不能插入阶段", 8_000);
+      return;
+    }
+    void this.projectWorkspace.snapshot().then((snapshot) => {
+      const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+      const source = snapshot.projects.flatMap((candidate) => candidate.cycles)
+        .find((cycle) => cycle.id === sourceCycleId);
+      const target = project?.cycles.find((cycle) => cycle.id === targetCycleId);
+      const relation = snapshot.relations.find((candidate) => candidate.id === relationId);
+      if (!project || !source || !target || !relation ||
+          !relation.fromCycleIds.includes(sourceCycleId) || relation.toCycleId !== targetCycleId) {
+        throw new Error("关系已经变化，请重新点击箭头");
+      }
+      new InsertCycleModal(this.app, source, target, async (stageTitle) => {
+        this.assertWritable();
+        const created = await this.withWritableProjectMutation(async () => {
+          const intent = stageCreationIntent([sourceCycleId], snapshot.relations);
+          const next = await this.projectWorkspace.createCycle(
+            projectId,
+            "auto",
+            [sourceCycleId],
+            {
+              expectedAutoIntent: {
+                relation: intent.relation,
+                convertedInheritanceRelationIds: intent.convertedInheritanceRelationIds,
+              },
+              confirmCrossProject: sourceCycleId !== targetCycleId &&
+                !project.cycles.some((cycle) => cycle.id === sourceCycleId),
+              stageTitle,
+            },
+          );
+          const nextPredecessors = relation.kind === "merge"
+            ? relation.fromCycleIds.map((id) => id === sourceCycleId ? next.id : id)
+            : [next.id];
+          await this.projectWorkspace.replaceRelation(
+            relationId,
+            nextPredecessors.length > 1 ? "merge" : "inherit",
+            nextPredecessors,
+            { confirmCrossProject: true },
+          );
+          if (next.status !== target.status) {
+            const plan = await this.projectWorkspace.prepareCycleStatusUpdate(next.id);
+            await this.projectWorkspace.updateCycleStatus(plan, target.status);
+          }
+          return next;
+        });
+        await this.service.refreshPersistedEvents();
+        onCreated?.(created.id);
+        new Notice("新阶段已插入，前后关系已更新为推进");
+      }).open();
+    }).catch((error) => new Notice(error instanceof Error ? error.message : String(error), 8_000));
   }
 
   private showDeleteCycleModal(
@@ -1834,6 +1934,58 @@ class RenameEntityModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
+class EditProjectModal extends Modal {
+  private title: string;
+  private color: string;
+
+  constructor(
+    app: HelixPlugin["app"],
+    currentTitle: string,
+    currentColor: string,
+    private readonly submit: (title: string, color: string) => Promise<void>,
+  ) {
+    super(app);
+    this.title = currentTitle;
+    this.color = currentColor;
+  }
+
+  onOpen(): void {
+    this.setTitle("编辑项目");
+    let input: HTMLInputElement;
+    new Setting(this.contentEl).setName("项目名称").addText((text) => {
+      input = text.inputEl;
+      text.setValue(this.title).onChange((value) => { this.title = value; });
+    });
+    new Setting(this.contentEl).setName("项目颜色").addColorPicker((picker) => {
+      picker.setValue(this.color).onChange((value) => { this.color = value; });
+    });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { cls: "mod-cta", text: "保存" });
+    const save = (): void => {
+      const title = this.title.trim();
+      if (!title) {
+        new Notice("请输入项目名称");
+        return;
+      }
+      confirm.disabled = true;
+      void this.submit(title, this.color).then(() => this.close()).catch((error) => {
+        confirm.disabled = false;
+        new Notice(error instanceof Error ? error.message : String(error), 8_000);
+      });
+    };
+    confirm.addEventListener("click", save);
+    input!.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      save();
+    });
+    window.setTimeout(() => { input!.focus(); input!.select(); }, 0);
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
+
 class DeleteProjectModal extends Modal {
   private static readonly CONFIRMATION = "我确认删除该项目。";
   private confirmation = "";
@@ -1902,7 +2054,7 @@ class CyclePromptModal extends Modal {
     }>,
     private readonly intent: StageCreationIntent,
     private readonly crossProject: boolean,
-    private readonly nextStageSequence: number,
+    private readonly nextStageCode: string,
     private readonly submit: (
       stageTitle: string,
       crossProjectConfirmed: boolean,
@@ -1914,8 +2066,8 @@ class CyclePromptModal extends Modal {
   onOpen(): void {
     const singleSource = this.sources.length === 1 ? this.sources[0] : null;
     this.setTitle(this.intent.relation === "merge"
-      ? `合并为 ${this.project.title} / 阶段 ${this.nextStageSequence}`
-      : `添加阶段 ${this.nextStageSequence} · ${singleSource?.cycle.title ?? this.project.title}`);
+      ? `合并为 ${this.project.title} / 阶段 ${this.nextStageCode}`
+      : `添加阶段 ${this.nextStageCode} · ${singleSource?.cycle.title ?? this.project.title}`);
     if (this.project.cycles.length === 0) {
       this.contentEl.createDiv({
         cls: "helix-modal-note",
@@ -1931,7 +2083,7 @@ class CyclePromptModal extends Modal {
     relation.createSpan({ text: this.intentSummary() });
     new Setting(this.contentEl)
       .setName("阶段标题")
-      .setDesc(`序号将自动生成为“阶段 ${this.nextStageSequence}”`)
+      .setDesc(`展示编号将自动生成为“阶段 ${this.nextStageCode}”`)
       .addText((text) => {
         this.titleInput = text.inputEl;
         text.setPlaceholder("例如：验证基线实验").onChange((value) => {
@@ -1943,7 +2095,7 @@ class CyclePromptModal extends Modal {
     actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
     const confirm = actions.createEl("button", {
       cls: "mod-cta",
-      text: `创建阶段 ${this.nextStageSequence}`,
+      text: `创建阶段 ${this.nextStageCode}`,
     });
     const submitStage = (): void => {
       if (confirm.disabled) return;
@@ -2015,6 +2167,56 @@ class CyclePromptModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+class InsertCycleModal extends Modal {
+  private stageTitle = "";
+
+  constructor(
+    app: HelixPlugin["app"],
+    private readonly source: ProjectWorkspaceProject["cycles"][number],
+    private readonly target: ProjectWorkspaceProject["cycles"][number],
+    private readonly submit: (stageTitle: string) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("在推进关系中插入阶段");
+    this.contentEl.createDiv({
+      cls: "helix-modal-note",
+      text: `${this.source.title} → 新阶段 → ${this.target.title}`,
+    });
+    let input: HTMLInputElement;
+    new Setting(this.contentEl).setName("阶段标题").addText((text) => {
+      input = text.inputEl;
+      text.setPlaceholder("例如：补充验证").onChange((value) => { this.stageTitle = value; });
+    });
+    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { cls: "mod-cta", text: "插入阶段" });
+    const save = (): void => {
+      const title = this.stageTitle.trim();
+      if (!title) {
+        new Notice("请输入阶段标题");
+        return;
+      }
+      confirm.disabled = true;
+      void this.submit(title).then(() => this.close()).catch((error) => {
+        confirm.disabled = false;
+        new Notice(error instanceof Error ? error.message : String(error), 8_000);
+      });
+    };
+    confirm.addEventListener("click", save);
+    input!.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      save();
+    });
+    window.setTimeout(() => input!.focus(), 0);
+  }
+
+  onClose(): void { this.contentEl.empty(); }
 }
 
 class DeleteCycleModal extends Modal {

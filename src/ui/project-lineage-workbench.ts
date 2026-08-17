@@ -60,6 +60,24 @@ export interface LineageLayoutSnapshot {
   [entityId: string]: LineagePoint;
 }
 
+export function lineageShiftAlignedPoint(
+  moving: LineagePoint,
+  fixed: readonly LineagePoint[],
+  threshold = 10,
+): LineagePoint {
+  const snap = (value: number, candidates: number[]): number => {
+    const nearest = candidates.reduce<{ value: number; distance: number } | null>((best, item) => {
+      const distance = Math.abs(item - value);
+      return !best || distance < best.distance ? { value: item, distance } : best;
+    }, null);
+    return nearest && nearest.distance <= threshold ? nearest.value : value;
+  };
+  return {
+    x: snap(moving.x, fixed.map((point) => point.x)),
+    y: snap(moving.y, fixed.map((point) => point.y)),
+  };
+}
+
 export interface LineageLayoutDraft {
   canvasRevisionHash: string;
   positions: LineageLayoutSnapshot;
@@ -83,11 +101,17 @@ interface WorkbenchOptions {
   onCreateCycle: (projectId: string, sourceCycleIds: string[]) => void;
   onDeleteCycle: (cycleId: string) => void;
   onDeleteProject: (projectId: string) => void;
-  onRenameProject: (projectId: string, currentTitle: string) => void;
+  onRenameProject: (projectId: string, currentTitle: string, currentColor: string) => void;
   onRenameCycle: (cycleId: string, currentTitle: string) => void;
   onOpenNote: (path: string) => void;
   onSaveLayout: (moves: ProjectWorkspaceNodeMove[]) => Promise<void>;
   onManageRelation: (relationId: string) => void;
+  onInsertCycle: (
+    relationId: string,
+    sourceCycleId: string,
+    targetCycleId: string,
+    projectId: string,
+  ) => void;
   onConnectCycles: (sourceCycleId: string, targetCycleId: string) => void;
   onChooseConnectionTarget: (
     sourceCycleId: string,
@@ -903,6 +927,7 @@ export class ProjectLineageWorkbench {
   private undoButton: HTMLButtonElement | null = null;
   private redoButton: HTMLButtonElement | null = null;
   private arrangeButton: HTMLButtonElement | null = null;
+  private restoreLayoutButton: HTMLButtonElement | null = null;
   private saveLayoutButton: HTMLButtonElement | null = null;
   private layoutSavePending = false;
 
@@ -1102,6 +1127,12 @@ export class ProjectLineageWorkbench {
       text: "整理",
     });
     arrange.addEventListener("click", () => this.arrangeCurrentScope());
+    const restore = actions.createEl("button", {
+      cls: "helix-secondary-button",
+      text: "读取保存布局",
+      attr: { title: "放弃尚未保存的视图变化，恢复 Canvas 中最后保存的位置" },
+    });
+    restore.addEventListener("click", () => this.restoreSavedLayout());
     const save = actions.createEl("button", {
       cls: "helix-secondary-button",
       text: "保存当前布局",
@@ -1116,6 +1147,7 @@ export class ProjectLineageWorkbench {
     this.undoButton = undo;
     this.redoButton = redo;
     this.arrangeButton = arrange;
+    this.restoreLayoutButton = restore;
     this.saveLayoutButton = save;
     this.updateLayoutControls();
   }
@@ -1314,10 +1346,28 @@ export class ProjectLineageWorkbench {
       const dy = (event.clientY - drag.clientY) / this.zoom;
       if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
       if (!drag.moved) return;
+      let alignedDx = dx;
+      let alignedDy = dy;
+      if (event.shiftKey && drag.starts[0]) {
+        const movingIds = new Set(drag.starts.map((item) => item.node.entityId));
+        const fixed = [...this.layout.entries()]
+          .filter(([id]) => !movingIds.has(id))
+          .map(([, point]) => point);
+        const candidate = lineageShiftAlignedPoint({
+          x: drag.starts[0].point.x + dx,
+          y: drag.starts[0].point.y + dy,
+        }, fixed, 12 / this.zoom);
+        alignedDx = candidate.x - drag.starts[0].point.x;
+        alignedDy = candidate.y - drag.starts[0].point.y;
+        card.toggleClass("is-shift-aligned", candidate.x !== drag.starts[0].point.x + dx ||
+          candidate.y !== drag.starts[0].point.y + dy);
+      } else {
+        card.removeClass("is-shift-aligned");
+      }
       for (const item of drag.starts) {
         const next = {
-          x: Math.max(16, item.point.x + dx),
-          y: Math.max(16, item.point.y + dy),
+          x: Math.max(16, item.point.x + alignedDx),
+          y: Math.max(16, item.point.y + alignedDy),
         };
         this.layout.set(item.node.entityId, next);
         item.el.style.left = `${next.x}px`;
@@ -1336,6 +1386,7 @@ export class ProjectLineageWorkbench {
       drag = null;
       if (card.hasPointerCapture(event.pointerId)) card.releasePointerCapture(event.pointerId);
       for (const item of completed.starts) item.el.removeClass("is-dragging");
+      card.removeClass("is-shift-aligned");
       if (!completed.moved || this.destroyed || this.movePending) return;
       this.recordLayoutChange(completed.beforeLayout);
     };
@@ -1350,6 +1401,7 @@ export class ProjectLineageWorkbench {
         item.el.style.left = `${item.point.x}px`;
         item.el.style.top = `${item.point.y}px`;
       }
+      card.removeClass("is-shift-aligned");
       this.updateProjectContainerGeometry(
         new Set(canceled.starts.map((item) => item.node.projectId)),
       );
@@ -1417,15 +1469,15 @@ export class ProjectLineageWorkbench {
       const rename = header.createEl("button", {
         cls: "helix-lineage-project-container-rename",
         attr: {
-          "aria-label": `重命名项目 ${project.title}`,
-          title: "重命名项目",
+          "aria-label": `编辑项目 ${project.title}`,
+          title: "编辑项目名称和颜色",
         },
       });
       setIcon(rename, "pencil");
       rename.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        this.options.onRenameProject(project.id, project.title);
+        this.options.onRenameProject(project.id, project.title, this.projectColor(project));
       });
       const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
@@ -2114,6 +2166,38 @@ export class ProjectLineageWorkbench {
           else this.selectRelation(relation.id);
         });
         this.svg.appendChild(path);
+        if (!item.aggregate) {
+          const insert = document.createElementNS("http://www.w3.org/2000/svg", "g");
+          insert.classList.add("helix-lineage-edge-insert");
+          if (this.selectedRelationId === relation.id) insert.classList.add("is-visible");
+          insert.setAttribute("role", "button");
+          insert.setAttribute("tabindex", "0");
+          insert.setAttribute("aria-label", "在这条关系中插入新阶段");
+          insert.setAttribute("transform", `translate(${(start.x + end.x) / 2} ${(start.y + end.y) / 2})`);
+          const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          circle.setAttribute("r", "12");
+          insert.appendChild(circle);
+          for (const d of ["M -5 0 H 5", "M 0 -5 V 5"]) {
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            line.setAttribute("d", d);
+            insert.appendChild(line);
+          }
+          const activate = (event: Event): void => {
+            event.preventDefault();
+            event.stopPropagation();
+            this.options.onInsertCycle(
+              relation.id,
+              item.sourceId,
+              item.targetId,
+              targetNode.projectId,
+            );
+          };
+          insert.addEventListener("click", activate);
+          insert.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") activate(event);
+          });
+          this.svg.appendChild(insert);
+        }
         const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
         label.classList.add(
           "helix-lineage-edge-label",
@@ -3032,6 +3116,18 @@ export class ProjectLineageWorkbench {
     this.updateLayoutControls();
   }
 
+  private restoreSavedLayout(): void {
+    const before = this.captureRawLayout();
+    if (this.layoutsEqual(before, this.persistedLayout)) return;
+    this.layoutUndo.push(cloneLayoutSnapshot(before));
+    if (this.layoutUndo.length > 50) this.layoutUndo.shift();
+    this.layoutRedo = [];
+    this.applyRawLayout(this.persistedLayout);
+    this.layoutDirty = false;
+    this.renderLayoutPositions();
+    this.updateLayoutControls();
+  }
+
   private currentArrangeScope(): LineageArrangeScope {
     return lineageArrangeScope(
       [...this.selected],
@@ -3116,6 +3212,12 @@ export class ProjectLineageWorkbench {
   private updateLayoutControls(): void {
     if (this.undoButton) this.undoButton.disabled = this.layoutUndo.length === 0;
     if (this.redoButton) this.redoButton.disabled = this.layoutRedo.length === 0;
+    if (this.restoreLayoutButton) {
+      this.restoreLayoutButton.disabled = this.layoutsEqual(
+        this.captureRawLayout(),
+        this.persistedLayout,
+      );
+    }
     const scope = this.currentArrangeScope();
     if (this.arrangeButton) {
       this.arrangeButton.disabled = scope.kind === "disabled";

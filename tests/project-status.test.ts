@@ -72,4 +72,15 @@ describe("阶段展示编号", () => {
       [{ kind: "inherit", fromCycleIds: ["root"], toCycleId: "merged" }],
     ))).toEqual({ root: "1", merged: "2" });
   });
+
+  it("按 DAG 而非物理文件序号维护插入节点编号", () => {
+    expect(Object.fromEntries(maintainedStageCodes([
+      { id: "root", sequence: 1, code: "1" },
+      { id: "old-target", sequence: 2, code: "2.1" },
+      { id: "inserted", sequence: 3, code: "2.2" },
+    ], [
+      { kind: "inherit", fromCycleIds: ["root"], toCycleId: "inserted" },
+      { kind: "inherit", fromCycleIds: ["inserted"], toCycleId: "old-target" },
+    ]))).toEqual({ root: "1", inserted: "2", "old-target": "3" });
+  });
 });

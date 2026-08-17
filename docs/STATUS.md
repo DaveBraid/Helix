@@ -1,8 +1,8 @@
 # 当前开发状态
 
 最后更新：2026-08-17
-当前基线提交：`6319737 fix: refine project canvas layout interactions`（分支 `main`）
-工作树状态：分支边中插编号修复待提交。
+当前基线提交：`214d114 fix: preserve stage code when inserting on branch`（分支 `main`）
+工作树状态：工作树干净。
 当前阶段：在 `1.0.1` 主线基线上修复本地项目画布，不引入 `dev` 的滴答同步提交。
 
 ## 本轮目标

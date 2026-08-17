@@ -4731,9 +4731,12 @@
   opacity: 0;
   pointer-events: none;
   cursor: pointer;
-  transition: opacity .12s ease, transform .12s ease;
+  transition: opacity .16s ease;
 }
-.helix-lineage-edge-insert.is-visible {
+.helix-lineage-edge:hover + .helix-lineage-edge-insert,
+.helix-lineage-edge:focus-visible + .helix-lineage-edge-insert,
+.helix-lineage-edge-insert:hover,
+.helix-lineage-edge-insert:focus-visible {
   opacity: 1;
   pointer-events: all;
 }

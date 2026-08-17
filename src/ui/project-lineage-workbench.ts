@@ -2169,15 +2169,14 @@ export class ProjectLineageWorkbench {
         if (!item.aggregate) {
           const insert = document.createElementNS("http://www.w3.org/2000/svg", "g");
           insert.classList.add("helix-lineage-edge-insert");
-          if (this.selectedRelationId === relation.id) insert.classList.add("is-visible");
           insert.setAttribute("role", "button");
           insert.setAttribute("tabindex", "0");
           insert.setAttribute("aria-label", "在这条关系中插入新阶段");
           insert.setAttribute("transform", `translate(${(start.x + end.x) / 2} ${(start.y + end.y) / 2})`);
           const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-          circle.setAttribute("r", "12");
+          circle.setAttribute("r", "9");
           insert.appendChild(circle);
-          for (const d of ["M -5 0 H 5", "M 0 -5 V 5"]) {
+          for (const d of ["M -3.5 0 H 3.5", "M 0 -3.5 V 3.5"]) {
             const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
             line.setAttribute("d", d);
             insert.appendChild(line);

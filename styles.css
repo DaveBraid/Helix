@@ -4723,7 +4723,7 @@
   cursor: pointer;
   transition: opacity .16s ease;
 }
-.helix-lineage-edge-hit:hover ~ .helix-lineage-edge-insert,
+.helix-lineage-edge-hit:hover + .helix-lineage-edge + .helix-lineage-edge-insert,
 .helix-lineage-edge:hover + .helix-lineage-edge-insert,
 .helix-lineage-edge:focus-visible + .helix-lineage-edge-insert,
 .helix-lineage-edge-insert:hover,

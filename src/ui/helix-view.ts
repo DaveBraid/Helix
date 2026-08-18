@@ -796,10 +796,17 @@ export class HelixView extends ItemView {
     const localTask = this.localProjectTaskSnapshot?.byId.get(task.id);
     const row = parent.createDiv({ cls: `helix-task-row${prominent ? " is-prominent" : ""}` });
     if (localTask) row.addClass("is-local-project-task");
+    const completed = localTask
+      ? localTask.state === "completed" || localTask.state === "terminated"
+      : task.status === 2;
     const check = row.createEl("button", {
-      cls: "helix-task-check",
-      attr: { "aria-label": `完成 ${task.title}` },
+      cls: `helix-task-check${completed ? " is-completed" : ""}`,
+      attr: {
+        "aria-label": completed ? `重新打开 ${task.title}` : `完成 ${task.title}`,
+        title: completed ? "重新打开任务" : "完成任务",
+      },
     });
+    if (completed) setIcon(check, "check");
     const body = row.createDiv({ cls: "helix-task-copy" });
     const title = body.createDiv({
       cls: "helix-task-title",
@@ -888,20 +895,31 @@ export class HelixView extends ItemView {
       });
       edit.addEventListener("click", () => this.openLocalProjectTaskEditor(localTask));
     } else if (!task.id.startsWith("sample-")) {
-      if (!DIDA_TASK_WRITE_AVAILABLE) {
+      const canWriteTask = DIDA_TASK_WRITE_AVAILABLE && (this.state?.taskCrudVerified ?? false);
+      if (!canWriteTask) {
         check.disabled = true;
-        edit.disabled = true;
-        check.title = "当前阶段仅开放滴答读取";
-        edit.title = "当前阶段仅开放滴答读取";
+        const reason = DIDA_TASK_WRITE_AVAILABLE
+          ? "滴答写入能力尚未通过当前版本合同核验"
+          : "当前阶段仅开放滴答读取";
+        check.title = reason;
+        edit.title = `${reason}；可打开查看详情`;
       }
       check.addEventListener("click", () => {
-        if (!DIDA_TASK_WRITE_AVAILABLE) return;
+        if (!canWriteTask) return;
         check.disabled = true;
+        check.addClass(task.status === 2 ? "is-reopening" : "is-completing");
+        if (task.status !== 2) {
+          check.addClass("is-completed");
+          setIcon(check, "check");
+        }
         const request = task.status === 2
           ? this.service.reopenTask(task.id)
           : this.service.completeTask(task.id);
         void request
-          .then(() => this.render())
+          .then(() => {
+            check.addClass("is-success");
+            globalThis.setTimeout(() => void this.render(), 220);
+          })
           .catch((error) => {
             new Notice(error instanceof Error ? error.message : String(error), 8_000);
             void this.render();
@@ -961,6 +979,9 @@ export class HelixView extends ItemView {
     }
     if (task.status === 2 && (localTask || task.id.startsWith("sample-") || !this.state?.taskReopenVerified)) {
       check.disabled = true;
+      if (!localTask && !task.id.startsWith("sample-") && !this.state?.taskReopenVerified) {
+        check.title = "当前账号尚未通过任务重开核验";
+      }
     }
   }
 
@@ -5430,6 +5451,11 @@ class TaskEditModal extends Modal {
   private tags: string[];
   private reminders: string[];
   private repeatFlag: string | null;
+  private scheduleDate: string;
+  private startTime: string;
+  private endTime: string;
+  private timeMode: "none" | "point" | "range";
+  private scheduleDirty = false;
   private remindersDirty = false;
   private repeatFlagDirty = false;
   private titleDirty = false;
@@ -5473,6 +5499,16 @@ class TaskEditModal extends Modal {
     this.tags = [...(task.tags ?? [])];
     this.reminders = [...(task.reminders ?? [])];
     this.repeatFlag = task.repeatFlag ?? null;
+    const startWall = instantToWallDateTime(task.startDate, this.timeZone);
+    const dueWall = instantToWallDateTime(task.dueDate, this.timeZone);
+    this.scheduleDate = (startWall || dueWall).slice(0, 10);
+    this.startTime = startWall.slice(11, 16);
+    this.endTime = dueWall.slice(11, 16);
+    this.timeMode = task.isAllDay || (!this.startTime && !this.endTime)
+      ? "none"
+      : this.startTime && this.endTime && this.startTime !== this.endTime
+        ? "range"
+        : "point";
     this.initialEditable = {
       title: this.title,
       content: this.content,
@@ -5489,14 +5525,17 @@ class TaskEditModal extends Modal {
   }
 
   onOpen(): void {
-    this.setTitle(this.preview ? "编辑演示任务" : "编辑任务");
+    this.setTitle("");
     this.modalEl.addClass("helix-task-editor-modal");
-    this.contentEl.addClass("helix-task-edit-modal", "helix-task-editor");
+    this.contentEl.addClass(
+      "helix-task-edit-modal",
+      "helix-task-editor",
+      "is-local-task-editor",
+      "is-dida-task-editor",
+    );
     const context = this.contentEl.createDiv({ cls: "helix-task-editor-context" });
-    context.createSpan({
-      cls: "helix-chip is-soft",
-      text: this.preview ? "演示任务" : "滴答任务",
-    });
+    context.createSpan({ text: this.preview ? "Helix 演示" : "滴答清单" });
+    context.createSpan({ cls: "helix-task-editor-context-separator", text: "/" });
     context.createSpan({
       cls: "helix-task-editor-context-copy",
       text: this.didaProjects.find((project) => project.id === this.didaProjectId)?.name ?? "当前清单",
@@ -5505,9 +5544,10 @@ class TaskEditModal extends Modal {
     let projectSelectEl: HTMLSelectElement | undefined;
     let prioritySelectEl: HTMLSelectElement | undefined;
     let tagsInputEl: HTMLInputElement | undefined;
-    const title = this.contentEl.createEl("textarea", {
+    const titleRow = this.contentEl.createDiv({ cls: "helix-task-editor-title-row" });
+    const title = titleRow.createEl("textarea", {
       cls: "helix-task-editor-title",
-      attr: { rows: "2", "aria-label": "任务标题", placeholder: "任务标题" },
+      attr: { rows: "1", "aria-label": "任务标题", placeholder: "任务标题" },
     });
     title.value = this.title;
     titleInputEl = title;
@@ -5515,19 +5555,105 @@ class TaskEditModal extends Modal {
       this.title = title.value;
       this.titleDirty = true;
     });
-    const content = this.contentEl.createEl("textarea", {
-      cls: "helix-task-editor-content",
-      attr: { rows: "4", "aria-label": "任务备注", placeholder: "添加备注…" },
+    const titleEdit = titleRow.createSpan({ cls: "helix-task-editor-title-icon" });
+    setIcon(titleEdit, "pencil");
+    const scheduleEditorMode = taskScheduleEditorMode(this.task, this.scheduleMode);
+    const scheduleMetadataLocked = scheduleEditorMode === "locked-duration";
+    const denseProperties = this.contentEl.createDiv({ cls: "helix-task-editor-properties" });
+    const denseProperty = (label: string, icon: string, cls = ""): HTMLElement => {
+      const field = denseProperties.createDiv({ cls: `helix-task-editor-property ${cls}`.trim() });
+      const iconEl = field.createSpan({ cls: "helix-task-editor-property-icon" });
+      setIcon(iconEl, icon);
+      field.createSpan({ cls: "helix-task-editor-property-label", text: label });
+      return field;
+    };
+    const statusField = denseProperty("状态", "circle-dot");
+    const status = statusField.createEl("select", {
+      attr: { "aria-label": "任务状态", title: "完成与重开请使用任务列表中的完成按钮" },
     });
-    content.value = this.content;
-    content.addEventListener("input", () => { this.content = content.value; });
+    status.createEl("option", { value: "open", text: "待完成" });
+    status.createEl("option", { value: "completed", text: "已完成" });
+    status.value = this.task.status === 2 ? "completed" : "open";
+    status.disabled = true;
+    const priorityField = denseProperty("优先级", "flag");
+    const densePriority = priorityField.createEl("select", { attr: { "aria-label": "优先级" } });
+    for (const [value, label] of [["0", "无优先级"], ["1", "低优先级"], ["3", "中优先级"], ["5", "高优先级"]]) {
+      densePriority.createEl("option", { value, text: label });
+    }
+    densePriority.value = String(this.priority);
+    densePriority.addEventListener("change", () => {
+      this.priority = Number(densePriority.value);
+    });
+    prioritySelectEl = densePriority;
+    const dateField = denseProperty("日期", "calendar-days", "is-date");
+    const denseDate = dateField.createEl("input", {
+      type: "date",
+      value: this.scheduleDate,
+      attr: { "aria-label": "任务日期" },
+    });
+    denseDate.disabled = scheduleMetadataLocked;
+    denseDate.addEventListener("input", () => {
+      this.scheduleDate = denseDate.value;
+      this.scheduleDirty = true;
+    });
+    const timeField = denseProperty("时间", "clock-3", "is-time");
+    const denseTimeMode = timeField.createEl("select", { attr: { "aria-label": "时间类型" } });
+    denseTimeMode.createEl("option", { value: "none", text: "无时间" });
+    denseTimeMode.createEl("option", { value: "point", text: "时间点" });
+    if (scheduleEditorMode !== "point") denseTimeMode.createEl("option", { value: "range", text: "时间段" });
+    denseTimeMode.value = scheduleEditorMode === "point" && this.timeMode === "range" ? "point" : this.timeMode;
+    denseTimeMode.disabled = scheduleMetadataLocked;
+    const denseTimeInputs = timeField.createDiv({ cls: "helix-task-editor-time-inputs" });
+    const denseStart = denseTimeInputs.createEl("input", {
+      type: "time",
+      value: this.startTime || this.endTime,
+      attr: { "aria-label": "开始时间" },
+    });
+    const denseDash = denseTimeInputs.createSpan({ text: "–" });
+    const denseEnd = denseTimeInputs.createEl("input", {
+      type: "time",
+      value: this.endTime,
+      attr: { "aria-label": "结束时间" },
+    });
+    const syncDenseTime = (): void => {
+      this.timeMode = denseTimeMode.value as "none" | "point" | "range";
+      denseTimeInputs.toggleClass("is-hidden", this.timeMode === "none");
+      denseEnd.toggleClass("is-hidden", this.timeMode !== "range");
+      denseDash.toggleClass("is-hidden", this.timeMode !== "range");
+    };
+    denseStart.disabled = scheduleMetadataLocked;
+    denseEnd.disabled = scheduleMetadataLocked;
+    denseTimeMode.addEventListener("change", () => {
+      this.scheduleDirty = true;
+      syncDenseTime();
+    });
+    denseStart.addEventListener("input", () => {
+      this.startTime = denseStart.value;
+      this.scheduleDirty = true;
+    });
+    denseEnd.addEventListener("input", () => {
+      this.endTime = denseEnd.value;
+      this.scheduleDirty = true;
+    });
+    syncDenseTime();
+    const tagsField = denseProperty("标签", "tags", "is-tags");
+    const denseTags = tagsField.createEl("input", {
+      type: "text",
+      value: this.tags.join(" "),
+      placeholder: "标签",
+      attr: { "aria-label": "标签" },
+    });
+    denseTags.addEventListener("input", () => {
+      this.tags = [...new Set(denseTags.value.split(/[\s,，]+/u).map((tag) => tag.trim()).filter(Boolean))];
+    });
+    tagsInputEl = denseTags;
     const properties = this.contentEl.createEl("details", {
       cls: "helix-task-editor-details",
     });
     const propertiesSummary = properties.createEl("summary");
     const propertyIcon = propertiesSummary.createSpan();
     setIcon(propertyIcon, "sliders-horizontal");
-    propertiesSummary.createSpan({ text: "属性" });
+    propertiesSummary.createSpan({ text: "滴答扩展" });
     propertiesSummary.createSpan({
       cls: "helix-task-editor-summary-value",
       text: `${taskPriorityLabel(this.priority as 0 | 1 | 3 | 5)}优先级 · ${this.tags.length} 个标签`,
@@ -5600,67 +5726,6 @@ class TaskEditModal extends Modal {
           this.didaProjectId = value;
         });
       });
-    const scheduleEditorMode = taskScheduleEditorMode(this.task, this.scheduleMode);
-    const scheduleMetadataLocked = scheduleEditorMode === "locked-duration";
-    if (scheduleEditorMode === "point") {
-      new Setting(propertyBody)
-        .setName("任务时间")
-        .addText((text) => {
-          text.inputEl.type = "datetime-local";
-          text.setValue(this.dueDate || this.startDate).onChange((value) => {
-            this.startDate = value;
-            this.dueDate = value;
-          });
-        });
-    } else if (scheduleEditorMode === "locked-duration") {
-      new Setting(propertyBody)
-        .setName("已有开始时间")
-        .setDesc("该任务已有独立时间段；当前账号仅支持单点任务时间，因此保持原值且不可在此转换。")
-        .addText((text) => {
-          text.inputEl.type = "datetime-local";
-          text.setValue(this.startDate).setDisabled(true);
-        });
-      new Setting(propertyBody)
-        .setName("已有截止时间")
-        .setDesc("仍可修改标题、内容、清单等其他字段，不会折叠这段时间。")
-        .addText((text) => {
-          text.inputEl.type = "datetime-local";
-          text.setValue(this.dueDate).setDisabled(true);
-        });
-    } else {
-      new Setting(propertyBody)
-        .setName("开始时间")
-        .addText((text) => {
-          text.inputEl.type = "datetime-local";
-          text.setValue(this.startDate).onChange((value) => {
-            this.startDate = value;
-          });
-        });
-      new Setting(propertyBody)
-        .setName("截止时间")
-        .addText((text) => {
-          text.inputEl.type = "datetime-local";
-          text.setValue(this.dueDate).onChange((value) => {
-            this.dueDate = value;
-          });
-        });
-    }
-    new Setting(propertyBody)
-      .setName("全天")
-      .setDesc(scheduleMetadataLocked ? "已有时间段的全天状态保持原值。" : "")
-      .addToggle((toggle) => {
-        toggle.setValue(this.isAllDay).setDisabled(scheduleMetadataLocked).onChange((value) => {
-          this.isAllDay = value;
-        });
-      });
-    new Setting(propertyBody)
-      .setName("时区")
-      .setDesc(scheduleMetadataLocked ? "已有时间段的时区保持原值。" : "")
-      .addText((text) => {
-        text.setValue(this.timeZone).setDisabled(scheduleMetadataLocked).onChange((value) => {
-          this.timeZone = value;
-        });
-      });
     const reminderPresentations = presentDidaReminders(this.task.reminders);
     const reminderSetting = new Setting(propertyBody).setName("提醒");
     if (this.writeCapabilities.reminderWriteVerified) {
@@ -5715,29 +5780,6 @@ class TaskEditModal extends Modal {
         text: repeatPresentation.label,
       });
     }
-    new Setting(propertyBody)
-      .setName("标签")
-      .setDesc("多个标签使用空格或逗号分隔。")
-      .addText((text) => {
-        tagsInputEl = text.inputEl;
-        text.setValue(this.tags.join(" ")).onChange((value) => {
-          this.tags = [...new Set(value.split(/[\s,，]+/u).map((tag) => tag.trim()).filter(Boolean))];
-        });
-      });
-    new Setting(propertyBody)
-      .setName("优先级")
-      .addDropdown((dropdown) => {
-        prioritySelectEl = dropdown.selectEl;
-        dropdown
-          .addOption("0", "无")
-          .addOption("1", "低")
-          .addOption("3", "中")
-          .addOption("5", "高")
-          .setValue(String(this.priority))
-          .onChange((value) => {
-            this.priority = Number(value);
-          });
-      });
     if (!this.preview) this.renderReferenceEditor();
     const taskActions = this.contentEl.createDiv({ cls: "helix-task-editor-footer" });
     if (this.deleteTask) {
@@ -5792,6 +5834,23 @@ class TaskEditModal extends Modal {
       let startDate: string | null;
       let dueDate: string | null;
       try {
+        if (!scheduleMetadataLocked || this.scheduleDirty) {
+          if (!this.scheduleDate) {
+            this.startDate = "";
+            this.dueDate = "";
+            this.isAllDay = false;
+          } else if (this.timeMode === "none") {
+            this.startDate = `${this.scheduleDate}T00:00`;
+            this.dueDate = `${this.scheduleDate}T00:00`;
+            this.isAllDay = true;
+          } else {
+            const startTime = this.startTime || this.endTime || "09:00";
+            const endTime = this.timeMode === "range" ? (this.endTime || startTime) : startTime;
+            this.startDate = `${this.scheduleDate}T${startTime}`;
+            this.dueDate = `${this.scheduleDate}T${endTime}`;
+            this.isAllDay = false;
+          }
+        }
         assertTimeZone(timeZone);
         startDate = wallDateTimeToInstant(this.startDate, timeZone);
         dueDate = wallDateTimeToInstant(this.dueDate, timeZone);

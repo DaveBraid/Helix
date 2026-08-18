@@ -136,9 +136,12 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toContain('class LocalProjectTaskEditModal extends Modal');
     expect(view).toContain('class TaskEditModal extends Modal');
     expect(view.match(/addClass\("helix-task-editor-modal"\)/g)).toHaveLength(2);
-    expect(view.match(/addClass\([^\n]*"helix-task-editor"/g)).toHaveLength(2);
+    expect(localEditor).toContain('addClass("helix-task-editor", "is-local-task-editor")');
+    expect(view.slice(view.indexOf("class TaskEditModal"))).toMatch(
+      /addClass\([\s\S]*?"helix-task-editor"[\s\S]*?"is-dida-task-editor"/,
+    );
     expect(view).toMatch(/LocalProjectTaskEditModal[\s\S]*添加子任务[\s\S]*void this\.save\(/);
-    expect(view).toMatch(/const properties = this\.contentEl\.createEl\("details"[\s\S]*text: "属性"/);
+    expect(localEditor).toMatch(/const properties = this\.contentEl\.createDiv\(\{ cls: "helix-task-editor-properties" \}\)/);
     expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
     expect(localEditor).toMatch(/helix-task-editor-title-row[\s\S]*helix-task-editor-properties/);
     expect(localEditor).toMatch(/timeMode[\s\S]*"none"[\s\S]*"point"[\s\S]*"range"/);
@@ -151,6 +154,33 @@ describe("workbench layout and navigation structure", () => {
     expect(localEditor).not.toContain('placeholder: "添加备注…"');
     expect(localEditor).not.toContain('text: "时区"');
     expect(css).toMatch(/Dense task canvas[\s\S]*grid-template-columns: repeat\(3/);
+  });
+
+  it("reuses the Dense task shell for Dida details without a duplicate notes surface", () => {
+    const didaEditor = view.slice(
+      view.indexOf("class TaskEditModal"),
+      view.indexOf("private renderReferenceEditor", view.indexOf("class TaskEditModal")),
+    );
+    expect(didaEditor).toMatch(/is-local-task-editor[\s\S]*is-dida-task-editor/);
+    expect(didaEditor).toMatch(/helix-task-editor-context[\s\S]*helix-task-editor-title-row[\s\S]*helix-task-editor-properties[\s\S]*helix-task-editor-details/);
+    expect(didaEditor).toMatch(/denseProperty\("状态"[\s\S]*denseProperty\("优先级"[\s\S]*denseProperty\("日期"[\s\S]*denseProperty\("时间"[\s\S]*denseProperty\("标签"/);
+    expect(didaEditor).toContain('propertiesSummary.createSpan({ text: "滴答扩展" })');
+    expect(didaEditor).not.toContain("helix-task-editor-content");
+    expect(didaEditor).not.toContain('.setName("时区")');
+    expect(didaEditor).not.toContain('.setName("开始时间")');
+    expect(didaEditor).not.toContain('.setName("截止时间")');
+    expect(css).toMatch(/is-dida-task-editor[\s\S]*grid-template-columns: repeat\(2/);
+  });
+
+  it("renders remote completion truth before allowing the completion control to reopen it", () => {
+    const taskRow = view.slice(
+      view.indexOf("private renderTaskRow"),
+      view.indexOf("private startInlineTaskTitleEdit"),
+    );
+    expect(taskRow).toMatch(/task\.status === 2[\s\S]*helix-task-check\$\{completed \? " is-completed"/);
+    expect(taskRow).toMatch(/completed \? `重新打开[\s\S]*setIcon\(check, "check"\)/);
+    expect(taskRow).toMatch(/is-completing[\s\S]*is-success[\s\S]*setTimeout/);
+    expect(css).toContain("@keyframes helix-task-check-pulse");
   });
 
   it("uses project-colored neutral stage cards with one hover action bar", () => {

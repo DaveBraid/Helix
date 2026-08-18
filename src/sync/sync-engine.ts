@@ -58,6 +58,13 @@ export interface SyncEngineDependencies<T extends RemoteEntity> {
     desired: EntitySnapshot<T>,
     actual: T,
   ) => boolean | undefined;
+  /** 服务端生成字段不同但业务意图已经收敛时，直接采纳远端快照。 */
+  acceptRemoteConvergence?: (
+    operation: SyncQueueOperation<T>,
+    base: EntitySnapshot<T>,
+    local: EntitySnapshot<T>,
+    remote: EntitySnapshot<T>,
+  ) => boolean;
 }
 
 export class SyncEngine<T extends RemoteEntity> {
@@ -147,6 +154,16 @@ export class SyncEngine<T extends RemoteEntity> {
 
     const localChanged = snapshotChanged(local, base);
     const remoteChanged = snapshotChanged(remoteSnapshot, base);
+    if (localChanged && remoteChanged && this.dependencies.acceptRemoteConvergence?.(
+      operation,
+      base,
+      local,
+      remoteSnapshot,
+    )) {
+      await this.dependencies.snapshots.saveBase(remoteSnapshot);
+      await this.dependencies.snapshots.saveLocal(remoteSnapshot);
+      return { outcome: "pulled", snapshot: remoteSnapshot };
+    }
     if (localChanged && remoteChanged && local.stamp.hash === remoteSnapshot.stamp.hash) {
       await this.dependencies.snapshots.saveBase(remoteSnapshot);
       await this.dependencies.snapshots.saveLocal(remoteSnapshot);

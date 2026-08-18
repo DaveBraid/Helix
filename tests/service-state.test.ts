@@ -2806,16 +2806,25 @@ describe("HelixService runtime recovery", () => {
       { getDidaToken: () => "token" } as HelixSecretStore,
     );
     await service.initialize();
+    let captured: SyncQueueOperation<DidaTask> | undefined;
     Object.defineProperty(service, "taskEngine", {
       value: {
         async process(operation: SyncQueueOperation<DidaTask>) {
-          return { outcome: "pushed", snapshot: operation.local };
+          captured = structuredClone(operation);
+          return {
+            outcome: "pushed",
+            snapshot: createSnapshot("task", task.id, {
+              ...operation.local.value,
+              completedTime: "2026-08-19T08:00:00.000Z",
+            }),
+          };
         },
       },
     });
 
     await service.completeTask(task.id);
 
+    expect(captured?.local.value.completedTime).toBeNull();
     expect(persisted.events).toMatchObject([
       {
         type: "task-completed",

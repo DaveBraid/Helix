@@ -12,6 +12,7 @@ import type {
   SyncQueueOperation,
   RemoteWriteContext,
 } from "../src/sync/types";
+import { taskCompletionConverged } from "../src/domain/dida-task-metadata";
 
 class MemoryRepository implements SnapshotRepository, ConflictRepository {
   base: EntitySnapshot<unknown> | null = null;
@@ -118,6 +119,37 @@ function operation(local: DidaTask, base: EntitySnapshot<DidaTask>): SyncQueueOp
 }
 
 describe("SyncEngine safety gates", () => {
+  it("adopts an independently completed remote task without reopening or conflicting", async () => {
+    const baseTask = task("same task");
+    const localTask = { ...baseTask, status: 2, completedTime: null };
+    const remoteTask = {
+      ...baseTask,
+      status: 2,
+      completedTime: "2026-08-19T08:00:00.000Z",
+    };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+      acceptRemoteConvergence: (queued, queuedBase, local, remote) =>
+        queued.operation === "complete" &&
+        taskCompletionConverged(queuedBase.value, local.value, remote.value),
+    });
+    const queued = { ...operation(localTask, base), operation: "complete" as const };
+
+    const result = await engine.process(queued);
+
+    expect(result).toMatchObject({ outcome: "pulled", snapshot: { value: remoteTask } });
+    expect(adapter.updateCount).toBe(0);
+    expect(repository.conflicts).toEqual([]);
+  });
+
   it("pushes the queued local snapshot even when the repository now holds a resolved snapshot", async () => {
     const base = createSnapshot("task", "task-1", task("base"));
     const repository = new MemoryRepository();

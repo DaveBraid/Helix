@@ -83,6 +83,7 @@ import {
   buildTaskUpdateOperation,
   migrateInProgressTaskId,
 } from "./task-operations";
+import { taskCompletionConverged } from "../domain/dida-task-metadata";
 import { buildProjectUpdateOperation } from "./project-operations";
 import { isInsideSyncWindow } from "./sync-window";
 import { SingleFlight } from "./single-flight";
@@ -363,6 +364,9 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         isProjectionQueueOperation(operation)
           ? sameProjectionCreateSnapshot(desired.value, actual)
           : undefined,
+      acceptRemoteConvergence: (operation, base, local, remote) =>
+        operation.kind === "task" && operation.operation === "complete" &&
+        taskCompletionConverged(base.value, local.value, remote.value),
     });
     this.projectEngine = new SyncEngine({
       adapter: new DidaProjectAdapter(this.api),
@@ -2186,7 +2190,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     if (!task) throw new Error("找不到任务");
     if (task.status === 2) return;
     await this.queueTaskUpdate(
-      { ...task, status: 2, completedTime: new Date().toISOString() },
+      { ...task, status: 2, completedTime: null },
       "complete",
     );
   }

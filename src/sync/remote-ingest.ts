@@ -4,6 +4,8 @@ import type { HelixPersistedData } from "../storage/model";
 import { createSnapshot } from "./snapshots";
 import { buildConflictFields } from "./three-way-merge";
 import type { SyncConflict } from "./types";
+import { taskCompletionConverged } from "../domain/dida-task-metadata";
+import type { DidaTask } from "../domain/entities";
 
 export interface RemoteRecord {
   id?: string;
@@ -33,6 +35,20 @@ export function ingestRemoteRecords<T extends RemoteRecord>(
     const base = data.baseSnapshots[key] as EntitySnapshot<T> | undefined;
     const local = data.localSnapshots[key] as EntitySnapshot<T> | undefined;
     if (!base || !local) {
+      data.baseSnapshots[key] = remote;
+      data.localSnapshots[key] = remote;
+      continue;
+    }
+    const pendingCompletion = kind === "task" && data.queue.some((operation) =>
+      operation.kind === "task" && operation.entityId === record.id &&
+      operation.operation === "complete" &&
+      (operation.status === "pending" || operation.status === "running" ||
+        operation.status === "reconciliation"));
+    if (pendingCompletion && taskCompletionConverged(
+      base.value as unknown as DidaTask,
+      local.value as unknown as DidaTask,
+      record as unknown as DidaTask,
+    )) {
       data.baseSnapshots[key] = remote;
       data.localSnapshots[key] = remote;
       continue;

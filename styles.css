@@ -542,6 +542,27 @@
   border-radius: 50%;
 }
 
+.helix-task-check.is-completed {
+  border-color: color-mix(in srgb, var(--color-green) 75%, var(--helix-line));
+  background: color-mix(in srgb, var(--color-green) 82%, transparent);
+  color: var(--text-on-accent);
+}
+
+.helix-task-check.is-completing,
+.helix-task-check.is-reopening {
+  animation: helix-task-check-pulse 220ms ease-out;
+}
+
+.helix-task-check.is-success {
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-green) 18%, transparent);
+}
+
+@keyframes helix-task-check-pulse {
+  0% { transform: scale(.82); }
+  65% { transform: scale(1.16); }
+  100% { transform: scale(1); }
+}
+
 .helix-task-copy {
   min-width: 0;
   flex: 1;
@@ -1255,6 +1276,40 @@
 .is-local-task-editor .helix-task-editor-footer > button:not(.helix-task-editor-delete) {
   min-width: 84px;
   min-height: 38px;
+}
+
+/* 滴答任务复用 Dense task canvas；远端专属字段集中在一个扩展区。 */
+.is-dida-task-editor .helix-task-editor-details {
+  background: color-mix(in srgb, var(--background-secondary) 24%, transparent);
+}
+
+.is-dida-task-editor .helix-task-editor-details-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+  padding: 4px 16px 10px;
+}
+
+.is-dida-task-editor .helix-task-editor-details-body > .setting-item:first-child,
+.is-dida-task-editor .helix-task-reference-warning,
+.is-dida-task-editor .helix-task-stage-choices {
+  grid-column: 1 / -1;
+}
+
+.is-dida-task-editor .helix-task-editor-details-body .setting-item {
+  min-width: 0;
+}
+
+.is-dida-task-editor .helix-task-editor-details-body .setting-item-control,
+.is-dida-task-editor .helix-task-editor-details-body input,
+.is-dida-task-editor .helix-task-editor-details-body select {
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 760px) {
+  .is-dida-task-editor .helix-task-editor-details-body { grid-template-columns: 1fr; }
+  .is-dida-task-editor .helix-task-editor-details-body > * { grid-column: 1; }
 }
 
 @media (max-width: 760px) {

@@ -91,6 +91,8 @@ import {
 
 import {
   PROJECT_PROJECTION_ACTIVATION_VERSION,
+  PROJECTION_COLUMN_NAME,
+  PROJECTION_PROJECT_NAME,
   type DidaProjectionTarget,
   type ProjectionActivationPreview,
   type ProjectionActionState,
@@ -101,6 +103,8 @@ import {
   confirmProjectionActivationWithLease,
   projectionCounts,
   projectionInputFromProject,
+  projectionInputsFromProject,
+  projectionInputFromStage,
   projectionStageInProject,
 } from "./services/dida-project-projection-coordinator";
 import { stableHash } from "./domain/stable";
@@ -160,6 +164,7 @@ export default class HelixPlugin extends Plugin {
   private readonly deferredProjectEditorBlurListeners = new Map<HTMLElement, EventListener>();
   private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
+  private readonly projectProjectionBootstrapRunner = new SerializedRunner();
   private readonly settingsMutationRunner = new SerializedRunner();
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
   private projectStatusItem: HTMLElement | null = null;
@@ -270,9 +275,10 @@ export default class HelixPlugin extends Plugin {
     const projectionReadinessRunner = new SerializedRunner();
     this.register(this.service.subscribe(() => {
       void projectionReadinessRunner.run(async () => {
+        await this.ensureAutomaticProjectProjection();
         const readiness = await this.service.projectProjectionWriteReadiness();
         this.projectAutoSync.updateReadiness(
-          PROJECT_DIDA_PROJECTION_AVAILABLE && readiness.ready,
+          PROJECT_DIDA_PROJECTION_AVAILABLE && this.settings.autoSync && readiness.ready,
         );
       }).catch((error) => console.warn("Helix 无法刷新滴答项目后台写入条件", error));
     }));
@@ -673,6 +679,7 @@ export default class HelixPlugin extends Plugin {
   ): Promise<void> {
     const title = `Helix 合同项目 ${crypto.randomUUID()}`;
     let created: ProjectWorkspaceProject | undefined;
+    let projectionUnitId: string | undefined;
     const trackedRemoteIds = new Set<string>();
     const unknownDeleteIds = new Set<string>();
     const track = async (taskId: string) => {
@@ -722,6 +729,7 @@ export default class HelixPlugin extends Plugin {
       created = await this.withWritableProjectMutation(() =>
         this.projectWorkspace.createProject(title, "合同首阶段"));
       const stage = created.cycles[0]!;
+      projectionUnitId = stage.id;
       await this.withWritableProjectMutation(async () => {
         await this.localProjectTasks.createTask(
           await this.projectWorkspace.loadStableWorkspace(),
@@ -771,7 +779,7 @@ export default class HelixPlugin extends Plugin {
       await untrack(actionId);
       await untrack(parentId);
       await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
-      await contractProjection.finalizeProjectDeletion(created.id);
+      await contractProjection.finalizeProjectDeletion(secondInput.projectId);
       created = undefined;
     } finally {
       if (created) {
@@ -788,10 +796,11 @@ export default class HelixPlugin extends Plugin {
           await contractProjection.deleteProject(input);
           for (const taskId of [...trackedRemoteIds]) await untrack(taskId);
           await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
-          await contractProjection.finalizeProjectDeletion(created.id);
+          await contractProjection.finalizeProjectDeletion(input.projectId);
         } catch {
           const state = await contractProjection.readConfiguration();
-          const ownedEntries = state.ledger.filter((item) => item.projectId === created!.id);
+          const unitId = projectionUnitId;
+          const ownedEntries = state.ledger.filter((item) => item.projectId === unitId);
           for (const entry of ownedEntries) {
             if (entry.remoteId) {
               try { await track(entry.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
@@ -800,7 +809,7 @@ export default class HelixPlugin extends Plugin {
               await context.markUntrackedCreate();
             }
           }
-          const parent = state.parentCheckpoints.find((item) => item.projectId === created!.id);
+          const parent = state.parentCheckpoints.find((item) => item.projectId === unitId);
           if (parent?.remoteId) {
             try { await track(parent.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
             if (parent.tombstone && parent.frozen === "unknown-outcome") await markDeleteUnknown(parent.remoteId);
@@ -808,13 +817,12 @@ export default class HelixPlugin extends Plugin {
             await context.markUntrackedCreate();
           }
           try {
-            const projectRevision = await this.vaultRepository.read(created.notePath);
-            const parentMatch = projectRevision?.content.match(/^helix-dida-parent-task-id:\s*(.+)$/mu)?.[1]?.trim();
-            if (parentMatch) await track(parentMatch);
-            const stageIds = (await this.projectWorkspace.snapshot()).projects
+            const stagePaths = (await this.projectWorkspace.snapshot()).projects
               .find((project) => project.id === created!.id)?.cycles.flatMap((stage) => [stage.notePath]) ?? [];
-            for (const path of stageIds) {
+            for (const path of stagePaths) {
               const revision = await this.vaultRepository.read(path);
+              const parentMatch = revision?.content.match(/^helix-dida-parent-task-id:\s*(.+)$/mu)?.[1]?.trim();
+              if (parentMatch) await track(parentMatch);
               const ids = [...(revision?.content.matchAll(/remoteId=([^\s>]+)/gu) ?? [])]
                 .map((match) => decodeURIComponent(match[1]!))
                 .filter((id) => id !== "-");
@@ -823,15 +831,15 @@ export default class HelixPlugin extends Plugin {
           } catch {
             // 无法从本地回填身份时保持合同清理计划与恢复状态，不按标题猜测。
           }
-          const ownedParentId = state.parentBases?.find((item) => item.projectId === created!.id)?.remoteId ??
-            state.parentCheckpoints.find((item) => item.projectId === created!.id)?.remoteId;
+          const ownedParentId = state.parentBases?.find((item) => item.projectId === unitId)?.remoteId ??
+            state.parentCheckpoints.find((item) => item.projectId === unitId)?.remoteId;
           const ownedRemoteIds = [...new Set([
             ...ownedEntries.flatMap((entry) => entry.remoteId ? [entry.remoteId] : []),
             ...(ownedParentId ? [ownedParentId] : []),
           ])];
           const hasUntrackedIdentity = ownedEntries.some((entry) => !entry.remoteId) ||
             (!ownedParentId && (ownedEntries.length > 0 ||
-              state.parentCheckpoints.some((item) => item.projectId === created!.id)));
+              state.parentCheckpoints.some((item) => item.projectId === unitId)));
           if (!hasUntrackedIdentity && ownedRemoteIds.every((id) => trackedRemoteIds.has(id))) {
             const operationIds = new Set(ownedEntries.flatMap((entry) =>
               entry.operationId ? [entry.operationId] : []));
@@ -859,11 +867,11 @@ export default class HelixPlugin extends Plugin {
               if (projection) {
                 const next = {
                   ...projection,
-                  ledger: projection.ledger.filter((entry) => entry.projectId !== created!.id),
-                  parentCheckpoints: projection.parentCheckpoints.filter((entry) => entry.projectId !== created!.id),
-                  parentBases: projection.parentBases?.filter((entry) => entry.projectId !== created!.id),
+                  ledger: projection.ledger.filter((entry) => entry.projectId !== unitId),
+                  parentCheckpoints: projection.parentCheckpoints.filter((entry) => entry.projectId !== unitId),
+                  parentBases: projection.parentBases?.filter((entry) => entry.projectId !== unitId),
                   receiptCleanupPending: projection.receiptCleanupPending?.filter((entry) =>
-                    entry.projectId !== created!.id),
+                    entry.projectId !== unitId),
                 };
                 const empty = next.ledger.length === 0 && next.parentCheckpoints.length === 0 &&
                   (next.parentBases?.length ?? 0) === 0 && (next.receiptCleanupPending?.length ?? 0) === 0;
@@ -882,8 +890,34 @@ export default class HelixPlugin extends Plugin {
   }
 
   async readProjectProjection(projectId: string): Promise<ProjectionProjectReadModel> {
-    return this.withProjectWorkspaceRead(async () =>
-      this.projectProjection.readProject(await this.projectionInput(projectId)));
+    return this.withProjectWorkspaceRead(async () => {
+      const snapshot = await this.projectWorkspace.snapshot();
+      const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+      if (!project) throw new Error("找不到要读取滴答任务关联的 Helix 项目");
+      const models = await Promise.all(projectionInputsFromProject(project).map((input) =>
+        this.projectProjection.readProject(input)));
+      const configuration = await this.projectProjection.readConfiguration();
+      return {
+        enabled: configuration.enabled,
+        target: configuration.target ? { ...configuration.target } : undefined,
+        columnCreation: configuration.columnCreation
+          ? structuredClone(configuration.columnCreation)
+          : undefined,
+        project: {
+          id: project.id,
+          path: project.notePath,
+          title: project.title,
+          status: project.status,
+        },
+        stages: models.flatMap((model) => model.stages.map((stage) => ({
+          ...stage,
+          title: project.cycles.find((candidate) => candidate.id === stage.id)?.title,
+        }))),
+        receipts: models.flatMap((model) => model.receipts),
+        receiptCleanupPending: models.flatMap((model) => model.receiptCleanupPending),
+        orphanDiagnostics: models.flatMap((model) => model.orphanDiagnostics),
+      };
+    });
   }
 
   async readLocalProjectTasks(): Promise<LocalProjectTaskSnapshot> {
@@ -954,6 +988,83 @@ export default class HelixPlugin extends Plugin {
     return this.withProjectWorkspaceRead(() => this.projectProjection.readConfiguration());
   }
 
+  /** 普通自动同步开启后，唯一地建立 Helix Project 清单、专用分栏和 v2 阶段任务目标。 */
+  private ensureAutomaticProjectProjection(): Promise<void> {
+    return this.projectProjectionBootstrapRunner.run(async () => {
+      if (!PROJECT_DIDA_PROJECTION_AVAILABLE || this.recoveryMode || !this.settings.autoSync ||
+        !this.secrets.getDidaToken()) return;
+      const runtime = this.service.snapshot();
+      if (!runtime.authorizationConfigured || !runtime.taskCrudVerified ||
+        !runtime.taskParentingVerified || !runtime.projectProjectionVerified ||
+        !runtime.boardPlacementVerified || !runtime.columnCreateVerified) return;
+      const configuration = await this.projectProjection.readConfiguration();
+      if (configuration.enabled &&
+        configuration.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION &&
+        configuration.target && configuration.confirmedPreviewHash) return;
+      const snapshot = await this.projectWorkspace.loadStableWorkspace();
+      const stageIds = new Set(snapshot.projects.flatMap((project) =>
+        project.cycles.map((stage) => stage.id)));
+      const hasRecoveryIdentity = configuration.ledger.length > 0 ||
+        configuration.parentCheckpoints.length > 0 ||
+        (configuration.parentBases?.length ?? 0) > 0 ||
+        (configuration.receiptCleanupPending?.length ?? 0) > 0;
+      // 1.0.1-dev 曾把运行态写成 v2、加载器却只保留 v1。只在所有恢复身份
+      // 都明确以 Stage ID 为同步单元且仍属于当前工作区时，允许 fresh 复读后补回凭证。
+      const recoverableStageV2 = configuration.enabled === false &&
+        configuration.activationVersion === undefined &&
+        configuration.target !== undefined &&
+        typeof configuration.confirmedPreviewHash === "string" &&
+        configuration.ledger.every((entry) =>
+          entry.projectId === entry.stageId && stageIds.has(entry.projectId)) &&
+        configuration.parentCheckpoints.every((entry) => stageIds.has(entry.projectId)) &&
+        (configuration.parentBases ?? []).every((entry) => stageIds.has(entry.projectId)) &&
+        (configuration.receiptCleanupPending ?? []).every((entry) => stageIds.has(entry.projectId));
+      if (hasRecoveryIdentity && !recoverableStageV2) {
+        throw new Error("旧版项目任务同步仍有身份记录，必须先在冲突中心完成收口");
+      }
+      let matches = this.service.snapshot().projects.filter((project) =>
+        project.name === PROJECTION_PROJECT_NAME && !project.id.startsWith("local-project-"));
+      if (matches.length > 1) throw new Error(`存在多个“${PROJECTION_PROJECT_NAME}”清单，已停止自动选择`);
+      if (matches.length === 0) {
+        await this.service.createDidaProject(PROJECTION_PROJECT_NAME);
+        matches = this.service.snapshot().projects.filter((project) =>
+          project.name === PROJECTION_PROJECT_NAME && !project.id.startsWith("local-project-"));
+      }
+      if (matches.length !== 1) throw new Error(`无法唯一确认“${PROJECTION_PROJECT_NAME}”清单`);
+      const targetProject = matches[0]!;
+      let catalog = await this.service.readProjectionCatalog(targetProject.id);
+      let columns = catalog.columns.filter((column) => column.name === PROJECTION_COLUMN_NAME);
+      if (columns.length > 1) throw new Error(`存在多个“${PROJECTION_COLUMN_NAME}”分栏，已停止自动选择`);
+      if (columns.length === 0) {
+        const preview = await this.service.previewProjectionColumnCreation(targetProject.id);
+        if (preview.blockers.length > 0) {
+          throw new Error(`无法准备项目任务分栏：${preview.blockers.join("；")}`);
+        }
+        await this.service.confirmProjectionColumnCreation(preview, preview.previewHash);
+        catalog = await this.service.readProjectionCatalog(targetProject.id);
+        columns = catalog.columns.filter((column) => column.name === PROJECTION_COLUMN_NAME);
+      }
+      if (columns.length !== 1) throw new Error(`无法唯一确认“${PROJECTION_COLUMN_NAME}”分栏`);
+      const target = {
+        targetProjectId: targetProject.id,
+        targetColumnId: columns[0]!.id,
+      };
+      await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
+      const counts = await projectionCounts(snapshot, this.projectProjection);
+      const preview = await this.projectProjection.previewActivation(target, counts);
+      await this.service.withProjectProjectionActivationLease((readCatalog) =>
+        confirmProjectionActivationWithLease(
+          snapshot,
+          this.projectProjection,
+          preview,
+          preview.previewHash,
+          readCatalog,
+        ));
+      this.projectAutoSync.request(true);
+      new Notice(`项目任务已自动连接到“${PROJECTION_PROJECT_NAME}”清单`, 6_000);
+    });
+  }
+
   readProjectProjectionWriteReadiness() {
     return this.service.projectProjectionWriteReadiness();
   }
@@ -995,7 +1106,7 @@ export default class HelixPlugin extends Plugin {
       }));
     const readiness = await this.service.projectProjectionWriteReadiness();
     this.projectAutoSync.updateReadiness(
-      PROJECT_DIDA_PROJECTION_AVAILABLE && readiness.ready,
+      PROJECT_DIDA_PROJECTION_AVAILABLE && this.settings.autoSync && readiness.ready,
     );
     this.projectAutoSync.request(true);
   }
@@ -1065,10 +1176,14 @@ export default class HelixPlugin extends Plugin {
 
   async reconcileProjectProjectionFrozen(input:
     | { kind: "action"; projectId: string; stageId: string; uuid: string }
-    | { kind: "parent"; projectId: string }): Promise<void> {
+    | { kind: "parent"; projectId: string; stageId: string }): Promise<void> {
     this.assertProjectProjectionAvailable();
     await this.withWritableProjectMutation(async () => {
-      const projectionInput = await this.projectionInput(input.projectId);
+      const snapshot = await this.projectWorkspace.snapshot();
+      const project = snapshot.projects.find((candidate) => candidate.id === input.projectId);
+      const stage = project?.cycles.find((candidate) => candidate.id === input.stageId);
+      if (!project || !stage) throw new Error("找不到要复核的阶段任务");
+      const projectionInput = projectionInputFromStage(project, stage);
       if (input.kind === "action") {
         const stage = await this.requireProjectionStage(input.projectId, input.stageId);
         await this.projectProjection.reconcileFrozen({
@@ -1103,12 +1218,20 @@ export default class HelixPlugin extends Plugin {
 
   async syncProjectProjection(projectId: string): Promise<ProjectionSyncSummary> {
     this.assertProjectProjectionAvailable();
-    return this.withWritableProjectMutation(async () =>
-      this.projectProjection.synchronizeProject(await this.projectionInput(projectId)));
+    return this.withWritableProjectMutation(async () => {
+      const inputs = await this.projectionInputs(projectId);
+      const summary = emptyProjectionSummary();
+      for (const input of inputs) {
+        mergeProjectionSummary(summary, await this.projectProjection.synchronizeProject(input));
+      }
+      return summary;
+    });
   }
 
   private async projectAutoSyncScan() {
-    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) return { candidates: [], failures: [] };
+    if (!PROJECT_DIDA_PROJECTION_AVAILABLE || !this.settings.autoSync) {
+      return { candidates: [], failures: [] };
+    }
     return this.withProjectWorkspaceRead(async () => {
       const configuration = await this.projectProjection.readConfiguration();
       if (!configuration.enabled ||
@@ -1120,19 +1243,18 @@ export default class HelixPlugin extends Plugin {
       const candidates = [];
       const failures = [];
       for (const project of snapshot.projects) {
-        const input = projectionInputFromProject(project);
-        const fallbackFingerprint = stableHash(input);
+        const inputs = projectionInputsFromProject(project);
+        const fallbackFingerprint = stableHash(inputs);
         try {
-          const model = await this.projectProjection.readProject(input);
+          const models = await Promise.all(inputs.map((input) => this.projectProjection.readProject(input)));
           candidates.push({
             projectId: project.id,
             fingerprint: stableHash({
-              project: model.project,
-              stages: model.stages.map((stage) => ({
-                id: stage.id,
-                path: stage.path,
-                revisionHash: stage.revisionHash,
-              })),
+              project: { id: project.id, title: project.title, status: project.status },
+              stages: models.flatMap((model) => model.stages.map((stage) => ({
+                id: stage.id, path: stage.path, revisionHash: stage.revisionHash,
+                parentTaskId: stage.parentTaskId,
+              }))),
             }),
           });
         } catch {
@@ -1159,11 +1281,11 @@ export default class HelixPlugin extends Plugin {
     }
   }
 
-  private async projectionInput(projectId: string): Promise<ProjectionProjectInput> {
+  private async projectionInputs(projectId: string): Promise<ProjectionProjectInput[]> {
     const snapshot = await this.projectWorkspace.snapshot();
     const project = snapshot.projects.find((candidate) => candidate.id === projectId);
     if (!project) throw new Error("找不到要同步到滴答的 Helix 项目");
-    return projectionInputFromProject(project);
+    return projectionInputsFromProject(project);
   }
 
   private async requireProjectionStage(projectId: string, stageId: string) {
@@ -1245,6 +1367,7 @@ export default class HelixPlugin extends Plugin {
       this.immediateSyncTimerId = null;
     }
     if (!DIDA_READ_AVAILABLE) return;
+    if (!this.settings.autoSync) this.projectAutoSync.updateReadiness(false);
     const plan = autoSyncPlan({
       recoveryMode: this.recoveryMode,
       tokenConfigured: Boolean(this.secrets.getDidaToken()),
@@ -1450,11 +1573,15 @@ export default class HelixPlugin extends Plugin {
           plan,
           async (bridge, confirmCrossProject) => {
             this.assertWritable();
-            await this.withWritableProjectMutation(() =>
-              this.projectWorkspace.deleteCycle(plan, {
+            await this.withWritableProjectMutation(async () => {
+              const projectionInput = projectionInputFromStage(owner, cycle);
+              await this.projectProjection.deleteProject(projectionInput);
+              await this.projectWorkspace.deleteCycle(plan, {
                 bridge,
                 confirmCrossProject,
-              }));
+              });
+              await this.projectProjection.finalizeProjectDeletion(projectionInput.projectId);
+            });
             const focusEntityId = snapshot.relations
               .filter((relation) =>
                 relation.fromCycleIds.includes(cycleId) ||
@@ -1492,9 +1619,14 @@ export default class HelixPlugin extends Plugin {
         new DeleteProjectModal(this.app, project, async () => {
           this.assertWritable();
           await this.withWritableProjectMutation(async () => {
-            await this.projectProjection.deleteProject(projectionInputFromProject(project));
+            const projectionInputs = projectionInputsFromProject(project);
+            for (const input of projectionInputs) {
+              await this.projectProjection.deleteProject(input);
+            }
             await this.projectWorkspace.deleteProject(projectId);
-            await this.projectProjection.finalizeProjectDeletion(projectId);
+            for (const input of projectionInputs) {
+              await this.projectProjection.finalizeProjectDeletion(input.projectId);
+            }
           });
           onDeleted?.();
           new Notice(`项目“${project.title}”及其 ${project.cycles.length} 个阶段已移入废纸篓`);
@@ -2111,7 +2243,7 @@ class DeleteProjectModal extends Modal {
     this.setTitle(`删除项目：${this.project.title}`);
     this.contentEl.createEl("p", {
       cls: "helix-modal-note",
-      text: `项目笔记、${this.project.cycles.length} 个阶段笔记、项目容器及其 Helix 关系将一并移入 Obsidian 废纸篓。此操作不会删除任何滴答清单数据。`,
+      text: `项目笔记、${this.project.cycles.length} 个阶段笔记、项目容器及其 Helix 关系将一并移入 Obsidian 废纸篓；已由 Helix 创建的对应阶段任务及子任务也会从滴答删除，但不会删除“${PROJECTION_PROJECT_NAME}”清单或其他任务。`,
     });
     this.contentEl.createEl("p", {
       text: `请输入“${DeleteProjectModal.CONFIRMATION}”以继续。`,
@@ -2696,6 +2828,33 @@ class LegacyMigrationModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+function emptyProjectionSummary(): ProjectionSyncSummary {
+  return {
+    createdParents: 0,
+    updatedParents: 0,
+    completedParents: 0,
+    createdActions: 0,
+    updatedActions: 0,
+    completedActions: 0,
+    deletedActions: 0,
+    frozen: [],
+  };
+}
+
+function mergeProjectionSummary(
+  target: ProjectionSyncSummary,
+  source: ProjectionSyncSummary,
+): void {
+  target.createdParents += source.createdParents;
+  target.updatedParents += source.updatedParents;
+  target.completedParents += source.completedParents;
+  target.createdActions += source.createdActions;
+  target.updatedActions += source.updatedActions;
+  target.completedActions += source.completedActions;
+  target.deletedActions += source.deletedActions;
+  target.frozen.push(...source.frozen);
 }
 
 function formatDate(date: Date): string {

@@ -18,6 +18,7 @@ import { normalizeTask } from "../src/integrations/dida/normalization";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import type { DidaProjectProjectionContractContext } from "../src/integrations/dida/write-contract";
 import { DidaHttpError } from "../src/integrations/dida/http-contract";
+import { PROJECT_PROJECTION_ACTIVATION_VERSION } from "../src/domain/dida-project-projection";
 
 function grantTaskCrud(
   data: ReturnType<typeof createDefaultData>,
@@ -98,7 +99,7 @@ it("keeps project auto-sync readiness false until projection is explicitly versi
   await store.mutate((draft) => {
     draft.didaProjectionState = {
       enabled: true,
-      activationVersion: 1,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
       target: { targetProjectId: "target-list", targetColumnId: "target-column" },
       confirmedPreviewHash: "a".repeat(64),
       ledger: [],
@@ -2444,6 +2445,7 @@ describe("HelixService runtime recovery", () => {
       { getDidaToken: () => "token" } as HelixSecretStore,
     );
     await service.initialize();
+    (service as unknown as { remoteConnectivity: "offline" }).remoteConnectivity = "offline";
 
     await service.setDidaProjectViewMode(project.id, "kanban");
 

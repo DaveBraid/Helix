@@ -48,13 +48,28 @@ export async function confirmProjectionActivationWithLease(
 }
 
 export function projectionInputFromProject(project: ProjectWorkspaceProject): ProjectionProjectInput {
+  if (project.cycles.length !== 1) {
+    throw new Error("阶段任务同步必须逐阶段构建输入");
+  }
+  return projectionInputFromStage(project, project.cycles[0]!);
+}
+
+/** 滴答层级以 Stage 为父任务；Helix Project 只负责在本地组织这些阶段。 */
+export function projectionInputFromStage(
+  project: ProjectWorkspaceProject,
+  stage: ProjectWorkspaceProject["cycles"][number],
+): ProjectionProjectInput {
   return {
-    projectId: project.id,
-    projectPath: project.notePath,
-    projectTitle: project.title,
-    projectStatus: project.status,
-    stages: project.cycles.map((stage) => ({ path: stage.notePath, stageId: stage.id })),
+    projectId: stage.id,
+    projectPath: stage.notePath,
+    projectTitle: stage.title,
+    projectStatus: stage.status === "idea" ? "planned" : stage.status,
+    stages: [{ path: stage.notePath, stageId: stage.id }],
   };
+}
+
+export function projectionInputsFromProject(project: ProjectWorkspaceProject): ProjectionProjectInput[] {
+  return project.cycles.map((stage) => projectionInputFromStage(project, stage));
 }
 
 export function projectionStageInProject(
@@ -72,7 +87,7 @@ export async function projectionCounts(
   snapshot: ProjectWorkspaceSnapshot,
   projection: Pick<ProjectionApplicationPort, "readProject">,
 ): Promise<{ projectCount: number; actionCount: number }> {
-  const inputs = snapshot.projects.map(projectionInputFromProject);
+  const inputs = snapshot.projects.flatMap(projectionInputsFromProject);
   const models = await Promise.all(inputs.map((input) => projection.readProject(input)));
   return {
     projectCount: inputs.length,

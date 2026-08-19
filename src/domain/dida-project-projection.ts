@@ -50,8 +50,9 @@ export interface ProjectionActivationPreview {
 }
 
 export const PROJECTION_COLUMN_NAME = "Helix项目";
+export const PROJECTION_PROJECT_NAME = "Helix Project";
 /** 旧调试状态没有此凭证；门禁开放后必须由当前设置页重新预览确认。 */
-export const PROJECT_PROJECTION_ACTIVATION_VERSION = 1;
+export const PROJECT_PROJECTION_ACTIVATION_VERSION = 2;
 
 export interface ProjectionColumnBaseline {
   id: string;
@@ -822,7 +823,6 @@ function readinessBlockers(value: ProjectionReadiness, project: DidaProject): st
     !value.boardFresh ? "目标看板快照已过期" : undefined,
     value.unknownOutcomes > 0 ? "仍有远端结果未知对象" : undefined,
     project.permission && project.permission !== "write" ? "目标清单没有写权限" : undefined,
-    project.viewMode !== "kanban" ? "目标清单当前不是看板视图" : undefined,
   ].filter((item): item is string => Boolean(item));
 }
 

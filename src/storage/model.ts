@@ -23,12 +23,13 @@ import {
   type TaskMatrixRules,
 } from "../domain/task-views";
 import { normalizeTemplateFolder } from "../domain/template-path";
-import type {
-  DidaProjectionTarget,
-  ProjectionColumnCreationCheckpoint,
-  ProjectionFreezeReason,
-  ProjectionLedgerEntry,
-  ProjectionReceiptCleanupProof,
+import {
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
+  type DidaProjectionTarget,
+  type ProjectionColumnCreationCheckpoint,
+  type ProjectionFreezeReason,
+  type ProjectionLedgerEntry,
+  type ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
 import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import {
@@ -797,12 +798,15 @@ function validateDidaProjectionState(
   }
   const normalized: NonNullable<HelixPersistedData["didaProjectionState"]> = {
     // 旧版调试状态没有当前激活凭证；保留映射与诊断，但绝不在升级后自动写入。
-    enabled: record.enabled === true && record.activationVersion === 1,
+    enabled: record.enabled === true &&
+      record.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION,
     ledger: normalizedLedger.map((entry) => ({ ...entry })),
     parentCheckpoints: (checkpoints as NonNullable<HelixPersistedData["didaProjectionState"]>["parentCheckpoints"])
       .map((entry) => ({ ...entry })),
   };
-  if (record.activationVersion === 1) normalized.activationVersion = 1;
+  if (record.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION) {
+    normalized.activationVersion = PROJECT_PROJECTION_ACTIVATION_VERSION;
+  }
   if (normalizedTarget) normalized.target = { ...normalizedTarget };
   if (typeof record.confirmedPreviewHash === "string") {
     normalized.confirmedPreviewHash = record.confirmedPreviewHash;

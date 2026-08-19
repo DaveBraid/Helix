@@ -20,6 +20,7 @@ export const LOCAL_PROJECT_TASK_PREFIX = "helix-local-task:";
 export interface LocalProjectTask {
   id: string;
   uuid: string;
+  remoteId?: string;
   title: string;
   state: ProjectionActionState;
   content?: string;
@@ -112,8 +113,9 @@ export class LocalProjectTaskService {
             if (owner) throw new Error(`任务 UUID 与 ${owner} 重复：${action.uuid}`);
             globalUuids.set(action.uuid, stage.notePath);
             tasks.push({
-              id: localProjectTaskId(action.uuid),
+              id: action.remoteId ?? localProjectTaskId(action.uuid),
               uuid: action.uuid,
+              ...(action.remoteId ? { remoteId: action.remoteId } : {}),
               title: action.title,
               state: action.state,
               ...(action.content ? { content: action.content } : {}),

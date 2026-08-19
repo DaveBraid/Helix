@@ -2152,7 +2152,10 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         projects: this.state.projects.map((candidate) =>
           candidate.id === projectId ? next : candidate),
       });
-      if (!this.state.connected) return;
+      // connected=false 也可能只是习惯／专注等可选端点失败；清单创建刚刚已通过
+      // 同一授权写通时，不应把视图更新滞留到下一次全量拉取并制造假删除冲突。
+      // 只有请求治理器已明确判定离线时才保留队列。
+      if (this.remoteConnectivity === "offline") return;
       await this.drainQueue();
       await this.throwIfOperationNeedsAttention(effectiveOperationId);
       const finalData = await this.store.snapshot();

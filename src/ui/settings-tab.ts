@@ -18,25 +18,12 @@ import {
   DIDA_TASK_WRITE_AVAILABLE,
   PROJECT_DIDA_PROJECTION_AVAILABLE,
 } from "../release-capabilities";
-import {
-  PROJECTION_COLUMN_NAME,
-  type ProjectionActivationPreview,
-  type ProjectionColumnCreationPreview,
-} from "../domain/dida-project-projection";
-import type { ProjectionCatalogSnapshot } from "../services/dida-project-projection";
-import { projectionActivationText, projectionPauseText, projectionTargetText } from "./project-projection-presenter";
+import { PROJECTION_COLUMN_NAME, PROJECTION_PROJECT_NAME } from "../domain/dida-project-projection";
 import { DidaWriteContractConfirmationGate } from "./dida-write-contract-confirmation";
 
 export class HelixSettingTab extends PluginSettingTab {
   private writeTestResult: string | null = null;
   private writeTestPreflight: string | null = null;
-  private projectionProjectId = "";
-  private projectionColumnId = "";
-  private projectionCatalog: ProjectionCatalogSnapshot | null = null;
-  private projectionPreview: ProjectionActivationPreview | null = null;
-  private projectionColumnPreview: ProjectionColumnCreationPreview | null = null;
-  private readonly projectionActivationConfirmation = new DidaWriteContractConfirmationGate();
-  private readonly projectionColumnConfirmation = new DidaWriteContractConfirmationGate();
   private readonly clearCacheConfirmation = new DidaWriteContractConfirmationGate();
   constructor(app: App, private readonly plugin: HelixPlugin) {
     super(app, plugin);
@@ -130,7 +117,7 @@ export class HelixSettingTab extends PluginSettingTab {
 
     this.renderTemplateSetting();
 
-    if (PROJECT_DIDA_PROJECTION_AVAILABLE) this.renderProjectProjectionSettings();
+    if (PROJECT_DIDA_PROJECTION_AVAILABLE) this.renderAutomaticProjectProjectionStatus();
 
     // 写入合同和能力探测只服务开发验证；默认折叠，不干扰日常授权、拉取与同步配置。
     // 原生 details/summary 自带键盘可达和展开状态；展开仅限本次设置页会话，不作持久化。
@@ -181,167 +168,27 @@ export class HelixSettingTab extends PluginSettingTab {
         }));
   }
 
-  private renderProjectProjectionSettings(): void {
-    const state = this.plugin.service.snapshot();
-    const remoteProjects = state.projects.filter((project) => !project.id.startsWith("local-project-"));
+  private renderAutomaticProjectProjectionStatus(): void {
     const section = this.containerEl.createEl("details", {
       cls: "helix-settings-project-projection",
-      attr: { open: "", "aria-label": "项目同步" },
+      attr: { "aria-label": "项目任务同步" },
     });
-    section.createEl("summary", { text: "项目同步" });
+    section.createEl("summary", { text: "项目任务同步" });
     const content = section.createDiv();
-    const setupContent = content.createDiv({ cls: "helix-settings-project-projection-setup" });
-    void this.plugin.readProjectProjectionConfiguration().then((configuration) => {
+    new Setting(content)
+      .setName("自动目标")
+      .setDesc(`开启“自动同步”后，Helix 自动准备“${PROJECTION_PROJECT_NAME}”清单及“${PROJECTION_COLUMN_NAME}”专用归属。阶段成为父任务，“计划行动”成为其子任务；不会更改该清单的列表／看板偏好。`)
+      .setDisabled(true);
+    void Promise.all([
+      this.plugin.readProjectProjectionConfiguration(),
+      this.plugin.readProjectProjectionWriteReadiness(),
+    ]).then(([configuration, readiness]) => {
+      const active = this.plugin.settings.autoSync && configuration.enabled && readiness.ready;
       new Setting(content)
         .setName("当前状态")
-        .setDesc(projectionTargetText(configuration))
+        .setDesc(active ? "后台自动同步已就绪" : "跟随下方“自动同步”开关；关闭时不会写入滴答")
         .setDisabled(true);
-      if (configuration.enabled) {
-        setupContent.empty();
-        setupContent.hide();
-        void this.plugin.readProjectProjectionWriteReadiness().then((readiness) => {
-          new Setting(content)
-            .setName("后台写入")
-            .setDesc(projectionPauseText(readiness))
-            .setDisabled(true);
-        }).catch(() => undefined);
-        new Setting(content)
-          .setName("停止项目同步")
-          .setDesc("停止后保留已有滴答任务与本地映射，不执行删除。")
-          .addButton((button) => button.setButtonText("停用").setWarning().onClick(async () => {
-            try {
-              await this.plugin.disableProjectProjection();
-              new Notice("项目同步已停用；已有远端任务保持不变");
-              this.display();
-            } catch (error) {
-              new Notice(error instanceof Error ? error.message : String(error), 10_000);
-            }
-          }));
-      }
     }).catch(() => undefined);
-
-    new Setting(setupContent)
-      .setName("目标滴答清单")
-      .setDesc("只读取你选择的清单；启用前会再次精确复读。")
-      .addDropdown((dropdown) => {
-        dropdown.addOption("", "请选择清单");
-        for (const project of remoteProjects) dropdown.addOption(project.id, project.name);
-        dropdown.setValue(this.projectionProjectId).onChange((value) => {
-          this.projectionActivationConfirmation.disarm();
-          this.projectionColumnConfirmation.disarm();
-          this.projectionProjectId = value;
-          this.projectionColumnId = "";
-          this.projectionCatalog = null;
-          this.projectionPreview = null;
-          this.projectionColumnPreview = null;
-        });
-      })
-      .addButton((button) => button.setButtonText("读取分栏").onClick(async () => {
-        if (!this.projectionProjectId) return new Notice("请先选择目标清单");
-        button.setDisabled(true).setButtonText("读取中…");
-        try {
-          this.projectionCatalog = await this.plugin.readProjectProjectionCatalog(this.projectionProjectId);
-          this.projectionActivationConfirmation.disarm();
-          this.projectionColumnConfirmation.disarm();
-          this.projectionColumnId = this.projectionCatalog.columns.find(
-            (column) => column.name === PROJECTION_COLUMN_NAME,
-          )?.id ?? "";
-          this.projectionPreview = null;
-          this.display();
-        } catch (error) {
-          new Notice(error instanceof Error ? error.message : String(error), 8_000);
-        }
-      }));
-
-    if (!this.projectionCatalog) return;
-    const catalog = this.projectionCatalog;
-    new Setting(setupContent)
-      .setName("目标看板分栏")
-      .setDesc(`建议使用“${PROJECTION_COLUMN_NAME}”；不会修改其他分栏。`)
-      .addDropdown((dropdown) => {
-        dropdown.addOption("", "请选择分栏");
-        for (const column of catalog.columns) dropdown.addOption(column.id, column.name);
-        dropdown.setValue(this.projectionColumnId).onChange((value) => {
-          this.projectionActivationConfirmation.disarm();
-          this.projectionColumnId = value;
-          this.projectionPreview = null;
-        });
-      });
-
-    if (!catalog.columns.some((column) => column.name === PROJECTION_COLUMN_NAME)) {
-      new Setting(setupContent)
-        .setName(`创建“${PROJECTION_COLUMN_NAME}”分栏`)
-        .setDesc(this.projectionColumnPreview
-          ? this.projectionColumnPreview.blockers.length > 0
-            ? `暂不可创建：${this.projectionColumnPreview.blockers.join("；")}`
-            : "预览已完成；再次点击确认只创建这一分栏。"
-          : "先只读预览；确认时写前会重新核对完整分栏基线。")
-        .addButton((button) => button.setButtonText(this.projectionColumnPreview ? "确认创建" : "预览创建").onClick(async () => {
-          try {
-            if (!this.projectionColumnPreview) {
-              this.projectionColumnConfirmation.disarm();
-              this.projectionColumnPreview = await this.plugin.previewProjectProjectionColumn(this.projectionProjectId);
-              this.display();
-              return;
-            }
-            const confirmation = this.projectionColumnConfirmation.request();
-            if (confirmation === "armed") {
-              button.setButtonText("再次点击创建").setWarning();
-              return;
-            }
-            const created = await this.plugin.confirmProjectProjectionColumn(
-              this.projectionColumnPreview,
-              this.projectionColumnPreview.previewHash,
-            );
-            this.projectionColumnId = created.id;
-            this.projectionCatalog = await this.plugin.readProjectProjectionCatalog(this.projectionProjectId);
-            this.projectionColumnPreview = null;
-            new Notice(`已创建“${PROJECTION_COLUMN_NAME}”分栏`);
-            this.display();
-          } catch (error) {
-            new Notice(error instanceof Error ? error.message : String(error), 10_000);
-          }
-        }));
-      return;
-    }
-
-    const previewDescription = this.projectionPreview
-      ? projectionActivationText(this.projectionPreview).join("；")
-      : "先生成只读预览；不会立即创建或修改任务。";
-    new Setting(setupContent)
-      .setName("启用后台项目同步")
-      .setDesc(previewDescription)
-      .addButton((button) => button.setButtonText(this.projectionPreview ? "确认启用" : "生成预览").onClick(async () => {
-        try {
-          if (!this.projectionProjectId || !this.projectionColumnId) {
-            new Notice("请先选择精确清单与分栏");
-            return;
-          }
-          if (!this.projectionPreview) {
-            this.projectionActivationConfirmation.disarm();
-            this.projectionPreview = await this.plugin.previewProjectProjection({
-              targetProjectId: this.projectionProjectId,
-              targetColumnId: this.projectionColumnId,
-            });
-            this.display();
-            return;
-          }
-          const confirmation = this.projectionActivationConfirmation.request();
-          if (confirmation === "armed") {
-            button.setButtonText("再次点击启用").setWarning();
-            return;
-          }
-          await this.plugin.confirmProjectProjection(
-            this.projectionPreview,
-            this.projectionPreview.previewHash,
-          );
-          this.projectionPreview = null;
-          new Notice("项目同步已启用；后续变更会在后台自动同步并通知结果");
-          this.display();
-        } catch (error) {
-          new Notice(error instanceof Error ? error.message : String(error), 10_000);
-        }
-      }));
   }
 
   private renderContractTests(): void {

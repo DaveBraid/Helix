@@ -91,19 +91,9 @@ describe("workbench layout and navigation structure", () => {
     );
   });
 
-  it("shows project task references only in the task view", () => {
-    expect(view).toMatch(/renderTasks\(content[\s\S]*renderProjectLinkedTasks\(content\)/);
-    expect(view).toMatch(/renderProjectLinkedTasks[\s\S]*项目关联任务[\s\S]*renderTaskRow/);
-    const projects = view.slice(
-      view.indexOf("private async renderProjects"),
-      view.indexOf("private renderProjectLinkedTasks"),
-    );
-    expect(projects).not.toContain("renderProjectLinkedTasks");
-    const linkedTasks = view.slice(
-      view.indexOf("private renderProjectLinkedTasks"),
-      view.indexOf("private async requestCycleStatusChange"),
-    );
-    expect(linkedTasks).not.toMatch(/didaProjectId|projection/i);
+  it("does not render the retired project-linked-task panel", () => {
+    expect(view).not.toContain("renderProjectLinkedTasks");
+    expect(view).not.toContain("项目关联任务");
   });
 
   it("projects Stage actions into tasks without creating a second local task store", () => {
@@ -423,7 +413,10 @@ describe("workbench layout and navigation structure", () => {
     expect(view).not.toContain("editProjectAction");
     expect(view).not.toContain("同步此项目到滴答");
     expect(view).not.toContain("当前只写 Stage，尚未发送滴答");
-    expect(settings).toMatch(/PROJECT_DIDA_PROJECTION_AVAILABLE\) this\.renderProjectProjectionSettings\(\)/);
+    expect(settings).toMatch(/PROJECT_DIDA_PROJECTION_AVAILABLE\) this\.renderAutomaticProjectProjectionStatus\(\)/);
+    expect(settings).toContain("阶段成为父任务，“计划行动”成为其子任务");
+    expect(settings).not.toContain("renderProjectProjectionSettings");
+    expect(settings).not.toContain("目标滴答清单");
   });
 
   it("registers Live Preview marker hiding and routes project changes through one background coordinator", () => {
@@ -440,9 +433,16 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/adoptProjectAction[\s\S]*projectAutoSync\.invalidate\(input\.projectId\)/);
     expect(main).toMatch(/editProjectAction[\s\S]*projectAutoSync\.invalidate\(input\.projectId\)/);
     expect(main).toMatch(/previewProjectProjection[\s\S]*localProjectTasks\.snapshot\(snapshot, \{ adoptUnmanaged: true \}\)[\s\S]*projectionCounts/);
-    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && readiness\.ready/);
+    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && this\.settings\.autoSync && readiness\.ready/);
+    expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*PROJECTION_PROJECT_NAME[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)[\s\S]*PROJECTION_COLUMN_NAME[\s\S]*confirmProjectionActivationWithLease/);
+    const automaticBootstrap = main.slice(
+      main.indexOf("private ensureAutomaticProjectProjection"),
+      main.indexOf("readProjectProjectionWriteReadiness"),
+    );
+    expect(automaticBootstrap).not.toContain("setDidaProjectViewMode");
+    expect(main).toMatch(/refreshAutoSync[\s\S]*!this\.settings\.autoSync\) this\.projectAutoSync\.updateReadiness\(false\)/);
     expect(main).toMatch(/reportProjectAutoSync[\s\S]*report\.mutations > 0[\s\S]*滴答项目同步完成/);
-    expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE[\s\S]*candidates: \[\], failures: \[\]/);
+    expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE \|\| !this\.settings\.autoSync[\s\S]*candidates: \[\], failures: \[\]/);
     const readiness = service.slice(
       service.indexOf("async projectProjectionWriteReadiness"),
       service.indexOf("async replaceDidaToken"),
@@ -491,10 +491,10 @@ describe("workbench layout and navigation structure", () => {
     const modal = main.slice(main.indexOf("class ProjectPromptModal"), main.indexOf("class CyclePromptModal"));
     expect(view).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
     expect(settings).not.toContain("ProjectionUiActionCoordinator");
-    expect(settings).toMatch(/projectionActivationConfirmation\.request\(\)[\s\S]*confirmProjectProjection/);
-    expect(settings).toMatch(/configuration\.enabled[\s\S]*setupContent\.empty\(\)[\s\S]*setupContent\.hide\(\)/);
-    expect(settings).toMatch(/readProjectProjectionWriteReadiness\(\)[\s\S]*projectionPauseText/);
-    expect(settings).toContain("后续变更会在后台自动同步并通知结果");
+    expect(settings).toMatch(/renderAutomaticProjectProjectionStatus[\s\S]*readProjectProjectionWriteReadiness/);
+    expect(settings).toContain("跟随下方“自动同步”开关；关闭时不会写入滴答");
+    expect(settings).not.toContain("projectionActivationConfirmation");
+    expect(settings).not.toContain("confirmProjectProjection(");
     expect(settings).not.toContain("后台静默处理");
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
     expect(modal).toMatch(/submit\(title, initialStageTitle, this\.color\)/);
@@ -504,12 +504,15 @@ describe("workbench layout and navigation structure", () => {
 
   it("hides projection column creation while retaining safe unknown reconciliation", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
     const confirm = service.slice(
       service.indexOf("async confirmProjectionColumnCreation"),
       service.indexOf("async reconcileProjectionColumnCreation"),
     );
-    expect(settings).toMatch(/PROJECTION_COLUMN_NAME[\s\S]*previewProjectProjectionColumn[\s\S]*projectionColumnConfirmation\.request\(\)[\s\S]*confirmProjectProjectionColumn/);
+    expect(settings).toMatch(/PROJECTION_COLUMN_NAME[\s\S]*阶段成为父任务/);
+    expect(settings).not.toContain("previewProjectProjectionColumn");
+    expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*previewProjectionColumnCreation[\s\S]*confirmProjectionColumnCreation/);
     expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
     expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
     expect(confirm).toMatch(/enterExclusive\("滴答项目同步分栏创建"\)/);

@@ -362,8 +362,11 @@ export interface ProjectionProjectReadModel {
   project: { id: string; path: string; title: string; status: ProjectionProjectInput["projectStatus"]; parentTaskId?: string };
   stages: Array<{
     id: string;
+    title?: string;
     path: string;
     revisionHash: string;
+    parentTaskId?: string;
+    parentDiagnostic?: ProjectionPersistentState["parentCheckpoints"][number];
     managed: Array<{
       uuid: string;
       line: number;
@@ -419,6 +422,8 @@ export class DidaProjectProjectionService {
         id: stage.stageId,
         path: stage.path,
         revisionHash: revision.hash,
+        parentTaskId: identity.parentTaskId,
+        parentDiagnostic: state.parentCheckpoints.find((item) => item.projectId === identity.projectId),
         managed: parsed.actions.map((action) => {
           const persisted = state.ledger.find((entry) => entry.uuid === action.uuid &&
             entry.projectId === input.projectId && entry.stageId === stage.stageId);
@@ -1044,6 +1049,17 @@ export class DidaProjectProjectionService {
       readiness.taskReopenVerified,
       summary,
     )) return summary;
+
+    // Stage 同时是远端父任务的身份载体；首次回填父 ID 后必须刷新同一份
+    // Markdown revision，避免随后写行动 remoteId 时拿旧 hash 触发伪 CAS 冲突。
+    for (const stage of preflightStages) {
+      const source = input.stages.find((candidate) => candidate.stageId === stage.stageId);
+      if (source?.path !== input.projectPath) continue;
+      const refreshed = await this.requireRevision(source.path);
+      assertProjectionStageIdentity(refreshed.content, stage.stageId);
+      stage.revision = refreshed;
+      stage.actions = parseManagedPlanActions(refreshed.content).actions;
+    }
 
     const freshState = await this.state.read();
     assertProjectionUuidOwnership(freshState, projectIdentity.projectId, preflightStages);

@@ -8,6 +8,7 @@ import { stableHash, stableStringify } from "../src/domain/stable";
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import { rotatingChallenges } from "../src/domain/gamification";
+import { PROJECT_PROJECTION_ACTIVATION_VERSION } from "../src/domain/dida-project-projection";
 import {
   beginDataGeneration,
   invalidateDataGeneration,
@@ -806,6 +807,7 @@ describe("HelixDataStore serialization", () => {
   it("rejects projection state shadow fields, duplicate identities, and target ownership mismatch", () => {
     const validState = {
       enabled: true,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
       target: { targetProjectId: "target-list", targetColumnId: "target-column" },
       confirmedPreviewHash: "a".repeat(64),
       ledger: [{
@@ -851,6 +853,10 @@ describe("HelixDataStore serialization", () => {
       validState.receiptCleanupPending,
     );
     expect(hydrateData(valid).didaProjectionState?.ledger[0]?.remoteEntity).toBe("task");
+    expect(hydrateData(valid).didaProjectionState).toMatchObject({
+      enabled: true,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
+    });
 
     const deletionTombstone = createDefaultData("device-projection-delete-tombstone");
     deletionTombstone.didaProjectionState = {

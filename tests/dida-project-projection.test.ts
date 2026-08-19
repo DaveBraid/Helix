@@ -115,7 +115,8 @@ describe("Dida project projection domain", () => {
       projectCount: 1,
       actionCount: 0,
     });
-    expect(preview.blockers.join(" ")).toMatch(/队列非空.*授权合同.*结果未知.*没有写权限.*不是看板/);
+    expect(preview.blockers.join(" ")).toMatch(/队列非空.*授权合同.*结果未知.*没有写权限/);
+    expect(preview.blockers.join(" ")).not.toMatch(/看板/);
     expect(() => buildProjectionActivationPreview({
       target: { targetProjectId: "list-1", targetColumnId: "column-1" },
       projects: [project], columns: [{ ...column, projectId: "other" }], readiness: ready, projectCount: 1, actionCount: 0,

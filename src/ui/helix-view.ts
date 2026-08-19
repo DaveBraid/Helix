@@ -325,7 +325,7 @@ export class HelixView extends ItemView {
       readProjectProjection: (projectId: string) => Promise<ProjectionProjectReadModel>;
       reconcileProjectProjectionFrozen: (input:
         | { kind: "action"; projectId: string; stageId: string; uuid: string }
-        | { kind: "parent"; projectId: string }) => Promise<void>;
+        | { kind: "parent"; projectId: string; stageId: string }) => Promise<void>;
       recoverPendingProjectProjectionReceiptCleanup: () => Promise<void>;
       removeResolvedProjectProjectionReceipt: (operationId: string) => Promise<void>;
       reconcileProjectProjectionColumn: () => Promise<void>;
@@ -474,7 +474,7 @@ export class HelixView extends ItemView {
       ? this.previewTasks
       : DIDA_READ_AVAILABLE ? (this.state?.tasks ?? []) : [];
     const localOpenCount = this.localProjectTaskSnapshot?.roots.filter((task) =>
-      task.state !== "completed" && task.state !== "terminated").length ?? 0;
+      !task.remoteId && task.state !== "completed" && task.state !== "terminated").length ?? 0;
     const projectSection = sidebar.createDiv({ cls: "helix-sidebar-lists" });
     const projectHeading = projectSection.createDiv({ cls: "helix-sidebar-lists-head" });
     projectHeading.createSpan({ text: "清单" });
@@ -633,7 +633,7 @@ export class HelixView extends ItemView {
     const localWorkspace = (this.localProjectTaskSnapshot?.destinations.length ?? 0) > 0;
     const remoteTasks = this.state?.demoMode && localWorkspace ? this.state.tasks : state.tasks;
     const remoteProjects = this.state?.demoMode && localWorkspace ? this.state.projects : state.projects;
-    const tasks = [...remoteTasks, ...localTasks];
+    const tasks = mergeProjectTaskCollections(remoteTasks, localTasks);
     const projects: DidaProject[] = [
       ...remoteProjects,
       ...(this.localProjectTaskSnapshot?.destinations ?? []).map((project) => ({
@@ -699,9 +699,10 @@ export class HelixView extends ItemView {
           project: projects.find((project) => project.id === rendered.projectId),
         }];
       });
+    const localItemIds = new Set(localItems.map((item) => item.task.id));
     const allRealItems = [
       ...localItems,
-      ...this.service.visibleInProgress(true).map((item) => ({
+      ...this.service.visibleInProgress(true).filter((item) => !localItemIds.has(item.task.id)).map((item) => ({
         task: item.task,
         project: item.project,
       })),
@@ -1399,7 +1400,7 @@ export class HelixView extends ItemView {
       ? (this.state?.tasks ?? [])
       : displayed.tasks;
     const localTasks = this.localProjectTaskDidaTasks();
-    const tasks = [...remoteTasks, ...localTasks];
+    const tasks = mergeProjectTaskCollections(remoteTasks, localTasks);
     const projects = this.state?.demoMode && hasLocalWorkspace
       ? (this.state?.projects ?? [])
       : displayed.projects;
@@ -1647,7 +1648,6 @@ export class HelixView extends ItemView {
     } else {
       this.renderTaskCalendar(panel, visibleTasks, taskProjects, this.taskViewMode);
     }
-    this.renderProjectLinkedTasks(content);
   }
 
   private renderTaskBoard(
@@ -2718,45 +2718,6 @@ export class HelixView extends ItemView {
     return workbench;
   }
 
-  private renderProjectLinkedTasks(content: HTMLElement): void {
-    if (!DIDA_READ_AVAILABLE) return;
-    const snapshot = this.taskReferenceSnapshot;
-    if (!snapshot) return;
-    const references = snapshot.references;
-    const taskById = new Map((this.state?.tasks ?? []).map((task) => [task.id, task]));
-    const card = content.createDiv({ cls: "helix-card helix-project-linked-tasks" });
-    const header = card.createDiv({ cls: "helix-section-header" });
-    header.createEl("h3", { text: "项目关联任务" });
-    header.createSpan({ cls: "helix-chip is-soft", text: String(references.length) });
-    if (references.length === 0) {
-      card.createDiv({ cls: "helix-empty", text: "暂无关联任务" });
-      return;
-    }
-    for (const reference of references) {
-      const task = taskById.get(reference.taskId);
-      if (task) {
-        const didaProject = (this.state?.projects ?? []).find((project) =>
-          project.id === task.projectId);
-        this.renderTaskRow(card, task, didaProject, false);
-        continue;
-      }
-      const row = card.createDiv({ cls: "helix-task-row" });
-      const copy = row.createDiv({ cls: "helix-task-copy" });
-      copy.createDiv({ cls: "helix-task-title", text: "任务暂不在同步缓存中" });
-      copy.createDiv({
-        cls: "helix-task-meta",
-        text: reference.stages.map((stage) => `阶段 ${stage.stageCode}`).join(" · ") ||
-          reference.project?.title || reference.projectId,
-      });
-      const open = row.createEl("button", {
-        cls: "helix-mini-action",
-        attr: { "aria-label": "打开任务关联笔记", title: "打开任务关联笔记" },
-      });
-      setIcon(open, "file-text");
-      open.addEventListener("click", () => void this.actions.openProjectFile(reference.notePath));
-    }
-  }
-
   private async requestCycleStatusChange(
     cycleId: string,
     expectedStatus: ProjectWorkspaceCycleStatus,
@@ -3772,12 +3733,15 @@ export class HelixView extends ItemView {
     const frozenActions = models.flatMap((model) => model.stages.flatMap((stage) =>
       stage.managed.filter((action) => action.frozen).map((action) => ({ model, stageId: stage.id, action }))));
     const orphaned = models.flatMap((model) => model.orphanDiagnostics.map((action) => ({ model, action })));
-    const frozenParents = models.filter((model) => model.parentDiagnostic?.frozen);
+    const frozenParents = models.flatMap((model) => model.stages
+      .filter((stage) => stage.parentDiagnostic?.frozen)
+      .map((stage) => ({ model, stage })));
     const referenced = new Set([
       ...pending.map((item) => item.operationId),
       ...frozenActions.flatMap((item) => item.action.operationId ? [item.action.operationId] : []),
       ...orphaned.flatMap((item) => item.action.operationId ? [item.action.operationId] : []),
-      ...frozenParents.flatMap((model) => model.parentDiagnostic?.operationId ? [model.parentDiagnostic.operationId] : []),
+      ...frozenParents.flatMap(({ stage }) =>
+        stage.parentDiagnostic?.operationId ? [stage.parentDiagnostic.operationId] : []),
     ]);
     const receipts = [...new Map(models.flatMap((model) => model.receipts)
       .map((receipt) => [receipt.operationId, receipt])).values()]
@@ -3819,14 +3783,16 @@ export class HelixView extends ItemView {
       this.renderProjectionReconcileCard(group, token, model, action.stageId, action.uuid,
         `失联关联 ${action.uuid} · ${action.frozen ?? action.state}`, Boolean(action.frozen));
     }
-    for (const model of frozenParents) {
+    for (const { model, stage } of frozenParents) {
       const card = group.createDiv({ cls: "helix-card helix-projection-conflict-card" });
-      card.createEl("strong", { text: `${model.project.title} · 父任务冻结` });
-      card.createEl("code", { text: model.parentDiagnostic?.operationId ?? "无操作 ID" });
+      card.createEl("strong", { text: `${model.project.title}／${stage.title ?? stage.id} · 阶段任务冻结` });
+      card.createEl("code", { text: stage.parentDiagnostic?.operationId ?? "无操作 ID" });
       if (PROJECT_DIDA_PROJECTION_AVAILABLE) {
         const reconcile = card.createEl("button", { text: "精确复读并收口" });
         reconcile.addEventListener("click", () => this.runProjectionUiAction(reconcile, token,
-          () => this.actions.reconcileProjectProjectionFrozen({ kind: "parent", projectId: model.project.id })));
+          () => this.actions.reconcileProjectProjectionFrozen({
+            kind: "parent", projectId: model.project.id, stageId: stage.id,
+          })));
       }
     }
     for (const receipt of receipts) {
@@ -6168,6 +6134,24 @@ function localTaskStateLabel(state: ProjectionActionState): string {
     paused: "已暂停",
     terminated: "已终止",
   }[state];
+}
+
+function mergeProjectTaskCollections(remoteTasks: DidaTask[], localTasks: DidaTask[]): DidaTask[] {
+  const tasks = new Map(remoteTasks.map((task) => [task.id, task]));
+  for (const local of localTasks) {
+    const remote = tasks.get(local.id);
+    tasks.set(local.id, remote ? {
+      ...remote,
+      ...local,
+      projectId: remote.projectId,
+      ...(remote.parentId !== undefined ? { parentId: remote.parentId } : {}),
+      ...(remote.columnId !== undefined ? { columnId: remote.columnId } : {}),
+      ...(remote.columnName !== undefined ? { columnName: remote.columnName } : {}),
+      ...(remote.sortOrder !== undefined ? { sortOrder: remote.sortOrder } : {}),
+      ...(remote.childIds !== undefined ? { childIds: remote.childIds } : {}),
+    } : local);
+  }
+  return [...tasks.values()];
 }
 
 function localTaskDestinationValue(projectId: string, stageId: string): string {

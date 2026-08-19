@@ -106,6 +106,21 @@ describe("LocalProjectTaskService", () => {
     expect(markdown.value()).toContain("- [ ]\n\n# 行动结果");
   });
 
+  it("uses the stable remote task identity after an action is synchronized", async () => {
+    const content = stage.replace(
+      "- [ ] 根任务\n  - [ ] 子任务",
+      "- [ ] 已同步任务 <!-- helix-dida-action:v1 uuid=uuid-remote remoteId=remote-task-1 state=idea -->",
+    );
+    const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(content)).snapshot(workspace());
+    expect(snapshot.roots[0]).toMatchObject({
+      id: "remote-task-1",
+      remoteId: "remote-task-1",
+      uuid: "uuid-remote",
+      title: "已同步任务",
+    });
+    expect(snapshot.byId.get("remote-task-1")?.uuid).toBe("uuid-remote");
+  });
+
   it("creates a root and child, updates the child, then deletes the subtree with CAS", async () => {
     const markdown = new MemoryMarkdown(stage.replace("- [ ] 根任务\n  - [ ] 子任务\n", ""));
     const service = new LocalProjectTaskService(markdown);

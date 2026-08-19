@@ -804,6 +804,32 @@ describe("HelixDataStore serialization", () => {
     expect(hydrated.recoveryIssues.join(" ")).toMatch(/同步状态.*同步创建收据/);
   });
 
+  it("accepts markerless v3 projection receipts only for known internal identities", () => {
+    const raw = createDefaultData("device-projection-markerless");
+    raw.projectionOperationReceipts = [{
+      clientIdentity: "helix-parent:stage-a",
+      projectId: "target-list",
+      operationId: "op-projection-parent-a",
+      marker: "",
+      outcome: "verified",
+      remoteTaskId: "remote-a",
+    }, {
+      clientIdentity: "foreign-client",
+      projectId: "target-list",
+      operationId: "op-foreign",
+      marker: "",
+      outcome: "verified",
+      remoteTaskId: "remote-b",
+    }];
+
+    const hydrated = hydrateData(raw);
+
+    expect(hydrated.projectionOperationReceipts).toEqual([
+      expect.objectContaining({ clientIdentity: "helix-parent:stage-a", marker: "" }),
+    ]);
+    expect(hydrated.recoveryIssues.join(" ")).toMatch(/同步创建收据/);
+  });
+
   it("rejects projection state shadow fields, duplicate identities, and target ownership mismatch", () => {
     const validState = {
       enabled: true,

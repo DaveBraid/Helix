@@ -50,9 +50,11 @@ export interface ProjectionActivationPreview {
 }
 
 export const PROJECTION_COLUMN_NAME = "Helix项目";
-export const PROJECTION_PROJECT_NAME = "Helix Project";
+export const PROJECTION_PROJECT_NAME = "Helix Projects";
+/** 项目阶段任务直接归入清单，不指定看板分栏。 */
+export const PROJECTION_NO_COLUMN_ID = "helix-no-column";
 /** 旧调试状态没有此凭证；门禁开放后必须由当前设置页重新预览确认。 */
-export const PROJECT_PROJECTION_ACTIVATION_VERSION = 2;
+export const PROJECT_PROJECTION_ACTIVATION_VERSION = 3;
 
 export interface ProjectionColumnBaseline {
   id: string;
@@ -178,7 +180,7 @@ export type ProjectionIntent =
   | { kind: "delete-action"; entry: ProjectionLedgerEntry };
 
 export type ProjectionTaskWriteField =
-  | "title" | "status" | "desc" | "startDate" | "dueDate" | "timeZone" | "isAllDay" | "priority" | "tags";
+  | "title" | "content" | "status" | "desc" | "startDate" | "dueDate" | "timeZone" | "isAllDay" | "priority" | "tags";
 
 const ACTION_MARKER_V1 = /^<!-- helix-dida-action:v1 uuid=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
 const ACTION_MARKER_V2 = /^<!-- helix-dida-action:v2 uuid=([^ ]+) parent=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
@@ -196,18 +198,18 @@ export function buildProjectionActivationPreview(input: {
   assertStableId(input.target.targetProjectId, "目标清单 ID");
   assertStableId(input.target.targetColumnId, "目标分栏 ID");
   const matchingProjects = input.projects.filter((item) => item.id === input.target.targetProjectId);
-  const matchingColumns = input.columns.filter((item) => item.id === input.target.targetColumnId);
   if (matchingProjects.length !== 1) throw new Error("目标滴答清单身份缺失或重复");
-  if (matchingColumns.length !== 1 || matchingColumns[0]!.projectId !== input.target.targetProjectId) {
+  const project = matchingProjects[0]!;
+  const withoutColumn = input.target.targetColumnId === PROJECTION_NO_COLUMN_ID;
+  const matchingColumns = input.columns.filter((item) => item.id === input.target.targetColumnId);
+  if (!withoutColumn && (matchingColumns.length !== 1 || matchingColumns[0]!.projectId !== input.target.targetProjectId)) {
     throw new Error("目标看板分栏身份或归属不一致");
   }
-  const project = matchingProjects[0]!;
-  const column = matchingColumns[0]!;
   const blockers = readinessBlockers(input.readiness, project);
   const stable = {
     target: input.target,
     projectName: project.name,
-    columnName: column.name,
+    columnName: withoutColumn ? "不指定分栏" : matchingColumns[0]!.name,
     projectCount: input.projectCount,
     actionCount: input.actionCount,
     blockers,
@@ -696,7 +698,7 @@ export function planProjectionChanges(
 export function verifyProjectedTask(
   task: DidaTask,
   entry: ProjectionLedgerEntry,
-  marker: string,
+  _marker: string,
   options: { title?: boolean; state?: boolean; attributes?: boolean; column?: boolean } = {},
 ): void {
   const verifyTitle = options.title ?? true;
@@ -707,8 +709,9 @@ export function verifyProjectedTask(
     remoteId: Boolean(entry.remoteId) && task.id === entry.remoteId,
     projectId: task.projectId === entry.targetProjectId,
     parentId: task.parentId === entry.parentTaskId,
-    columnId: options.column === false || task.columnId === entry.targetColumnId,
-    marker: task.content === marker,
+    columnId: options.column === false || entry.targetColumnId === PROJECTION_NO_COLUMN_ID ||
+      task.columnId === entry.targetColumnId,
+    marker: task.content === undefined || task.content === "",
     title: !verifyTitle || task.title === entry.title,
     state: !verifyState || (entry.state === "completed" ? task.status === 2 : task.status !== 2),
     attributes: attributeFailures.length === 0,
@@ -819,8 +822,6 @@ function readinessBlockers(value: ProjectionReadiness, project: DidaProject): st
     !value.queueEmpty ? "现有任务队列非空" : undefined,
     !value.authorizationCurrent ? "滴答授权合同缺失或过期" : undefined,
     !value.taskParentingVerified ? "真实子任务父子关系尚未验证" : undefined,
-    !value.boardPlacementVerified ? "看板归栏能力尚未验证" : undefined,
-    !value.boardFresh ? "目标看板快照已过期" : undefined,
     value.unknownOutcomes > 0 ? "仍有远端结果未知对象" : undefined,
     project.permission && project.permission !== "write" ? "目标清单没有写权限" : undefined,
   ].filter((item): item is string => Boolean(item));

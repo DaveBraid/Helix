@@ -82,6 +82,7 @@ export async function runDidaProjectProjectionContractProbe(
     projectPath,
     projectTitle: `${context.marker} 投影项目`,
     projectStatus: "active" as const,
+    createWhenMissing: true,
     stages: [{ path: stagePath, stageId }],
   };
   const preview = await projection.previewActivation(target, { projectCount: 1, actionCount: 1 });
@@ -265,7 +266,7 @@ class ContractProjectionPipeline implements ProjectionTaskPipeline {
     const operationId = `contract-projection-delete-${crypto.randomUUID()}`;
     const before = await this.rereadTask(expected.targetProjectId, expected.taskId);
     if (!before || before.parentId !== expected.parentTaskId || before.columnId !== expected.targetColumnId ||
-      before.content !== expected.marker) {
+      Boolean(before.content)) {
       return { operationId, outcome: "preflight-changed", message: "项目投影合同删除前身份不一致" };
     }
     let unknown: unknown;
@@ -296,11 +297,11 @@ class ContractProjectionPipeline implements ProjectionTaskPipeline {
   async deleteParentTask(
     taskId: string,
     target: DidaProjectionTarget,
-    projectId: string,
+    _projectId: string,
   ): Promise<void> {
     const before = await this.rereadTask(target.targetProjectId, taskId);
     if (!before || before.parentId || before.columnId !== target.targetColumnId ||
-      before.content !== `helix-project-projection:${projectId}`) {
+      Boolean(before.content)) {
       throw new Error("项目投影合同父任务清理前身份不一致");
     }
     let unknown: unknown;
@@ -328,17 +329,17 @@ async function assertParentAndChild(
   parentId: string,
   childId: string,
   target: DidaProjectionTarget,
-  projectId: string,
-  actionId: string,
+  _projectId: string,
+  _actionId: string,
 ): Promise<void> {
   const parent = normalizeTask(await context.api.getTask(target.targetProjectId, parentId));
   const child = normalizeTask(await context.api.getTask(target.targetProjectId, childId));
   if (parent.projectId !== target.targetProjectId || parent.columnId !== target.targetColumnId ||
-    parent.content !== `helix-project-projection:${projectId}` || parent.status === 2) {
+    Boolean(parent.content) || parent.status === 2) {
     throw new Error("项目投影合同父任务身份不一致");
   }
   if (child.projectId !== target.targetProjectId || child.columnId !== target.targetColumnId ||
-    child.parentId !== parentId || child.content !== `helix-projection:${actionId}` || child.status === 2) {
+    child.parentId !== parentId || Boolean(child.content) || child.status === 2) {
     throw new Error("项目投影合同真实子任务身份不一致");
   }
 }

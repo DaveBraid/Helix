@@ -34,6 +34,7 @@ import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import {
   PROJECT_PROJECTION_ACTIVATION_VERSION,
   PROJECTION_COLUMN_NAME,
+  PROJECTION_NO_COLUMN_ID,
   verifyClientChecklistAppendResult,
   type ProjectionColumnBaseline,
   type ProjectionColumnCreationCheckpoint,
@@ -164,11 +165,11 @@ export interface DidaWriteContractPreflight {
 export function projectProjectionGlobalCapabilitiesReady(
   state: Pick<HelixRuntimeState,
     "connected" | "authorizationConfigured" | "taskCrudVerified" |
-    "taskParentingVerified" | "boardPlacementVerified" | "projectProjectionVerified">,
+    "taskParentingVerified" | "projectProjectionVerified">,
 ): boolean {
   // 重开只在具体 reopen 操作门禁检查；不能阻止普通创建、更新或完成从队列阻塞中恢复。
   return state.connected && state.authorizationConfigured && state.taskCrudVerified &&
-    state.taskParentingVerified && state.boardPlacementVerified && state.projectProjectionVerified;
+    state.taskParentingVerified && state.projectProjectionVerified;
 }
 
 export type StateListener = (state: HelixRuntimeState) => void;
@@ -1850,12 +1851,12 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     }
   }
 
-  async enqueueProjectionComplete(task: DidaTask): Promise<ProjectionWriteReceipt> {
-    return this.enqueueProjectionExisting(task, "complete", []);
+  async enqueueProjectionComplete(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt> {
+    return this.enqueueProjectionExisting(task, "complete", [], undefined, freshBase);
   }
 
-  async enqueueProjectionReopen(task: DidaTask): Promise<ProjectionWriteReceipt> {
-    return this.enqueueProjectionExisting(task, "update", ["status"]);
+  async enqueueProjectionReopen(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt> {
+    return this.enqueueProjectionExisting(task, "update", ["status"], undefined, freshBase);
   }
 
   async enqueueProjectionDelete(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt> {
@@ -1868,8 +1869,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         expected.taskId,
       );
       if ((remote.parentId ?? "") !== (expected.parentTaskId ?? "") ||
-        remote.columnId !== expected.targetColumnId ||
-        remote.content !== expected.marker) {
+        (expected.targetColumnId !== PROJECTION_NO_COLUMN_ID && remote.columnId !== expected.targetColumnId)) {
         return { operationId: `op-projection-delete-${crypto.randomUUID()}`, outcome: "conflict", message: "同步删除写前身份复读不一致" };
       }
       const now = new Date().toISOString();
@@ -2620,8 +2620,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
     const capabilities = this.contractProjectionQueueProbeCapabilities ?? this.state;
     if (!this.contractProjectionQueueProbeRunning) this.assertTaskCrudVerified();
     if (!capabilities.taskCrudVerified || !capabilities.taskParentingVerified ||
-      !capabilities.boardPlacementVerified || !capabilities.projectProjectionVerified) {
-      throw new Error("当前授权尚未验证滴答项目同步所需的真实子任务、看板归栏与完整闭环");
+      !capabilities.projectProjectionVerified) {
+      throw new Error("当前授权尚未验证滴答项目同步所需的真实子任务与完整闭环");
     }
     if (reopen && !capabilities.taskReopenVerified) {
       throw new Error("当前授权尚未验证任务重开能力");
@@ -3233,6 +3233,12 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
           ) {
             delete data.baseSnapshots[`task:${claimedOperation.entityId}`];
             delete data.localSnapshots[`task:${claimedOperation.entityId}`];
+            // 已按精确任务 ID 证明删除后，旧 create/update 收据不能继续占用
+            // clientIdentity；否则用户在本地重新纳入同一 Stage／行动 UUID 时会被
+            // 一个已不存在的远端对象永久阻塞。保留本次 delete 收据供上层收口。
+            data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
+              receipt.operationId === claimedOperation.id ||
+              receipt.remoteTaskId !== claimedOperation.entityId);
             data.inProgress = data.inProgress.filter(
               (entry) => entry.taskId !== claimedOperation.entityId,
             );
@@ -3943,7 +3949,7 @@ function projectionWriteReceipt(
     };
   }
   if (receipt.outcome === "verified" && task && task.id === receipt.remoteTaskId &&
-    task.projectId === receipt.projectId && task.content === receipt.marker) {
+    task.projectId === receipt.projectId) {
     return {
       operationId: receipt.operationId,
       outcome: "verified",

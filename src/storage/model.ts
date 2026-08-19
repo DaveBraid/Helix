@@ -546,8 +546,12 @@ function isProjectionCreateReceipt(
   if (Object.keys(record).some((key) => !allowed.has(key))) return false;
   const id = (candidate: unknown) => typeof candidate === "string" && candidate.length > 0 &&
     candidate === candidate.trim() && candidate.length <= 512 && !/[\r\n]/u.test(candidate);
+  const marker = id(record.marker) || (
+    record.marker === "" && typeof record.clientIdentity === "string" &&
+    /^(?:helix-parent:|helix-action:|helix-write:|helix-delete:helix-projection:)/u.test(record.clientIdentity)
+  );
   const outcomes = ["verified", "verified-absent", "preflight-changed", "unknown", "conflict", "retryable", "authorization", "capability"];
-  return id(record.clientIdentity) && id(record.projectId) && id(record.operationId) && id(record.marker) &&
+  return id(record.clientIdentity) && id(record.projectId) && id(record.operationId) && marker &&
     outcomes.includes(String(record.outcome)) &&
     (record.message === undefined || typeof record.message === "string") &&
     (record.conflictId === undefined || id(record.conflictId)) &&

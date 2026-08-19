@@ -64,6 +64,7 @@ export function projectionInputFromStage(
     projectPath: stage.notePath,
     projectTitle: stage.title,
     projectStatus: stage.status === "idea" ? "planned" : stage.status,
+    createWhenMissing: stage.status === "active",
     stages: [{ path: stage.notePath, stageId: stage.id }],
   };
 }

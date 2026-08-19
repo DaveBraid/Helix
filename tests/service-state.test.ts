@@ -373,6 +373,51 @@ it("hydrates sparse projection updates from Base instead of inventing cleared fi
   expect(persisted.queue).toEqual([]);
   expect(persisted.conflicts).toEqual([]);
 });
+
+it("completes a projection parent from a fresh Base after server-derived childIds change", async () => {
+  const data = createDefaultData("device-projection-parent-complete");
+  grantTaskCrud(data, "point");
+  data.didaContractCapabilities!.taskParentingVerified = true;
+  data.didaContractCapabilities!.projectProjectionVerified = true;
+  const stale = {
+    id: "projection-parent",
+    projectId: "contract-list",
+    title: "Stage",
+    content: "",
+    status: 0,
+    childIds: [],
+  } as DidaTask;
+  data.baseSnapshots[`task:${stale.id}`] = createSnapshot("task", stale.id, stale);
+  let persisted = structuredClone(data);
+  const service = new HelixService(new HelixDataStore({
+    async loadData() { return structuredClone(persisted); },
+    async saveData(value) { persisted = structuredClone(value) as typeof persisted; },
+  }), { getDidaToken: () => "token" } as HelixSecretStore, {
+    projectDidaProjectionAvailable: true,
+  });
+  await service.initialize();
+  let remote = normalizeTask({ ...stale, childIds: ["projection-child"] });
+  Object.assign((service as unknown as { api: Record<string, unknown> }).api, {
+    async getTask() { return structuredClone(remote); },
+    async completeTask() {
+      remote = { ...remote, status: 2, completedTime: "2026-08-19T00:00:00.000Z" };
+    },
+  });
+
+  await expect(service.enqueueProjectionComplete({
+    ...remote,
+    status: 2,
+    completedTime: "2026-08-19T00:00:00.000Z",
+  }, remote)).resolves.toMatchObject({ outcome: "verified", task: { status: 2 } });
+
+  expect(persisted.queue).toEqual([]);
+  expect(persisted.conflicts).toEqual([]);
+  expect(persisted.baseSnapshots[`task:${stale.id}`]?.value).toMatchObject({
+    status: 2,
+    childIds: ["projection-child"],
+  });
+});
+
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 
 async function createBoardMoveHarness(): Promise<{
@@ -2895,6 +2940,14 @@ describe("HelixService runtime recovery", () => {
       lastTouchedAt: "2026-08-13T00:00:00.000Z",
       activeFocus: false,
     }];
+    data.projectionOperationReceipts = [{
+      clientIdentity: "helix-action:project:stage:uuid-delete",
+      projectId: task.projectId,
+      operationId: "op-old-projection-create",
+      marker: "helix-projection:uuid-delete",
+      outcome: "verified",
+      remoteTaskId: task.id,
+    }];
     let persisted = structuredClone(data);
     let captured: SyncQueueOperation<DidaTask> | undefined;
     const service = new HelixService(
@@ -2925,6 +2978,7 @@ describe("HelixService runtime recovery", () => {
     expect(persisted.baseSnapshots[`task:${task.id}`]).toBeUndefined();
     expect(persisted.localSnapshots[`task:${task.id}`]).toBeUndefined();
     expect(persisted.inProgress).toEqual([]);
+    expect(persisted.projectionOperationReceipts).toEqual([]);
     expect(service.snapshot().tasks).toEqual([]);
   });
 
@@ -3704,7 +3758,7 @@ describe("HelixService runtime recovery", () => {
     await expect(service.recoverProjectionCreate(
       "helix-action:project-a:stage-a:uuid-c",
       "target-list",
-    )).resolves.toMatchObject({ outcome: "conflict" });
+    )).resolves.toMatchObject({ outcome: "verified", task: { id: remote.id, projectId: remote.projectId } });
 
     await store.mutate((draft) => {
       draft.baseSnapshots[`task:${remote.id}`] = createSnapshot("task", remote.id, {

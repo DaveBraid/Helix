@@ -18,7 +18,7 @@ import {
   DIDA_TASK_WRITE_AVAILABLE,
   PROJECT_DIDA_PROJECTION_AVAILABLE,
 } from "../release-capabilities";
-import { PROJECTION_COLUMN_NAME, PROJECTION_PROJECT_NAME } from "../domain/dida-project-projection";
+import { PROJECTION_PROJECT_NAME } from "../domain/dida-project-projection";
 import { DidaWriteContractConfirmationGate } from "./dida-write-contract-confirmation";
 
 export class HelixSettingTab extends PluginSettingTab {
@@ -177,7 +177,7 @@ export class HelixSettingTab extends PluginSettingTab {
     const content = section.createDiv();
     new Setting(content)
       .setName("自动目标")
-      .setDesc(`开启“自动同步”后，Helix 自动准备“${PROJECTION_PROJECT_NAME}”清单及“${PROJECTION_COLUMN_NAME}”专用归属。阶段成为父任务，“计划行动”成为其子任务；不会更改该清单的列表／看板偏好。`)
+      .setDesc(`开启“自动同步”后，Helix 使用“${PROJECTION_PROJECT_NAME}”清单，不创建看板或分栏。只有进行中阶段会首次生成父任务，“计划行动”成为其子任务。`)
       .setDisabled(true);
     void Promise.all([
       this.plugin.readProjectProjectionConfiguration(),

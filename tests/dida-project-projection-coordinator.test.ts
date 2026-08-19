@@ -93,6 +93,8 @@ describe("project projection application coordinator", () => {
       { id: "stage-1b", title: "阶段二", path: "Stage-1b.md", stages: [{ path: "Stage-1b.md", stageId: "stage-1b" }] },
     ]);
     expect(projectionInputFromStage(project, second).projectStatus).toBe("completed");
+    expect(projectionInputFromStage(project, second).createWhenMissing).toBe(false);
+    expect(projectionInputFromStage(project, project.cycles[0]!).createWhenMissing).toBe(true);
   });
 });
 

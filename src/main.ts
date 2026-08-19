@@ -91,7 +91,7 @@ import {
 
 import {
   PROJECT_PROJECTION_ACTIVATION_VERSION,
-  PROJECTION_COLUMN_NAME,
+  PROJECTION_NO_COLUMN_ID,
   PROJECTION_PROJECT_NAME,
   type DidaProjectionTarget,
   type ProjectionActivationPreview,
@@ -988,38 +988,24 @@ export default class HelixPlugin extends Plugin {
     return this.withProjectWorkspaceRead(() => this.projectProjection.readConfiguration());
   }
 
-  /** 普通自动同步开启后，唯一地建立 Helix Project 清单、专用分栏和 v2 阶段任务目标。 */
+  /** 普通自动同步开启后，唯一地连接 Helix Projects 清单和无分栏阶段任务目标。 */
   private ensureAutomaticProjectProjection(): Promise<void> {
     return this.projectProjectionBootstrapRunner.run(async () => {
       if (!PROJECT_DIDA_PROJECTION_AVAILABLE || this.recoveryMode || !this.settings.autoSync ||
         !this.secrets.getDidaToken()) return;
       const runtime = this.service.snapshot();
       if (!runtime.authorizationConfigured || !runtime.taskCrudVerified ||
-        !runtime.taskParentingVerified || !runtime.projectProjectionVerified ||
-        !runtime.boardPlacementVerified || !runtime.columnCreateVerified) return;
+        !runtime.taskParentingVerified || !runtime.projectProjectionVerified) return;
       const configuration = await this.projectProjection.readConfiguration();
       if (configuration.enabled &&
         configuration.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION &&
         configuration.target && configuration.confirmedPreviewHash) return;
       const snapshot = await this.projectWorkspace.loadStableWorkspace();
-      const stageIds = new Set(snapshot.projects.flatMap((project) =>
-        project.cycles.map((stage) => stage.id)));
       const hasRecoveryIdentity = configuration.ledger.length > 0 ||
         configuration.parentCheckpoints.length > 0 ||
         (configuration.parentBases?.length ?? 0) > 0 ||
         (configuration.receiptCleanupPending?.length ?? 0) > 0;
-      // 1.0.1-dev 曾把运行态写成 v2、加载器却只保留 v1。只在所有恢复身份
-      // 都明确以 Stage ID 为同步单元且仍属于当前工作区时，允许 fresh 复读后补回凭证。
-      const recoverableStageV2 = configuration.enabled === false &&
-        configuration.activationVersion === undefined &&
-        configuration.target !== undefined &&
-        typeof configuration.confirmedPreviewHash === "string" &&
-        configuration.ledger.every((entry) =>
-          entry.projectId === entry.stageId && stageIds.has(entry.projectId)) &&
-        configuration.parentCheckpoints.every((entry) => stageIds.has(entry.projectId)) &&
-        (configuration.parentBases ?? []).every((entry) => stageIds.has(entry.projectId)) &&
-        (configuration.receiptCleanupPending ?? []).every((entry) => stageIds.has(entry.projectId));
-      if (hasRecoveryIdentity && !recoverableStageV2) {
+      if (hasRecoveryIdentity) {
         throw new Error("旧版项目任务同步仍有身份记录，必须先在冲突中心完成收口");
       }
       let matches = this.service.snapshot().projects.filter((project) =>
@@ -1032,22 +1018,9 @@ export default class HelixPlugin extends Plugin {
       }
       if (matches.length !== 1) throw new Error(`无法唯一确认“${PROJECTION_PROJECT_NAME}”清单`);
       const targetProject = matches[0]!;
-      let catalog = await this.service.readProjectionCatalog(targetProject.id);
-      let columns = catalog.columns.filter((column) => column.name === PROJECTION_COLUMN_NAME);
-      if (columns.length > 1) throw new Error(`存在多个“${PROJECTION_COLUMN_NAME}”分栏，已停止自动选择`);
-      if (columns.length === 0) {
-        const preview = await this.service.previewProjectionColumnCreation(targetProject.id);
-        if (preview.blockers.length > 0) {
-          throw new Error(`无法准备项目任务分栏：${preview.blockers.join("；")}`);
-        }
-        await this.service.confirmProjectionColumnCreation(preview, preview.previewHash);
-        catalog = await this.service.readProjectionCatalog(targetProject.id);
-        columns = catalog.columns.filter((column) => column.name === PROJECTION_COLUMN_NAME);
-      }
-      if (columns.length !== 1) throw new Error(`无法唯一确认“${PROJECTION_COLUMN_NAME}”分栏`);
       const target = {
         targetProjectId: targetProject.id,
-        targetColumnId: columns[0]!.id,
+        targetColumnId: PROJECTION_NO_COLUMN_ID,
       };
       await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
       const counts = await projectionCounts(snapshot, this.projectProjection);

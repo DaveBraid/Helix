@@ -414,7 +414,7 @@ describe("workbench layout and navigation structure", () => {
     expect(view).not.toContain("同步此项目到滴答");
     expect(view).not.toContain("当前只写 Stage，尚未发送滴答");
     expect(settings).toMatch(/PROJECT_DIDA_PROJECTION_AVAILABLE\) this\.renderAutomaticProjectProjectionStatus\(\)/);
-    expect(settings).toContain("阶段成为父任务，“计划行动”成为其子任务");
+    expect(settings).toContain("只有进行中阶段会首次生成父任务，“计划行动”成为其子任务");
     expect(settings).not.toContain("renderProjectProjectionSettings");
     expect(settings).not.toContain("目标滴答清单");
   });
@@ -434,7 +434,7 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/editProjectAction[\s\S]*projectAutoSync\.invalidate\(input\.projectId\)/);
     expect(main).toMatch(/previewProjectProjection[\s\S]*localProjectTasks\.snapshot\(snapshot, \{ adoptUnmanaged: true \}\)[\s\S]*projectionCounts/);
     expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && this\.settings\.autoSync && readiness\.ready/);
-    expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*PROJECTION_PROJECT_NAME[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)[\s\S]*PROJECTION_COLUMN_NAME[\s\S]*confirmProjectionActivationWithLease/);
+    expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*PROJECTION_PROJECT_NAME[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)[\s\S]*PROJECTION_NO_COLUMN_ID[\s\S]*confirmProjectionActivationWithLease/);
     const automaticBootstrap = main.slice(
       main.indexOf("private ensureAutomaticProjectProjection"),
       main.indexOf("readProjectProjectionWriteReadiness"),
@@ -502,7 +502,7 @@ describe("workbench layout and navigation structure", () => {
     expect(modal).toMatch(/class RenameEntityModal extends Modal/);
   });
 
-  it("hides projection column creation while retaining safe unknown reconciliation", () => {
+  it("uses the exact Helix Projects list without creating a board column", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
@@ -510,9 +510,15 @@ describe("workbench layout and navigation structure", () => {
       service.indexOf("async confirmProjectionColumnCreation"),
       service.indexOf("async reconcileProjectionColumnCreation"),
     );
-    expect(settings).toMatch(/PROJECTION_COLUMN_NAME[\s\S]*阶段成为父任务/);
+    expect(settings).toMatch(/PROJECTION_PROJECT_NAME[\s\S]*不创建看板或分栏[\s\S]*只有进行中阶段会首次生成父任务/);
     expect(settings).not.toContain("previewProjectProjectionColumn");
-    expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*previewProjectionColumnCreation[\s\S]*confirmProjectionColumnCreation/);
+    const automaticBootstrap = main.slice(
+      main.indexOf("private ensureAutomaticProjectProjection"),
+      main.indexOf("readProjectProjectionWriteReadiness"),
+    );
+    expect(automaticBootstrap).toContain("PROJECTION_NO_COLUMN_ID");
+    expect(automaticBootstrap).not.toContain("previewProjectionColumnCreation");
+    expect(automaticBootstrap).not.toContain("confirmProjectionColumnCreation");
     expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
     expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
     expect(confirm).toMatch(/enterExclusive\("滴答项目同步分栏创建"\)/);

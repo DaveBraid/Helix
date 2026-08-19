@@ -18,6 +18,7 @@ import {
   restoreManagedPlanAction,
   verifyProjectedTask,
   PROJECTION_ACTION_EDITABLE_STATES,
+  PROJECTION_NO_COLUMN_ID,
   PROJECT_PROJECTION_ACTIVATION_VERSION,
   type DidaProjectionTarget,
   type ProjectionActivationPreview,
@@ -62,8 +63,8 @@ export interface ProjectionTaskPipeline {
   updateTask(task: DidaTask, writeFields: string[], operationId?: string, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
   stageTaskConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string, writeFields: string[]): Promise<ProjectionWriteReceipt>;
   stageItemsConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string): Promise<ProjectionWriteReceipt>;
-  completeTask(task: DidaTask): Promise<ProjectionWriteReceipt>;
-  reopenTask(task: DidaTask): Promise<ProjectionWriteReceipt>;
+  completeTask(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
+  reopenTask(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
   deleteTask(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt>;
   rereadTask(projectId: string, taskId: string): Promise<DidaTask | null>;
 }
@@ -79,8 +80,8 @@ export interface ExistingHelixTaskQueuePort {
   enqueueProjectionUpdate(task: DidaTask, writeFields: string[], operationId?: string, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
   stageProjectionTaskConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string, writeFields: string[]): Promise<ProjectionWriteReceipt>;
   stageProjectionItemsConflict(local: DidaTask, remote: DidaTask, base: DidaTask, operationId: string): Promise<ProjectionWriteReceipt>;
-  enqueueProjectionComplete(task: DidaTask): Promise<ProjectionWriteReceipt>;
-  enqueueProjectionReopen(task: DidaTask): Promise<ProjectionWriteReceipt>;
+  enqueueProjectionComplete(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
+  enqueueProjectionReopen(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt>;
   enqueueProjectionDelete(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt>;
   verifyRemoteTask(projectId: string, taskId: string): Promise<DidaTask>;
 }
@@ -119,12 +120,12 @@ export class ExistingHelixTaskPipelineAdapter implements ProjectionTaskPipeline 
     return this.operations.stageProjectionItemsConflict(local, remote, base, operationId);
   }
 
-  async completeTask(task: DidaTask): Promise<ProjectionWriteReceipt> {
-    return this.operations.enqueueProjectionComplete(task);
+  async completeTask(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt> {
+    return this.operations.enqueueProjectionComplete(task, freshBase);
   }
 
-  async reopenTask(task: DidaTask): Promise<ProjectionWriteReceipt> {
-    return this.operations.enqueueProjectionReopen(task);
+  async reopenTask(task: DidaTask, freshBase?: DidaTask): Promise<ProjectionWriteReceipt> {
+    return this.operations.enqueueProjectionReopen(task, freshBase);
   }
 
   async deleteTask(expected: ProjectionRemoteIdentity): Promise<ProjectionDeleteReceipt> {
@@ -276,8 +277,8 @@ export class PersistedProjectionDiagnosticsPort implements ProjectionDiagnostics
     const candidates = receipt ? Object.values(data.baseSnapshots)
       .filter((snapshot) => snapshot.kind === "task" && snapshot.value !== null)
       .map((snapshot) => snapshot.value as DidaTask)
-      .filter((task) => task.projectId === receipt.projectId && task.content === receipt.marker &&
-        (receipt.remoteTaskId === undefined || task.id === receipt.remoteTaskId)) : [];
+      .filter((task) => task.projectId === receipt.projectId &&
+        receipt.remoteTaskId !== undefined && task.id === receipt.remoteTaskId) : [];
     return {
       receipt: receipt ? structuredClone(receipt) : undefined,
       blocked,
@@ -336,6 +337,7 @@ export interface ProjectionProjectInput {
   projectPath: string;
   projectTitle: string;
   projectStatus: "planned" | "active" | "paused" | "completed" | "terminated";
+  createWhenMissing: boolean;
   stages: Array<{ path: string; stageId: string }>;
 }
 
@@ -445,11 +447,20 @@ export class DidaProjectProjectionService {
       projectionLedgerIdentity({ projectId: identity.projectId, stageId: stage.id, uuid: action.uuid }))));
     const orphanEntries = state.ledger.filter((entry) => entry.projectId === identity.projectId &&
       !managedIdentities.has(projectionLedgerIdentity(entry)));
+    const ownedRemoteIds = new Set([
+      ...(identity.parentTaskId ? [identity.parentTaskId] : []),
+      ...stages.flatMap((stage) => stage.managed.flatMap((action) => action.remoteId ? [action.remoteId] : [])),
+      ...orphanEntries.flatMap((entry) => entry.remoteId ? [entry.remoteId] : []),
+    ]);
+    const ownedOperationIds = new Set([
+      ...state.parentCheckpoints.flatMap((entry) =>
+        entry.projectId === identity.projectId && entry.operationId ? [entry.operationId] : []),
+      ...state.ledger.flatMap((entry) =>
+        entry.projectId === identity.projectId && entry.operationId ? [entry.operationId] : []),
+    ]);
     const receipts = (await this.diagnostics?.list() ?? []).filter((receipt) =>
-      receipt.marker === `helix-project-projection:${identity.projectId}` ||
-      stages.some((stage) => stage.managed.some((action) =>
-        receipt.marker === projectionMarker(action.uuid))) ||
-      orphanEntries.some((entry) => receipt.marker === projectionMarker(entry.uuid)));
+      ownedOperationIds.has(receipt.operationId) ||
+      (receipt.remoteTaskId !== undefined && ownedRemoteIds.has(receipt.remoteTaskId)));
     return {
       enabled: state.enabled,
       target: state.target ? { ...state.target } : undefined,
@@ -1037,6 +1048,7 @@ export class DidaProjectProjectionService {
       projectRevision,
       projectIdentity.projectId,
       input.projectTitle,
+      input.createWhenMissing,
       summary,
     );
     if (!parentTaskId) return summary;
@@ -1230,9 +1242,9 @@ export class DidaProjectProjectionService {
           id: `local-helix-action-${stableHash(clientIdentity).slice(0, 24)}`,
           projectId: entry.targetProjectId,
           parentId: entry.parentTaskId,
-          columnId: entry.targetColumnId,
+          ...(entry.targetColumnId !== PROJECTION_NO_COLUMN_ID ? { columnId: entry.targetColumnId } : {}),
           title: entry.title,
-          content: markerFor(entry),
+          content: "",
           desc: entry.content,
           startDate: entry.startDate,
           dueDate: entry.dueDate,
@@ -1289,7 +1301,7 @@ export class DidaProjectProjectionService {
         await settle(adopted, result);
         params.summary.createdActions += 1;
         if (entry.state === "completed") {
-          const completeResult = await this.pipeline.completeTask({ ...createdTask, status: 2 });
+          const completeResult = await this.pipeline.completeTask({ ...createdTask, status: 2 }, createdTask);
           if (completeResult.outcome !== "verified") {
             const frozen = { ...adopted, frozen: resultReason(completeResult), operationId: completeResult.operationId,
               conflictId: completeResult.conflictId };
@@ -1354,10 +1366,11 @@ export class DidaProjectProjectionService {
       }
       const desiredStatus = entry.state === "completed" ? 2 : 0;
       const baseStatus = previous.state === "completed" ? 2 : 0;
-      const fields: ProjectionTaskWriteField[] = intent.kind === "update-action" ? intent.writeFields :
+      const fields: ProjectionTaskWriteField[] = intent.kind === "update-action" ? [...intent.writeFields] :
         intent.kind === "complete-action" || intent.kind === "reopen-action" ? ["status"] : [];
+      if (remote.content) fields.push("content");
       const operationId = `op-projection-task-update-${crypto.randomUUID()}`;
-      const desired = { ...remote, title: entry.title, desc: entry.content,
+      const desired = { ...remote, title: entry.title, content: "", desc: entry.content,
         startDate: entry.startDate, dueDate: entry.dueDate, timeZone: entry.timeZone,
         isAllDay: entry.isAllDay, priority: entry.priority,
         tags: entry.tags ? [...entry.tags] : undefined,
@@ -1382,9 +1395,9 @@ export class DidaProjectProjectionService {
         continue;
       } else {
         result = intent.kind === "complete-action"
-          ? await this.pipeline.completeTask(desired)
+          ? await this.pipeline.completeTask(desired, remote)
           : intent.kind === "reopen-action"
-            ? await this.pipeline.reopenTask(desired)
+            ? await this.pipeline.reopenTask(desired, remote)
             : await this.pipeline.updateTask(desired, fields, operationId, remote);
       }
       if (result.outcome !== "verified") {
@@ -1494,6 +1507,7 @@ export class DidaProjectProjectionService {
     revision: ProjectionMarkdownRevision,
     projectId: string,
     title: string,
+    createWhenMissing: boolean,
     summary: ProjectionSyncSummary,
   ): Promise<string | undefined> {
     const checkpoint = state.parentCheckpoints.find((item) => item.projectId === projectId);
@@ -1520,6 +1534,7 @@ export class DidaProjectProjectionService {
       await this.saveParentBase(await this.state.read(), projectId, remote);
       return checkpoint.remoteId;
     }
+    if (!createWhenMissing) return undefined;
     const marker = `helix-project-projection:${projectId}`;
     const target = state.target!;
     const parentClientIdentity = parentCreateClientIdentity(projectId);
@@ -1527,9 +1542,9 @@ export class DidaProjectProjectionService {
     const result = recovered ?? await this.pipeline.createTask({
       id: `local-helix-project-${projectId}`,
       projectId: target.targetProjectId,
-      columnId: target.targetColumnId,
+      ...(target.targetColumnId !== PROJECTION_NO_COLUMN_ID ? { columnId: target.targetColumnId } : {}),
       title,
-      content: marker,
+      content: "",
       status: 0,
     }, parentClientIdentity);
     if (result.outcome !== "verified") {
@@ -1540,8 +1555,9 @@ export class DidaProjectProjectionService {
     }
     const createdTask = await this.exactVerifiedTask(result, target.targetProjectId);
     if (!createdTask.id || createdTask.id.startsWith("local-") ||
-      createdTask.projectId !== target.targetProjectId || createdTask.columnId !== target.targetColumnId ||
-      createdTask.content !== marker || createdTask.title !== title || createdTask.status === 2) {
+      createdTask.projectId !== target.targetProjectId ||
+      (target.targetColumnId !== PROJECTION_NO_COLUMN_ID && createdTask.columnId !== target.targetColumnId) ||
+      Boolean(createdTask.content) || createdTask.title !== title || createdTask.status === 2) {
       await this.freezeParent(state, projectId, marker, createdTask.id, "identity-mismatch");
       summary.frozen.push({ uuid: `project:${projectId}`, reason: "identity-mismatch", message: "父任务写后复读身份不一致" });
       return undefined;
@@ -1634,7 +1650,7 @@ export class DidaProjectProjectionService {
         summary.frozen.push({ uuid: `project:${projectId}`, reason: "capability", message: "父任务重开能力尚无真实合同，已冻结等待人工处理" });
         return false;
       }
-      const result = await this.pipeline.reopenTask({ ...remote, status: 0, completedTime: null });
+      const result = await this.pipeline.reopenTask({ ...remote, status: 0, completedTime: null }, remote);
       if (result.outcome !== "verified") {
         await this.freezeParent(state, projectId, marker, remoteId, resultReason(result), result);
         summary.frozen.push({ uuid: `project:${projectId}`, reason: resultReason(result), message: result.message });
@@ -1648,12 +1664,15 @@ export class DidaProjectProjectionService {
       }
       verified = reopenedTask;
     }
-    if (verified.title !== title) {
-      const fields = [verified.title !== title ? "title" : undefined]
-        .filter((item): item is string => Boolean(item));
+    if (verified.title !== title || verified.content) {
+      const fields: ProjectionTaskWriteField[] = [
+        verified.title !== title ? "title" : undefined,
+        verified.content ? "content" : undefined,
+      ].filter((item): item is ProjectionTaskWriteField => Boolean(item));
       const result = await this.pipeline.updateTask({
         ...verified,
         title,
+        content: "",
         status: desiredStatus,
         completedTime: desiredStatus === 0 ? null : remote.completedTime,
       }, fields, undefined, verified);
@@ -1666,7 +1685,10 @@ export class DidaProjectProjectionService {
       if (fields.includes("title")) summary.updatedParents += 1;
     }
     if (verified.status !== 2 && desiredStatus === 2) {
-      const result = await this.pipeline.completeTask({ ...verified, status: 2, completedTime: this.now() });
+      const result = await this.pipeline.completeTask(
+        { ...verified, status: 2, completedTime: this.now() },
+        verified,
+      );
       if (result.outcome !== "verified") {
         await this.freezeParent(state, projectId, marker, remoteId, resultReason(result), result);
         summary.frozen.push({ uuid: `project:${projectId}`, reason: resultReason(result), message: result.message });
@@ -1687,7 +1709,7 @@ export class DidaProjectProjectionService {
 
   private sameParentIdentity(task: DidaTask, projectId: string, remoteId: string, target: DidaProjectionTarget): boolean {
     return task.id === remoteId && task.projectId === target.targetProjectId &&
-      task.columnId === target.targetColumnId && task.content === `helix-project-projection:${projectId}` &&
+      (target.targetColumnId === PROJECTION_NO_COLUMN_ID || task.columnId === target.targetColumnId) &&
       !task.parentId;
   }
 
@@ -1858,6 +1880,7 @@ function projectionTaskFromEntry(
   return {
     ...remote,
     title: entry.title,
+    content: "",
     desc: entry.content,
     startDate: entry.startDate,
     dueDate: entry.dueDate,
@@ -1871,6 +1894,7 @@ function projectionTaskFromEntry(
 
 function projectionTaskField(task: DidaTask, field: ProjectionTaskWriteField): unknown {
   switch (field) {
+    case "content": return task.content;
     case "desc": return task.desc;
     case "title": return task.title;
     case "status": return task.status;
@@ -2451,7 +2475,6 @@ function assertReceiptMatchesProof(
   proof: ProjectionReceiptCleanupProof,
 ): void {
   if (receipt.operationId !== proof.operationId || receipt.projectId !== proof.targetProjectId ||
-    receipt.marker !== proof.marker ||
     (receipt.remoteTaskId !== undefined && receipt.remoteTaskId !== proof.remoteTaskId) ||
     receipt.conflictId !== proof.conflictId) {
     throw new Error("同步操作收据与冻结对象身份不一致，禁止收口");

@@ -20,6 +20,7 @@ import {
   verifyClientChecklistAppendResult,
   PROJECTION_ACTION_EDITABLE_STATES,
   PROJECT_PROJECTION_ACTIVATION_VERSION,
+  PROJECTION_NO_COLUMN_ID,
   type ProjectionLedgerEntry,
   type ProjectionReadiness,
 } from "../src/domain/dida-project-projection";
@@ -336,9 +337,9 @@ describe("Dida project projection domain", () => {
     });
   });
 
-  it("verifies every remote identity field and unique marker", () => {
+  it("verifies every remote identity field without exposing an identity marker", () => {
     const entry = ledger({ remoteId: "task-1" });
-    const task: DidaTask = { id: "task-1", projectId: "list-1", parentId: "parent-1", columnId: "column-1", title: "行动", content: projectionMarker("uuid-1"), status: 0 };
+    const task: DidaTask = { id: "task-1", projectId: "list-1", parentId: "parent-1", columnId: "column-1", title: "行动", content: "", status: 0 };
     expect(() => verifyProjectedTask(task, entry, projectionMarker("uuid-1"))).not.toThrow();
     expect(() => verifyProjectedTask({ ...task, parentId: "foreign" }, entry, projectionMarker("uuid-1"))).toThrow(/复读不一致/);
   });
@@ -350,7 +351,7 @@ describe("Dida project projection domain", () => {
       projectId: "list-1",
       parentId: "parent-1",
       title: "行动",
-      content: projectionMarker("uuid-1"),
+      content: "",
       status: 0,
       tags: ["helix", "本地验收"],
     };
@@ -369,7 +370,7 @@ describe("Dida project projection domain", () => {
       parentId: "parent-1",
       columnId: "column-1",
       title: "行动",
-      content: projectionMarker("uuid-1"),
+      content: "",
       status: 0,
       timeZone: "Asia/Shanghai",
     };
@@ -456,17 +457,27 @@ function reconcileAction(entry: ProjectionLedgerEntry) {
   };
 }
 
-function input(overrides: Partial<{ projectTitle: string; projectStatus: "planned" | "active" | "paused" | "completed" | "terminated" }> = {}) {
+function input(overrides: Partial<{
+  projectTitle: string;
+  projectStatus: "planned" | "active" | "paused" | "completed" | "terminated";
+  createWhenMissing: boolean;
+}> = {}) {
   return {
     projectId: "project-1",
     projectPath: "Project.md",
     projectTitle: overrides.projectTitle ?? "Alpha",
     projectStatus: overrides.projectStatus ?? "active" as const,
+    createWhenMissing: overrides.createWhenMissing ?? true,
     stages: [{ path: "Stage.md", stageId: "stage-1" }],
   };
 }
 
-function makeHarness(activate = false, failFirstCas = false, taskReopenVerified = false) {
+function makeHarness(
+  activate = false,
+  failFirstCas = false,
+  taskReopenVerified = false,
+  targetColumnId = "column-1",
+) {
   const markdown = new MemoryMarkdown({ "Project.md": projectMarkdown(), "Stage.md": adoptPlanAction(stage("- [ ] 行动"), 10, "uuid-1") });
   markdown.failNextCas = failFirstCas;
   const pipeline = new FakePipeline();
@@ -480,7 +491,7 @@ function makeHarness(activate = false, failFirstCas = false, taskReopenVerified 
   };
   const service = new DidaProjectProjectionService(markdown, pipeline, state, catalog, () => "2026-08-05T00:00:00.000Z");
   if (activate) {
-    const preview = buildProjectionActivationPreview({ target: { targetProjectId: "list-1", targetColumnId: "column-1" }, projects: [project], columns: [column], readiness: ready, projectCount: 1, actionCount: 1 });
+    const preview = buildProjectionActivationPreview({ target: { targetProjectId: "list-1", targetColumnId }, projects: [project], columns: [column], readiness: ready, projectCount: 1, actionCount: 1 });
     state.value = { enabled: true, activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION, target: preview.target, confirmedPreviewHash: preview.previewHash, ledger: [], parentCheckpoints: [] };
   }
   return { markdown, pipeline, state, service };
@@ -737,7 +748,7 @@ class FakePipeline implements ProjectionTaskPipeline {
       return result;
     }
     const task = this.tasks.get(expected.taskId);
-    if (!task || (task.parentId ?? "") !== expected.parentTaskId || task.projectId !== expected.targetProjectId || task.columnId !== expected.targetColumnId || task.content !== expected.marker) {
+    if (!task || (task.parentId ?? "") !== expected.parentTaskId || task.projectId !== expected.targetProjectId || task.columnId !== expected.targetColumnId) {
       return { operationId: `op-${++this.operationSequence}`, outcome: "conflict" as const, message: "identity mismatch" };
     }
     this.tasks.delete(expected.taskId);
@@ -754,6 +765,45 @@ class FakePipeline implements ProjectionTaskPipeline {
 }
 
 describe("DidaProjectProjectionService with real child tasks", () => {
+  it("does not create a missing parent for a stage that is not active", async () => {
+    const harness = makeHarness(true);
+
+    const summary = await harness.service.synchronizeProject(input({
+      projectStatus: "completed",
+      createWhenMissing: false,
+    }));
+
+    expect(summary).toMatchObject({ createdParents: 0, createdActions: 0, frozen: [] });
+    expect(harness.pipeline.created).toEqual([]);
+    expect(harness.state.value.parentCheckpoints).toEqual([]);
+    expect(harness.state.value.ledger).toEqual([]);
+  });
+
+  it("creates active stage tasks in the list root without a board column", async () => {
+    const harness = makeHarness(true, false, false, PROJECTION_NO_COLUMN_ID);
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ createdParents: 1, createdActions: 1, frozen: [] });
+    expect(harness.pipeline.created[0]).not.toHaveProperty("columnId");
+    expect(harness.pipeline.created[1]).not.toHaveProperty("columnId");
+    expect(harness.pipeline.created[0]?.content).toBe("");
+    expect(harness.pipeline.created[1]?.content).toBe("");
+  });
+
+  it("completes an existing stage parent when the stage becomes completed", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+
+    const summary = await harness.service.synchronizeProject(input({
+      projectStatus: "completed",
+      createWhenMissing: false,
+    }));
+
+    expect(summary).toMatchObject({ completedParents: 1, frozen: [] });
+    expect(harness.pipeline.tasks.get("remote-1")?.status).toBe(2);
+  });
+
   it("creates a project parent and one ordinary child task with stable identity", async () => {
     const harness = makeHarness(true);
 
@@ -770,7 +820,7 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       projectId: "list-1",
       columnId: "column-1",
       title: "行动",
-      content: projectionMarker("uuid-1"),
+      content: "",
       status: 0,
     });
     expect(child.items).toBeUndefined();
@@ -855,7 +905,7 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       title: "新行动",
       status: 2,
       parentId: "remote-1",
-      content: projectionMarker("uuid-1"),
+      content: "",
     });
   });
 
@@ -874,7 +924,7 @@ describe("DidaProjectProjectionService with real child tasks", () => {
     await harness.service.synchronizeProject(input());
 
     expect(harness.pipeline.tasks.get("remote-2")).toMatchObject({
-      content: projectionMarker("uuid-1"),
+      content: "",
       desc: "验证数据处理流程",
       startDate: "2026-08-15T09:30:00.000+08:00",
       dueDate: "2026-08-15T16:00:00.000+08:00",
@@ -887,7 +937,7 @@ describe("DidaProjectProjectionService with real child tasks", () => {
     });
   });
 
-  it("clears optional task attributes explicitly without changing the identity marker", async () => {
+  it("clears optional task attributes without adding a visible identity marker", async () => {
     const harness = makeHarness(true);
     harness.markdown.set("Stage.md", patchManagedPlanAction(harness.markdown.content("Stage.md"), {
       uuid: "uuid-1", content: "旧备注", priority: 3, tags: ["旧标签"],
@@ -901,7 +951,7 @@ describe("DidaProjectProjectionService with real child tasks", () => {
 
     expect(summary).toMatchObject({ updatedActions: 1, frozen: [] });
     expect(harness.pipeline.tasks.get("remote-2")).toMatchObject({
-      content: projectionMarker("uuid-1"),
+      content: "",
     });
     expect(harness.pipeline.tasks.get("remote-2")?.priority ?? 0).toBe(0);
     expect(harness.pipeline.tasks.get("remote-2")?.tags ?? []).toEqual([]);

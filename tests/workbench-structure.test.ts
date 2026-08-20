@@ -149,6 +149,8 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-task-tree \.helix-task-title[\s\S]*font-size: 13px/);
     expect(css).toMatch(/\.helix-task-summary[\s\S]*font-size: 11px/);
     expect(css).toMatch(/\.helix-task-tree \.helix-task-meta[\s\S]*font-size: 10px/);
+    expect(css).toMatch(/button\.helix-task-tree-progress[\s\S]*min-width: 48px[\s\S]*max-width: 48px[\s\S]*border-radius: 50% !important/);
+    expect(css).toMatch(/button\.helix-task-tree-progress:hover[\s\S]*background: transparent !important/);
     expect(view).toContain('attr: { "data-task-id": task.id }');
     expect(view).toContain("collapsedTaskTreeIds");
     expect(view).toContain("taskTreeRows");

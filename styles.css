@@ -686,28 +686,50 @@
   height: 18px;
 }
 
-.helix-task-tree-progress {
+.helix-root button.helix-task-tree-progress {
+  appearance: none;
+  display: grid;
+  flex: 0 0 48px;
   width: 48px;
+  min-width: 48px;
+  max-width: 48px;
   height: 48px;
+  min-height: 48px;
+  max-height: 48px;
+  place-items: center;
   padding: 0;
   border: 4px solid color-mix(in srgb, var(--text-muted) 24%, transparent);
-  border-radius: 50%;
-  background: transparent;
+  border-radius: 50% !important;
+  background: transparent !important;
+  background-image: none !important;
   color: var(--text-muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   font-weight: 600;
-  box-shadow: none;
+  line-height: 1;
+  box-shadow: none !important;
 }
 
-.helix-task-tree-progress.is-completed {
+.helix-root button.helix-task-tree-progress:hover,
+.helix-root button.helix-task-tree-progress:focus-visible {
+  border-radius: 50% !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.helix-root button.helix-task-tree-progress:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--interactive-accent) 54%, transparent);
+  outline-offset: 3px;
+}
+
+.helix-root button.helix-task-tree-progress.is-completed {
   border-color: color-mix(in srgb, var(--color-green) 62%, transparent);
   color: var(--color-green);
 }
 
-.helix-task-tree-progress.is-success {
+.helix-root button.helix-task-tree-progress.is-success {
   border-color: var(--color-green);
-  box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-green) 14%, transparent);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-green) 14%, transparent) !important;
 }
 
 .helix-task-tree .helix-task-check {

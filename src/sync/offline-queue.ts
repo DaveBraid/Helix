@@ -15,6 +15,17 @@ export class OfflineQueue {
     this.operations = cloneValue(initial);
     if (!options.recoverInterrupted) return;
     for (const operation of this.operations) {
+      if (
+        operation.status === "failed" &&
+        operation.operation === "delete" &&
+        operation.lastError === "删除后验证失败：远端记录仍然存在"
+      ) {
+        operation.status = "reconciliation";
+        operation.remoteOutcomeUnknown = true;
+        operation.lastError = "旧版在删除请求发送后使用了滞后的详情复读；已转为结果未知，禁止重试";
+        operation.updatedAt = new Date().toISOString();
+        continue;
+      }
       if (operation.status !== "running") continue;
       operation.status = "reconciliation";
       operation.remoteOutcomeUnknown = true;

@@ -1544,6 +1544,23 @@ export class ProjectWorkspaceService {
     return this.ensureCanvasFromSnapshot(snapshot, { allowWrite: false });
   }
 
+  /**
+   * 项目扫描只读取项目根目录、上次已纳管路径和元数据缓存确认的 Helix 文件。
+   * 正式 Vault 可能有数千篇 Markdown；逐次读取整个 Vault 会让一次状态修改
+   * 放大为四轮全库 I/O（稳定快照各读取两次）。
+   */
+  private projectMarkdownCandidates(): TFile[] {
+    const projectsRoot = normalizePath(`${this.rootFolder()}/Projects`);
+    return this.app.vault.getMarkdownFiles().filter((file) => {
+      const normalized = normalizePath(file.path);
+      if (normalized.startsWith(`${projectsRoot}/`) || this.knownMarkdownPaths.has(normalized)) {
+        return true;
+      }
+      const kind = this.app.metadataCache?.getFileCache(file)?.frontmatter?.["helix-kind"];
+      return kind === "helix-project" || kind === "helix-stage" || kind === "helix-cycle";
+    });
+  }
+
   private async readStableSnapshot(): Promise<ProjectWorkspaceSnapshot> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1728,7 +1745,8 @@ export class ProjectWorkspaceService {
 
   async snapshot(): Promise<ProjectWorkspaceSnapshot> {
     this.beginOperation();
-    const projectFiles = (await Promise.all(this.app.vault.getMarkdownFiles().map(async (file) => {
+    const markdownCandidates = this.projectMarkdownCandidates();
+    const projectFiles = (await Promise.all(markdownCandidates.map(async (file) => {
       const revision = await this.repository.read(file.path);
       const frontmatter = revision
         ? frontmatterFromContent(revision.content)
@@ -1811,7 +1829,7 @@ export class ProjectWorkspaceService {
         });
       }
     }
-    for (const file of this.app.vault.getMarkdownFiles()) {
+    for (const file of markdownCandidates) {
       const revision = await this.repository.read(file.path);
       const frontmatter = revision
         ? frontmatterFromContent(revision.content)

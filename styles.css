@@ -534,12 +534,44 @@
   min-height: 66px;
 }
 
+.helix-task-row.is-subtask {
+  position: relative;
+  padding-inline-start: calc(16px + var(--helix-task-indent, 0px));
+}
+
+.helix-task-row.is-subtask::before {
+  content: none;
+}
+
 .helix-task-check {
   flex: 0 0 auto;
   width: 18px;
   height: 18px;
   padding: 0;
   border-radius: 50%;
+}
+
+.helix-task-check.is-completed {
+  border-color: color-mix(in srgb, var(--color-green) 75%, var(--helix-line));
+  background: color-mix(in srgb, var(--color-green) 82%, transparent);
+  color: var(--text-on-accent);
+}
+
+.helix-task-check.is-completing,
+.helix-task-check.is-reopening,
+.helix-task-tree-progress.is-completing,
+.helix-task-tree-progress.is-reopening {
+  animation: helix-task-check-pulse 220ms ease-out;
+}
+
+.helix-task-check.is-success {
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-green) 18%, transparent);
+}
+
+@keyframes helix-task-check-pulse {
+  0% { transform: scale(.82); }
+  65% { transform: scale(1.16); }
+  100% { transform: scale(1); }
 }
 
 .helix-task-copy {
@@ -588,6 +620,207 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 任务总览：纯缩进递归任务树。层级只由行缩进表达，不绘制导轨或连接符。 */
+.helix-task-tree {
+  position: relative;
+  min-width: 0;
+}
+
+.helix-task-tree .helix-task-row {
+  position: relative;
+  min-height: 70px;
+  padding: 12px 18px;
+  padding-inline-start: calc(18px + var(--helix-task-indent, 0px));
+  gap: 14px;
+  border-color: color-mix(in srgb, var(--helix-line) 64%, transparent);
+  background: transparent;
+  transition: background-color .14s ease;
+}
+
+.helix-task-tree .helix-task-row.has-summary {
+  min-height: 92px;
+}
+
+.helix-task-tree .helix-task-row:hover,
+.helix-task-tree .helix-task-row:focus-within {
+  background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
+}
+
+.helix-task-tree-leading {
+  width: 86px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.helix-task-tree-leading > .helix-task-check:first-child {
+  margin-inline-start: 38px;
+}
+
+.helix-task-tree-toggle,
+.helix-task-row-more {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  box-shadow: none;
+}
+
+.helix-task-tree-toggle:hover,
+.helix-task-tree-toggle:focus-visible,
+.helix-task-row-more:hover,
+.helix-task-row-more:focus-visible {
+  background: color-mix(in srgb, var(--interactive-accent) 8%, transparent);
+  color: var(--text-normal);
+}
+
+.helix-task-tree-toggle svg,
+.helix-task-row-more svg {
+  width: 18px;
+  height: 18px;
+}
+
+.helix-root button.helix-task-tree-progress {
+  appearance: none;
+  display: grid;
+  flex: 0 0 48px;
+  width: 48px;
+  min-width: 48px;
+  max-width: 48px;
+  height: 48px;
+  min-height: 48px;
+  max-height: 48px;
+  place-items: center;
+  padding: 0;
+  border: 4px solid color-mix(in srgb, var(--text-muted) 24%, transparent);
+  border-radius: 50% !important;
+  background: transparent !important;
+  background-image: none !important;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 1;
+  box-shadow: none !important;
+}
+
+.helix-root button.helix-task-tree-progress:hover,
+.helix-root button.helix-task-tree-progress:focus-visible {
+  border-radius: 50% !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.helix-root button.helix-task-tree-progress:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--interactive-accent) 54%, transparent);
+  outline-offset: 3px;
+}
+
+.helix-root button.helix-task-tree-progress.is-completed {
+  border-color: color-mix(in srgb, var(--color-green) 62%, transparent);
+  color: var(--color-green);
+}
+
+.helix-root button.helix-task-tree-progress.is-success {
+  border-color: var(--color-green);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-green) 14%, transparent) !important;
+}
+
+.helix-task-tree .helix-task-check {
+  width: 24px;
+  height: 24px;
+  border-color: color-mix(in srgb, var(--text-muted) 48%, transparent);
+  background: transparent;
+}
+
+.helix-task-tree .helix-task-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.helix-task-summary {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-tree .helix-task-meta {
+  margin-top: 6px;
+  gap: 7px;
+  font-size: 10px;
+}
+
+.helix-task-row-more {
+  margin-inline-start: auto;
+  flex: 0 0 auto;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease, background-color .12s ease;
+}
+
+.helix-task-row:hover .helix-task-row-more,
+.helix-task-row:focus-within .helix-task-row-more {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.helix-task-tree-root-drop {
+  display: none;
+  margin: 8px 14px;
+  padding: 8px 12px;
+  border: 1px dashed color-mix(in srgb, var(--interactive-accent) 46%, var(--helix-line));
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.helix-task-tree.is-reparenting .helix-task-tree-root-drop {
+  display: block;
+}
+
+.helix-task-row.is-task-tree-drop-target,
+.helix-task-tree-root-drop.is-task-tree-drop-target {
+  background: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 48%, transparent);
+}
+
+.helix-task-row.is-dragging {
+  opacity: .44;
+}
+
+.helix-task-tree-drop-label {
+  display: none;
+  margin-inline-start: 8px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--interactive-accent) 10%, var(--background-primary));
+  color: var(--interactive-accent);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.helix-task-row.is-task-tree-drop-target .helix-task-tree-drop-label {
+  display: inline-flex;
 }
 
 .modal:has(.helix-task-edit-modal) {
@@ -758,8 +991,8 @@
 }
 
 .helix-task-editor-details > summary {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr);
+  display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
   min-height: 42px;
@@ -771,7 +1004,12 @@
 }
 
 .helix-task-editor-details > summary::-webkit-details-marker {
-  display: none;
+  display: none !important;
+}
+
+.helix-task-editor-details > summary::before {
+  display: none !important;
+  content: none !important;
 }
 
 .helix-task-editor-details > summary svg {
@@ -781,6 +1019,8 @@
 }
 
 .helix-task-editor-summary-value {
+  min-width: 0;
+  margin-left: auto;
   overflow: hidden;
   color: var(--text-muted);
   font-size: 11px;
@@ -788,6 +1028,16 @@
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.helix-task-editor-more-properties > summary > span:first-child {
+  display: inline-flex;
+  flex: 0 0 auto;
+  transition: transform .14s ease;
+}
+
+.helix-task-editor-more-properties[open] > summary > span:first-child {
+  transform: rotate(90deg);
 }
 
 .helix-task-editor-details-body {
@@ -945,9 +1195,9 @@
 }
 
 /* Dense task canvas：本地任务以标题、属性矩阵和子任务进度为视觉核心。 */
-.modal.helix-task-editor-modal:has(.is-local-task-editor) {
-  width: min(960px, calc(100vw - 56px));
-  max-height: min(820px, calc(100vh - 48px));
+.modal.helix-task-editor-modal.helix-unified-task-editor-modal {
+  width: min(1180px, calc(100vw - 56px));
+  max-height: min(900px, calc(100vh - 48px));
   padding: 0;
   border: 1px solid color-mix(in srgb, var(--background-modifier-border) 88%, transparent);
   border-radius: 15px;
@@ -955,28 +1205,44 @@
   box-shadow: 0 24px 70px rgba(0, 0, 0, .28);
 }
 
-.helix-task-editor-modal:has(.is-local-task-editor) .modal-title {
+.helix-task-editor-modal.helix-unified-task-editor-modal .modal-title {
   display: none;
 }
 
-.helix-task-editor.is-local-task-editor {
+.helix-task-editor.helix-unified-task-editor {
   gap: 16px;
   padding: 24px 28px 22px;
   font-size: 14px;
 }
 
-.is-local-task-editor .helix-task-editor-context {
+.helix-unified-task-editor .helix-task-editor-context {
   gap: 9px;
   padding-right: 34px;
   color: var(--text-muted);
   font-size: 13px;
 }
 
-.is-local-task-editor .helix-task-editor-context-separator {
+.helix-task-editor-sync {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.helix-task-editor-sync svg {
+  width: 15px;
+  height: 15px;
+}
+
+.helix-unified-task-editor .helix-task-editor-context-separator {
   color: var(--text-faint);
 }
 
-.is-local-task-editor .helix-task-editor-location {
+.helix-unified-task-editor .helix-task-editor-location {
   padding: 2px 4px;
   font-size: inherit;
 }
@@ -987,14 +1253,28 @@
   gap: 8px;
 }
 
-.is-local-task-editor .helix-task-editor-title {
+.helix-unified-task-editor .helix-task-editor-title {
   min-height: 50px;
-  padding: 3px 4px;
+  padding: 7px 10px;
   resize: none;
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 28%, var(--background-modifier-border));
   border-radius: 7px;
+  background: color-mix(in srgb, var(--background-primary) 96%, var(--interactive-accent));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 7%, transparent);
   font-size: clamp(24px, 2.2vw, 30px);
   font-weight: 720;
   line-height: 1.35;
+}
+
+.helix-unified-task-editor .helix-task-editor-title:focus {
+  border-color: color-mix(in srgb, var(--interactive-accent) 62%, var(--background-modifier-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 14%, transparent);
+}
+
+.helix-unified-task-editor .helix-task-editor-title:disabled,
+.helix-unified-task-editor input:disabled,
+.helix-unified-task-editor select:disabled {
+  opacity: .72;
 }
 
 .helix-task-editor-title-icon {
@@ -1011,13 +1291,13 @@
   height: 18px;
 }
 
-.is-local-task-editor .helix-task-editor-properties {
+.helix-unified-task-editor .helix-task-editor-properties {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
 
-.is-local-task-editor .helix-task-editor-property {
+.helix-unified-task-editor .helix-task-editor-property {
   display: grid;
   min-width: 0;
   min-height: 56px;
@@ -1030,11 +1310,11 @@
   background: color-mix(in srgb, var(--background-secondary) 34%, transparent);
 }
 
-.is-local-task-editor .helix-task-editor-property.is-time {
+.helix-unified-task-editor .helix-task-editor-property.is-time {
   grid-template-columns: auto auto auto minmax(0, 1fr);
 }
 
-.is-local-task-editor .helix-task-editor-property.is-tags {
+.helix-unified-task-editor .helix-task-editor-property.is-tags {
   grid-column: span 2;
 }
 
@@ -1049,8 +1329,8 @@
   white-space: nowrap;
 }
 
-.is-local-task-editor .helix-task-editor-property select,
-.is-local-task-editor .helix-task-editor-property input {
+.helix-unified-task-editor .helix-task-editor-property select,
+.helix-unified-task-editor .helix-task-editor-property input {
   width: 100%;
   min-width: 0;
   height: 34px;
@@ -1070,14 +1350,14 @@
   gap: 4px;
 }
 
-.is-local-task-editor .helix-task-editor-time-inputs input {
+.helix-unified-task-editor .helix-task-editor-time-inputs input {
   width: 70px;
   min-width: 70px;
   padding: 0;
   font-size: 13px;
 }
 
-.is-local-task-editor .helix-task-editor-time-inputs input::-webkit-calendar-picker-indicator {
+.helix-unified-task-editor .helix-task-editor-time-inputs input::-webkit-calendar-picker-indicator {
   width: 0;
   margin: 0;
   padding: 0;
@@ -1089,12 +1369,12 @@
   display: none;
 }
 
-.is-local-task-editor .helix-task-editor-subtasks {
+.helix-unified-task-editor .helix-task-editor-subtasks {
   border-radius: 12px;
   background: color-mix(in srgb, var(--background-secondary) 24%, transparent);
 }
 
-.is-local-task-editor .helix-task-editor-section-head {
+.helix-unified-task-editor .helix-task-editor-section-head {
   padding: 13px 18px;
   font-size: 16px;
 }
@@ -1140,7 +1420,7 @@
   background: color-mix(in srgb, var(--background-primary) 75%, transparent);
 }
 
-.is-local-task-editor .helix-task-editor-subtask {
+.helix-unified-task-editor .helix-task-editor-subtask {
   position: relative;
   min-height: 48px;
   padding: 5px 10px 5px 5px;
@@ -1148,11 +1428,11 @@
   transition: opacity .14s ease, background .14s ease, transform .14s ease;
 }
 
-.is-local-task-editor .helix-task-editor-subtask.is-dragging {
+.helix-unified-task-editor .helix-task-editor-subtask.is-dragging {
   opacity: .42;
 }
 
-.is-local-task-editor .helix-task-editor-subtask.is-drop-target {
+.helix-unified-task-editor .helix-task-editor-subtask.is-drop-target {
   background: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
   transform: translateY(2px);
 }
@@ -1168,7 +1448,7 @@
   height: 15px;
 }
 
-.is-local-task-editor .helix-task-editor-subtask input[type="text"] {
+.helix-unified-task-editor .helix-task-editor-subtask input[type="text"] {
   min-width: 120px;
   height: 34px;
   font-size: 14px;
@@ -1234,16 +1514,16 @@
   color: var(--text-error);
 }
 
-.is-local-task-editor .helix-task-editor-subtask-add {
+.helix-unified-task-editor .helix-task-editor-subtask-add {
   min-height: 44px;
   color: var(--interactive-accent);
 }
 
-.is-local-task-editor .helix-task-editor-footer {
+.helix-unified-task-editor .helix-task-editor-footer {
   padding-top: 6px;
 }
 
-.is-local-task-editor .helix-task-editor-delete {
+.helix-unified-task-editor .helix-task-editor-delete {
   width: auto;
   min-width: 112px;
   padding: 0 12px;
@@ -1252,27 +1532,102 @@
   color: var(--text-error);
 }
 
-.is-local-task-editor .helix-task-editor-footer > button:not(.helix-task-editor-delete) {
+.helix-unified-task-editor .helix-task-editor-footer > button:not(.helix-task-editor-delete) {
   min-width: 84px;
   min-height: 38px;
 }
 
+/* 滴答任务复用 Dense task canvas；远端专属字段集中在一个扩展区。 */
+.is-dida-task-editor .helix-task-editor-details {
+  background: color-mix(in srgb, var(--background-secondary) 24%, transparent);
+}
+
+.is-dida-task-editor .helix-task-editor-details-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+  padding: 4px 16px 10px;
+}
+
+.is-dida-task-editor .helix-task-editor-details-body > .setting-item:first-child,
+.is-dida-task-editor .helix-task-reference-warning,
+.is-dida-task-editor .helix-task-stage-choices {
+  grid-column: 1 / -1;
+}
+
+.is-dida-task-editor .helix-task-editor-details-body .setting-item {
+  min-width: 0;
+}
+
+.is-dida-task-editor .helix-task-editor-details-body .setting-item-control,
+.is-dida-task-editor .helix-task-editor-details-body input,
+.is-dida-task-editor .helix-task-editor-details-body select {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.helix-task-editor-more-properties {
+  background: color-mix(in srgb, var(--background-secondary) 24%, transparent);
+}
+
+.helix-task-editor-more-properties .helix-task-editor-details-body {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px 16px 14px;
+}
+
+.helix-task-editor-extra-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.helix-task-editor-extra-row select {
+  min-width: 0;
+  width: 100%;
+}
+
+.helix-task-editor-date-picker.is-disabled {
+  opacity: .72;
+}
+
 @media (max-width: 760px) {
-  .modal.helix-task-editor-modal:has(.is-local-task-editor) {
+  .is-dida-task-editor .helix-task-editor-details-body { grid-template-columns: 1fr; }
+  .is-dida-task-editor .helix-task-editor-details-body > * { grid-column: 1; }
+}
+
+@media (max-width: 760px) {
+  .modal.helix-task-editor-modal.helix-unified-task-editor-modal {
     width: calc(100vw - 24px);
   }
 
-  .helix-task-editor.is-local-task-editor { padding: 20px 18px; }
-  .is-local-task-editor .helix-task-editor-properties { grid-template-columns: 1fr 1fr; }
-  .is-local-task-editor .helix-task-editor-property.is-tags { grid-column: 1 / -1; }
+  .helix-task-editor.helix-unified-task-editor { padding: 20px 18px; }
+  .helix-unified-task-editor .helix-task-editor-properties { grid-template-columns: 1fr 1fr; }
+  .helix-unified-task-editor .helix-task-editor-property.is-tags { grid-column: 1 / -1; }
   .helix-task-editor-subtask-body { grid-template-columns: 1fr; }
   .helix-task-editor-progress { grid-template-columns: auto auto; justify-content: center; }
   .helix-task-editor-progress-ring { width: 76px; height: 76px; font-size: 18px; }
+  .helix-task-editor-sync { max-width: 42%; overflow: hidden; text-overflow: ellipsis; }
+  .helix-task-editor-more-properties .helix-task-editor-details-body { grid-template-columns: 1fr; }
 }
 
 .helix-task-row.is-local-project-task {
   --helix-task-local-tint: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
   background: var(--helix-task-local-tint);
+}
+
+.helix-task-tree .helix-task-row.is-local-project-task {
+  background: transparent;
+}
+
+.helix-task-tree .helix-task-row.is-local-project-task:hover,
+.helix-task-tree .helix-task-row.is-local-project-task:focus-within {
+  background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
 }
 
 .helix-task-reference-warning {
@@ -1489,6 +1844,11 @@
 .helix-chip.is-danger {
   background: var(--helix-danger-soft);
   color: var(--helix-danger-ink);
+}
+
+.helix-chip.is-warning {
+  background: var(--helix-warning-soft);
+  color: var(--helix-warning-ink);
 }
 
 .helix-challenge-hero {
@@ -3282,6 +3642,17 @@
   color: var(--helix-muted);
   box-shadow: none;
   font-size: 11px;
+}
+
+.helix-filter-row button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.helix-filter-row button svg {
+  width: 13px;
+  height: 13px;
 }
 
 .helix-filter-row button.is-active {

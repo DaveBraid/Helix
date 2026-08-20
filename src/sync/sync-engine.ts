@@ -52,6 +52,19 @@ export interface SyncEngineDependencies<T extends RemoteEntity> {
     desired: EntitySnapshot<T>,
     actual: T,
   ) => boolean | undefined;
+  /** 仅供服务端派生字段不进入普通快照的专用创建；调用方仍须随后精确复读身份。 */
+  verifyCreateResult?: (
+    operation: SyncQueueOperation<T>,
+    desired: EntitySnapshot<T>,
+    actual: T,
+  ) => boolean | undefined;
+  /** 服务端生成字段不同但业务意图已经收敛时，直接采纳远端快照。 */
+  acceptRemoteConvergence?: (
+    operation: SyncQueueOperation<T>,
+    base: EntitySnapshot<T>,
+    local: EntitySnapshot<T>,
+    remote: EntitySnapshot<T>,
+  ) => boolean;
 }
 
 export class SyncEngine<T extends RemoteEntity> {
@@ -111,10 +124,20 @@ export class SyncEngine<T extends RemoteEntity> {
         projectId: operation.projectId,
         writeFields: operation.writeFields,
       });
-      const verified = await this.dependencies.adapter.get(operation.entityId, {
-        projectId: operation.projectId,
-      });
-      if (verified !== null) throw new Error("删除后验证失败：远端记录仍然存在");
+      let verified: T | null;
+      try {
+        verified = await this.dependencies.adapter.get(operation.entityId, {
+          projectId: operation.projectId,
+          verifyDeletion: true,
+        });
+      } catch (error) {
+        throw unknownRemoteOutcome(
+          `删除请求已发送，但复读失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (verified !== null) {
+        throw unknownRemoteOutcome("删除请求已发送，但权威集合仍可见该记录，必须人工核对");
+      }
       return { outcome: "deleted" };
     }
 
@@ -131,6 +154,21 @@ export class SyncEngine<T extends RemoteEntity> {
 
     const localChanged = snapshotChanged(local, base);
     const remoteChanged = snapshotChanged(remoteSnapshot, base);
+    if (localChanged && remoteChanged && this.dependencies.acceptRemoteConvergence?.(
+      operation,
+      base,
+      local,
+      remoteSnapshot,
+    )) {
+      await this.dependencies.snapshots.saveBase(remoteSnapshot);
+      await this.dependencies.snapshots.saveLocal(remoteSnapshot);
+      return { outcome: "pulled", snapshot: remoteSnapshot };
+    }
+    if (localChanged && remoteChanged && local.stamp.hash === remoteSnapshot.stamp.hash) {
+      await this.dependencies.snapshots.saveBase(remoteSnapshot);
+      await this.dependencies.snapshots.saveLocal(remoteSnapshot);
+      return { outcome: "pulled", snapshot: remoteSnapshot };
+    }
     if (localChanged && remoteChanged && local.stamp.hash !== remoteSnapshot.stamp.hash) {
       if (this.dependencies.allowUnsentRebaseline?.(operation, base, local, remoteSnapshot)) {
         await this.dependencies.snapshots.saveBase(remoteSnapshot);
@@ -313,7 +351,11 @@ export class SyncEngine<T extends RemoteEntity> {
         remoteOutcomeUnknown: true,
       };
     }
-    if (!verified || !equivalentForVerification(operation.local.value, verified, true)) {
+    const specializedVerification = verified
+      ? this.dependencies.verifyCreateResult?.(operation, operation.local, verified)
+      : undefined;
+    if (!verified || !(specializedVerification ??
+      equivalentForVerification(operation.local.value, verified, true))) {
       throw {
         category: "unknown-outcome",
         message: "远端创建结果无法通过复读验证，已转入待核对状态",

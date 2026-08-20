@@ -13,6 +13,34 @@ import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import { DIDA_RATE_LIMIT_PERSISTENCE_RECOVERY_ISSUE } from "../src/integrations/dida/request-governor";
 
 describe("HelixService contract-test exclusivity", () => {
+  it("opens the isolated contract path without opening ordinary task writes", async () => {
+    const { service } = await serviceFixture({
+      didaReadAvailable: true,
+      didaTaskWriteAvailable: false,
+      didaContractTestAvailable: true,
+      projectDidaProjectionAvailable: false,
+    });
+    const api = serviceApi(service);
+    let contractCreates = 0;
+    let ordinaryCreates = 0;
+    api.getProjects = async () => [];
+    api.createProject = async () => {
+      contractCreates += 1;
+      throw new Error("intentional contract boundary stop");
+    };
+    api.createTask = async () => {
+      ordinaryCreates += 1;
+      throw new Error("ordinary write must not run");
+    };
+
+    const report = await service.runDidaWriteContractTest();
+    expect(report.status).toBe("failed");
+    expect(contractCreates).toBe(1);
+    await expect(service.createTask("blocked", "project-a"))
+      .rejects.toThrow(/暂未开放滴答普通任务写入/);
+    expect(ordinaryCreates).toBe(0);
+  });
+
   it("preserves quick-entry task attributes through the normal create queue", async () => {
     const { service } = await serviceFixture();
     const api = serviceApi(service);
@@ -150,6 +178,28 @@ describe("HelixService contract-test exclusivity", () => {
     await ordinaryWrite;
   });
 
+  it("keeps project activation mutually exclusive with a running contract", async () => {
+    const { service } = await serviceFixture();
+    const api = serviceApi(service);
+    const contractCreateStarted = deferred<void>();
+    const allowContractCreate = deferred<void>();
+    api.getProjects = async () => [];
+    api.createProject = async () => {
+      contractCreateStarted.resolve();
+      await allowContractCreate.promise;
+      throw new Error("stop contract after exclusivity assertion");
+    };
+
+    const contract = service.runDidaWriteContractTest();
+    await contractCreateStarted.promise;
+    const activation = vi.fn(async () => undefined);
+    await expect(service.withProjectProjectionActivationLease(activation))
+      .rejects.toThrow(/合同测试正在运行|远端访问正在进行/);
+    expect(activation).not.toHaveBeenCalled();
+    allowContractCreate.resolve();
+    await contract;
+  });
+
   it("blocks a new contract before any remote call while cleanup is pending", async () => {
     const { service, store } = await serviceFixture();
     const api = serviceApi(service);
@@ -173,6 +223,86 @@ describe("HelixService contract-test exclusivity", () => {
     });
 
     await expect(service.runDidaWriteContractTest()).rejects.toThrow(/待安全清理/);
+    expect(getProjects).not.toHaveBeenCalled();
+  });
+
+  it("blocks a new contract before invalidating capabilities when project projection is enabled", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    const before = (await store.snapshot()).didaContractCapabilities;
+    await store.mutate((data) => {
+      data.didaProjectionState = {
+        enabled: true,
+        activationVersion: 2,
+        confirmedPreviewHash: "preview",
+        target: { targetProjectId: "existing-list", targetColumnId: "existing-column" },
+        ledger: [],
+        parentCheckpoints: [],
+      };
+    });
+
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/先停用/);
+    expect(getProjects).not.toHaveBeenCalled();
+    expect((await store.snapshot()).didaContractCapabilities).toEqual(before);
+    expect((await store.snapshot()).pendingDidaContractCleanup).toBeUndefined();
+  });
+
+  it("blocks a new contract before any remote call when a production operation is queued", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+    const before = (await store.snapshot()).didaContractCapabilities;
+    await store.mutate((data) => {
+      const now = "2026-08-13T00:00:00.000Z";
+      const value = { id: "task-existing", projectId: "project-a", title: "待同步", status: 0 } as DidaTask;
+      data.queue = [{
+        id: "op-existing",
+        kind: "task",
+        entityId: value.id,
+        projectId: value.projectId,
+        operation: "update",
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+        status: "pending",
+        base: createSnapshot("task", value.id, value, { capturedAt: now }),
+        local: createSnapshot("task", value.id, { ...value, title: "本地编辑" }, { capturedAt: now }),
+      }];
+    });
+
+    await expect(service.runDidaWriteContractTest()).rejects.toThrow(/生产同步队列/);
+    expect(getProjects).not.toHaveBeenCalled();
+    expect((await store.snapshot()).didaContractCapabilities).toEqual(before);
+    expect((await store.snapshot()).queue).toHaveLength(1);
+    expect((await store.snapshot()).pendingDidaContractCleanup).toBeUndefined();
+  });
+
+  it("reports a redacted actionable preflight without contacting Dida", async () => {
+    const { service, store } = await serviceFixture();
+    const api = serviceApi(service);
+    const getProjects = vi.fn(async () => []);
+    api.getProjects = getProjects;
+
+    await expect(service.didaWriteContractPreflight()).resolves.toEqual({
+      ready: true,
+      reason: "隔离条件已满足；运行时只会操作唯一标记的专用测试对象",
+    });
+    await store.mutate((data) => {
+      data.didaProjectionState = {
+        enabled: true,
+        activationVersion: 2,
+        confirmedPreviewHash: "preview",
+        target: { targetProjectId: "secret-list-id", targetColumnId: "secret-column-id" },
+        ledger: [],
+        parentCheckpoints: [],
+      };
+    });
+    const blocked = await service.didaWriteContractPreflight();
+    expect(blocked).toEqual({ ready: false, reason: "项目滴答同步仍处于启用状态，请先停用" });
+    expect(JSON.stringify(blocked)).not.toContain("secret-list-id");
     expect(getProjects).not.toHaveBeenCalled();
   });
 
@@ -767,7 +897,12 @@ describe("HelixService contract-test exclusivity", () => {
   });
 });
 
-async function serviceFixture(): Promise<{
+async function serviceFixture(options: {
+  didaReadAvailable?: boolean;
+  didaTaskWriteAvailable?: boolean;
+  didaContractTestAvailable?: boolean;
+  projectDidaProjectionAvailable?: boolean;
+} = {}): Promise<{
   service: HelixService;
   secrets: HelixSecretStore;
   store: HelixDataStore;
@@ -803,14 +938,14 @@ async function serviceFixture(): Promise<{
   const secrets = new HelixSecretStore(app);
   secrets.setDidaToken("initial-contract-token");
   const store = new HelixDataStore(port);
-  const service = new HelixService(store, secrets);
+  const service = new HelixService(store, secrets, options);
   await service.initialize();
   return {
     service,
     secrets,
     store,
     async reload() {
-      const replacement = new HelixService(new HelixDataStore(port), secrets);
+      const replacement = new HelixService(new HelixDataStore(port), secrets, options);
       await replacement.initialize();
       return replacement;
     },

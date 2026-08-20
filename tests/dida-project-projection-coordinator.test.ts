@@ -3,6 +3,8 @@ import { buildProjectionActivationPreview } from "../src/domain/dida-project-pro
 import type { ProjectWorkspaceSnapshot } from "../src/services/project-workspace";
 import {
   confirmProjectionActivation,
+  projectionInputsFromProject,
+  projectionInputFromStage,
   projectionStageInProject,
   type ProjectionApplicationPort,
 } from "../src/services/dida-project-projection-coordinator";
@@ -11,6 +13,7 @@ const readiness = {
   writable: true,
   queueEmpty: true,
   authorizationCurrent: true,
+  taskParentingVerified: true,
   itemsRoundTripVerified: true, itemIdStableVerified: true,
   boardPlacementVerified: true,
   boardFresh: true,
@@ -69,6 +72,29 @@ describe("project projection application coordinator", () => {
     expect(projectionStageInProject(snapshot, "project-1", "stage-1").notePath).toBe("Stage-1.md");
     expect(() => projectionStageInProject(snapshot, "project-1", "stage-2"))
       .toThrow(/指定项目中的阶段/);
+  });
+
+  it("projects every stage as one parent task with only that stage's actions", () => {
+    const project = workspace().projects[0]!;
+    const second = {
+      id: "stage-1b", title: "阶段二", notePath: "Stage-1b.md",
+      sequence: 2, stageCode: "2", status: "completed" as const,
+    };
+    project.cycles.push(second);
+    const inputs = projectionInputsFromProject(project);
+    expect(inputs).toHaveLength(2);
+    expect(inputs.map((input) => ({
+      id: input.projectId,
+      title: input.projectTitle,
+      path: input.projectPath,
+      stages: input.stages,
+    }))).toEqual([
+      { id: "stage-1", title: "阶段一", path: "Stage-1.md", stages: [{ path: "Stage-1.md", stageId: "stage-1" }] },
+      { id: "stage-1b", title: "阶段二", path: "Stage-1b.md", stages: [{ path: "Stage-1b.md", stageId: "stage-1b" }] },
+    ]);
+    expect(projectionInputFromStage(project, second).projectStatus).toBe("completed");
+    expect(projectionInputFromStage(project, second).createWhenMissing).toBe(false);
+    expect(projectionInputFromStage(project, project.cycles[0]!).createWhenMissing).toBe(true);
   });
 });
 

@@ -12,14 +12,14 @@ describe("autoSyncPlan", () => {
     })).toEqual({ runImmediately: true, intervalMs: 600_000 });
   });
 
-  it("allows a one-time credential refresh while automatic sync is disabled", () => {
+  it("does not contact Dida after credential changes while automatic sync is disabled", () => {
     expect(autoSyncPlan({
       recoveryMode: false,
       tokenConfigured: true,
       autoSync: false,
       runImmediately: true,
       intervalMinutes: 10,
-    })).toEqual({ runImmediately: true, intervalMs: null });
+    })).toEqual({ runImmediately: false, intervalMs: null });
   });
 
   it("does not run immediately for an unrelated settings refresh", () => {

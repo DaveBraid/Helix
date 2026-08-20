@@ -68,6 +68,25 @@ export function projectionTargetText(state: Pick<ProjectionPersistentState, "ena
   return `${state.enabled ? "已启用" : "已禁用"} · ${state.target.targetProjectId} / ${state.target.targetColumnId}`;
 }
 
+export function projectionPauseText(readiness: {
+  capabilitiesBlocked: boolean;
+  queueBlocked: boolean;
+  conflictsBlocked: boolean;
+  inProgress: boolean;
+  recoveryBlocked: boolean;
+  unknownBlocked: boolean;
+}): string {
+  const reasons = [
+    readiness.capabilitiesBlocked ? "连接或写入合同尚未就绪" : "",
+    readiness.queueBlocked ? "普通任务队列尚未清空" : "",
+    readiness.conflictsBlocked ? "存在未解决冲突" : "",
+    readiness.inProgress ? "其他远端操作正在进行" : "",
+    readiness.recoveryBlocked ? "存在恢复或清理锁" : "",
+    readiness.unknownBlocked ? "存在远端结果未知记录" : "",
+  ].filter(Boolean);
+  return reasons.length > 0 ? `后台写入已暂停：${reasons.join("；")}` : "后台写入条件已就绪";
+}
+
 export function projectionSyncSummaryText(summary: ProjectionSyncSummary): {
   text: string;
   warning: boolean;
@@ -133,11 +152,12 @@ export function conflictCenterIsEmpty(input: {
   workspaceDiagnostic: boolean;
   lineageConflict: boolean;
   contractCleanup: boolean;
+  requestControlAttention: boolean;
 }): boolean {
   return input.conflicts === 0 && input.focusConflicts === 0 && input.recoveryIssues === 0 &&
     input.reconciliation === 0 && input.failed === 0 && input.orphanedBlocked === 0 &&
     input.projectionIssues === 0 && !input.workspaceDiagnostic && !input.lineageConflict &&
-    !input.contractCleanup;
+    !input.contractCleanup && !input.requestControlAttention;
 }
 
 export function projectWorkspaceReadDiagnostic(error: unknown): string {

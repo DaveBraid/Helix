@@ -5,6 +5,10 @@ import { WORKBENCH_NAVIGATION } from "../src/domain/workbench-navigation";
 
 describe("workbench layout and navigation structure", () => {
   const view = readFileSync(resolve(process.cwd(), "src/ui/helix-view.ts"), "utf8");
+  const unifiedTaskEditor = readFileSync(
+    resolve(process.cwd(), "src/ui/unified-task-detail-modal.ts"),
+    "utf8",
+  );
   const css = readFileSync(resolve(process.cwd(), "styles.css"), "utf8");
   const projectWorkspace = readFileSync(
     resolve(process.cwd(), "src/services/project-workspace.ts"),
@@ -31,7 +35,6 @@ describe("workbench layout and navigation structure", () => {
     readFileSync(resolve(process.cwd(), "src/services/dida-project-projection-coordinator.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/domain/dida-project-projection.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/storage/model.ts"), "utf8"),
-    readFileSync(resolve(process.cwd(), "src/services/task-references.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/domain/stage-focus-bridge.ts"), "utf8"),
     projectWorkspace,
   ].join("\n");
@@ -48,7 +51,7 @@ describe("workbench layout and navigation structure", () => {
 
   it("reserves independent production budgets for contract work and cleanup", () => {
     expect(helixService).toContain("const DIDA_CONTRACT_REQUEST_TIMEOUT_MS = 30_000;");
-    expect(helixService).toMatch(/timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,\s*maxAttempts: 1,\s*maxCalls: 120/);
+    expect(helixService).toMatch(/timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS,\s*maxAttempts: 1,\s*maxCalls: DIDA_CONTRACT_REQUEST_BUDGET/);
     expect(helixService).toMatch(/maxAttempts: 1,\s*maxCalls: 40,\s*cooldownProbe: true,/);
     expect(helixService.match(/timeoutMs: DIDA_CONTRACT_REQUEST_TIMEOUT_MS/g)).toHaveLength(4);
     expect(helixService).not.toContain("timeoutMs: 5_000");
@@ -80,6 +83,7 @@ describe("workbench layout and navigation structure", () => {
       /metadataCache\.on\("changed", \(file\) => \{\s*this\.refreshActiveStatusForPaths\(file\.path\)/,
     );
     expect(main).toContain("if (signature === this.projectStatusSignature) return;");
+    expect(main).toMatch(/editingInsideView[\s\S]*view\.contentEl\.contains\(activeElement\)/);
     expect(view).toMatch(
       /service\.subscribe[\s\S]*activeLeaf === this\.leaf[\s\S]*renderPendingWhileInactive = true/,
     );
@@ -91,19 +95,31 @@ describe("workbench layout and navigation structure", () => {
     );
   });
 
-  it("shows project task references only in the task view", () => {
-    expect(view).toMatch(/renderTasks\(content[\s\S]*renderProjectLinkedTasks\(content\)/);
-    expect(view).toMatch(/renderProjectLinkedTasks[\s\S]*项目关联任务[\s\S]*renderTaskRow/);
-    const projects = view.slice(
-      view.indexOf("private async renderProjects"),
-      view.indexOf("private renderProjectLinkedTasks"),
+  it("keeps the project status popover open across unrelated service broadcasts", () => {
+    expect(view).toMatch(
+      /requestServiceRender\(\)[\s\S]*hasOpenStatusPopover\(\)[\s\S]*renderPendingWhileProjectPopover = true/,
     );
-    expect(projects).not.toContain("renderProjectLinkedTasks");
-    const linkedTasks = view.slice(
-      view.indexOf("private renderProjectLinkedTasks"),
-      view.indexOf("private async requestCycleStatusChange"),
+    expect(view).toMatch(
+      /onStatusPopoverChange: \(open\)[\s\S]*renderPendingWhileProjectPopover = false[\s\S]*requestServiceRender\(\)/,
     );
-    expect(linkedTasks).not.toMatch(/didaProjectId|projection/i);
+  });
+
+  it("deduplicates service broadcasts and swaps async pages atomically", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(view).toMatch(
+      /lastServicePresentationSignature[\s\S]*stableHash\(\{[\s\S]*projectViewRevision/,
+    );
+    expect(view).toMatch(/requestServiceRender[\s\S]*requestAnimationFrame/);
+    expect(view).toMatch(
+      /const atomic = this\.section !== "reviews"[\s\S]*this\.contentEl\.replaceChildren\(shell\)/,
+    );
+    expect(view).toMatch(/previousScrollTop[\s\S]*content\.scrollTop = previousScrollTop/);
+    expect(main.match(/projectViewRevision \+= 1/g)).toHaveLength(2);
+  });
+
+  it("does not render the retired project-linked-task panel", () => {
+    expect(view).not.toContain("renderProjectLinkedTasks");
+    expect(view).not.toContain("项目关联任务");
   });
 
   it("projects Stage actions into tasks without creating a second local task store", () => {
@@ -112,45 +128,85 @@ describe("workbench layout and navigation structure", () => {
       resolve(process.cwd(), "src/services/local-project-tasks.ts"),
       "utf8",
     );
-    expect(main).toMatch(
-      /readLocalProjectTasks[\s\S]*loadStableWorkspace\(\)[\s\S]*adoptUnmanaged: true/,
-    );
     const localRead = main.slice(
       main.indexOf("async readLocalProjectTasks"),
       main.indexOf("async createLocalProjectTask"),
     );
+    expect(localRead).toContain("this.localProjectTaskSnapshotCache");
+    expect(localRead).toContain("adoptUnmanaged: false");
     expect(localRead).toContain("this.assertWritable();");
     expect(localRead).toContain("this.withProjectWorkspaceRead");
     expect(localRead).not.toContain("withWritableProjectMutation");
     expect(view).toMatch(/render\(\)[\s\S]*refreshLocalProjectTaskSnapshot\(token\)/);
     expect(view).toMatch(/localProjectTaskDidaTasks[\s\S]*this\.localProjectTaskSnapshot/);
-    expect(view).toMatch(/saveLocalProjectTask[\s\S]*LocalProjectTaskEditModal/);
+    expect(view).toMatch(/saveLocalProjectTask[\s\S]*UnifiedTaskDetailModal/);
     expect(localTasks).not.toMatch(/data\.json|HelixDataStore|OfflineQueue/);
   });
 
-  it("uses one compact editor shell and exposes local subtasks without Dida writes", () => {
-    const localEditor = view.slice(
-      view.indexOf("class LocalProjectTaskEditModal"),
-      view.indexOf("function knownReminderPreset"),
+  it("keeps task rendering read-only and shows the real Stage/action hierarchy", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const localTasks = readFileSync(
+      resolve(process.cwd(), "src/services/local-project-tasks.ts"),
+      "utf8",
     );
-    expect(view).toContain('class LocalProjectTaskEditModal extends Modal');
-    expect(view).toContain('class TaskEditModal extends Modal');
-    expect(view.match(/addClass\("helix-task-editor-modal"\)/g)).toHaveLength(2);
-    expect(view.match(/addClass\([^\n]*"helix-task-editor"/g)).toHaveLength(2);
-    expect(view).toMatch(/LocalProjectTaskEditModal[\s\S]*添加子任务[\s\S]*void this\.save\(/);
-    expect(view).toMatch(/const properties = this\.contentEl\.createEl\("details"[\s\S]*text: "属性"/);
+    expect(main).toMatch(/finishProjectStartup[\s\S]*loadStableWorkspace\(\)[\s\S]*localProjectTaskSnapshotCache/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*const snapshot = await this\.projectWorkspace\.loadStableWorkspace\(\)[\s\S]*repairDerivedProjectCanvasCache\(snapshot\)[\s\S]*localProjectTasks\.snapshot/);
+    expect(view).toContain("flattenTaskTree(visibleTasks, {");
+    expect(view).toContain("hideCompletedTasks");
+    expect(view).toContain("didaTaskDetailDraft");
+    expect(localTasks).toContain("byRemoteParentTaskId");
+    expect(css).toContain(".helix-task-tree .helix-task-row");
+    expect(css).toMatch(/\.helix-task-tree \.helix-task-title[\s\S]*font-size: 13px/);
+    expect(css).toMatch(/\.helix-task-summary[\s\S]*font-size: 11px/);
+    expect(css).toMatch(/\.helix-task-tree \.helix-task-meta[\s\S]*font-size: 10px/);
+    expect(css).toMatch(/button\.helix-task-tree-progress[\s\S]*min-width: 48px[\s\S]*max-width: 48px[\s\S]*border-radius: 50% !important/);
+    expect(css).toMatch(/button\.helix-task-tree-progress:hover[\s\S]*background: transparent !important/);
+    expect(view).toContain('attr: { "data-task-id": task.id }');
+    expect(view).toContain("collapsedTaskTreeIds");
+    expect(view).toContain("taskTreeRows");
+  });
+
+  it("uses one compact editor shell for all task sources", () => {
+    expect(view).not.toContain("class LocalProjectTaskEditModal");
+    expect(view).not.toContain("class TaskEditModal");
+    expect(unifiedTaskEditor).toContain("export class UnifiedTaskDetailModal extends Modal");
+    expect(unifiedTaskEditor.match(/addClass\("helix-task-editor-modal"/g)).toHaveLength(1);
+    expect(view.match(/new UnifiedTaskDetailModal/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(unifiedTaskEditor).toContain('placeholder: "添加子任务"');
+    expect(unifiedTaskEditor).toContain('cls: "helix-task-editor-properties"');
     expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
-    expect(localEditor).toMatch(/helix-task-editor-title-row[\s\S]*helix-task-editor-properties/);
-    expect(localEditor).toMatch(/timeMode[\s\S]*"none"[\s\S]*"point"[\s\S]*"range"/);
     expect(css).toMatch(/\.helix-task-editor-time-inputs input \{[\s\S]*width: 70px;[\s\S]*min-width: 70px;[\s\S]*padding: 0;/);
-    expect(localEditor).toMatch(/openTimePicker[\s\S]*showPicker\(\)/);
-    expect(localEditor).toMatch(/helix-task-editor-date-picker[\s\S]*上个月[\s\S]*下个月[\s\S]*helix-task-editor-calendar-grid/);
-    expect(localEditor).not.toContain('type: "date",\n      value: this.scheduleDate');
-    expect(localEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
-    expect(localEditor).toMatch(/helix-task-editor-subtask-grip[\s\S]*draggable: "true"[\s\S]*dragstart[\s\S]*drop/);
-    expect(localEditor).not.toContain('placeholder: "添加备注…"');
-    expect(localEditor).not.toContain('text: "时区"');
-    expect(css).toMatch(/Dense task canvas[\s\S]*grid-template-columns: repeat\(3/);
+    expect(unifiedTaskEditor).toMatch(/helix-task-editor-date-picker[\s\S]*上个月[\s\S]*下个月[\s\S]*helix-task-editor-calendar-grid/);
+    expect(unifiedTaskEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
+    expect(unifiedTaskEditor).toMatch(/helix-task-editor-subtask-grip[\s\S]*dragstart[\s\S]*drop/);
+    expect(unifiedTaskEditor).not.toContain('placeholder: "添加备注…"');
+    expect(unifiedTaskEditor).not.toContain('text: "时区"');
+  });
+
+  it("keeps source differences in adapters and removes Task Reference runtime support", () => {
+    expect(view).toContain('source: "stage-action"');
+    expect(view).toContain('source: "stage-projection"');
+    expect(view).toContain('source: "dida"');
+    expect(unifiedTaskEditor).toContain('text: "更多属性"');
+    expect(css).toMatch(/\.helix-task-editor-details > summary::before \{[\s\S]*content: none !important/);
+    expect(css).toMatch(/\.helix-task-editor-summary-value \{[\s\S]*margin-left: auto/);
+    expect(unifiedTaskEditor).not.toContain("滴答扩展");
+    expect(unifiedTaskEditor).not.toContain("Helix 关联");
+    expect(view).not.toContain("saveTaskReference(");
+    expect(view).not.toContain("TaskReferenceRebindModal");
+    expect(view).not.toContain("TaskReference");
+    expect(view).not.toContain("关联诊断");
+  });
+
+  it("renders remote completion truth before allowing the completion control to reopen it", () => {
+    const taskRow = view.slice(
+      view.indexOf("private renderTaskRow"),
+      view.indexOf("private startInlineTaskTitleEdit"),
+    );
+    expect(taskRow).toMatch(/task\.status === 2[\s\S]*helix-task-tree-progress[\s\S]*helix-task-check[\s\S]*completed \? " is-completed"/);
+    expect(taskRow).toMatch(/completed \? `重新打开[\s\S]*setIcon\(check, "check"\)/);
+    expect(taskRow).toMatch(/is-completing[\s\S]*is-success[\s\S]*setTimeout/);
+    expect(css).toContain("@keyframes helix-task-check-pulse");
   });
 
   it("uses project-colored neutral stage cards with one hover action bar", () => {
@@ -293,6 +349,13 @@ describe("workbench layout and navigation structure", () => {
       /withProjectMutation<T>[\s\S]*projectRefreshBatch\.begin\(\)[\s\S]*try[\s\S]*finally[\s\S]*projectRefreshBatch\.end\(\)/,
     );
     expect(main).toMatch(/onunload[\s\S]*projectRefreshBatch\?\.dispose\(\)/);
+    const refreshBody = main.slice(
+      main.indexOf("private scheduleProjectRefresh"),
+      main.indexOf("private deferProjectRefreshForActiveEditor"),
+    );
+    const refreshRunner = refreshBody.slice(refreshBody.indexOf("projectMutationRunner.run"));
+    expect(refreshRunner).not.toContain("projectRefreshBatch.begin()");
+    expect(refreshRunner).not.toContain("projectRefreshBatch.end()");
   });
 
   it("persists focus startup failures into the generic recovery center", () => {
@@ -343,8 +406,6 @@ describe("workbench layout and navigation structure", () => {
     const diagnosticOldTerms = /(?:new (?:Error|FocusBridgeError)|corrupt\(|issues\.push\(|reasons\.add\(|message:\s*)[^\n]*(?:投影|受管链接区块|托管|非托管|受管(?:引用|标记|包络|块))/u;
     expect(userReachableDiagnostics).not.toMatch(diagnosticOldTerms);
     expect(userReachableDiagnostics).toContain("滴答项目同步分栏创建");
-    expect(userReachableDiagnostics).toContain("Helix 自动链接区块无效");
-    expect(userReachableDiagnostics).toContain("自动引用区域缺失、重复或顺序错误");
     expect(userReachableDiagnostics).toContain("尚未交由 Helix 管理");
   });
 
@@ -366,20 +427,26 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/if \(this\.closed\) return;[\s\S]*this\.pendingKanbanArrivalCycleId = cycleId;/);
   });
 
-  it("ships the current formal release in local-only mode", () => {
+  it("ships only the explicitly staged Dida capabilities", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
     const capabilities = readFileSync(resolve(process.cwd(), "src/release-capabilities.ts"), "utf8");
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
-    expect(capabilities).toContain("export const DIDA_SYNC_AVAILABLE = false");
-    expect(main).toContain("if (DIDA_SYNC_AVAILABLE) this.registerDidaCommands()");
-    expect(main).toMatch(/new HelixService[\s\S]*didaSyncAvailable: DIDA_SYNC_AVAILABLE/);
-    expect(main).toMatch(/refreshAutoSync[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return/);
-    expect(settings).toMatch(/if \(!DIDA_SYNC_AVAILABLE\)[\s\S]*本地正式版[\s\S]*renderTemplateSetting\(\)/);
-    expect(view).toMatch(/displayState[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return \{ projects: \[\], tasks: \[\] \}/);
-    expect(view).toMatch(/renderHeader[\s\S]*if \(!DIDA_SYNC_AVAILABLE\) return/);
-    expect(helixService).toMatch(/async sync\(\)[\s\S]*this\.assertDidaSyncAvailable\(\)/);
-    expect(helixService).toMatch(/applyConflict[\s\S]*this\.assertDidaSyncAvailable\(\)/);
-    expect(helixService).toMatch(/assertDidaSyncAvailable[\s\S]*本地正式版暂未开放滴答网络同步/);
+    expect(capabilities).toContain("export const DIDA_READ_AVAILABLE = true");
+    expect(capabilities).toContain("export const DIDA_CONTRACT_TEST_AVAILABLE = true");
+    expect(capabilities).toContain("export const DIDA_TASK_WRITE_AVAILABLE = true");
+    expect(capabilities).toContain("export const PROJECT_DIDA_PROJECTION_AVAILABLE = true");
+    expect(main).toContain("if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands()");
+    expect(main).toContain("if (DIDA_CONTRACT_TEST_AVAILABLE) this.registerDidaContractCommands()");
+    expect(main).toMatch(/new HelixService[\s\S]*didaReadAvailable: DIDA_READ_AVAILABLE[\s\S]*didaTaskWriteAvailable: DIDA_TASK_WRITE_AVAILABLE[\s\S]*didaContractTestAvailable: DIDA_CONTRACT_TEST_AVAILABLE/);
+    expect(main).toMatch(/refreshAutoSync[\s\S]*if \(!DIDA_READ_AVAILABLE\) return/);
+    expect(settings).toMatch(/if \(!DIDA_READ_AVAILABLE\)[\s\S]*本地正式版[\s\S]*renderTemplateSetting\(\)/);
+    expect(settings).toContain("if (DIDA_CONTRACT_TEST_AVAILABLE) this.renderContractTests()");
+    expect(view).toMatch(/displayState[\s\S]*if \(!DIDA_READ_AVAILABLE\) return \{ projects: \[\], tasks: \[\] \}/);
+    expect(view).toMatch(/renderHeader[\s\S]*if \(!DIDA_READ_AVAILABLE\) return/);
+    expect(helixService).toMatch(/async sync\(\)[\s\S]*this\.assertDidaReadAvailable\(\)[\s\S]*syncWithAuthorizationLease\(!this\.didaTaskWriteAvailable\)/);
+    expect(helixService).toMatch(/runDidaWriteContractTest[\s\S]*this\.assertDidaContractTestAvailable\(\)/);
+    expect(helixService).toMatch(/applyConflict[\s\S]*this\.assertDidaTaskWriteAvailable\(\)/);
+    expect(helixService).toMatch(/assertDidaTaskWriteAvailable[\s\S]*当前版本暂未开放滴答普通任务写入/);
     expect(view).not.toContain("renderProjectDidaMappingBar");
     expect(view).not.toContain("ProjectDidaMappingConfirmModal");
     expect(view).not.toContain("renderProjectProjectionPanel");
@@ -387,8 +454,10 @@ describe("workbench layout and navigation structure", () => {
     expect(view).not.toContain("editProjectAction");
     expect(view).not.toContain("同步此项目到滴答");
     expect(view).not.toContain("当前只写 Stage，尚未发送滴答");
-    expect(settings).not.toContain("滴答项目同步");
+    expect(settings).toMatch(/PROJECT_DIDA_PROJECTION_AVAILABLE\) this\.renderAutomaticProjectProjectionStatus\(\)/);
+    expect(settings).toContain("只有进行中阶段会首次生成父任务，“计划行动”成为其子任务");
     expect(settings).not.toContain("renderProjectProjectionSettings");
+    expect(settings).not.toContain("目标滴答清单");
   });
 
   it("registers Live Preview marker hiding and routes project changes through one background coordinator", () => {
@@ -396,10 +465,25 @@ describe("workbench layout and navigation structure", () => {
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
     expect(main).toContain("this.registerEditorExtension(helixMarkerVisibilityExtension)");
     expect(main).toMatch(/new ProjectAutoSyncCoordinator[\s\S]*scan: \(\) => this\.projectAutoSyncScan\(\)[\s\S]*synchronize: \(projectId\) => this\.syncProjectProjection\(projectId\)/);
+    expect(main).toMatch(/runVaultProjectProjectionContractProbe[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(input\)[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(secondInput\)/);
+    expect(main).toMatch(/hasUntrackedIdentity[\s\S]*ownedRemoteIds\.every\(\(id\) => trackedRemoteIds\.has\(id\)\)[\s\S]*data\.queue = data\.queue\.filter[\s\S]*projectWorkspace\.deleteProject/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);
-    expect(main).toMatch(/confirmProjectProjection[\s\S]*projectAutoSync\.request\(true\)/);
-    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && readiness\.ready/);
-    expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE[\s\S]*candidates: \[\], failures: \[\]/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*localProjectTasks\.snapshot[\s\S]*adoptUnmanaged: true[\s\S]*projectAutoSync\.request\(\)/);
+    expect(main).toMatch(/confirmProjectProjection[\s\S]*withProjectProjectionActivationLease[\s\S]*confirmProjectionActivationWithLease[\s\S]*projectProjectionWriteReadiness\(\)[\s\S]*projectAutoSync\.updateReadiness[\s\S]*projectAutoSync\.request\(true\)/);
+    expect(main).toMatch(/disableProjectProjection[\s\S]*projectProjection\.disable\(\)[\s\S]*projectAutoSync\.updateReadiness\(false\)/);
+    expect(main).toMatch(/adoptProjectAction[\s\S]*projectAutoSync\.invalidate\(input\.projectId\)/);
+    expect(main).toMatch(/editProjectAction[\s\S]*projectAutoSync\.invalidate\(input\.projectId\)/);
+    expect(main).toMatch(/previewProjectProjection[\s\S]*localProjectTasks\.snapshot\(snapshot, \{ adoptUnmanaged: true \}\)[\s\S]*projectionCounts/);
+    expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && this\.settings\.autoSync && readiness\.ready/);
+    expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*PROJECTION_PROJECT_NAME[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)[\s\S]*PROJECTION_NO_COLUMN_ID[\s\S]*confirmProjectionActivationWithLease/);
+    const automaticBootstrap = main.slice(
+      main.indexOf("private ensureAutomaticProjectProjection"),
+      main.indexOf("readProjectProjectionWriteReadiness"),
+    );
+    expect(automaticBootstrap).not.toContain("setDidaProjectViewMode");
+    expect(main).toMatch(/refreshAutoSync[\s\S]*!this\.settings\.autoSync\) this\.projectAutoSync\.updateReadiness\(false\)/);
+    expect(main).toMatch(/reportProjectAutoSync[\s\S]*report\.mutations > 0[\s\S]*滴答项目同步完成/);
+    expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE \|\| !this\.settings\.autoSync[\s\S]*candidates: \[\], failures: \[\]/);
     const readiness = service.slice(
       service.indexOf("async projectProjectionWriteReadiness"),
       service.indexOf("async replaceDidaToken"),
@@ -407,6 +491,15 @@ describe("workbench layout and navigation structure", () => {
     expect(readiness).toMatch(/data\.queue\.length[\s\S]*data\.conflicts\.some[\s\S]*state\.loading[\s\S]*remoteWriteGate\.isIdle[\s\S]*recoveryIssues[\s\S]*remoteOutcomeUnknown[\s\S]*projectionOperationReceipts/);
     expect(service).toContain("new RemoteWriteGate(() => this.emit())");
     expect(view).not.toContain("syncProjectProjection:");
+  });
+
+  it("deletes an owned remote project before local trash and finalizes only after local commit", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const deletion = main.slice(
+      main.indexOf("private showDeleteProjectModal"),
+      main.indexOf("private showManageRelationModal"),
+    );
+    expect(deletion).toMatch(/projectProjection\.deleteProject[\s\S]*projectWorkspace\.deleteProject[\s\S]*projectProjection\.finalizeProjectDeletion/);
   });
 
   it("routes projection conflicts only through strict reconciliation and safe cleanup", () => {
@@ -439,22 +532,34 @@ describe("workbench layout and navigation structure", () => {
     const modal = main.slice(main.indexOf("class ProjectPromptModal"), main.indexOf("class CyclePromptModal"));
     expect(view).toMatch(/ProjectionUiActionCoordinator[\s\S]*projectionUiActions\.run/);
     expect(settings).not.toContain("ProjectionUiActionCoordinator");
-    expect(settings).not.toContain("confirmProjectProjection");
+    expect(settings).toMatch(/renderAutomaticProjectProjectionStatus[\s\S]*readProjectProjectionWriteReadiness/);
+    expect(settings).toContain("跟随下方“自动同步”开关；关闭时不会写入滴答");
+    expect(settings).not.toContain("projectionActivationConfirmation");
+    expect(settings).not.toContain("confirmProjectProjection(");
+    expect(settings).not.toContain("后台静默处理");
     expect(modal).not.toMatch(/didaProjectId|滴答清单映射|verifyRemoteProject/);
     expect(modal).toMatch(/submit\(title, initialStageTitle, this\.color\)/);
     expect(modal).toMatch(/首阶段名称/);
     expect(modal).toMatch(/class RenameEntityModal extends Modal/);
   });
 
-  it("hides projection column creation while retaining safe unknown reconciliation", () => {
+  it("uses the exact Helix Projects list without creating a board column", () => {
     const settings = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
     const confirm = service.slice(
       service.indexOf("async confirmProjectionColumnCreation"),
       service.indexOf("async reconcileProjectionColumnCreation"),
     );
-    expect(settings).not.toContain("PROJECTION_COLUMN_NAME");
+    expect(settings).toMatch(/PROJECTION_PROJECT_NAME[\s\S]*不创建看板或分栏[\s\S]*只有进行中阶段会首次生成父任务/);
     expect(settings).not.toContain("previewProjectProjectionColumn");
+    const automaticBootstrap = main.slice(
+      main.indexOf("private ensureAutomaticProjectProjection"),
+      main.indexOf("readProjectProjectionWriteReadiness"),
+    );
+    expect(automaticBootstrap).toContain("PROJECTION_NO_COLUMN_ID");
+    expect(automaticBootstrap).not.toContain("previewProjectionColumnCreation");
+    expect(automaticBootstrap).not.toContain("confirmProjectionColumnCreation");
     expect(view).toMatch(/分栏创建结果未知[\s\S]*reconcileProjectProjectionColumn/);
     expect(service).toMatch(/status: "running"[\s\S]*api\.createColumn[\s\S]*readProjectionCatalogWithLeaseHeld/);
     expect(confirm).toMatch(/enterExclusive\("滴答项目同步分栏创建"\)/);
@@ -465,7 +570,9 @@ describe("workbench layout and navigation structure", () => {
   it("keeps recovery and column-unknown diagnostics visible when the project workspace is unreadable", () => {
     expect(view).toMatch(/loadProjectionConflictModels[\s\S]*persisted\.didaProjectionState\?\.columnCreation/);
     expect(view).toMatch(/项目工作区只读[\s\S]*滴答项目同步诊断暂不可读[\s\S]*脱敏错误/);
-    expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)/);
+    expect(view).toMatch(/conflictCenterIsEmpty\([\s\S]*workspaceDiagnostic: Boolean\(projectionLoad\.diagnostic\)[\s\S]*requestControlAttention/);
+    expect(view).toMatch(/滴答请求冷却[\s\S]*远端写入保持暂停[\s\S]*一次受控读取/);
+    expect(css).toMatch(/\.helix-chip\.is-warning/);
   });
 
   it("uses a prioritized conflict table with inline three-step field resolution", () => {

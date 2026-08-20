@@ -31,10 +31,28 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     private readonly writeCapabilities: () => DidaTaskWriteCapabilities = () => ({}),
   ) {}
 
-  async get(entityId: string, context?: { projectId?: string }): Promise<DidaTask | null> {
+  async get(entityId: string, context?: RemoteWriteContext): Promise<DidaTask | null> {
     if (!context?.projectId) throw new Error("Task lookup requires projectId");
     try {
-      return taskSyncProjection(normalizeTask(await this.api.getTask(context.projectId, entityId)));
+      if (context.verifyDeletion) {
+        const data = await this.api.getProjectData(context.projectId);
+        const open = data.tasks.map(normalizeTask).find((task) => task.id === entityId);
+        if (open) return taskSyncProjection(open);
+        const completed = await this.api.getCompletedTasks({
+          projectIds: [context.projectId],
+          startDate: new Date(0).toISOString(),
+          endDate: new Date(Date.now() + 86_400_000).toISOString(),
+        });
+        const match = completed.map(normalizeTask).find(
+          (task) => task.id === entityId && task.projectId === context.projectId,
+        );
+        return match ? taskSyncProjection(match) : null;
+      }
+      const response = await this.api.getTask(context.projectId, entityId);
+      // 滴答在“任务存在但不属于所查清单”时可能返回空响应或空数组而不是 404。
+      // 只把这两种精确空值视为缺失；其他畸形响应仍报错，避免掩盖协议变化。
+      if (response == null || (Array.isArray(response) && response.length === 0)) return null;
+      return taskSyncProjection(normalizeTask(response));
     } catch (error) {
       if (isNotFound(error)) return null;
       throw error;
@@ -87,6 +105,7 @@ export class DidaTaskAdapter implements RemoteEntityAdapter<DidaTask> {
     const verified = this.writeCapabilities();
     const writeFields = new Set(context?.writeFields ?? []);
     const changedCapabilities: DidaTaskWriteCapabilities = {
+      taskParentingVerified: verified.taskParentingVerified === true && writeFields.has("parentId"),
       reminderWriteVerified: verified.reminderWriteVerified === true && writeFields.has("reminders"),
       repeatWriteVerified: verified.repeatWriteVerified === true && writeFields.has("repeatFlag"),
       itemsRoundTripVerified: verified.itemsRoundTripVerified === true && writeFields.has("items"),
@@ -205,6 +224,7 @@ function isNotFound(error: unknown): boolean {
 
 export interface DidaTaskWriteCapabilities {
   taskCrudVerified?: boolean;
+  taskParentingVerified?: boolean;
   reminderWriteVerified?: boolean;
   repeatWriteVerified?: boolean;
   itemsRoundTripVerified?: boolean;
@@ -241,6 +261,9 @@ export function taskCreatePayload(
       : {}),
     ...(capabilities.boardPlacementVerified && Object.hasOwn(value, "columnId")
       ? { columnId: value.columnId }
+      : {}),
+    ...(capabilities.taskParentingVerified && typeof value.parentId === "string" && value.parentId
+      ? { parentId: value.parentId }
       : {}),
   };
 }
@@ -287,6 +310,9 @@ export function taskUpdatePayload(
       : {}),
     ...(writeFields.has("status") && capabilities.taskReopenVerified && value.status === 0
       ? { status: 0 }
+      : {}),
+    ...(writeFields.has("parentId") && capabilities.taskParentingVerified
+      ? { parentId: value.parentId ?? "" }
       : {}),
   };
 }
@@ -345,5 +371,12 @@ export function taskSyncProjection(value: DidaTask): DidaTask {
   // columnName 是服务端随看板详情派生的展示字段；它不属于任务三方同步
   // 的业务真值，更不能变成可写冲突。
   const { columnId: _columnId, columnName: _columnName, ...syncValue } = withoutMetadata;
-  return syncValue;
+  return {
+    ...syncValue,
+    tags: syncValue.tags === undefined
+      ? undefined
+      : [...new Set(syncValue.tags.map((tag) => tag.trim()).filter(Boolean))].sort(
+          (left, right) => left.localeCompare(right),
+        ),
+  };
 }

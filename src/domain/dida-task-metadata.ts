@@ -48,3 +48,13 @@ export function didaTaskDifferenceFields(
   return [...keys].filter((key) =>
     !ignored.has(key) && !deepEqual(leftRecord[key], rightRecord[key]));
 }
+
+/** 完成时间由滴答生成；本地只有完成意图且远端也已完成时应采纳远端结果。 */
+export function taskCompletionConverged(
+  base: DidaTask,
+  local: DidaTask,
+  remote: DidaTask,
+): boolean {
+  return base.status !== 2 && local.status === 2 && remote.status === 2 &&
+    sameDidaTaskExcept(base, local, ["status", "completedTime"]);
+}

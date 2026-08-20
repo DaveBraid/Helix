@@ -73,6 +73,75 @@ function apiState() {
 }
 
 describe("DidaContractCleanupService", () => {
+  it("adopts marker-owned tasks into an existing exact project plan without writing", async () => {
+    const state = apiState();
+    const plan = pendingPlan();
+    plan.plan.tasks = [];
+    const store = new MemoryStore(plan);
+
+    await new DidaContractCleanupService(state.api as never, store)
+      .adoptTasksIntoExistingPlan(binding);
+
+    expect(store.pending?.plan.tasks).toEqual([
+      { id: "t", candidateProjectIds: ["a", "b"], state: "open" },
+    ]);
+    expect(state.api.deleteTask).not.toHaveBeenCalled();
+    expect(state.api.deleteProject).not.toHaveBeenCalled();
+  });
+
+  it("adopts only an exact Helix project parent and its marker-owned children", async () => {
+    const state = apiState();
+    state.tasks.set("a", [
+      { id: "parent", projectId: "a", columnId: "column-a", title: "Vault project", status: 0,
+        content: "helix-project-projection:project-id" } as DidaTask,
+      { id: "child", projectId: "a", parentId: "parent", columnId: "column-a", title: "Action", status: 0,
+        content: "helix-projection:action-id" } as DidaTask,
+    ]);
+    const plan = pendingPlan();
+    plan.plan.tasks = [];
+    const store = new MemoryStore(plan);
+
+    await new DidaContractCleanupService(state.api as never, store)
+      .adoptTasksIntoExistingPlan(binding);
+
+    expect(store.pending?.plan.tasks.map((entry) => entry.id).sort()).toEqual(["child", "parent"]);
+    expect(state.api.deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("deletes an adopted exact Helix project parent through the normal recovery flow", async () => {
+    const state = apiState();
+    state.tasks.set("a", [
+      { id: "parent", projectId: "a", columnId: "column-a", title: "Vault project", status: 0,
+        content: "helix-project-projection:project-id" } as DidaTask,
+    ]);
+    const plan = pendingPlan();
+    plan.plan.tasks = [];
+    const store = new MemoryStore(plan);
+    const cleanup = new DidaContractCleanupService(state.api as never, store);
+    await cleanup.adoptTasksIntoExistingPlan(binding);
+
+    await cleanup.recover(binding);
+
+    expect(state.api.deleteTask).toHaveBeenCalledWith("a", "parent");
+    expect(store.pending).toBeUndefined();
+    expect(state.projects).toEqual([]);
+  });
+
+  it("refuses task adoption when an exact contract project contains a foreign task", async () => {
+    const state = apiState();
+    state.tasks.get("a")!.push({ id: "foreign", projectId: "a", title: "用户任务", status: 0 } as DidaTask);
+    const plan = pendingPlan();
+    plan.plan.tasks = [];
+    const store = new MemoryStore(plan);
+
+    await expect(new DidaContractCleanupService(state.api as never, store)
+      .adoptTasksIntoExistingPlan(binding)).rejects.toThrow(/非本轮任务/);
+
+    expect(store.pending?.plan.tasks).toEqual([]);
+    expect(state.api.deleteTask).not.toHaveBeenCalled();
+    expect(state.api.deleteProject).not.toHaveBeenCalled();
+  });
+
   it("strictly adopts one exact A/B run with a dual-source column baseline", async () => {
     const state = apiState();
     const store = new MemoryStore();

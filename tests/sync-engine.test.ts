@@ -12,6 +12,7 @@ import type {
   SyncQueueOperation,
   RemoteWriteContext,
 } from "../src/sync/types";
+import { taskCompletionConverged } from "../src/domain/dida-task-metadata";
 
 class MemoryRepository implements SnapshotRepository, ConflictRepository {
   base: EntitySnapshot<unknown> | null = null;
@@ -118,6 +119,37 @@ function operation(local: DidaTask, base: EntitySnapshot<DidaTask>): SyncQueueOp
 }
 
 describe("SyncEngine safety gates", () => {
+  it("adopts an independently completed remote task without reopening or conflicting", async () => {
+    const baseTask = task("same task");
+    const localTask = { ...baseTask, status: 2, completedTime: null };
+    const remoteTask = {
+      ...baseTask,
+      status: 2,
+      completedTime: "2026-08-19T08:00:00.000Z",
+    };
+    const base = createSnapshot("task", "task-1", baseTask);
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = createSnapshot("task", "task-1", localTask);
+    const adapter = new TaskAdapter(remoteTask);
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+      acceptRemoteConvergence: (queued, queuedBase, local, remote) =>
+        queued.operation === "complete" &&
+        taskCompletionConverged(queuedBase.value, local.value, remote.value),
+    });
+    const queued = { ...operation(localTask, base), operation: "complete" as const };
+
+    const result = await engine.process(queued);
+
+    expect(result).toMatchObject({ outcome: "pulled", snapshot: { value: remoteTask } });
+    expect(adapter.updateCount).toBe(0);
+    expect(repository.conflicts).toEqual([]);
+  });
+
   it("pushes the queued local snapshot even when the repository now holds a resolved snapshot", async () => {
     const base = createSnapshot("task", "task-1", task("base"));
     const repository = new MemoryRepository();
@@ -136,6 +168,28 @@ describe("SyncEngine safety gates", () => {
     expect(result.outcome).toBe("pushed");
     expect(adapter.value?.title).toBe("queued-rename");
     expect((repository.local?.value as DidaTask).title).toBe("queued-rename");
+  });
+
+  it("adopts an already matching remote result without sending a redundant update", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const desired = createSnapshot("task", "task-1", task("same result"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = desired;
+    const adapter = new TaskAdapter(task("same result"));
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+
+    const result = await engine.process(operation(task("same result"), base));
+
+    expect(result.outcome).toBe("pulled");
+    expect(adapter.updateCount).toBe(0);
+    expect((repository.base?.value as DidaTask).title).toBe("same result");
+    expect((repository.local?.value as DidaTask).title).toBe("same result");
   });
 
   it("passes persisted explicit field intent from queue processing to the adapter", async () => {
@@ -563,6 +617,37 @@ describe("SyncEngine safety gates", () => {
     const applied = await engine.applyConflict(result.conflict.id, { projectId: "project-1" });
     expect(applied.outcome).toBe("resolved");
     expect(adapter.value?.title).toBe("remote-change");
+  });
+
+  it("quarantines a delete when the post-write read still exposes the record", async () => {
+    const base = createSnapshot("task", "task-1", task("base"));
+    const repository = new MemoryRepository();
+    repository.base = base;
+    repository.local = base;
+    let deleteSent = false;
+    const adapter: RemoteEntityAdapter<DidaTask> = {
+      kind: "task",
+      async get() { return task("base"); },
+      async create(value) { return value; },
+      async update(_id, value) { return value; },
+      async delete() { deleteSent = true; },
+    };
+    const engine = new SyncEngine({
+      adapter,
+      snapshots: repository,
+      conflicts: repository,
+      deviceId: "device-a",
+    });
+
+    await expect(engine.process({
+      ...operation(task("base"), base),
+      operation: "delete",
+      local: createSnapshot("task", "task-1", null as unknown as DidaTask),
+    })).rejects.toMatchObject({
+      category: "unknown-outcome",
+      remoteOutcomeUnknown: true,
+    });
+    expect(deleteSent).toBe(true);
   });
 
   it("removes base and local caches after explicitly resolving to deletion", async () => {

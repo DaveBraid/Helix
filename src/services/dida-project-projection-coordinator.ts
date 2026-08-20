@@ -9,7 +9,9 @@ import type {
 import type {
   ProjectionProjectInput,
   ProjectionProjectReadModel,
+  ProjectionCatalogSnapshot,
 } from "./dida-project-projection";
+import { buildProjectionActivationPreview } from "../domain/dida-project-projection";
 
 export interface ProjectionApplicationPort {
   readProject(input: ProjectionProjectInput): Promise<ProjectionProjectReadModel>;
@@ -20,14 +22,55 @@ export interface ProjectionApplicationPort {
   activate(preview: ProjectionActivationPreview, confirmedHash: string): Promise<void>;
 }
 
+/** 确认事务已经持有排他租约；远端目录必须通过该租约提供的读取函数获取。 */
+export async function confirmProjectionActivationWithLease(
+  snapshot: ProjectWorkspaceSnapshot,
+  projection: ProjectionApplicationPort & {
+    activateVerifiedPreview(preview: ProjectionActivationPreview, confirmedHash: string): Promise<void>;
+  },
+  preview: ProjectionActivationPreview,
+  confirmedHash: string,
+  readCatalog: (projectId: string) => Promise<ProjectionCatalogSnapshot>,
+): Promise<void> {
+  const counts = await projectionCounts(snapshot, projection);
+  const catalog = await readCatalog(preview.target.targetProjectId);
+  const fresh = buildProjectionActivationPreview({
+    target: preview.target,
+    projects: catalog.projects,
+    columns: catalog.columns,
+    readiness: catalog.readiness,
+    ...counts,
+  });
+  if (fresh.previewHash !== confirmedHash) {
+    throw new Error("同步项目、行动或远端目标已变化，请重新预览确认");
+  }
+  await projection.activateVerifiedPreview(fresh, confirmedHash);
+}
+
 export function projectionInputFromProject(project: ProjectWorkspaceProject): ProjectionProjectInput {
+  if (project.cycles.length !== 1) {
+    throw new Error("阶段任务同步必须逐阶段构建输入");
+  }
+  return projectionInputFromStage(project, project.cycles[0]!);
+}
+
+/** 滴答层级以 Stage 为父任务；Helix Project 只负责在本地组织这些阶段。 */
+export function projectionInputFromStage(
+  project: ProjectWorkspaceProject,
+  stage: ProjectWorkspaceProject["cycles"][number],
+): ProjectionProjectInput {
   return {
-    projectId: project.id,
-    projectPath: project.notePath,
-    projectTitle: project.title,
-    projectStatus: project.status,
-    stages: project.cycles.map((stage) => ({ path: stage.notePath, stageId: stage.id })),
+    projectId: stage.id,
+    projectPath: stage.notePath,
+    projectTitle: stage.title,
+    projectStatus: stage.status === "idea" ? "planned" : stage.status,
+    createWhenMissing: stage.status === "active",
+    stages: [{ path: stage.notePath, stageId: stage.id }],
   };
+}
+
+export function projectionInputsFromProject(project: ProjectWorkspaceProject): ProjectionProjectInput[] {
+  return project.cycles.map((stage) => projectionInputFromStage(project, stage));
 }
 
 export function projectionStageInProject(
@@ -45,7 +88,7 @@ export async function projectionCounts(
   snapshot: ProjectWorkspaceSnapshot,
   projection: Pick<ProjectionApplicationPort, "readProject">,
 ): Promise<{ projectCount: number; actionCount: number }> {
-  const inputs = snapshot.projects.map(projectionInputFromProject);
+  const inputs = snapshot.projects.flatMap(projectionInputsFromProject);
   const models = await Promise.all(inputs.map((input) => projection.readProject(input)));
   return {
     projectCount: inputs.length,

@@ -22,6 +22,7 @@ import {
   type StageCreationIntent,
 } from "./domain/cycle-graph";
 import type { JournalPeriod } from "./domain/entities";
+import type { DidaProjectProjectionContractContext } from "./integrations/dida/write-contract";
 import {
   deterministicEventId,
 } from "./domain/events";
@@ -32,7 +33,6 @@ import {
   canSilentlyRepairProjectCanvas,
   ProjectWorkspaceService,
 } from "./services/project-workspace";
-import { TaskReferenceService } from "./services/task-references";
 import { SerializedRunner } from "./services/serialized-runner";
 import { TaskMatrixRuleUpdater } from "./services/task-view-settings";
 import { autoSyncPlan } from "./services/auto-sync";
@@ -43,6 +43,7 @@ import type {
   ProjectWorkspaceProject,
   ProjectWorkspaceProjectStatus,
   ProjectWorkspaceProjectStatusUpdatePlan,
+  ProjectWorkspaceSnapshot,
   StageDeletionPlan,
 } from "./services/project-workspace";
 import { HelixDataStore } from "./storage/data-store";
@@ -89,16 +90,22 @@ import {
   type ProjectionSyncSummary,
 } from "./services/dida-project-projection";
 
-import type {
-  DidaProjectionTarget,
-  ProjectionActivationPreview,
-  ProjectionActionState,
-  ProjectionColumnCreationPreview,
+import {
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
+  PROJECTION_NO_COLUMN_ID,
+  PROJECTION_PROJECT_NAME,
+  type DidaProjectionTarget,
+  type ProjectionActivationPreview,
+  type ProjectionActionState,
+  type ProjectionColumnCreationPreview,
 } from "./domain/dida-project-projection";
 import {
   confirmProjectionActivation,
+  confirmProjectionActivationWithLease,
   projectionCounts,
   projectionInputFromProject,
+  projectionInputsFromProject,
+  projectionInputFromStage,
   projectionStageInProject,
 } from "./services/dida-project-projection-coordinator";
 import { stableHash } from "./domain/stable";
@@ -114,7 +121,9 @@ import {
   type LocalProjectTaskSnapshot,
 } from "./services/local-project-tasks";
 import {
-  DIDA_SYNC_AVAILABLE,
+  DIDA_CONTRACT_TEST_AVAILABLE,
+  DIDA_READ_AVAILABLE,
+  DIDA_TASK_WRITE_AVAILABLE,
   PROJECT_DIDA_PROJECTION_AVAILABLE,
   assertProjectDidaProjectionAvailable,
 } from "./release-capabilities";
@@ -132,7 +141,6 @@ export default class HelixPlugin extends Plugin {
   vaultRepository!: HelixVaultRepository;
   templateManager!: HelixTemplateManager;
   projectWorkspace!: ProjectWorkspaceService;
-  taskReferences!: TaskReferenceService;
   localProjectTasks!: LocalProjectTaskService;
   projectProjection!: DidaProjectProjectionService;
   private projectAutoSync!: ProjectAutoSyncCoordinator;
@@ -156,10 +164,19 @@ export default class HelixPlugin extends Plugin {
   private readonly deferredProjectEditorBlurListeners = new Map<HTMLElement, EventListener>();
   private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
+  private readonly projectProjectionBootstrapRunner = new SerializedRunner();
   private readonly settingsMutationRunner = new SerializedRunner();
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
   private projectStatusItem: HTMLElement | null = null;
   private projectStatusSignature: string | null = null;
+  /**
+   * 任务页只消费最近一次稳定项目快照的派生结果。禁止每次服务状态变化或
+   * 页面 render 都重新扫描全部 Project／Stage，更不能在 render 中补写身份。
+   */
+  private localProjectTaskSnapshotCache: LocalProjectTaskSnapshot | null = null;
+  private focusBridgeConflictCountCache = 0;
+  /** 派生项目视图缓存每次完成一致性重建后递增，供 UI 区分真实变化与无状态广播。 */
+  private projectViewRevision = 0;
   private readonly persistentNotices = new Set<Notice>();
 
   async onload(): Promise<void> {
@@ -188,12 +205,6 @@ export default class HelixPlugin extends Plugin {
       () => this.settings.rootFolder,
       () => this.settings.lineageCanvasPath,
       (requests) => this.templateManager.renderMany(requests),
-    );
-    this.taskReferences = new TaskReferenceService(
-      this.app,
-      this.vaultRepository,
-      this.projectWorkspace,
-      () => this.settings.rootFolder,
     );
     this.localProjectTasks = new LocalProjectTaskService(
       new VaultProjectionMarkdownAdapter(this.vaultRepository),
@@ -242,9 +253,14 @@ export default class HelixPlugin extends Plugin {
       }
     }
     this.service = new HelixService(this.store, this.secrets, {
-      didaSyncAvailable: DIDA_SYNC_AVAILABLE,
+      didaReadAvailable: DIDA_READ_AVAILABLE,
+      didaTaskWriteAvailable: DIDA_TASK_WRITE_AVAILABLE,
+      didaContractTestAvailable: DIDA_CONTRACT_TEST_AVAILABLE,
+      projectDidaProjectionAvailable: PROJECT_DIDA_PROJECTION_AVAILABLE,
     });
     await this.service.initialize();
+    this.service.setVaultProjectProjectionContractProbe((context) =>
+      this.runVaultProjectProjectionContractProbe(context));
     this.projectProjection = new DidaProjectProjectionService(
       new VaultProjectionMarkdownAdapter(this.vaultRepository),
       new ExistingHelixTaskPipelineAdapter(this.service),
@@ -261,9 +277,10 @@ export default class HelixPlugin extends Plugin {
     const projectionReadinessRunner = new SerializedRunner();
     this.register(this.service.subscribe(() => {
       void projectionReadinessRunner.run(async () => {
+        await this.ensureAutomaticProjectProjection();
         const readiness = await this.service.projectProjectionWriteReadiness();
         this.projectAutoSync.updateReadiness(
-          PROJECT_DIDA_PROJECTION_AVAILABLE && readiness.ready,
+          PROJECT_DIDA_PROJECTION_AVAILABLE && this.settings.autoSync && readiness.ready,
         );
       }).catch((error) => console.warn("Helix 无法刷新滴答项目后台写入条件", error));
     }));
@@ -308,12 +325,13 @@ export default class HelixPlugin extends Plugin {
           this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
-        taskReferences: this.taskReferences,
         readLocalProjectTasks: () => this.readLocalProjectTasks(),
         createLocalProjectTask: (input) => this.createLocalProjectTask(input),
         updateLocalProjectTask: (input) => this.updateLocalProjectTask(input),
         saveLocalProjectTask: (input) => this.saveLocalProjectTask(input),
         deleteLocalProjectTask: (input) => this.deleteLocalProjectTask(input),
+        readFocusBridgeConflictCount: () => this.readFocusBridgeConflictCount(),
+        readProjectViewRevision: () => this.projectViewRevision,
         readProjectWorkspace: (operation) => this.withProjectWorkspaceRead(operation),
         mutateProjectWorkspace: (operation) => this.withWritableProjectMutation(operation),
         repairProjectCanvas: () => this.repairProjectCanvas(),
@@ -339,7 +357,8 @@ export default class HelixPlugin extends Plugin {
       name: "打开工作台",
       callback: () => void this.activateView(),
     });
-    if (DIDA_SYNC_AVAILABLE) this.registerDidaCommands();
+    if (DIDA_READ_AVAILABLE) this.registerDidaReadCommands();
+    if (DIDA_CONTRACT_TEST_AVAILABLE) this.registerDidaContractCommands();
     this.addCommand({
       id: "create-project",
       name: "创建项目",
@@ -433,10 +452,6 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(file.path);
           return;
         }
-        if (this.taskReferences.isKnownTaskReferencePath(file.path)) {
-          this.scheduleProjectRefresh();
-          return;
-        }
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
@@ -452,20 +467,13 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(file.path);
           return;
         }
-        if (this.taskReferences.isKnownTaskReferencePath(file.path)) {
-          this.scheduleProjectRefresh();
-          return;
-        }
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
         this.refreshActiveStatusForPaths(file.path);
-        if (
-          this.isProjectWorkspaceFile(file.path) ||
-          this.taskReferences.isKnownTaskReferencePath(file.path)
-        ) {
+        if (this.isProjectWorkspaceFile(file.path)) {
           this.scheduleProjectRefresh(file.path);
         }
       }),
@@ -480,13 +488,6 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(
             this.isProjectWorkspaceFile(file.path) ? file.path : oldPath,
           );
-          return;
-        }
-        if (
-          this.taskReferences.isKnownTaskReferencePath(file.path) ||
-          this.taskReferences.isKnownTaskReferencePath(oldPath)
-        ) {
-          this.scheduleProjectRefresh();
           return;
         }
         this.scheduleProjectIdentityProbe(file.path);
@@ -507,7 +508,7 @@ export default class HelixPlugin extends Plugin {
       void this.finishProjectStartup(staleFocusBridgeIssues);
     });
     // 重启后从 Markdown/Canvas 权威源重扫；队列与写门仍由既有同步管线负责。
-    this.projectAutoSync.request();
+    this.projectAutoSync.invalidate();
   }
 
   private async finishProjectStartup(staleFocusBridgeIssues: readonly string[]): Promise<void> {
@@ -518,7 +519,18 @@ export default class HelixPlugin extends Plugin {
         await this.projectWorkspace.loadStableWorkspace();
         await this.store.resolveRecoveryIssuesAfterValidation(staleFocusBridgeIssues);
       }
-      if (!this.recoveryMode) await this.projectWorkspace.initializeFocusBridgeState();
+      if (!this.recoveryMode) {
+        await this.projectWorkspace.initializeFocusBridgeState();
+        const snapshot = await this.projectWorkspace.loadStableWorkspace();
+        await this.repairDerivedProjectCanvasCache(snapshot);
+        this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+          snapshot,
+          { adoptUnmanaged: true },
+        );
+        this.focusBridgeConflictCountCache =
+          (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+        this.projectViewRevision += 1;
+      }
     } catch (error) {
       const message = `${FOCUS_BRIDGE_RECOVERY_PREFIX}${
         error instanceof Error ? error.message : String(error)}`;
@@ -528,7 +540,7 @@ export default class HelixPlugin extends Plugin {
       this.projectStartupReady = true;
     }
     await this.service.refreshPersistedEvents();
-    if (!this.recoveryMode) this.scheduleProjectRefresh();
+    if (!this.recoveryMode) this.projectAutoSync.request();
   }
 
   private activeHelixStatusTarget(): ActiveHelixStatusTarget | null {
@@ -665,18 +677,268 @@ export default class HelixPlugin extends Plugin {
     this.refreshAutoSync(runImmediately);
   }
 
+  /** 合同临时清单内运行真实 Vault→Markdown→投影→生产队列主链路。 */
+  private async runVaultProjectProjectionContractProbe(
+    context: DidaProjectProjectionContractContext,
+  ): Promise<void> {
+    const title = `Helix 合同项目 ${crypto.randomUUID()}`;
+    let created: ProjectWorkspaceProject | undefined;
+    let projectionUnitId: string | undefined;
+    const trackedRemoteIds = new Set<string>();
+    const unknownDeleteIds = new Set<string>();
+    const track = async (taskId: string) => {
+      if (trackedRemoteIds.has(taskId)) return;
+      await context.trackTask(await context.api.getTask(context.project.id, taskId));
+      trackedRemoteIds.add(taskId);
+    };
+    const untrack = async (taskId: string) => {
+      if (!trackedRemoteIds.delete(taskId)) return;
+      await context.untrackTask(taskId);
+    };
+    const markDeleteUnknown = async (taskId: string) => {
+      if (!trackedRemoteIds.has(taskId) || unknownDeleteIds.has(taskId)) return;
+      await context.markTaskDeleteUnknown(taskId);
+      unknownDeleteIds.add(taskId);
+    };
+    const previous = await this.projectProjection.readConfiguration();
+    const target = { targetProjectId: context.project.id, targetColumnId: context.column.id };
+    if (previous.enabled || previous.ledger.length > 0 || previous.parentCheckpoints.length > 0 ||
+      (previous.parentBases?.length ?? 0) > 0 || (previous.receiptCleanupPending?.length ?? 0) > 0) {
+      throw new Error("Vault 项目合同探针要求远端项目联动处于完全关闭且无历史绑定的纯净状态");
+    }
+    const contractProjection = new DidaProjectProjectionService(
+      new VaultProjectionMarkdownAdapter(this.vaultRepository),
+      new ExistingHelixTaskPipelineAdapter(this.service),
+      new PersistedProjectionStatePort(this.store),
+      { read: async () => ({
+        projects: [context.project],
+        columns: [context.column],
+        readiness: {
+          writable: true,
+          queueEmpty: true,
+          authorizationCurrent: true,
+          taskParentingVerified: true,
+          itemsRoundTripVerified: true,
+          itemIdStableVerified: true,
+          boardPlacementVerified: true,
+          boardFresh: true,
+          taskReopenVerified: true,
+          unknownOutcomes: 0,
+        },
+      }) },
+      () => new Date().toISOString(),
+      new PersistedProjectionDiagnosticsPort(this.store),
+    );
+    try {
+      created = await this.withWritableProjectMutation(() =>
+        this.projectWorkspace.createProject(title, "合同首阶段"));
+      const stage = created.cycles[0]!;
+      projectionUnitId = stage.id;
+      await this.withWritableProjectMutation(async () => {
+        await this.localProjectTasks.createTask(
+          await this.projectWorkspace.loadStableWorkspace(),
+          { projectId: created!.id, stageId: stage.id, title: `${context.marker} Vault 行动` },
+        );
+      });
+      const counts = { projectCount: 1, actionCount: 1 };
+      const preview = await contractProjection.previewActivation(target, counts);
+      if (preview.blockers.length > 0) throw new Error(`Vault 项目链路探针无法激活：${preview.blockers.join("；")}`);
+      await contractProjection.activate(preview, preview.previewHash);
+      const input = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
+        .find((project) => project.id === created!.id)!);
+      // 投影会在远端请求之间回填 Project／Stage Markdown；整个同步必须加入自写批次，
+      // 否则前序 createTask 的延迟 Vault 事件可能在回填瞬间启动扫描并制造假 markdown-race。
+      const first = await this.withWritableProjectMutation(() =>
+        contractProjection.synchronizeProject(input));
+      if (first.createdParents !== 1 || first.createdActions !== 1 || first.frozen.length > 0) {
+        throw new Error("Vault 项目链路探针首次同步未完整收口");
+      }
+      const model = await contractProjection.readProject(input);
+      const parentId = model.project.parentTaskId;
+      const actionId = model.stages[0]?.managed[0]?.remoteId;
+      if (!parentId || !actionId) throw new Error("Vault 项目探针未回填远端稳定身份");
+      await track(parentId);
+      await track(actionId);
+      await this.withWritableProjectMutation(async () => {
+        const workspace = await this.projectWorkspace.loadStableWorkspace();
+        const task = (await this.localProjectTasks.snapshot(workspace)).tasks.find((item) =>
+          item.projectId === created!.id)!;
+        await this.localProjectTasks.updateTask(workspace, {
+          projectId: created!.id,
+          stageId: stage.id,
+          uuid: task.uuid,
+          expectedHash: task.revisionHash,
+          title: `${context.marker} Vault 行动已编辑`,
+          state: "completed",
+        });
+      });
+      const secondInput = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
+        .find((project) => project.id === created!.id)!);
+      const second = await this.withWritableProjectMutation(() =>
+        contractProjection.synchronizeProject(secondInput));
+      if (second.updatedActions !== 1 || second.completedActions !== 1 || second.frozen.length > 0) {
+        throw new Error("Vault 项目链路探针编辑与完成未完整收口");
+      }
+      await contractProjection.deleteProject(secondInput);
+      await untrack(actionId);
+      await untrack(parentId);
+      await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
+      await contractProjection.finalizeProjectDeletion(secondInput.projectId);
+      created = undefined;
+    } finally {
+      if (created) {
+        try {
+          const input = projectionInputFromProject((await this.projectWorkspace.snapshot()).projects
+            .find((project) => project.id === created!.id)!);
+          const model = await contractProjection.readProject(input);
+          if (model.project.parentTaskId) {
+            await track(model.project.parentTaskId);
+          }
+          for (const taskId of model.stages.flatMap((stage) => stage.managed.flatMap((action) => action.remoteId ? [action.remoteId] : []))) {
+            await track(taskId);
+          }
+          await contractProjection.deleteProject(input);
+          for (const taskId of [...trackedRemoteIds]) await untrack(taskId);
+          await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
+          await contractProjection.finalizeProjectDeletion(input.projectId);
+        } catch {
+          const state = await contractProjection.readConfiguration();
+          const unitId = projectionUnitId;
+          const ownedEntries = state.ledger.filter((item) => item.projectId === unitId);
+          for (const entry of ownedEntries) {
+            if (entry.remoteId) {
+              try { await track(entry.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
+              if (entry.tombstone && entry.frozen === "unknown-outcome") await markDeleteUnknown(entry.remoteId);
+            } else if (entry.frozen === "unknown-outcome") {
+              await context.markUntrackedCreate();
+            }
+          }
+          const parent = state.parentCheckpoints.find((item) => item.projectId === unitId);
+          if (parent?.remoteId) {
+            try { await track(parent.remoteId); } catch { /* 外层清理仍可按已登记身份复核。 */ }
+            if (parent.tombstone && parent.frozen === "unknown-outcome") await markDeleteUnknown(parent.remoteId);
+          } else if (parent?.frozen === "unknown-outcome") {
+            await context.markUntrackedCreate();
+          }
+          try {
+            const stagePaths = (await this.projectWorkspace.snapshot()).projects
+              .find((project) => project.id === created!.id)?.cycles.flatMap((stage) => [stage.notePath]) ?? [];
+            for (const path of stagePaths) {
+              const revision = await this.vaultRepository.read(path);
+              const parentMatch = revision?.content.match(/^helix-dida-parent-task-id:\s*(.+)$/mu)?.[1]?.trim();
+              if (parentMatch) await track(parentMatch);
+              const ids = [...(revision?.content.matchAll(/remoteId=([^\s>]+)/gu) ?? [])]
+                .map((match) => decodeURIComponent(match[1]!))
+                .filter((id) => id !== "-");
+              for (const id of ids) await track(id);
+            }
+          } catch {
+            // 无法从本地回填身份时保持合同清理计划与恢复状态，不按标题猜测。
+          }
+          const ownedParentId = state.parentBases?.find((item) => item.projectId === unitId)?.remoteId ??
+            state.parentCheckpoints.find((item) => item.projectId === unitId)?.remoteId;
+          const ownedRemoteIds = [...new Set([
+            ...ownedEntries.flatMap((entry) => entry.remoteId ? [entry.remoteId] : []),
+            ...(ownedParentId ? [ownedParentId] : []),
+          ])];
+          const hasUntrackedIdentity = ownedEntries.some((entry) => !entry.remoteId) ||
+            (!ownedParentId && (ownedEntries.length > 0 ||
+              state.parentCheckpoints.some((item) => item.projectId === unitId)));
+          if (!hasUntrackedIdentity && ownedRemoteIds.every((id) => trackedRemoteIds.has(id))) {
+            const operationIds = new Set(ownedEntries.flatMap((entry) =>
+              entry.operationId ? [entry.operationId] : []));
+            const conflictIds = new Set(ownedEntries.flatMap((entry) =>
+              entry.conflictId ? [entry.conflictId] : []));
+            // 先让用户可见的临时 Project／Stage／Canvas 完成原子删除；若随后派生状态
+            // 清理失败，只会留下可重试诊断，绝不出现文件仍在而身份账本先被抹掉。
+            await this.withWritableProjectMutation(() => this.projectWorkspace.deleteProject(created!.id));
+            await this.store.mutate((data) => {
+              data.queue = data.queue.filter((operation) =>
+                !ownedRemoteIds.includes(operation.entityId) && !operationIds.has(operation.id));
+              data.conflicts = data.conflicts.filter((conflict) =>
+                !ownedRemoteIds.includes(conflict.entityId) && !conflictIds.has(conflict.id));
+              data.projectionOperationReceipts = data.projectionOperationReceipts.filter((receipt) =>
+                !ownedRemoteIds.includes(receipt.remoteTaskId ?? "") &&
+                !operationIds.has(receipt.operationId));
+              data.events = data.events.filter((event) =>
+                !event || typeof event !== "object" || Array.isArray(event) ||
+                (event as Record<string, unknown>).projectId !== context.project.id);
+              for (const remoteId of ownedRemoteIds) {
+                delete data.baseSnapshots[`task:${remoteId}`];
+                delete data.localSnapshots[`task:${remoteId}`];
+              }
+              const projection = data.didaProjectionState;
+              if (projection) {
+                const next = {
+                  ...projection,
+                  ledger: projection.ledger.filter((entry) => entry.projectId !== unitId),
+                  parentCheckpoints: projection.parentCheckpoints.filter((entry) => entry.projectId !== unitId),
+                  parentBases: projection.parentBases?.filter((entry) => entry.projectId !== unitId),
+                  receiptCleanupPending: projection.receiptCleanupPending?.filter((entry) =>
+                    entry.projectId !== unitId),
+                };
+                const empty = next.ledger.length === 0 && next.parentCheckpoints.length === 0 &&
+                  (next.parentBases?.length ?? 0) === 0 && (next.receiptCleanupPending?.length ?? 0) === 0;
+                data.didaProjectionState = empty ? structuredClone(previous) : next;
+              }
+            });
+            created = undefined;
+          }
+        }
+      }
+      const current = await contractProjection.readConfiguration();
+      if (current.ledger.length === 0 && current.parentCheckpoints.length === 0) {
+        await new PersistedProjectionStatePort(this.store).write(current, previous);
+      }
+    }
+  }
+
   async readProjectProjection(projectId: string): Promise<ProjectionProjectReadModel> {
-    return this.withProjectWorkspaceRead(async () =>
-      this.projectProjection.readProject(await this.projectionInput(projectId)));
+    return this.withProjectWorkspaceRead(async () => {
+      const snapshot = await this.projectWorkspace.snapshot();
+      const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+      if (!project) throw new Error("找不到要读取滴答任务关联的 Helix 项目");
+      const models = await Promise.all(projectionInputsFromProject(project).map((input) =>
+        this.projectProjection.readProject(input)));
+      const configuration = await this.projectProjection.readConfiguration();
+      return {
+        enabled: configuration.enabled,
+        target: configuration.target ? { ...configuration.target } : undefined,
+        columnCreation: configuration.columnCreation
+          ? structuredClone(configuration.columnCreation)
+          : undefined,
+        project: {
+          id: project.id,
+          path: project.notePath,
+          title: project.title,
+          status: project.status,
+        },
+        stages: models.flatMap((model) => model.stages.map((stage) => ({
+          ...stage,
+          title: project.cycles.find((candidate) => candidate.id === stage.id)?.title,
+        }))),
+        receipts: models.flatMap((model) => model.receipts),
+        receiptCleanupPending: models.flatMap((model) => model.receiptCleanupPending),
+        orphanDiagnostics: models.flatMap((model) => model.orphanDiagnostics),
+      };
+    });
   }
 
   async readLocalProjectTasks(): Promise<LocalProjectTaskSnapshot> {
     this.assertWritable();
-    return this.withProjectWorkspaceRead(async () =>
-      this.localProjectTasks.snapshot(
+    if (this.localProjectTaskSnapshotCache) return this.localProjectTaskSnapshotCache;
+    return this.withProjectWorkspaceRead(async () => {
+      if (this.localProjectTaskSnapshotCache) return this.localProjectTaskSnapshotCache;
+      this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
         await this.projectWorkspace.loadStableWorkspace(),
-        { adoptUnmanaged: true },
-      ));
+        { adoptUnmanaged: false },
+      );
+      return this.localProjectTaskSnapshotCache;
+    });
+  }
+
+  readFocusBridgeConflictCount(): number {
+    return this.focusBridgeConflictCountCache;
   }
 
   async createLocalProjectTask(input: {
@@ -738,17 +1000,73 @@ export default class HelixPlugin extends Plugin {
     return this.withProjectWorkspaceRead(() => this.projectProjection.readConfiguration());
   }
 
-  async readProjectProjectionCatalog(): Promise<ProjectionCatalogSnapshot[]> {
-    const projectIds = [...new Set(this.service.snapshot().projects
-      .map((project) => project.id)
-      .filter((id) => !id.startsWith("local-project-")))];
-    return Promise.all(projectIds.map((projectId) => this.service.readProjectionCatalog(projectId)));
+  /** 普通自动同步开启后，唯一地连接 Helix Projects 清单和无分栏阶段任务目标。 */
+  private ensureAutomaticProjectProjection(): Promise<void> {
+    return this.projectProjectionBootstrapRunner.run(async () => {
+      if (!PROJECT_DIDA_PROJECTION_AVAILABLE || this.recoveryMode || !this.settings.autoSync ||
+        !this.secrets.getDidaToken()) return;
+      const runtime = this.service.snapshot();
+      if (!runtime.authorizationConfigured || !runtime.taskCrudVerified ||
+        !runtime.taskParentingVerified || !runtime.projectProjectionVerified) return;
+      const configuration = await this.projectProjection.readConfiguration();
+      if (configuration.enabled &&
+        configuration.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION &&
+        configuration.target && configuration.confirmedPreviewHash) return;
+      const snapshot = await this.projectWorkspace.loadStableWorkspace();
+      const hasRecoveryIdentity = configuration.ledger.length > 0 ||
+        configuration.parentCheckpoints.length > 0 ||
+        (configuration.parentBases?.length ?? 0) > 0 ||
+        (configuration.receiptCleanupPending?.length ?? 0) > 0;
+      if (hasRecoveryIdentity) {
+        throw new Error("旧版项目任务同步仍有身份记录，必须先在冲突中心完成收口");
+      }
+      let matches = this.service.snapshot().projects.filter((project) =>
+        project.name === PROJECTION_PROJECT_NAME && !project.id.startsWith("local-project-"));
+      if (matches.length > 1) throw new Error(`存在多个“${PROJECTION_PROJECT_NAME}”清单，已停止自动选择`);
+      if (matches.length === 0) {
+        await this.service.createDidaProject(PROJECTION_PROJECT_NAME);
+        matches = this.service.snapshot().projects.filter((project) =>
+          project.name === PROJECTION_PROJECT_NAME && !project.id.startsWith("local-project-"));
+      }
+      if (matches.length !== 1) throw new Error(`无法唯一确认“${PROJECTION_PROJECT_NAME}”清单`);
+      const targetProject = matches[0]!;
+      const target = {
+        targetProjectId: targetProject.id,
+        targetColumnId: PROJECTION_NO_COLUMN_ID,
+      };
+      await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
+      const counts = await projectionCounts(snapshot, this.projectProjection);
+      const preview = await this.projectProjection.previewActivation(target, counts);
+      await this.service.withProjectProjectionActivationLease((readCatalog) =>
+        confirmProjectionActivationWithLease(
+          snapshot,
+          this.projectProjection,
+          preview,
+          preview.previewHash,
+          readCatalog,
+        ));
+      this.projectAutoSync.request(true);
+      new Notice(`项目任务已自动连接到“${PROJECTION_PROJECT_NAME}”清单`, 6_000);
+    });
+  }
+
+  readProjectProjectionWriteReadiness() {
+    return this.service.projectProjectionWriteReadiness();
+  }
+
+  async readProjectProjectionCatalog(projectId: string): Promise<ProjectionCatalogSnapshot> {
+    if (!this.service.snapshot().projects.some((project) => project.id === projectId) ||
+      projectId.startsWith("local-project-")) {
+      throw new Error("请选择已同步且身份明确的滴答清单");
+    }
+    return this.service.readProjectionCatalog(projectId);
   }
 
   async previewProjectProjection(target: DidaProjectionTarget): Promise<ProjectionActivationPreview> {
     this.assertProjectProjectionAvailable();
-    return this.withProjectWorkspaceRead(async () => {
-      const snapshot = await this.projectWorkspace.snapshot();
+    return this.withWritableProjectMutation(async () => {
+      const snapshot = await this.projectWorkspace.loadStableWorkspace();
+      await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
       const counts = await projectionCounts(snapshot, this.projectProjection);
       return this.projectProjection.previewActivation(target, counts);
     });
@@ -759,15 +1077,28 @@ export default class HelixPlugin extends Plugin {
     confirmedHash: string,
   ): Promise<void> {
     this.assertProjectProjectionAvailable();
-    await this.withWritableProjectMutation(async () => {
-      const snapshot = await this.projectWorkspace.snapshot();
-      await confirmProjectionActivation(snapshot, this.projectProjection, preview, confirmedHash);
-    });
+    await this.service.withProjectProjectionActivationLease((readCatalog) =>
+      this.withWritableProjectMutation(async () => {
+        const snapshot = await this.projectWorkspace.loadStableWorkspace();
+        await this.localProjectTasks.snapshot(snapshot, { adoptUnmanaged: true });
+        await confirmProjectionActivationWithLease(
+          snapshot,
+          this.projectProjection,
+          preview,
+          confirmedHash,
+          readCatalog,
+        );
+      }));
+    const readiness = await this.service.projectProjectionWriteReadiness();
+    this.projectAutoSync.updateReadiness(
+      PROJECT_DIDA_PROJECTION_AVAILABLE && this.settings.autoSync && readiness.ready,
+    );
     this.projectAutoSync.request(true);
   }
 
   async disableProjectProjection(): Promise<void> {
     await this.withWritableProjectMutation(() => this.projectProjection.disable());
+    this.projectAutoSync.updateReadiness(false);
   }
 
   previewProjectProjectionColumn(projectId: string): Promise<ProjectionColumnCreationPreview> {
@@ -803,7 +1134,7 @@ export default class HelixPlugin extends Plugin {
         line: input.line,
       });
     });
-    this.projectAutoSync.request();
+    this.projectAutoSync.invalidate(input.projectId);
   }
 
   async editProjectAction(input: {
@@ -825,15 +1156,19 @@ export default class HelixPlugin extends Plugin {
         state: input.state,
       });
     });
-    this.projectAutoSync.request();
+    this.projectAutoSync.invalidate(input.projectId);
   }
 
   async reconcileProjectProjectionFrozen(input:
     | { kind: "action"; projectId: string; stageId: string; uuid: string }
-    | { kind: "parent"; projectId: string }): Promise<void> {
+    | { kind: "parent"; projectId: string; stageId: string }): Promise<void> {
     this.assertProjectProjectionAvailable();
     await this.withWritableProjectMutation(async () => {
-      const projectionInput = await this.projectionInput(input.projectId);
+      const snapshot = await this.projectWorkspace.snapshot();
+      const project = snapshot.projects.find((candidate) => candidate.id === input.projectId);
+      const stage = project?.cycles.find((candidate) => candidate.id === input.stageId);
+      if (!project || !stage) throw new Error("找不到要复核的阶段任务");
+      const projectionInput = projectionInputFromStage(project, stage);
       if (input.kind === "action") {
         const stage = await this.requireProjectionStage(input.projectId, input.stageId);
         await this.projectProjection.reconcileFrozen({
@@ -868,34 +1203,43 @@ export default class HelixPlugin extends Plugin {
 
   async syncProjectProjection(projectId: string): Promise<ProjectionSyncSummary> {
     this.assertProjectProjectionAvailable();
-    return this.withWritableProjectMutation(async () =>
-      this.projectProjection.synchronizeProject(await this.projectionInput(projectId)));
+    return this.withWritableProjectMutation(async () => {
+      const inputs = await this.projectionInputs(projectId);
+      const summary = emptyProjectionSummary();
+      for (const input of inputs) {
+        mergeProjectionSummary(summary, await this.projectProjection.synchronizeProject(input));
+      }
+      return summary;
+    });
   }
 
   private async projectAutoSyncScan() {
-    if (!PROJECT_DIDA_PROJECTION_AVAILABLE) return { candidates: [], failures: [] };
+    if (!PROJECT_DIDA_PROJECTION_AVAILABLE || !this.settings.autoSync) {
+      return { candidates: [], failures: [] };
+    }
     return this.withProjectWorkspaceRead(async () => {
       const configuration = await this.projectProjection.readConfiguration();
-      if (!configuration.enabled || !configuration.target || !configuration.confirmedPreviewHash) {
+      if (!configuration.enabled ||
+        configuration.activationVersion !== PROJECT_PROJECTION_ACTIVATION_VERSION ||
+        !configuration.target || !configuration.confirmedPreviewHash) {
         return { candidates: [], failures: [] };
       }
       const snapshot = await this.projectWorkspace.snapshot();
       const candidates = [];
       const failures = [];
       for (const project of snapshot.projects) {
-        const input = projectionInputFromProject(project);
-        const fallbackFingerprint = stableHash(input);
+        const inputs = projectionInputsFromProject(project);
+        const fallbackFingerprint = stableHash(inputs);
         try {
-          const model = await this.projectProjection.readProject(input);
+          const models = await Promise.all(inputs.map((input) => this.projectProjection.readProject(input)));
           candidates.push({
             projectId: project.id,
             fingerprint: stableHash({
-              project: model.project,
-              stages: model.stages.map((stage) => ({
-                id: stage.id,
-                path: stage.path,
-                revisionHash: stage.revisionHash,
-              })),
+              project: { id: project.id, title: project.title, status: project.status },
+              stages: models.flatMap((model) => model.stages.map((stage) => ({
+                id: stage.id, path: stage.path, revisionHash: stage.revisionHash,
+                parentTaskId: stage.parentTaskId,
+              }))),
             }),
           });
         } catch {
@@ -917,13 +1261,16 @@ export default class HelixPlugin extends Plugin {
       new Notice(`滴答项目同步暂缓 ${report.blocked} 项${frozen}；请查看冲突中心或同步设置`, 10_000);
       return;
     }
+    if (report.mutations > 0) {
+      new Notice(`滴答项目同步完成：${report.synchronized} 个项目，${report.mutations} 项变更`, 6_000);
+    }
   }
 
-  private async projectionInput(projectId: string): Promise<ProjectionProjectInput> {
+  private async projectionInputs(projectId: string): Promise<ProjectionProjectInput[]> {
     const snapshot = await this.projectWorkspace.snapshot();
     const project = snapshot.projects.find((candidate) => candidate.id === projectId);
     if (!project) throw new Error("找不到要同步到滴答的 Helix 项目");
-    return projectionInputFromProject(project);
+    return projectionInputsFromProject(project);
   }
 
   private async requireProjectionStage(projectId: string, stageId: string) {
@@ -1004,7 +1351,8 @@ export default class HelixPlugin extends Plugin {
       window.clearTimeout(this.immediateSyncTimerId);
       this.immediateSyncTimerId = null;
     }
-    if (!DIDA_SYNC_AVAILABLE) return;
+    if (!DIDA_READ_AVAILABLE) return;
+    if (!this.settings.autoSync) this.projectAutoSync.updateReadiness(false);
     const plan = autoSyncPlan({
       recoveryMode: this.recoveryMode,
       tokenConfigured: Boolean(this.secrets.getDidaToken()),
@@ -1030,12 +1378,15 @@ export default class HelixPlugin extends Plugin {
     this.registerInterval(this.syncIntervalId);
   }
 
-  private registerDidaCommands(): void {
+  private registerDidaReadCommands(): void {
     this.addCommand({
       id: "sync-now",
       name: "立即同步滴答数据",
       callback: () => void this.service.sync().catch((error) => this.service.notifySyncError(error)),
     });
+  }
+
+  private registerDidaContractCommands(): void {
     this.addCommand({
       id: "show-dida-write-contract-status",
       name: "显示滴答写入合同状态",
@@ -1302,11 +1653,15 @@ export default class HelixPlugin extends Plugin {
           plan,
           async (bridge, confirmCrossProject) => {
             this.assertWritable();
-            await this.withWritableProjectMutation(() =>
-              this.projectWorkspace.deleteCycle(plan, {
+            await this.withWritableProjectMutation(async () => {
+              const projectionInput = projectionInputFromStage(owner, cycle);
+              await this.projectProjection.deleteProject(projectionInput);
+              await this.projectWorkspace.deleteCycle(plan, {
                 bridge,
                 confirmCrossProject,
-              }));
+              });
+              await this.projectProjection.finalizeProjectDeletion(projectionInput.projectId);
+            });
             const focusEntityId = snapshot.relations
               .filter((relation) =>
                 relation.fromCycleIds.includes(cycleId) ||
@@ -1343,8 +1698,16 @@ export default class HelixPlugin extends Plugin {
         if (!project) throw new Error("找不到需要删除的项目");
         new DeleteProjectModal(this.app, project, async () => {
           this.assertWritable();
-          await this.withWritableProjectMutation(() =>
-            this.projectWorkspace.deleteProject(projectId));
+          await this.withWritableProjectMutation(async () => {
+            const projectionInputs = projectionInputsFromProject(project);
+            for (const input of projectionInputs) {
+              await this.projectProjection.deleteProject(input);
+            }
+            await this.projectWorkspace.deleteProject(projectId);
+            for (const input of projectionInputs) {
+              await this.projectProjection.finalizeProjectDeletion(input.projectId);
+            }
+          });
           onDeleted?.();
           new Notice(`项目“${project.title}”及其 ${project.cycles.length} 个阶段已移入废纸篓`);
         }).open();
@@ -1572,11 +1935,25 @@ export default class HelixPlugin extends Plugin {
       const markdownPaths = [...this.projectMarkdownRefreshPaths];
       this.projectMarkdownRefreshPaths.clear();
       void this.projectMutationRunner.run(async () => {
+        // 扫描本身不是自写事务，禁止 begin/end：end 会安排下一轮扫描，
+        // 进而形成无限刷新。真正的 Markdown/Canvas 写入仍由各 mutation
+        // 或 repairDerivedProjectCanvasCache 单独进入 quiet-window。
         if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
         if (!this.recoveryMode && markdownPaths.length > 0) {
           await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
         }
-        if (!this.recoveryMode) await this.repairDerivedProjectCanvasCache();
+        if (!this.recoveryMode) {
+          // 本轮只读取一次稳定工作区，供 Canvas 派生修复和任务派生共同使用。
+          const snapshot = await this.projectWorkspace.loadStableWorkspace();
+          await this.repairDerivedProjectCanvasCache(snapshot);
+          this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+            snapshot,
+            { adoptUnmanaged: markdownPaths.length > 0 },
+          );
+          this.focusBridgeConflictCountCache =
+            (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+          this.projectViewRevision += 1;
+        }
         await this.service.refreshPersistedEvents();
         this.projectAutoSync.request();
       }).catch(async (error) => {
@@ -1595,7 +1972,11 @@ export default class HelixPlugin extends Plugin {
   private deferProjectRefreshForActiveEditor(path: string): boolean {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     const normalized = normalizePath(path);
-    if (!view || normalizePath(view.file?.path ?? "") !== normalized || !view.editor.hasFocus()) {
+    const activeElement = view?.contentEl.ownerDocument.activeElement;
+    const editingInsideView = !!view && (
+      view.editor.hasFocus() || (!!activeElement && view.contentEl.contains(activeElement))
+    );
+    if (!view || normalizePath(view.file?.path ?? "") !== normalized || !editingInsideView) {
       return false;
     }
     this.deferredProjectEditorRefreshPaths.add(normalized);
@@ -1604,7 +1985,9 @@ export default class HelixPlugin extends Plugin {
     const ownerWindow = element.ownerDocument.defaultView ?? window;
     const listener: EventListener = () => {
       ownerWindow.requestAnimationFrame(() => {
-        if (this.unloaded || view.editor.hasFocus()) return;
+        const nextActiveElement = view.contentEl.ownerDocument.activeElement;
+        if (this.unloaded || view.editor.hasFocus() ||
+          (!!nextActiveElement && view.contentEl.contains(nextActiveElement))) return;
         element.removeEventListener("focusout", listener, true);
         this.deferredProjectEditorBlurListeners.delete(element);
         const paths = [...this.deferredProjectEditorRefreshPaths];
@@ -1618,12 +2001,14 @@ export default class HelixPlugin extends Plugin {
   }
 
   /** 已持有 projectMutationRunner；只对可重建派生字段开启自写事件批次。 */
-  private async repairDerivedProjectCanvasCache(): Promise<void> {
-    const snapshot = await this.projectWorkspace.loadStableWorkspace();
-    if (!canSilentlyRepairProjectCanvas(snapshot)) return;
+  private async repairDerivedProjectCanvasCache(
+    snapshot?: ProjectWorkspaceSnapshot,
+  ): Promise<void> {
+    const stable = snapshot ?? await this.projectWorkspace.loadStableWorkspace();
+    if (!canSilentlyRepairProjectCanvas(stable)) return;
     this.projectRefreshBatch.begin();
     try {
-      await this.projectWorkspace.repairDerivedCanvasCache(snapshot);
+      await this.projectWorkspace.repairDerivedCanvasCache(stable);
     } finally {
       this.projectRefreshBatch.end();
     }
@@ -1637,14 +2022,9 @@ export default class HelixPlugin extends Plugin {
     const timer = window.setTimeout(() => {
       this.projectIdentityProbeTimers.delete(normalized);
       if (this.unloaded || this.isProjectWorkspaceFile(normalized)) return;
-      void Promise.all([
-        this.projectWorkspace.hasProjectWorkspaceIdentity(normalized),
-        this.taskReferences.hasTaskReferenceIdentity(normalized),
-      ])
-        .then(([isProjectWorkspaceMarkdown, isTaskReferenceMarkdown]) => {
-          if (isProjectWorkspaceMarkdown || isTaskReferenceMarkdown) {
-            this.scheduleProjectRefresh(normalized);
-          }
+      void this.projectWorkspace.hasProjectWorkspaceIdentity(normalized)
+        .then((isProjectWorkspaceMarkdown) => {
+          if (isProjectWorkspaceMarkdown) this.scheduleProjectRefresh(normalized);
         })
         .catch((error) => {
           console.warn("Helix 无法检查 Markdown 的项目身份", error);
@@ -2006,7 +2386,7 @@ class DeleteProjectModal extends Modal {
     this.setTitle(`删除项目：${this.project.title}`);
     this.contentEl.createEl("p", {
       cls: "helix-modal-note",
-      text: `项目笔记、${this.project.cycles.length} 个阶段笔记、项目容器及其 Helix 关系将一并移入 Obsidian 废纸篓。此操作不会删除任何滴答清单数据。`,
+      text: `项目笔记、${this.project.cycles.length} 个阶段笔记、项目容器及其 Helix 关系将一并移入 Obsidian 废纸篓；已由 Helix 创建的对应阶段任务及子任务也会从滴答删除，但不会删除“${PROJECTION_PROJECT_NAME}”清单或其他任务。`,
     });
     this.contentEl.createEl("p", {
       text: `请输入“${DeleteProjectModal.CONFIRMATION}”以继续。`,
@@ -2641,6 +3021,33 @@ class LegacyMigrationModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+function emptyProjectionSummary(): ProjectionSyncSummary {
+  return {
+    createdParents: 0,
+    updatedParents: 0,
+    completedParents: 0,
+    createdActions: 0,
+    updatedActions: 0,
+    completedActions: 0,
+    deletedActions: 0,
+    frozen: [],
+  };
+}
+
+function mergeProjectionSummary(
+  target: ProjectionSyncSummary,
+  source: ProjectionSyncSummary,
+): void {
+  target.createdParents += source.createdParents;
+  target.updatedParents += source.updatedParents;
+  target.completedParents += source.completedParents;
+  target.createdActions += source.createdActions;
+  target.updatedActions += source.updatedActions;
+  target.completedActions += source.completedActions;
+  target.deletedActions += source.deletedActions;
+  target.frozen.push(...source.frozen);
 }
 
 function formatDate(date: Date): string {

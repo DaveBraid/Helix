@@ -23,7 +23,7 @@ import { DidaHttpError } from "./http-contract";
 import { normalizeColumns, normalizeProject, normalizeTask } from "./normalization";
 import { createDidaChecklistClientItem, serializeDidaDate } from "./serialization";
 
-type ContractApi = Pick<
+export type ContractApi = Pick<
   DidaApi,
   | "createProject"
   | "getProjects"
@@ -64,6 +64,8 @@ export interface DidaWriteContractReport {
   boardPlacementVerified: boolean;
   columnCreateVerified: boolean;
   taskCrudVerified: boolean;
+  taskParentingVerified: boolean;
+  projectProjectionVerified: boolean;
   reminderWriteVerified: boolean;
   repeatWriteVerified: boolean;
   itemsRoundTripVerified: boolean;
@@ -80,6 +82,18 @@ export interface DidaWriteContractReport {
   capabilityFailureCodes: string[];
   /** 仅供持久恢复使用；不得进入 Notice 或普通诊断。 */
   cleanupPlan?: DidaContractCleanupPlan;
+}
+
+export interface DidaProjectProjectionContractContext {
+  api: ContractApi;
+  marker: string;
+  project: DidaProject;
+  column: DidaColumn;
+  taskScheduleMode: Exclude<TaskScheduleMode, "unknown">;
+  trackTask(task: DidaTask): Promise<void>;
+  untrackTask(taskId: string): Promise<void>;
+  markTaskDeleteUnknown(taskId: string): Promise<void>;
+  markUntrackedCreate(): Promise<void>;
 }
 
 export type ItemsOwnedAppendFailureCode =
@@ -134,6 +148,8 @@ interface CreatedTask {
   candidateProjectIds: string[];
   state: "open" | "completed" | "unknown";
   deleteState?: "sent-unknown";
+  /** 仅本次进程使用：集合未见但精确详情已证明存在，删除后还需详情 404 证明。 */
+  detailFallback?: boolean;
 }
 
 export class DidaWriteContractRunner {
@@ -142,6 +158,8 @@ export class DidaWriteContractRunner {
   private boardPlacementVerified = false;
   private columnCreateVerified = false;
   private taskCrudVerified = false;
+  private taskParentingVerified = false;
+  private projectProjectionVerified = false;
   private reminderWriteVerified = false;
   private repeatWriteVerified = false;
   private itemsRoundTripVerified = false;
@@ -165,6 +183,9 @@ export class DidaWriteContractRunner {
       plan: DidaContractCleanupPlan | undefined,
     ) => Promise<void> = async () => undefined,
     private readonly cleanupApi: ContractApi = api,
+    private readonly runProjectProjectionProbe?: (
+      context: DidaProjectProjectionContractContext,
+    ) => Promise<void>,
   ) {
     this.api = api;
   }
@@ -175,6 +196,8 @@ export class DidaWriteContractRunner {
     this.boardPlacementVerified = false;
     this.columnCreateVerified = false;
     this.taskCrudVerified = false;
+    this.taskParentingVerified = false;
+    this.projectProjectionVerified = false;
     this.reminderWriteVerified = false;
     this.repeatWriteVerified = false;
     this.itemsRoundTripVerified = false;
@@ -444,6 +467,75 @@ export class DidaWriteContractRunner {
         ? "独立写入并清空每日重复规则"
         : "当前账号未通过重复规则写入合同，保持生产只读");
 
+      this.beginStage("独立验证真实子任务父子关系");
+      try {
+        let createdChild: DidaTask;
+        try {
+          createdChild = normalizeTask(await this.api.createTask(taskCreatePayload({
+            id: "local-contract-child",
+            projectId: projectA.id,
+            parentId: created.id,
+            title: `${marker} 子任务能力任务`,
+            content: `${marker} parenting-probe`,
+            priority: 0,
+            status: 0,
+          }, { taskParentingVerified: true })));
+        } catch (error) {
+          if (isUnknownRemoteOutcome(error)) {
+            this.untrackedCreateOutcome = true;
+            await this.cleanupCheckpoint();
+          }
+          throw error;
+        }
+        childTask = {
+          id: createdChild.id,
+          projectId: projectA.id,
+          candidateProjectIds: [projectA.id],
+          state: "open",
+        };
+        await this.cleanupCheckpoint();
+        this.assertTaskIdentity(createdChild, createdChild.id, projectA.id, marker);
+        const attached = normalizeTask(await this.api.getTask(projectA.id, createdChild.id));
+        this.assertTaskIdentity(attached, createdChild.id, projectA.id, marker);
+        if (attached.parentId !== created.id) throw new Error("子任务创建后 parentId 未指向测试父任务");
+
+        const detached = await this.updateAndVerifyTaskProperties(
+          createdChild.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...attached, parentId: null }, { taskParentingVerified: true }, ["parentId"]),
+          (reread) => {
+            if (reread.parentId !== null || !sameDidaTaskExcept(attached, reread, ["parentId"])) {
+              throw new Error("解除父子关系后 parentId 或其他任务字段不一致");
+            }
+          },
+        );
+        await this.updateAndVerifyTaskProperties(
+          createdChild.id,
+          projectA.id,
+          marker,
+          taskUpdatePayload({ ...detached, parentId: created.id }, { taskParentingVerified: true }, ["parentId"]),
+          (reread) => {
+            if (reread.parentId !== created.id || !sameDidaTaskExcept(detached, reread, ["parentId"])) {
+              throw new Error("重新挂接父任务后 parentId 或其他任务字段不一致");
+            }
+          },
+        );
+        this.taskParentingVerified = true;
+        steps.push("创建真实子任务并验证解除、重新挂接父任务");
+      } catch (error) {
+        if (this.untrackedCreateOutcome || isUnprovenRemoteOutcome(error)) throw error;
+        this.taskParentingVerified = false;
+        capabilityFailures.push(capabilityFailureSummary("taskParenting"));
+        steps.push("当前账号未通过真实子任务父子关系合同，项目行动投影保持关闭");
+      } finally {
+        if (childTask) {
+          await this.cleanupTask(childTask, marker);
+          childTask = null;
+          await this.cleanupCheckpoint();
+        }
+      }
+
       this.beginStage("验证父任务检查项往返与 ID 稳定性");
       const parentTask = await this.createCapabilityTask(
         projectA.id,
@@ -570,7 +662,9 @@ export class DidaWriteContractRunner {
         await this.cleanupCheckpoint();
       } catch (error) {
         if (this.untrackedCreateOutcome) throw error;
-        if (isUnprovenRemoteOutcome(error)) throw error;
+        // items 是独立可选能力。即使写入结果未知，也不领养、不重发；只有按精确
+        // 任务身份安全删除并证明临时父任务已不存在后，才允许关闭本能力并继续用
+        // 全新测试对象验证其他能力。清理无法证明时 cleanupTask 会抛出并全局中止。
         await this.cleanupTask(parentTask, marker);
         optionalTasks.splice(optionalTasks.indexOf(parentTask), 1);
         await this.cleanupCheckpoint();
@@ -626,6 +720,58 @@ export class DidaWriteContractRunner {
       await this.deleteVerifiedTask(boardTask, marker);
       optionalTasks.splice(optionalTasks.indexOf(boardTask), 1);
       await this.cleanupCheckpoint();
+
+      if (this.runProjectProjectionProbe) {
+        if (!this.taskParentingVerified || !this.boardPlacementVerified || !this.columnCreateVerified) {
+          throw new Error("真实项目投影探针的父子任务、看板归栏或分栏能力前置条件未满足");
+        }
+        this.beginStage("验证项目父任务与 Stage 真实子任务投影");
+        await this.updateAndVerifyProjectViewMode(projectA, "kanban");
+        try {
+          await this.runProjectProjectionProbe({
+            api: this.api,
+            marker,
+            project: normalizeProject(await this.api.getProject(projectA.id)),
+            column: createCapabilityColumn,
+            taskScheduleMode: this.taskScheduleMode as Exclude<TaskScheduleMode, "unknown">,
+            trackTask: async (createdTask) => {
+              const task = normalizeTask(createdTask);
+              if (task.projectId !== projectA.id || !task.id ||
+                optionalTasks.some((candidate) => candidate.id === task.id)) {
+                throw new Error("项目投影探针试图登记无效或重复的测试任务");
+              }
+              optionalTasks.push({
+                id: task.id,
+                projectId: task.projectId,
+                candidateProjectIds: [projectA.id],
+                state: task.status === 2 ? "completed" : "open",
+              });
+              await this.cleanupCheckpoint!();
+            },
+            untrackTask: async (taskId) => {
+              const index = optionalTasks.findIndex((candidate) => candidate.id === taskId);
+              if (index < 0) throw new Error("项目投影探针清理了未登记的测试任务");
+              optionalTasks.splice(index, 1);
+              await this.cleanupCheckpoint!();
+            },
+            markTaskDeleteUnknown: async (taskId) => {
+              const tracked = optionalTasks.find((candidate) => candidate.id === taskId);
+              if (!tracked) throw new Error("项目同步队列探针标记了未登记任务的删除结果");
+              tracked.state = "unknown";
+              tracked.deleteState = "sent-unknown";
+              await this.cleanupCheckpoint!();
+            },
+            markUntrackedCreate: async () => {
+              this.untrackedCreateOutcome = true;
+              await this.cleanupCheckpoint!();
+            },
+          });
+          this.projectProjectionVerified = true;
+          steps.push("验证项目父任务与 Stage 行动真实子任务的创建、编辑、完成、重开、删除及生产队列收据");
+        } finally {
+          await this.updateAndVerifyProjectViewMode(projectA, "list");
+        }
+      }
 
       this.beginStage("移动测试任务并核对来源清单");
       const beforeMove = normalizeTask(await this.api.getTask(projectA.id, created.id));
@@ -800,6 +946,8 @@ export class DidaWriteContractRunner {
       columnCreateVerified: this.columnCreateVerified &&
         cleanupErrors.length === 0 && !this.untrackedCreateOutcome,
       taskCrudVerified: this.taskCrudVerified,
+      taskParentingVerified: this.taskParentingVerified,
+      projectProjectionVerified: this.projectProjectionVerified,
       reminderWriteVerified: this.reminderWriteVerified,
       repeatWriteVerified: this.repeatWriteVerified,
       itemsRoundTripVerified: this.itemsRoundTripVerified,
@@ -1429,18 +1577,39 @@ export class DidaWriteContractRunner {
   }
 
   private async assertTaskPresentInObservableCollection(task: CreatedTask): Promise<void> {
-    await this.waitForConsistency(async () => {
-      const tasks = await this.readObservableTasks(task);
-      if (!tasks.some((candidate) => candidate.id === task.id)) {
-        throw new ConsistencyPendingError("删除前任务不在预期可观察集合，拒绝执行删除");
-      }
-    }, "等待任务进入可观察集合");
+    try {
+      await this.waitForConsistency(async () => {
+        const tasks = await this.readObservableTasks(task);
+        if (!tasks.some((candidate) => candidate.id === task.id)) {
+          throw new ConsistencyPendingError("删除前任务不在预期可观察集合，拒绝执行删除");
+        }
+      }, "等待任务进入可观察集合");
+      task.detailFallback = false;
+    } catch (error) {
+      if (!(error instanceof ConsistencyPendingError)) throw error;
+      const exact = normalizeTask(await this.api.getTask(task.projectId, task.id));
+      if (exact.id !== task.id || exact.projectId !== task.projectId) throw error;
+      // 调用方紧邻本方法前已校验本轮 marker；集合最终一致性滞后时，精确详情
+      // 足以证明“要删的仍是同一个对象”，不会扩大删除范围。
+      task.detailFallback = true;
+    }
   }
 
   private async assertTaskAbsentFromObservableCollection(task: CreatedTask): Promise<void> {
     const tasks = await this.readObservableTasks(task);
     if (tasks.some((candidate) => candidate.id === task.id)) {
       throw new ConsistencyPendingError("任务删除后仍存在于可观察任务集合");
+    }
+    if (!task.detailFallback) return;
+    try {
+      const exact = normalizeTask(await this.api.getTask(task.projectId, task.id));
+      if (exact.id === task.id && exact.projectId === task.projectId) {
+        throw new ConsistencyPendingError("任务删除后精确详情仍可读取");
+      }
+      throw new Error("任务删除后精确详情身份异常");
+    } catch (error) {
+      if (isNotFound(error)) return;
+      throw error;
     }
   }
 
@@ -1545,6 +1714,27 @@ export class DidaWriteContractRunner {
       }
     }
     if (ambiguous) throw new Error("测试任务同时存在于多个候选清单集合，拒绝猜测归属");
+    // 开放／已完成集合可能在创建后短暂漏项。只有集合与候选清单的精确详情端点
+    // 都证明不存在，才允许把任务从清理计划移除；详情仍可读时继续按 ID 删除。
+    const exactMatches: CreatedTask[] = [];
+    for (const projectId of task.candidateProjectIds) {
+      try {
+        const exact = normalizeTask(await this.api.getTask(projectId, task.id));
+        if (exact.id !== task.id || exact.projectId !== projectId) {
+          throw new Error("测试任务精确复读身份与候选清单不一致");
+        }
+        exactMatches.push({ ...task, projectId });
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+      }
+    }
+    if (exactMatches.length > 1) throw new Error("测试任务精确详情同时存在于多个候选清单，拒绝猜测归属");
+    if (exactMatches.length === 1) {
+      task.projectId = exactMatches[0]!.projectId;
+      task.detailFallback = true;
+      await this.cleanupCheckpoint?.();
+      return task;
+    }
     return null;
   }
 
@@ -1632,7 +1822,7 @@ function isUnprovenRemoteOutcome(error: unknown): boolean {
 }
 
 function capabilityFailureSummary(
-  capability: "reminders" | "repeatFlag" | "items" | "boardPlacement" | "taskReopen",
+  capability: "reminders" | "repeatFlag" | "items" | "boardPlacement" | "taskReopen" | "taskParenting",
 ): string {
   const name = {
     reminders: "提醒",
@@ -1640,6 +1830,7 @@ function capabilityFailureSummary(
     items: "检查项",
     boardPlacement: "看板归栏",
     taskReopen: "任务重开",
+    taskParenting: "真实子任务",
   }[capability];
   return `${name}：未通过写入合同，保持只读`;
 }

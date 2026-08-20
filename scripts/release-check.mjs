@@ -4,6 +4,9 @@ const manifest = JSON.parse(await readFile("manifest.json", "utf8"));
 const versions = JSON.parse(await readFile("versions.json", "utf8"));
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 const releaseCapabilities = await readFile("src/release-capabilities.ts", "utf8");
+const settingsUi = await readFile("src/ui/settings-tab.ts", "utf8");
+const mainSource = await readFile("src/main.ts", "utf8");
+const projectionService = await readFile("src/services/dida-project-projection.ts", "utf8");
 
 const requiredArtifacts = [
   "manifest.json",
@@ -43,8 +46,27 @@ if (versions[manifest.version] !== manifest.minAppVersion) {
 if (!manifest.isDesktopOnly) {
   throw new Error("当前桌面阶段必须保持 isDesktopOnly=true");
 }
-if (!releaseCapabilities.includes("export const DIDA_SYNC_AVAILABLE = false")) {
-  throw new Error("当前本地正式版必须关闭滴答网络同步门禁");
+if (!releaseCapabilities.includes("export const DIDA_READ_AVAILABLE = true")) {
+  throw new Error("当前开发基线必须开放滴答只读门禁");
+}
+if (!releaseCapabilities.includes("export const DIDA_CONTRACT_TEST_AVAILABLE = true")) {
+  throw new Error("当前合同验证基线必须开放专用合同门禁");
+}
+if (!releaseCapabilities.includes("export const DIDA_TASK_WRITE_AVAILABLE = true")) {
+  throw new Error("当前开发基线必须开放滴答普通任务写入门禁");
+}
+if (!releaseCapabilities.includes("export const PROJECT_DIDA_PROJECTION_AVAILABLE = true")) {
+  throw new Error("当前开发基线必须开放项目同步门禁");
+}
+if (!settingsUi.includes("renderAutomaticProjectProjectionStatus") ||
+    !settingsUi.includes("关闭时不会写入滴答") ||
+    !mainSource.includes("ensureAutomaticProjectProjection") ||
+    !mainSource.includes("confirmProjectionActivationWithLease")) {
+  throw new Error("项目任务自动同步入口或排他激活门禁缺失");
+}
+if (!projectionService.includes("PROJECT_PROJECTION_ACTIVATION_VERSION") ||
+    !projectionService.includes("activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION")) {
+  throw new Error("项目同步入口缺少版本化激活凭证");
 }
 
 console.log(`Helix ${manifest.version} 发布产物检查通过：${requiredArtifacts.join("、")}`);

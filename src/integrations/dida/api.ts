@@ -401,7 +401,10 @@ export class DidaApi {
         true,
       );
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    if (lastError instanceof Error) {
+      throw new DidaHttpError("transient", lastError.message);
+    }
+    throw new DidaHttpError("transient", String(lastError));
   }
 
   private consumeBudget(): void {

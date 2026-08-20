@@ -29,6 +29,7 @@ export interface ProjectionReadiness {
   writable: boolean;
   queueEmpty: boolean;
   authorizationCurrent: boolean;
+  taskParentingVerified: boolean;
   itemsRoundTripVerified: boolean;
   itemIdStableVerified: boolean;
   boardPlacementVerified: boolean;
@@ -49,6 +50,11 @@ export interface ProjectionActivationPreview {
 }
 
 export const PROJECTION_COLUMN_NAME = "Helix项目";
+export const PROJECTION_PROJECT_NAME = "Helix Projects";
+/** 项目阶段任务直接归入清单，不指定看板分栏。 */
+export const PROJECTION_NO_COLUMN_ID = "helix-no-column";
+/** 旧调试状态没有此凭证；门禁开放后必须由当前设置页重新预览确认。 */
+export const PROJECT_PROJECTION_ACTIVATION_VERSION = 3;
 
 export interface ProjectionColumnBaseline {
   id: string;
@@ -110,8 +116,17 @@ export interface ProjectionLedgerEntry {
   targetProjectId: string;
   targetColumnId: string;
   remoteId?: string;
+  /** 缺失表示 1.0.1 及以前的历史 items 映射，只允许诊断，不得按 Task 写入。 */
+  remoteEntity?: "task" | "item";
   title: string;
   state: ProjectionActionState;
+  content?: string;
+  startDate?: string;
+  dueDate?: string;
+  timeZone?: string;
+  isAllDay?: boolean;
+  priority?: 0 | 1 | 3 | 5;
+  tags?: string[];
   sourceHash: string;
   tombstone?: boolean;
   frozen?: ProjectionFreezeReason;
@@ -159,10 +174,13 @@ export type ProjectionIntent =
   | { kind: "recover-action"; entry: ProjectionLedgerEntry }
   | { kind: "reconcile-delete"; entry: ProjectionLedgerEntry }
   | { kind: "freeze-action"; entry: ProjectionLedgerEntry; reason: ProjectionFreezeReason }
-  | { kind: "update-action"; entry: ProjectionLedgerEntry; writeFields: Array<"title" | "status"> }
+  | { kind: "update-action"; entry: ProjectionLedgerEntry; writeFields: ProjectionTaskWriteField[] }
   | { kind: "complete-action"; entry: ProjectionLedgerEntry }
   | { kind: "reopen-action"; entry: ProjectionLedgerEntry }
   | { kind: "delete-action"; entry: ProjectionLedgerEntry };
+
+export type ProjectionTaskWriteField =
+  | "title" | "content" | "status" | "desc" | "startDate" | "dueDate" | "timeZone" | "isAllDay" | "priority" | "tags";
 
 const ACTION_MARKER_V1 = /^<!-- helix-dida-action:v1 uuid=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
 const ACTION_MARKER_V2 = /^<!-- helix-dida-action:v2 uuid=([^ ]+) parent=([^ ]+) remoteId=([^ ]+) state=(idea|active|completed|paused|terminated) -->$/;
@@ -180,18 +198,18 @@ export function buildProjectionActivationPreview(input: {
   assertStableId(input.target.targetProjectId, "目标清单 ID");
   assertStableId(input.target.targetColumnId, "目标分栏 ID");
   const matchingProjects = input.projects.filter((item) => item.id === input.target.targetProjectId);
-  const matchingColumns = input.columns.filter((item) => item.id === input.target.targetColumnId);
   if (matchingProjects.length !== 1) throw new Error("目标滴答清单身份缺失或重复");
-  if (matchingColumns.length !== 1 || matchingColumns[0]!.projectId !== input.target.targetProjectId) {
+  const project = matchingProjects[0]!;
+  const withoutColumn = input.target.targetColumnId === PROJECTION_NO_COLUMN_ID;
+  const matchingColumns = input.columns.filter((item) => item.id === input.target.targetColumnId);
+  if (!withoutColumn && (matchingColumns.length !== 1 || matchingColumns[0]!.projectId !== input.target.targetProjectId)) {
     throw new Error("目标看板分栏身份或归属不一致");
   }
-  const project = matchingProjects[0]!;
-  const column = matchingColumns[0]!;
   const blockers = readinessBlockers(input.readiness, project);
   const stable = {
     target: input.target,
     projectName: project.name,
-    columnName: column.name,
+    columnName: withoutColumn ? "不指定分栏" : matchingColumns[0]!.name,
     projectCount: input.projectCount,
     actionCount: input.actionCount,
     blockers,
@@ -230,6 +248,8 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     if (!checkbox) continue;
     const markerStart = line.indexOf("<!-- helix-dida-action:");
     if (markerStart < 0) {
+      // 模板用空复选框提示可填写位置；它不是任务，也不得进入纳管或预览计数。
+      if (!checkbox[3]!.trim()) continue;
       unmanagedChecklistLines.push(index + 1);
       continue;
     }
@@ -461,7 +481,7 @@ export function patchManagedPlanAction(markdown: string, input: {
   title?: string;
   state?: ProjectionActionState;
   remoteId?: string | null;
-  content?: string;
+  content?: string | null;
   startDate?: string | null;
   dueDate?: string | null;
   timeZone?: string | null;
@@ -597,8 +617,16 @@ export function buildProjectionLedger(input: {
       targetProjectId: input.target.targetProjectId,
       targetColumnId: input.target.targetColumnId,
       remoteId: action.remoteId,
+      remoteEntity: "task",
       title: action.title,
       state: action.state,
+      content: action.content,
+      startDate: action.startDate,
+      dueDate: action.dueDate,
+      timeZone: action.timeZone,
+      isAllDay: action.isAllDay,
+      priority: action.priority,
+      tags: action.tags ? [...action.tags] : undefined,
       sourceHash: actionSourceHash(action),
     };
   });
@@ -629,17 +657,34 @@ export function planProjectionChanges(
       continue;
     }
     if (!entry.remoteId && old.remoteId) entry.remoteId = old.remoteId;
-    const writeFields: Array<"title" | "status"> = [];
+    const writeFields: ProjectionTaskWriteField[] = [];
     if (old.title !== entry.title) writeFields.push("title");
+    let statusIntent: "complete-action" | "reopen-action" | undefined;
     if (old.state === "completed" && entry.state !== "completed") {
       if (!options.taskReopenVerified) {
         intents.push({ kind: "freeze-action", entry: { ...entry, frozen: "capability" }, reason: "capability" });
         continue;
       }
-      writeFields.push("status");
+      statusIntent = "reopen-action";
     }
-    if (old.state !== "completed" && entry.state === "completed") writeFields.push("status");
-    if (writeFields.length > 0) intents.push({ kind: "update-action", entry, writeFields });
+    if (old.state !== "completed" && entry.state === "completed") statusIntent = "complete-action";
+    if (old.content !== entry.content) writeFields.push("desc");
+    if (old.startDate !== entry.startDate) writeFields.push("startDate");
+    if (old.dueDate !== entry.dueDate) writeFields.push("dueDate");
+    if (old.timeZone !== entry.timeZone) writeFields.push("timeZone");
+    if (old.isAllDay !== entry.isAllDay) writeFields.push("isAllDay");
+    if (old.priority !== entry.priority) writeFields.push("priority");
+    if (stableHash(old.tags) !== stableHash(entry.tags)) writeFields.push("tags");
+    if (writeFields.length > 0) {
+      // 滴答完成／重开不是普通字段更新。先以旧状态写其他属性，再用专用端点
+      // 改状态，避免把 status=2 混入 update payload 后得到“成功但未完成”。
+      intents.push({
+        kind: "update-action",
+        entry: statusIntent ? { ...entry, state: old.state } : entry,
+        writeFields,
+      });
+    }
+    if (statusIntent) intents.push({ kind: statusIntent, entry });
   }
   for (const [uuid, old] of before) {
     if (after.has(uuid) || old.frozen) continue;
@@ -653,17 +698,58 @@ export function planProjectionChanges(
 export function verifyProjectedTask(
   task: DidaTask,
   entry: ProjectionLedgerEntry,
-  marker: string,
-  options: { title?: boolean; state?: boolean } = {},
+  _marker: string,
+  options: { title?: boolean; state?: boolean; attributes?: boolean; column?: boolean } = {},
 ): void {
   const verifyTitle = options.title ?? true;
   const verifyState = options.state ?? true;
-  if (!entry.remoteId || task.id !== entry.remoteId || task.projectId !== entry.targetProjectId ||
-    task.parentId !== entry.parentTaskId || task.columnId !== entry.targetColumnId ||
-    task.content !== marker || (verifyTitle && task.title !== entry.title) ||
-    (verifyState && (entry.state === "completed" ? task.status !== 2 : task.status === 2))) {
-    throw new Error("远端任务身份、父级、清单、分栏、标题、状态或唯一标记复读不一致");
+  const verifyAttributes = options.attributes ?? true;
+  const attributeFailures = verifyAttributes ? projectionTaskAttributeMismatches(task, entry) : [];
+  const checks = {
+    remoteId: Boolean(entry.remoteId) && task.id === entry.remoteId,
+    projectId: task.projectId === entry.targetProjectId,
+    parentId: task.parentId === entry.parentTaskId,
+    columnId: options.column === false || entry.targetColumnId === PROJECTION_NO_COLUMN_ID ||
+      task.columnId === entry.targetColumnId,
+    marker: task.content === undefined || task.content === "",
+    title: !verifyTitle || task.title === entry.title,
+    state: !verifyState || (entry.state === "completed" ? task.status === 2 : task.status !== 2),
+    attributes: attributeFailures.length === 0,
+  };
+  const failed = Object.entries(checks).filter(([, valid]) => !valid).map(([field]) => field)
+    .flatMap((field) => field === "attributes" ? attributeFailures.map((item) => `attributes.${item}`) : [field]);
+  if (failed.length > 0) {
+    throw new Error(`滴答项目同步任务复读不一致：${failed.join("、")}`);
   }
+}
+
+function projectionTaskAttributeMismatches(task: DidaTask, entry: ProjectionLedgerEntry): string[] {
+  const optional = (value: string | null | undefined) => value?.trim() || undefined;
+  // 滴答会把标签规范化为小写；标签身份不区分大小写，但仍严格比较集合内容。
+  const tags = (value: string[] | undefined) => [...new Set((value ?? [])
+    .map((tag) => tag.trim().toLocaleLowerCase()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+  // 滴答会给无日期任务补上账户默认时区；没有开始/截止时间时该字段没有业务语义，
+  // 不能把服务端默认值误判为项目行动写入失败。
+  const scheduleExists = Boolean(task.startDate || task.dueDate || entry.startDate || entry.dueDate);
+  return [
+    optional(task.desc) === optional(entry.content) ? undefined : "desc",
+    sameOptionalInstant(task.startDate, entry.startDate) ? undefined : "startDate",
+    sameOptionalInstant(task.dueDate, entry.dueDate) ? undefined : "dueDate",
+    !scheduleExists || optional(task.timeZone) === optional(entry.timeZone) ? undefined : "timeZone",
+    Boolean(task.isAllDay) === Boolean(entry.isAllDay) ? undefined : "isAllDay",
+    (task.priority ?? 0) === (entry.priority ?? 0) ? undefined : "priority",
+    stableHash(tags(task.tags)) === stableHash(tags(entry.tags)) ? undefined : "tags",
+  ].filter((item): item is string => Boolean(item));
+}
+
+function sameOptionalInstant(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  const leftTime = Date.parse(left.replace(/([+-]\d{2})(\d{2})$/u, "$1:$2"));
+  const rightTime = Date.parse(right.replace(/([+-]\d{2})(\d{2})$/u, "$1:$2"));
+  return Number.isFinite(leftTime) && Number.isFinite(rightTime) &&
+    Math.trunc(leftTime / 1_000) === Math.trunc(rightTime / 1_000);
 }
 
 /**
@@ -735,12 +821,9 @@ function readinessBlockers(value: ProjectionReadiness, project: DidaProject): st
     !value.writable ? "当前处于只读或恢复模式" : undefined,
     !value.queueEmpty ? "现有任务队列非空" : undefined,
     !value.authorizationCurrent ? "滴答授权合同缺失或过期" : undefined,
-    !value.itemsRoundTripVerified ? "检查项往返能力尚未验证" : undefined,
-    !value.boardPlacementVerified ? "看板归栏能力尚未验证" : undefined,
-    !value.boardFresh ? "目标看板快照已过期" : undefined,
+    !value.taskParentingVerified ? "真实子任务父子关系尚未验证" : undefined,
     value.unknownOutcomes > 0 ? "仍有远端结果未知对象" : undefined,
     project.permission && project.permission !== "write" ? "目标清单没有写权限" : undefined,
-    project.viewMode !== "kanban" ? "目标清单当前不是看板视图" : undefined,
   ].filter((item): item is string => Boolean(item));
 }
 
@@ -914,8 +997,9 @@ function decodeMarkerValue(value: string, label: string): string {
   } catch { throw new Error(`${label}编码无效`); }
 }
 
-function actionSourceHash(action: Pick<ManagedPlanAction, "uuid" | "title" | "state" | "remoteId">): string {
-  return stableHash({ uuid: action.uuid, title: action.title, state: action.state, remoteId: action.remoteId });
+function actionSourceHash(action: ManagedPlanAction): string {
+  const { line: _line, ...source } = action;
+  return stableHash(source);
 }
 
 function uniqueLedger(entries: ProjectionLedgerEntry[]): Map<string, ProjectionLedgerEntry> {
@@ -930,7 +1014,7 @@ function uniqueLedger(entries: ProjectionLedgerEntry[]): Map<string, ProjectionL
 function sameProjectionIdentity(left: ProjectionLedgerEntry, right: ProjectionLedgerEntry): boolean {
   return left.projectId === right.projectId && left.stageId === right.stageId &&
     left.parentTaskId === right.parentTaskId && left.targetProjectId === right.targetProjectId &&
-    left.targetColumnId === right.targetColumnId &&
+    left.targetColumnId === right.targetColumnId && left.remoteEntity === right.remoteEntity &&
     (!left.remoteId || !right.remoteId || left.remoteId === right.remoteId);
 }
 

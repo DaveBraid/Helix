@@ -144,6 +144,64 @@ export class DidaContractCleanupService {
     });
   }
 
+  /**
+   * 合同已持久化精确项目基线、但内部探针未及登记任务时的窄恢复入口。
+   * 只扫描计划中的本轮清单；任一非 marker 任务都会拒绝领养。
+   */
+  async adoptTasksIntoExistingPlan(authorizationBinding: string): Promise<void> {
+    const initial = (await this.store.snapshot()).pendingDidaContractCleanup;
+    if (!initial) throw new Error("没有待恢复的合同清理计划");
+    if (initial.authorizationBinding !== authorizationBinding) {
+      throw new Error("滴答授权已变化，拒绝领养旧授权下的测试任务");
+    }
+    if (initial.plan.projects.length === 0 || initial.plan.tasks.length > 0) {
+      throw new Error("当前清理计划不符合任务补登记条件");
+    }
+    const adopted = new Map<string, DidaContractCleanupPlan["tasks"][number]>();
+    for (const project of initial.plan.projects) {
+      const [data, completed] = await Promise.all([
+        this.readWithRateLimit(() => this.api.getProjectData(project.id)),
+        this.readCompleted(project.id),
+      ]);
+      const detail = normalizeProject(data.project);
+      if (detail.id !== project.id || detail.name !== project.name) {
+        throw new Error("合同清单详情身份发生竞争，拒绝补登记任务");
+      }
+      const visible = [...requireTaskArray(data.tasks, "合同清单开放任务列表"), ...completed];
+      const parentIds = new Set(visible.filter((task) =>
+        task.projectId === project.id && !task.parentId &&
+        typeof task.content === "string" && task.content.startsWith("helix-project-projection:") &&
+        task.columnId && project.expectedColumns.some((column) => column.id === task.columnId))
+        .map((task) => task.id));
+      for (const task of visible) {
+        const markerOwned = isDidaContractTaskTitle(task.title, initial.plan.marker) ||
+          (!task.parentId && parentIds.has(task.id)) ||
+          (Boolean(task.parentId) && parentIds.has(task.parentId!) &&
+            typeof task.content === "string" && task.content.startsWith("helix-projection:"));
+        if (task.projectId !== project.id || !markerOwned) {
+          throw new Error("合同清单含非本轮任务，拒绝补登记");
+        }
+        if (adopted.has(task.id)) throw new Error("同一合同任务出现在多个清单，拒绝补登记");
+        adopted.set(task.id, {
+          id: task.id,
+          candidateProjectIds: initial.plan.projects.map((candidate) => candidate.id),
+          state: task.status === 2 ? "completed" : "open",
+        });
+      }
+    }
+    await this.store.mutate((data) => {
+      const current = data.pendingDidaContractCleanup;
+      if (!current || current.authorizationBinding !== authorizationBinding ||
+        current.plan.runId !== initial.plan.runId || current.plan.tasks.length > 0) {
+        throw new Error("合同清理计划发生竞争，拒绝补登记");
+      }
+      data.pendingDidaContractCleanup = {
+        ...current,
+        plan: { ...current.plan, tasks: [...adopted.values()] },
+      };
+    });
+  }
+
   async recover(authorizationBinding: string): Promise<void> {
     const initial = (await this.store.snapshot()).pendingDidaContractCleanup;
     if (!initial) throw new Error("没有待恢复的合同清理计划");
@@ -178,7 +236,7 @@ export class DidaContractCleanupService {
     }
     if (matches.length !== 1) throw new Error("合同任务位置存在歧义，已保留清理计划");
     const match = matches[0]!;
-    if (!isDidaContractTaskTitle(match.task.title, pending.plan.marker)) {
+    if (!isOwnedCleanupTask(match.task, pending.plan)) {
       throw new Error("合同任务唯一标记不一致，拒绝删除");
     }
     if (task.deleteState === "sent-unknown") {
@@ -353,6 +411,19 @@ export class DidaContractCleanupService {
       }
     });
   }
+}
+
+function isOwnedCleanupTask(task: DidaTask, plan: DidaContractCleanupPlan): boolean {
+  if (isDidaContractTaskTitle(task.title, plan.marker)) return true;
+  const project = plan.projects.find((candidate) => candidate.id === task.projectId);
+  if (!project || !task.columnId || !project.expectedColumns.some((column) => column.id === task.columnId)) {
+    return false;
+  }
+  if (!task.parentId) {
+    return typeof task.content === "string" && task.content.startsWith("helix-project-projection:");
+  }
+  return plan.tasks.some((candidate) => candidate.id === task.parentId) &&
+    typeof task.content === "string" && task.content.startsWith("helix-projection:");
 }
 
 function requireTaskArray(value: unknown, label: string): DidaTask[] {

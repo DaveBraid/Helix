@@ -27,6 +27,29 @@ export function buildTaskUpdateOperation(
   };
 }
 
+export function buildTaskDeleteOperation(
+  task: DidaTask,
+  base: EntitySnapshot<DidaTask>,
+  now: string,
+  operationId: string,
+): SyncQueueOperation<DidaTask> {
+  if (!base.value.projectId) throw new Error("同步基线缺少任务原清单");
+  return {
+    id: operationId,
+    kind: "task",
+    entityId: task.id,
+    projectId: base.value.projectId,
+    operation: "delete",
+    createdAt: now,
+    updatedAt: now,
+    attempts: 0,
+    status: "pending",
+    base,
+    local: createSnapshot("task", task.id, null, { capturedAt: now }) as unknown as EntitySnapshot<DidaTask>,
+    writeFields: [],
+  };
+}
+
 export function migrateInProgressTaskId(
   entries: InProgressEntry[],
   previousTaskId: string,

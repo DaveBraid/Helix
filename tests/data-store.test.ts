@@ -8,6 +8,7 @@ import { stableHash, stableStringify } from "../src/domain/stable";
 import { didaAuthorizationBinding } from "../src/domain/dida-authorization";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 import { rotatingChallenges } from "../src/domain/gamification";
+import { PROJECT_PROJECTION_ACTIVATION_VERSION } from "../src/domain/dida-project-projection";
 import {
   beginDataGeneration,
   invalidateDataGeneration,
@@ -297,6 +298,40 @@ describe("HelixDataStore serialization", () => {
     });
     expect(data.queue).toEqual([]);
     expect(data.recoveryIssues).toContainEqual(expect.stringMatching(/队列操作/));
+  });
+
+  it("preserves a legacy unknown-result operation as frozen during schema migration", () => {
+    const task = {
+      id: "local-unknown",
+      projectId: "project-1",
+      title: "Unknown create",
+      status: 0,
+    };
+    const local = createSnapshot("task", task.id, task);
+    const data = hydrateData({
+      schemaVersion: 1,
+      queue: [{
+        id: "op-unknown",
+        kind: "task",
+        entityId: task.id,
+        projectId: task.projectId,
+        operation: "create",
+        status: "reconciliation",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:01:00.000Z",
+        attempts: 1,
+        remoteOutcomeUnknown: true,
+        local,
+      }],
+    });
+
+    expect(data.schemaVersion).toBe(2);
+    expect(data.queue).toMatchObject([{
+      id: "op-unknown",
+      status: "reconciliation",
+      attempts: 1,
+      remoteOutcomeUnknown: true,
+    }]);
   });
 
   it("rejects projection owned scope and item IDs unless both are persisted together", () => {
@@ -682,6 +717,8 @@ describe("HelixDataStore serialization", () => {
       boardPlacementVerified: true,
       columnCreateVerified: false,
       taskCrudVerified: false,
+      taskParentingVerified: false,
+      projectProjectionVerified: false,
       reminderWriteVerified: false,
       repeatWriteVerified: false,
       itemsRoundTripVerified: false,
@@ -767,9 +804,36 @@ describe("HelixDataStore serialization", () => {
     expect(hydrated.recoveryIssues.join(" ")).toMatch(/同步状态.*同步创建收据/);
   });
 
+  it("accepts markerless v3 projection receipts only for known internal identities", () => {
+    const raw = createDefaultData("device-projection-markerless");
+    raw.projectionOperationReceipts = [{
+      clientIdentity: "helix-parent:stage-a",
+      projectId: "target-list",
+      operationId: "op-projection-parent-a",
+      marker: "",
+      outcome: "verified",
+      remoteTaskId: "remote-a",
+    }, {
+      clientIdentity: "foreign-client",
+      projectId: "target-list",
+      operationId: "op-foreign",
+      marker: "",
+      outcome: "verified",
+      remoteTaskId: "remote-b",
+    }];
+
+    const hydrated = hydrateData(raw);
+
+    expect(hydrated.projectionOperationReceipts).toEqual([
+      expect.objectContaining({ clientIdentity: "helix-parent:stage-a", marker: "" }),
+    ]);
+    expect(hydrated.recoveryIssues.join(" ")).toMatch(/同步创建收据/);
+  });
+
   it("rejects projection state shadow fields, duplicate identities, and target ownership mismatch", () => {
     const validState = {
       enabled: true,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
       target: { targetProjectId: "target-list", targetColumnId: "target-column" },
       confirmedPreviewHash: "a".repeat(64),
       ledger: [{
@@ -780,8 +844,16 @@ describe("HelixDataStore serialization", () => {
         targetProjectId: "target-list",
         targetColumnId: "target-column",
         remoteId: "remote-a",
+        remoteEntity: "task" as const,
         title: "Action",
         state: "active" as const,
+        content: "行动备注",
+        startDate: "2026-08-14T09:00:00+08:00",
+        dueDate: "2026-08-14T09:00:00+08:00",
+        timeZone: "Asia/Shanghai",
+        isAllDay: false,
+        priority: 5 as const,
+        tags: ["科研"],
         sourceHash: "b".repeat(64),
       }],
       parentCheckpoints: [{
@@ -806,6 +878,27 @@ describe("HelixDataStore serialization", () => {
     expect(hydrateData(valid).didaProjectionState?.receiptCleanupPending).toEqual(
       validState.receiptCleanupPending,
     );
+    expect(hydrateData(valid).didaProjectionState?.ledger[0]?.remoteEntity).toBe("task");
+    expect(hydrateData(valid).didaProjectionState).toMatchObject({
+      enabled: true,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
+    });
+
+    const deletionTombstone = createDefaultData("device-projection-delete-tombstone");
+    deletionTombstone.didaProjectionState = {
+      ...structuredClone(validState),
+      ledger: [],
+      parentBases: [],
+      receiptCleanupPending: [],
+      parentCheckpoints: [{
+        projectId: "project-a",
+        remoteId: "parent-a",
+        marker: "helix-project-projection:project-a",
+        tombstone: true,
+      }],
+    };
+    expect(hydrateData(deletionTombstone).didaProjectionState?.parentCheckpoints[0])
+      .toMatchObject({ projectId: "project-a", remoteId: "parent-a", tombstone: true });
 
     const shadow = createDefaultData("device-projection-shadow-state");
     shadow.didaProjectionState = structuredClone(validState);
@@ -871,6 +964,23 @@ describe("HelixDataStore serialization", () => {
     cleanupShadow.didaProjectionState = structuredClone(validState);
     (cleanupShadow.didaProjectionState.receiptCleanupPending![0] as unknown as Record<string, unknown>).task = {};
     expect(hydrateData(cleanupShadow).didaProjectionState).toBeUndefined();
+  });
+
+  it("keeps legacy projection identities but disables an unversioned activation", () => {
+    const raw = createDefaultData("device-projection-legacy-activation");
+    raw.didaProjectionState = {
+      enabled: true,
+      target: { targetProjectId: "target-list", targetColumnId: "target-column" },
+      confirmedPreviewHash: "a".repeat(64),
+      ledger: [],
+      parentCheckpoints: [],
+    };
+
+    expect(hydrateData(raw).didaProjectionState).toMatchObject({
+      enabled: false,
+      target: raw.didaProjectionState.target,
+      confirmedPreviewHash: raw.didaProjectionState.confirmedPreviewHash,
+    });
   });
 
   it("hydrates the persisted client checklist identity used by restart-safe append", () => {

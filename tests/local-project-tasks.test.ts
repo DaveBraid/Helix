@@ -106,6 +106,37 @@ describe("LocalProjectTaskService", () => {
     expect(markdown.value()).toContain("- [ ]\n\n# 行动结果");
   });
 
+  it("uses the stable remote task identity after an action is synchronized", async () => {
+    const content = stage.replace(
+      "- [ ] 根任务\n  - [ ] 子任务",
+      "- [ ] 已同步任务 <!-- helix-dida-action:v1 uuid=uuid-remote remoteId=remote-task-1 state=idea -->",
+    );
+    const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(content)).snapshot(workspace());
+    expect(snapshot.roots[0]).toMatchObject({
+      id: "remote-task-1",
+      remoteId: "remote-task-1",
+      uuid: "uuid-remote",
+      title: "已同步任务",
+    });
+    expect(snapshot.byId.get("remote-task-1")?.uuid).toBe("uuid-remote");
+  });
+
+  it("maps the synchronized Stage parent without guessing from its title", async () => {
+    const content = stage.replace(
+      "helix-id: stage-1",
+      "helix-id: stage-1\nhelix-dida-parent-task-id: remote-stage-1",
+    );
+    const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(content)).snapshot(workspace());
+    expect(snapshot.stageParents).toEqual([expect.objectContaining({
+      remoteTaskId: "remote-stage-1",
+      projectId: "project-1",
+      stageId: "stage-1",
+      stageCode: "1",
+      stageStatus: "active",
+    })]);
+    expect(snapshot.byRemoteParentTaskId.get("remote-stage-1")?.stageTitle).toBe("验收");
+  });
+
   it("creates a root and child, updates the child, then deletes the subtree with CAS", async () => {
     const markdown = new MemoryMarkdown(stage.replace("- [ ] 根任务\n  - [ ] 子任务\n", ""));
     const service = new LocalProjectTaskService(markdown);

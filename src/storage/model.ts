@@ -23,12 +23,13 @@ import {
   type TaskMatrixRules,
 } from "../domain/task-views";
 import { normalizeTemplateFolder } from "../domain/template-path";
-import type {
-  DidaProjectionTarget,
-  ProjectionColumnCreationCheckpoint,
-  ProjectionFreezeReason,
-  ProjectionLedgerEntry,
-  ProjectionReceiptCleanupProof,
+import {
+  PROJECT_PROJECTION_ACTIVATION_VERSION,
+  type DidaProjectionTarget,
+  type ProjectionColumnCreationCheckpoint,
+  type ProjectionFreezeReason,
+  type ProjectionLedgerEntry,
+  type ProjectionReceiptCleanupProof,
 } from "../domain/dida-project-projection";
 import { isDidaChecklistClientId } from "../domain/dida-checklist-id";
 import {
@@ -55,7 +56,7 @@ export const DEFAULT_SETTINGS: HelixSettings = {
   rootFolder: "Helix",
   templateFolder: "Template",
   templateSetupCompleted: false,
-  autoSync: true,
+  autoSync: false,
   syncIntervalMinutes: 10,
   showSampleDataWhenDisconnected: true,
   lineageCanvasPath: "Helix/Project Lineage.canvas",
@@ -99,6 +100,7 @@ export interface HelixPersistedData {
   };
   didaProjectionState?: {
     enabled: boolean;
+    activationVersion?: number;
     target?: DidaProjectionTarget;
     confirmedPreviewHash?: string;
     ledger: ProjectionLedgerEntry[];
@@ -106,6 +108,7 @@ export interface HelixPersistedData {
       projectId: string;
       remoteId?: string;
       marker: string;
+      tombstone?: boolean;
       frozen?: ProjectionFreezeReason;
       operationId?: string;
       conflictId?: string;
@@ -126,6 +129,8 @@ export interface HelixPersistedData {
     boardPlacementVerified?: boolean;
     columnCreateVerified?: boolean;
     taskCrudVerified?: boolean;
+    taskParentingVerified?: boolean;
+    projectProjectionVerified?: boolean;
     reminderWriteVerified?: boolean;
     repeatWriteVerified?: boolean;
     itemsRoundTripVerified?: boolean;
@@ -374,6 +379,8 @@ function validateDidaContractCapabilities(
       "boardPlacementVerified",
       "columnCreateVerified",
       "taskCrudVerified",
+      "taskParentingVerified",
+      "projectProjectionVerified",
       "reminderWriteVerified",
       "repeatWriteVerified",
       "itemsRoundTripVerified",
@@ -391,6 +398,8 @@ function validateDidaContractCapabilities(
     boardPlacementVerified: record.boardPlacementVerified === true,
     columnCreateVerified: record.columnCreateVerified === true,
     taskCrudVerified: record.taskCrudVerified === true,
+    taskParentingVerified: record.taskParentingVerified === true,
+    projectProjectionVerified: record.projectProjectionVerified === true,
     reminderWriteVerified: record.reminderWriteVerified === true,
     repeatWriteVerified: record.repeatWriteVerified === true,
     itemsRoundTripVerified: record.itemsRoundTripVerified === true,
@@ -537,8 +546,12 @@ function isProjectionCreateReceipt(
   if (Object.keys(record).some((key) => !allowed.has(key))) return false;
   const id = (candidate: unknown) => typeof candidate === "string" && candidate.length > 0 &&
     candidate === candidate.trim() && candidate.length <= 512 && !/[\r\n]/u.test(candidate);
+  const marker = id(record.marker) || (
+    record.marker === "" && typeof record.clientIdentity === "string" &&
+    /^(?:helix-parent:|helix-action:|helix-write:|helix-delete:helix-projection:)/u.test(record.clientIdentity)
+  );
   const outcomes = ["verified", "verified-absent", "preflight-changed", "unknown", "conflict", "retryable", "authorization", "capability"];
-  return id(record.clientIdentity) && id(record.projectId) && id(record.operationId) && id(record.marker) &&
+  return id(record.clientIdentity) && id(record.projectId) && id(record.operationId) && marker &&
     outcomes.includes(String(record.outcome)) &&
     (record.message === undefined || typeof record.message === "string") &&
     (record.conflictId === undefined || id(record.conflictId)) &&
@@ -561,7 +574,7 @@ function validateDidaProjectionState(
   const onlyKeys = (candidate: Record<string, unknown>, allowed: readonly string[]) =>
     Object.keys(candidate).every((key) => allowed.includes(key));
   if (!onlyKeys(record, [
-    "enabled", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
+    "enabled", "activationVersion", "target", "confirmedPreviewHash", "ledger", "parentCheckpoints", "parentBases",
     "receiptCleanupPending", "columnCreation",
   ])) {
     issues.push("滴答项目同步状态含未知字段，已忽略并进入只读恢复模式");
@@ -585,7 +598,8 @@ function validateDidaProjectionState(
     const row = item as Record<string, unknown>;
     if (!onlyKeys(row, [
       "uuid", "projectId", "stageId", "stagePath", "parentTaskId", "targetProjectId", "targetColumnId",
-      "remoteId", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
+      "remoteId", "remoteEntity", "title", "state", "sourceHash", "tombstone", "frozen", "operationId", "conflictId",
+      "content", "startDate", "dueDate", "timeZone", "isAllDay", "priority", "tags",
       "createBaselineItemIds", "createBaselineItemsHash", "createBaselineItemHashes", "createBaselineSemanticHashes",
       "createItemId", "createItemSortOrder",
       "updateExpectedTitle", "updateExpectedStatus", "updateStageRevisionHash",
@@ -600,6 +614,14 @@ function validateDidaProjectionState(
       /^[a-f0-9]{64}$/u.test(String(row.sourceHash)) &&
       ["idea", "active", "completed", "paused", "terminated"].includes(String(row.state)) &&
       (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
+      (row.content === undefined || typeof row.content === "string") &&
+      (row.startDate === undefined || stableId(row.startDate)) &&
+      (row.dueDate === undefined || stableId(row.dueDate)) &&
+      (row.timeZone === undefined || stableId(row.timeZone)) &&
+      (row.isAllDay === undefined || typeof row.isAllDay === "boolean") &&
+      (row.priority === undefined || row.priority === 0 || row.priority === 1 || row.priority === 3 || row.priority === 5) &&
+      (row.tags === undefined || (Array.isArray(row.tags) && row.tags.every(stableId))) &&
+      (row.remoteEntity === undefined || row.remoteEntity === "task" || row.remoteEntity === "item") &&
       (row.operationId === undefined || stableId(row.operationId)) &&
       (row.conflictId === undefined || stableId(row.conflictId)) &&
       (row.remapStagePaths === undefined || (!!row.remapStagePaths &&
@@ -654,11 +676,12 @@ function validateDidaProjectionState(
   const validCheckpoints = Array.isArray(checkpoints) && checkpoints.every((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const row = item as Record<string, unknown>;
-    if (!onlyKeys(row, ["projectId", "remoteId", "marker", "frozen", "operationId", "conflictId"])) {
+    if (!onlyKeys(row, ["projectId", "remoteId", "marker", "tombstone", "frozen", "operationId", "conflictId"])) {
       return false;
     }
     return stableId(row.projectId) && row.marker === `helix-project-projection:${row.projectId}` &&
       (row.remoteId === undefined || stableId(row.remoteId)) && validFreeze(row.frozen) &&
+      (row.tombstone === undefined || typeof row.tombstone === "boolean") &&
       (row.operationId === undefined || stableId(row.operationId)) &&
       (row.conflictId === undefined || stableId(row.conflictId));
   });
@@ -713,7 +736,9 @@ function validateDidaProjectionState(
     }
     return stableHash(baseline) === row.baselineHash;
   })();
-  if (typeof record.enabled !== "boolean" || !validTarget || !validLedger || !validCheckpoints || !validBases ||
+  const validActivationVersion = record.activationVersion === undefined ||
+    (typeof record.activationVersion === "number" && Number.isSafeInteger(record.activationVersion));
+  if (typeof record.enabled !== "boolean" || !validActivationVersion || !validTarget || !validLedger || !validCheckpoints || !validBases ||
     !validCleanupPending || !validColumnCreation ||
     (record.enabled === true && (target === undefined || record.confirmedPreviewHash === undefined)) ||
     (record.confirmedPreviewHash !== undefined &&
@@ -776,11 +801,16 @@ function validateDidaProjectionState(
     }
   }
   const normalized: NonNullable<HelixPersistedData["didaProjectionState"]> = {
-    enabled: record.enabled as boolean,
+    // 旧版调试状态没有当前激活凭证；保留映射与诊断，但绝不在升级后自动写入。
+    enabled: record.enabled === true &&
+      record.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION,
     ledger: normalizedLedger.map((entry) => ({ ...entry })),
     parentCheckpoints: (checkpoints as NonNullable<HelixPersistedData["didaProjectionState"]>["parentCheckpoints"])
       .map((entry) => ({ ...entry })),
   };
+  if (record.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION) {
+    normalized.activationVersion = PROJECT_PROJECTION_ACTIVATION_VERSION;
+  }
   if (normalizedTarget) normalized.target = { ...normalizedTarget };
   if (typeof record.confirmedPreviewHash === "string") {
     normalized.confirmedPreviewHash = record.confirmedPreviewHash;
@@ -999,7 +1029,7 @@ function isQueueOperation(value: unknown): value is SyncQueueOperation {
     ["pending", "blocked", "running", "failed", "reconciliation"].includes(String(value.status)) &&
     typeof value.createdAt === "string" && typeof value.updatedAt === "string" &&
     typeof value.attempts === "number" && Number.isInteger(value.attempts) && value.attempts >= 0 &&
-    isSnapshot(value.local, false, false))) return false;
+    isSnapshot(value.local, value.operation === "delete", false))) return false;
   if (!Number.isFinite(Date.parse(value.createdAt)) ||
     !Number.isFinite(Date.parse(value.updatedAt)) ||
     !optionalString(value.projectId) || !optionalString(value.conflictId) ||

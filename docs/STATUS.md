@@ -1,7 +1,7 @@
 # 当前开发状态
 
 最后更新：2026-08-20
-当前基线提交：`8a630e1 fix: restore compact task tree typography`（分支 `dev`）
+当前基线提交：`6c36bc2 fix: enforce circular task progress controls`（分支 `dev`）
 工作树状态：工作树干净。
 当前阶段：统一任务详情页与纯缩进递归任务树已完成；暂不发布、不合并主分支。
 
@@ -30,6 +30,7 @@
 - `tests/task-tree.test.ts`、`tests/workbench-structure.test.ts`：覆盖任意深度、折叠、隐藏完成后的进度、防循环与稳定键结构。
 - `design-qa.md`：保存设计来源、实机截图、同屏对照、交互与视觉验收结论。
 - 用户实机发现初版任务树字号覆盖过大后，标题／摘要／元数据／进度已收紧为 13／11／10／11 px，与原任务总览密度一致。
+- 父任务聚合进度锁定为 48 × 48 px 单一圆环；主题、悬停与键盘聚焦均不得注入圆角方形底板。
 
 ## 相关约束
 
@@ -43,7 +44,9 @@
 
 - 完整门禁通过：71 个测试文件、1001 项测试；`typecheck`、`build`、`release:check`、`git diff --check` 全部通过。
 - 最终针对性复验：任务树与工作台结构 48 项通过；`typecheck`、`git diff --check` 通过。
+- 纯圆进度热修复：工作台结构 42 项通过；`typecheck`、`build`、`git diff --check` 通过。
 - Obsidian 实机：三级任务树展开、单节点收起／恢复、悬停菜单通过；折叠未触发远端写入。
+- Obsidian 强制重载复验：父任务进度在亮色主题中保持单一圆环，证据见 `/private/tmp/helix-task-tree-circle-fixed-crop.png`。
 - 视觉验收：设计稿与实现同屏全视图、聚焦区域对照通过；字号修复前后使用同一视口和数据同屏复核，见根目录 [design-qa.md](../design-qa.md)。
 - 本轮重启后 Obsidian CLI 未重新连接，实机交互改用最少量 Computer Use 完成；因此不得宣称本轮完成了新的 CLI 控制台错误缓冲复验。此前统一详情页门禁的控制台与错误缓冲为空。
 

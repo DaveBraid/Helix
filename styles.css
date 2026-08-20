@@ -536,18 +536,11 @@
 
 .helix-task-row.is-subtask {
   position: relative;
-  padding-left: calc(16px + var(--helix-task-indent));
-  background: color-mix(in srgb, var(--helix-surface-control) 34%, transparent);
+  padding-inline-start: calc(16px + var(--helix-task-indent, 0px));
 }
 
 .helix-task-row.is-subtask::before {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: calc(24px + var(--helix-task-indent) - 26px);
-  width: 1px;
-  background: color-mix(in srgb, var(--helix-accent-ink) 22%, var(--helix-line));
-  content: "";
+  content: none;
 }
 
 .helix-task-check {
@@ -565,7 +558,9 @@
 }
 
 .helix-task-check.is-completing,
-.helix-task-check.is-reopening {
+.helix-task-check.is-reopening,
+.helix-task-tree-progress.is-completing,
+.helix-task-tree-progress.is-reopening {
   animation: helix-task-check-pulse 220ms ease-out;
 }
 
@@ -625,6 +620,185 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 任务总览：纯缩进递归任务树。层级只由行缩进表达，不绘制导轨或连接符。 */
+.helix-task-tree {
+  position: relative;
+  min-width: 0;
+}
+
+.helix-task-tree .helix-task-row {
+  position: relative;
+  min-height: 70px;
+  padding: 12px 18px;
+  padding-inline-start: calc(18px + var(--helix-task-indent, 0px));
+  gap: 14px;
+  border-color: color-mix(in srgb, var(--helix-line) 64%, transparent);
+  background: transparent;
+  transition: background-color .14s ease;
+}
+
+.helix-task-tree .helix-task-row.has-summary {
+  min-height: 92px;
+}
+
+.helix-task-tree .helix-task-row:hover,
+.helix-task-tree .helix-task-row:focus-within {
+  background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
+}
+
+.helix-task-tree-leading {
+  width: 86px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.helix-task-tree-leading > .helix-task-check:first-child {
+  margin-inline-start: 38px;
+}
+
+.helix-task-tree-toggle,
+.helix-task-row-more {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  box-shadow: none;
+}
+
+.helix-task-tree-toggle:hover,
+.helix-task-tree-toggle:focus-visible,
+.helix-task-row-more:hover,
+.helix-task-row-more:focus-visible {
+  background: color-mix(in srgb, var(--interactive-accent) 8%, transparent);
+  color: var(--text-normal);
+}
+
+.helix-task-tree-toggle svg,
+.helix-task-row-more svg {
+  width: 18px;
+  height: 18px;
+}
+
+.helix-task-tree-progress {
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: 4px solid color-mix(in srgb, var(--text-muted) 24%, transparent);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.helix-task-tree-progress.is-completed {
+  border-color: color-mix(in srgb, var(--color-green) 62%, transparent);
+  color: var(--color-green);
+}
+
+.helix-task-tree-progress.is-success {
+  border-color: var(--color-green);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-green) 14%, transparent);
+}
+
+.helix-task-tree .helix-task-check {
+  width: 24px;
+  height: 24px;
+  border-color: color-mix(in srgb, var(--text-muted) 48%, transparent);
+  background: transparent;
+}
+
+.helix-task-tree .helix-task-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.helix-task-summary {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helix-task-tree .helix-task-meta {
+  margin-top: 6px;
+  gap: 7px;
+  font-size: 13px;
+}
+
+.helix-task-row-more {
+  margin-inline-start: auto;
+  flex: 0 0 auto;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease, background-color .12s ease;
+}
+
+.helix-task-row:hover .helix-task-row-more,
+.helix-task-row:focus-within .helix-task-row-more {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.helix-task-tree-root-drop {
+  display: none;
+  margin: 8px 14px;
+  padding: 8px 12px;
+  border: 1px dashed color-mix(in srgb, var(--interactive-accent) 46%, var(--helix-line));
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.helix-task-tree.is-reparenting .helix-task-tree-root-drop {
+  display: block;
+}
+
+.helix-task-row.is-task-tree-drop-target,
+.helix-task-tree-root-drop.is-task-tree-drop-target {
+  background: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 48%, transparent);
+}
+
+.helix-task-row.is-dragging {
+  opacity: .44;
+}
+
+.helix-task-tree-drop-label {
+  display: none;
+  margin-inline-start: 8px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--interactive-accent) 10%, var(--background-primary));
+  color: var(--interactive-accent);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.helix-task-row.is-task-tree-drop-target .helix-task-tree-drop-label {
+  display: inline-flex;
 }
 
 .modal:has(.helix-task-edit-modal) {
@@ -1423,6 +1597,15 @@
 .helix-task-row.is-local-project-task {
   --helix-task-local-tint: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
   background: var(--helix-task-local-tint);
+}
+
+.helix-task-tree .helix-task-row.is-local-project-task {
+  background: transparent;
+}
+
+.helix-task-tree .helix-task-row.is-local-project-task:hover,
+.helix-task-tree .helix-task-row.is-local-project-task:focus-within {
+  background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
 }
 
 .helix-task-reference-warning {

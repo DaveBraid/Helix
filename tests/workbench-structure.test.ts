@@ -141,11 +141,14 @@ describe("workbench layout and navigation structure", () => {
     );
     expect(main).toMatch(/finishProjectStartup[\s\S]*loadStableWorkspace\(\)[\s\S]*localProjectTaskSnapshotCache/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*const snapshot = await this\.projectWorkspace\.loadStableWorkspace\(\)[\s\S]*repairDerivedProjectCanvasCache\(snapshot\)[\s\S]*localProjectTasks\.snapshot/);
-    expect(view).toContain("flattenTaskTree(visibleTasks)");
+    expect(view).toContain("flattenTaskTree(visibleTasks, {");
     expect(view).toContain("hideCompletedTasks");
     expect(view).toContain("didaTaskDetailDraft");
     expect(localTasks).toContain("byRemoteParentTaskId");
-    expect(css).toContain(".helix-task-row.is-subtask");
+    expect(css).toContain(".helix-task-tree .helix-task-row");
+    expect(view).toContain('attr: { "data-task-id": task.id }');
+    expect(view).toContain("collapsedTaskTreeIds");
+    expect(view).toContain("taskTreeRows");
   });
 
   it("uses one compact editor shell for all task sources", () => {
@@ -185,7 +188,7 @@ describe("workbench layout and navigation structure", () => {
       view.indexOf("private renderTaskRow"),
       view.indexOf("private startInlineTaskTitleEdit"),
     );
-    expect(taskRow).toMatch(/task\.status === 2[\s\S]*helix-task-check\$\{completed \? " is-completed"/);
+    expect(taskRow).toMatch(/task\.status === 2[\s\S]*helix-task-tree-progress[\s\S]*helix-task-check[\s\S]*completed \? " is-completed"/);
     expect(taskRow).toMatch(/completed \? `重新打开[\s\S]*setIcon\(check, "check"\)/);
     expect(taskRow).toMatch(/is-completing[\s\S]*is-success[\s\S]*setTimeout/);
     expect(css).toContain("@keyframes helix-task-check-pulse");

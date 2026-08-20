@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { DidaTask } from "../src/domain/entities";
-import { completionLast, flattenTaskTree, withTaskDescendants } from "../src/domain/task-tree";
+import {
+  canReparentTask,
+  completionLast,
+  flattenTaskTree,
+  withTaskDescendants,
+} from "../src/domain/task-tree";
 
 const task = (id: string, status = 0, parentId?: string): DidaTask => ({
   id,
@@ -37,5 +42,39 @@ describe("task tree presentation", () => {
       task("grandchild", 0, "child"),
       task("other"),
     ], new Set(["parent"]))]).toEqual(["parent", "child", "grandchild"]);
+  });
+
+  it("recursively flattens arbitrary depth and collapses only the selected subtree", () => {
+    const rows = flattenTaskTree([
+      task("root"),
+      task("child", 0, "root"),
+      task("grandchild", 0, "child"),
+      task("sibling", 0, "root"),
+    ], { collapsedIds: new Set(["child"]) });
+    expect(rows.map((row) => [row.task.id, row.depth, row.expanded])).toEqual([
+      ["root", 0, true],
+      ["child", 1, false],
+      ["sibling", 1, false],
+    ]);
+  });
+
+  it("reports direct-child progress even when completed children are hidden", () => {
+    const all = [task("parent"), task("open", 0, "parent"), task("done", 2, "parent")];
+    const [parent] = flattenTaskTree(all.filter((item) => item.status !== 2), {
+      progressTasks: all,
+    });
+    expect(parent).toMatchObject({
+      hasChildren: true,
+      directChildCount: 2,
+      completedDirectChildCount: 1,
+    });
+  });
+
+  it("prevents a task from becoming itself or a descendant", () => {
+    const tasks = [task("root"), task("child", 0, "root"), task("grandchild", 0, "child")];
+    expect(canReparentTask(tasks, "root", "grandchild")).toBe(false);
+    expect(canReparentTask(tasks, "child", "child")).toBe(false);
+    expect(canReparentTask(tasks, "grandchild", "root")).toBe(true);
+    expect(canReparentTask(tasks, "child", null)).toBe(true);
   });
 });

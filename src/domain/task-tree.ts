@@ -3,6 +3,15 @@ import type { DidaTask } from "./entities";
 export interface TaskTreeRow {
   task: DidaTask;
   depth: number;
+  hasChildren: boolean;
+  directChildCount: number;
+  completedDirectChildCount: number;
+  expanded: boolean;
+}
+
+export interface TaskTreeOptions {
+  collapsedIds?: ReadonlySet<string>;
+  progressTasks?: readonly DidaTask[];
 }
 
 export function isTaskCompleted(task: DidaTask): boolean {
@@ -23,9 +32,13 @@ export function completionLast(tasks: readonly DidaTask[]): DidaTask[] {
  * 按真实 parentId 展开任务树。父任务不在当前筛选结果中时，子任务作为根展示；
  * 循环或损坏关系不会丢任务，而是降级为根节点。
  */
-export function flattenTaskTree(tasks: readonly DidaTask[]): TaskTreeRow[] {
+export function flattenTaskTree(
+  tasks: readonly DidaTask[],
+  options: TaskTreeOptions = {},
+): TaskTreeRow[] {
   const byId = new Map(tasks.map((task) => [task.id, task]));
   const children = new Map<string, DidaTask[]>();
+  const progressChildren = new Map<string, DidaTask[]>();
   const roots: DidaTask[] = [];
   for (const task of tasks) {
     const parentId = task.parentId || undefined;
@@ -37,12 +50,38 @@ export function flattenTaskTree(tasks: readonly DidaTask[]): TaskTreeRow[] {
     group.push(task);
     children.set(parentId, group);
   }
+  for (const task of options.progressTasks ?? tasks) {
+    const parentId = task.parentId || undefined;
+    if (!parentId || parentId === task.id) continue;
+    const group = progressChildren.get(parentId) ?? [];
+    group.push(task);
+    progressChildren.set(parentId, group);
+  }
   const rows: TaskTreeRow[] = [];
   const visited = new Set<string>();
+  const suppress = (task: DidaTask): void => {
+    if (visited.has(task.id)) return;
+    visited.add(task.id);
+    for (const child of children.get(task.id) ?? []) suppress(child);
+  };
   const visit = (task: DidaTask, depth: number): void => {
     if (visited.has(task.id)) return;
     visited.add(task.id);
-    rows.push({ task, depth });
+    const directChildren = progressChildren.get(task.id) ?? [];
+    const hasChildren = directChildren.length > 0;
+    const expanded = hasChildren && !options.collapsedIds?.has(task.id);
+    rows.push({
+      task,
+      depth,
+      hasChildren,
+      directChildCount: directChildren.length,
+      completedDirectChildCount: directChildren.filter(isTaskCompleted).length,
+      expanded,
+    });
+    if (hasChildren && !expanded) {
+      for (const child of children.get(task.id) ?? []) suppress(child);
+      return;
+    }
     for (const child of completionLast(children.get(task.id) ?? [])) visit(child, depth + 1);
   };
   for (const root of completionLast(roots)) visit(root, 0);
@@ -51,6 +90,25 @@ export function flattenTaskTree(tasks: readonly DidaTask[]): TaskTreeRow[] {
     visit(task, 0);
   }
   return rows;
+}
+
+/** 拒绝把任务移动到自身或任意后代之下；损坏关系按最保守方式拒绝。 */
+export function canReparentTask(
+  tasks: readonly DidaTask[],
+  taskId: string,
+  nextParentId?: string | null,
+): boolean {
+  if (!nextParentId) return true;
+  if (taskId === nextParentId) return false;
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const visited = new Set<string>();
+  let cursor: string | undefined = nextParentId;
+  while (cursor) {
+    if (cursor === taskId || visited.has(cursor)) return false;
+    visited.add(cursor);
+    cursor = byId.get(cursor)?.parentId || undefined;
+  }
+  return true;
 }
 
 export function withTaskDescendants(

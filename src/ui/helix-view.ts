@@ -1,5 +1,6 @@
 import {
   ItemView,
+  Menu,
   Modal,
   Notice,
   Setting,
@@ -90,9 +91,11 @@ import {
 } from "../domain/task-views";
 import { homeGreeting } from "../domain/home-dashboard";
 import {
+  canReparentTask,
   completionLast,
   flattenTaskTree,
   isTaskCompleted,
+  type TaskTreeRow,
   withTaskDescendants,
 } from "../domain/task-tree";
 import { stableHash } from "../domain/stable";
@@ -250,6 +253,10 @@ export class HelixView extends ItemView {
   private charts: echarts.ECharts[] = [];
   private chartObservers: ResizeObserver[] = [];
   private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
+  private taskTreeDrag: { taskId: string } | null = null;
+  private taskTreeSource: DidaTask[] = [];
+  private readonly collapsedTaskTreeIds = new Set<string>();
+  private readonly taskTreeRows = new Map<string, { element: HTMLElement; signature: string }>();
   private focusBridgeConflictCount = 0;
   private conflictSearch = "";
   private conflictTypeFilter: "all" | "project" | "task" | "focus" = "all";
@@ -426,6 +433,9 @@ export class HelixView extends ItemView {
     this.lineageCamera = undefined;
     this.projectWorkbench?.destroy();
     this.projectWorkbench = null;
+    this.taskTreeDrag = null;
+    this.taskTreeSource = [];
+    this.taskTreeRows.clear();
     this.disposeCharts();
   }
 
@@ -847,26 +857,57 @@ export class HelixView extends ItemView {
     project: DidaProject | undefined,
     prominent: boolean,
     depth = 0,
-  ): void {
+    tree?: TaskTreeRow,
+  ): HTMLElement {
     const localTask = this.localProjectTaskSnapshot?.byId.get(task.id);
     const stageParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id);
-    const row = parent.createDiv({ cls: `helix-task-row${prominent ? " is-prominent" : ""}` });
+    const summary = taskSummary(task, Boolean(localTask));
+    const row = parent.createDiv({
+      cls: `helix-task-row${prominent ? " is-prominent" : ""}${summary ? " has-summary" : ""}`,
+      attr: { "data-task-id": task.id },
+    });
+    row.style.setProperty("--depth", String(depth));
+    row.style.setProperty(
+      "--helix-task-indent",
+      `${Math.min(depth, 6) * 30 + Math.max(0, Math.min(depth - 6, 5)) * 14}px`,
+    );
     if (localTask) row.addClass("is-local-project-task");
-    if (depth > 0) {
-      row.addClass("is-subtask");
-      row.style.setProperty("--helix-task-indent", `${Math.min(depth, 6) * 26}px`);
-    }
+    if (depth > 0) row.addClass("is-subtask");
     const completed = localTask
       ? localTask.state === "completed" || localTask.state === "terminated"
       : task.status === 2;
-    const check = row.createEl("button", {
-      cls: `helix-task-check${completed ? " is-completed" : ""}`,
+    const leading = row.createDiv({ cls: "helix-task-tree-leading" });
+    if (tree?.hasChildren) {
+      const toggle = leading.createEl("button", {
+        cls: "helix-task-tree-toggle",
+        attr: {
+          "aria-label": `${tree.expanded ? "收起" : "展开"} ${task.title} 的子任务`,
+          "aria-expanded": String(tree.expanded),
+          title: tree.expanded ? "收起子任务" : "展开子任务",
+        },
+      });
+      setIcon(toggle, tree.expanded ? "chevron-down" : "chevron-right");
+      toggle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (tree.expanded) this.collapsedTaskTreeIds.add(task.id);
+        else this.collapsedTaskTreeIds.delete(task.id);
+        void this.render();
+      });
+    }
+    const check = leading.createEl("button", {
+      cls: `${tree?.hasChildren ? "helix-task-tree-progress" : "helix-task-check"}${completed ? " is-completed" : ""}`,
       attr: {
-        "aria-label": completed ? `重新打开 ${task.title}` : `完成 ${task.title}`,
-        title: completed ? "重新打开任务" : "完成任务",
+        "aria-label": tree?.hasChildren
+          ? `${task.title}：直属子任务完成 ${tree.completedDirectChildCount}/${tree.directChildCount}；${completed ? "重新打开父任务" : "完成父任务"}`
+          : completed ? `重新打开 ${task.title}` : `完成 ${task.title}`,
+        title: tree?.hasChildren
+          ? `直属子任务 ${tree.completedDirectChildCount}/${tree.directChildCount}；点击只切换父任务本身`
+          : completed ? "重新打开任务" : "完成任务",
       },
     });
-    if (completed) setIcon(check, "check");
+    if (tree?.hasChildren) {
+      check.createSpan({ text: `${tree.completedDirectChildCount}/${tree.directChildCount}` });
+    } else if (completed) setIcon(check, "check");
     const body = row.createDiv({ cls: "helix-task-copy" });
     const title = body.createDiv({
       cls: "helix-task-title",
@@ -886,6 +927,7 @@ export class HelixView extends ItemView {
       event.preventDefault();
       startTitleEdit();
     });
+    if (summary) body.createDiv({ cls: "helix-task-summary", text: summary });
     const meta = body.createDiv({ cls: "helix-task-meta" });
     const dot = meta.createSpan({ cls: "helix-project-dot" });
     dot.style.backgroundColor =
@@ -894,10 +936,9 @@ export class HelixView extends ItemView {
       meta.createSpan({ text: localTask.projectTitle });
       meta.createSpan({ text: `阶段 ${localTask.stageCode} · ${localTask.stageTitle}` });
       meta.createSpan({
-        cls: `helix-chip is-soft${task.parentId ? "" : ` is-${localTask.state}`}`,
-        text: task.parentId ? "子任务" : localTaskStateLabel(localTask.state),
+        cls: `helix-chip is-soft is-${localTask.state}`,
+        text: localTaskStateLabel(localTask.state),
       });
-      if (localTask.childCount > 0) meta.createSpan({ text: `${localTask.childCount} 个子任务` });
     } else if (stageParent) {
       meta.createSpan({ text: stageParent.projectTitle });
       meta.createSpan({ text: `阶段 ${stageParent.stageCode} · ${stageParent.stageTitle}` });
@@ -908,17 +949,10 @@ export class HelixView extends ItemView {
     } else {
       meta.createSpan({ text: `滴答 · ${project?.name ?? "未归档清单"}` });
     }
+    if (task.tags?.length) meta.createSpan({ text: task.tags.map((tag) => `#${tag}`).join(" ") });
     if (task.dueDate) meta.createSpan({ text: formatShortTime(task.dueDate) });
-    const edit = row.createEl("button", {
-      cls: "helix-mini-action",
-      attr: { "aria-label": "编辑任务", title: "编辑任务或移动项目" },
-    });
-    setIcon(edit, "pencil");
-    const action = row.createEl("button", {
-      cls: "helix-mini-action",
-      attr: { "aria-label": "切换正在进行", title: "切换正在进行" },
-    });
-    setIcon(action, localTask?.state === "active" || prominent ? "pin-off" : "play");
+    let editTask: (() => void) | undefined;
+    let toggleActive: (() => void) | undefined;
     if (localTask) {
       check.addEventListener("click", () => {
         check.disabled = true;
@@ -933,7 +967,7 @@ export class HelixView extends ItemView {
           new Notice(messageOf(error), 8_000);
         });
       });
-      action.addEventListener("click", () => {
+      toggleActive = () => {
         void this.actions.updateLocalProjectTask({
           projectId: localTask.projectId,
           stageId: localTask.stageId,
@@ -941,13 +975,13 @@ export class HelixView extends ItemView {
           expectedHash: localTask.revisionHash,
           state: localTask.state === "active" ? "idea" : "active",
         }).then(() => this.render()).catch((error) => new Notice(messageOf(error), 8_000));
-      });
-      edit.addEventListener("click", () => {
+      };
+      editTask = () => {
         const editorTask = localTask.parentUuid
           ? this.localProjectTaskSnapshot?.byUuid.get(localTask.parentUuid)
           : localTask;
         if (editorTask) this.openLocalProjectTaskEditor(editorTask);
-      });
+      };
     } else if (!task.id.startsWith("sample-")) {
       const canWriteTask = DIDA_TASK_WRITE_AVAILABLE && (this.state?.taskCrudVerified ?? false);
       if (!canWriteTask) {
@@ -956,7 +990,6 @@ export class HelixView extends ItemView {
           ? "滴答写入能力尚未通过当前版本合同核验"
           : "当前阶段仅开放滴答读取";
         check.title = reason;
-        edit.title = `${reason}；可打开查看详情`;
       }
       check.addEventListener("click", () => {
         if (!canWriteTask) return;
@@ -964,7 +997,7 @@ export class HelixView extends ItemView {
         check.addClass(task.status === 2 ? "is-reopening" : "is-completing");
         if (task.status !== 2) {
           check.addClass("is-completed");
-          setIcon(check, "check");
+          if (!tree?.hasChildren) setIcon(check, "check");
         }
         const request = task.status === 2
           ? this.service.reopenTask(task.id)
@@ -979,15 +1012,15 @@ export class HelixView extends ItemView {
             void this.render();
           });
       });
-      action.addEventListener("click", () => {
+      toggleActive = () => {
         void this.service.toggleInProgress(task.id).catch((error) => {
           new Notice(error instanceof Error ? error.message : String(error));
         });
-      });
-      edit.addEventListener("click", () => {
+      };
+      editTask = () => {
         if (!DIDA_TASK_WRITE_AVAILABLE) return;
         void this.openTaskEditor(task, this.state?.projects ?? []);
-      });
+      };
     } else {
       check.addEventListener("click", () => {
         this.previewTasks = this.previewTasks.map((candidate) =>
@@ -1002,21 +1035,44 @@ export class HelixView extends ItemView {
         this.previewInProgress.delete(task.id);
         void this.render();
       });
-      action.addEventListener("click", () => {
+      toggleActive = () => {
         if (this.previewInProgress.has(task.id)) this.previewInProgress.delete(task.id);
         else this.previewInProgress.add(task.id);
         void this.render();
-      });
-      edit.addEventListener("click", () => {
+      };
+      editTask = () => {
         this.openPreviewTaskEditor(task);
-      });
+      };
     }
+    const more = row.createEl("button", {
+      cls: "helix-task-row-more",
+      attr: { "aria-label": `${task.title} 的更多操作`, title: "更多操作" },
+    });
+    setIcon(more, "ellipsis");
+    more.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = new Menu();
+      if (editTask) {
+        menu.addItem((item) => item
+          .setTitle(DIDA_TASK_WRITE_AVAILABLE || localTask || task.id.startsWith("sample-") ? "编辑任务" : "查看详情")
+          .setIcon("pencil")
+          .onClick(editTask));
+      }
+      if (toggleActive) {
+        menu.addItem((item) => item
+          .setTitle(localTask?.state === "active" || prominent ? "取消正在进行" : "设为正在进行")
+          .setIcon(localTask?.state === "active" || prominent ? "pin-off" : "play")
+          .onClick(toggleActive));
+      }
+      menu.showAtMouseEvent(event);
+    });
     if (task.status === 2 && (localTask || task.id.startsWith("sample-") || !this.state?.taskReopenVerified)) {
       check.disabled = true;
       if (!localTask && !task.id.startsWith("sample-") && !this.state?.taskReopenVerified) {
         check.title = "当前账号尚未通过任务重开核验";
       }
     }
+    return row;
   }
 
   private startInlineTaskTitleEdit(container: HTMLElement, task: DidaTask): void {
@@ -1726,6 +1782,7 @@ export class HelixView extends ItemView {
       anchor: new Date(),
       helixProjectByTaskId,
     });
+    const taskTreeProgressSource = visibleTasks;
     if (this.hideCompletedTasks) {
       visibleTasks = visibleTasks.filter((task) => !isTaskCompleted(task));
     }
@@ -1750,18 +1807,145 @@ export class HelixView extends ItemView {
     } else if (this.taskViewMode === "list") {
       const card = panel.createDiv({ cls: "helix-card helix-table-card" });
       if (visibleTasks.length === 0) card.createDiv({ cls: "helix-empty", text: "当前筛选没有任务。" });
-      for (const row of flattenTaskTree(visibleTasks)) {
-        this.renderTaskRow(
-          card,
-          row.task,
-          taskProjects.find((project) => project.id === row.task.projectId),
-          false,
-          row.depth,
-        );
-      }
+      else this.renderTaskTree(card, visibleTasks, taskTreeProgressSource, taskProjects);
     } else {
       this.renderTaskCalendar(panel, visibleTasks, taskProjects, this.taskViewMode);
     }
+  }
+
+  private renderTaskTree(
+    parent: HTMLElement,
+    visibleTasks: DidaTask[],
+    progressTasks: DidaTask[],
+    projects: DidaProject[],
+  ): void {
+    this.taskTreeSource = progressTasks;
+    const tree = parent.createDiv({ cls: "helix-task-tree" });
+    const rootDrop = tree.createDiv({
+      cls: "helix-task-tree-root-drop",
+      text: "移到顶层",
+      attr: { role: "button", "aria-label": "把拖动的任务移到顶层" },
+    });
+    this.bindTaskTreeDropTarget(rootDrop, null);
+    const projectById = new Map(projects.map((project) => [project.id, project]));
+    const rows = flattenTaskTree(visibleTasks, {
+      collapsedIds: this.collapsedTaskTreeIds,
+      progressTasks,
+    });
+    const sourceIds = new Set(progressTasks.map((task) => task.id));
+    for (const [taskId, cached] of this.taskTreeRows) {
+      if (sourceIds.has(taskId)) continue;
+      cached.element.remove();
+      this.taskTreeRows.delete(taskId);
+      this.collapsedTaskTreeIds.delete(taskId);
+    }
+    for (const item of rows) {
+      const project = projectById.get(item.task.projectId);
+      const localTask = this.localProjectTaskSnapshot?.byId.get(item.task.id);
+      const stageParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(item.task.id);
+      const signature = stableHash({ item, project, localTask, stageParent });
+      let cached = this.taskTreeRows.get(item.task.id);
+      if (!cached || cached.signature !== signature) {
+        const staging = tree.ownerDocument.createElement("div");
+        const element = this.renderTaskRow(
+          staging,
+          item.task,
+          project,
+          false,
+          item.depth,
+          item,
+        );
+        this.bindTaskTreeDrag(element, item.task);
+        cached?.element.remove();
+        cached = { element, signature };
+        this.taskTreeRows.set(item.task.id, cached);
+      }
+      tree.append(cached.element);
+    }
+  }
+
+  private bindTaskTreeDrag(row: HTMLElement, task: DidaTask): void {
+    const localTask = this.localProjectTaskSnapshot?.byId.get(task.id);
+    const projectionParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id);
+    const writable = task.id.startsWith("sample-") || (
+      !localTask && !projectionParent && DIDA_TASK_WRITE_AVAILABLE &&
+      (this.state?.taskCrudVerified ?? false) && (this.state?.taskParentingVerified ?? false)
+    );
+    if (!writable) return;
+    row.draggable = true;
+    row.addClass("is-tree-draggable");
+    row.setAttribute("title", "拖到另一任务可调整父级；拖到顶部区域可移到顶层");
+    row.addEventListener("dragstart", (event) => {
+      this.taskTreeDrag = { taskId: task.id };
+      row.addClass("is-dragging");
+      row.closest(".helix-task-tree")?.addClass("is-reparenting");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", task.id);
+      }
+    });
+    row.addEventListener("dragend", () => this.finishTaskTreeDrag());
+    this.bindTaskTreeDropTarget(row, task.id);
+  }
+
+  private bindTaskTreeDropTarget(target: HTMLElement, parentId: string | null): void {
+    if (parentId && target.matches(".helix-task-row") &&
+      !target.querySelector(".helix-task-tree-drop-label")) {
+      target.createSpan({ cls: "helix-task-tree-drop-label", text: "设为此任务的子任务" });
+    }
+    target.addEventListener("dragover", (event) => {
+      const dragged = this.taskTreeDrag;
+      if (!dragged || !canReparentTask(this.taskTreeSource, dragged.taskId, parentId)) return;
+      event.preventDefault();
+      target.addClass("is-task-tree-drop-target");
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    });
+    target.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget instanceof Node && target.contains(event.relatedTarget)) return;
+      target.removeClass("is-task-tree-drop-target");
+    });
+    target.addEventListener("drop", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      target.removeClass("is-task-tree-drop-target");
+      const dragged = this.taskTreeDrag;
+      if (!dragged || !canReparentTask(this.taskTreeSource, dragged.taskId, parentId)) return;
+      this.finishTaskTreeDrag();
+      void this.reparentTask(dragged.taskId, parentId).catch((error) => {
+        new Notice(messageOf(error), 8_000);
+        void this.render();
+      });
+    });
+  }
+
+  private finishTaskTreeDrag(): void {
+    this.taskTreeDrag = null;
+    this.contentEl.querySelectorAll(
+      ".helix-task-tree.is-reparenting, .is-task-tree-drop-target, .helix-task-row.is-dragging",
+    )
+      .forEach((element) => {
+        element.removeClass("is-reparenting");
+        element.removeClass("is-task-tree-drop-target");
+        element.removeClass("is-dragging");
+      });
+  }
+
+  private async reparentTask(taskId: string, parentId: string | null): Promise<void> {
+    const task = this.taskTreeSource.find((candidate) => candidate.id === taskId);
+    if (!task || !canReparentTask(this.taskTreeSource, taskId, parentId)) {
+      new Notice("不能把任务移动到自身或其后代下面", 5_000);
+      return;
+    }
+    if ((task.parentId ?? null) === parentId) return;
+    if (task.id.startsWith("sample-")) {
+      this.previewTasks = this.previewTasks.map((candidate) =>
+        candidate.id === task.id ? { ...candidate, parentId } : candidate);
+      await this.render();
+      return;
+    }
+    await this.service.queueTaskUpdate({ ...task, parentId }, "update", ["parentId"]);
+    new Notice(parentId ? "子任务层级已加入同步队列" : "任务已移到顶层并加入同步队列");
+    await this.render();
   }
 
   private renderTaskBoard(
@@ -5147,6 +5331,16 @@ function localTaskStateLabel(state: ProjectionActionState): string {
     paused: "已暂停",
     terminated: "已终止",
   }[state];
+}
+
+function taskSummary(task: DidaTask, local = false): string | undefined {
+  const source = (local ? task.content ?? "" : task.desc || task.content || "")
+    .replace(/^---[\s\S]*?---\s*/u, "")
+    .replace(/<!--[\s\S]*?-->/gu, " ")
+    .replace(/^[#>*+\-\d.\s]+/gmu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return source || undefined;
 }
 
 function mergeProjectTaskCollections(remoteTasks: DidaTask[], localTasks: DidaTask[]): DidaTask[] {

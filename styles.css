@@ -795,8 +795,8 @@
 }
 
 .helix-task-editor-details > summary {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr);
+  display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
   min-height: 42px;
@@ -808,7 +808,12 @@
 }
 
 .helix-task-editor-details > summary::-webkit-details-marker {
-  display: none;
+  display: none !important;
+}
+
+.helix-task-editor-details > summary::before {
+  display: none !important;
+  content: none !important;
 }
 
 .helix-task-editor-details > summary svg {
@@ -818,6 +823,8 @@
 }
 
 .helix-task-editor-summary-value {
+  min-width: 0;
+  margin-left: auto;
   overflow: hidden;
   color: var(--text-muted);
   font-size: 11px;
@@ -825,6 +832,16 @@
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.helix-task-editor-more-properties > summary > span:first-child {
+  display: inline-flex;
+  flex: 0 0 auto;
+  transition: transform .14s ease;
+}
+
+.helix-task-editor-more-properties[open] > summary > span:first-child {
+  transform: rotate(90deg);
 }
 
 .helix-task-editor-details-body {

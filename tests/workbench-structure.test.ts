@@ -170,6 +170,8 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toContain('source: "stage-projection"');
     expect(view).toContain('source: "dida"');
     expect(unifiedTaskEditor).toContain('text: "更多属性"');
+    expect(css).toMatch(/\.helix-task-editor-details > summary::before \{[\s\S]*content: none !important/);
+    expect(css).toMatch(/\.helix-task-editor-summary-value \{[\s\S]*margin-left: auto/);
     expect(unifiedTaskEditor).not.toContain("滴答扩展");
     expect(unifiedTaskEditor).not.toContain("Helix 关联");
     expect(view).not.toContain("saveTaskReference(");

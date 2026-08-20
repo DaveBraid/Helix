@@ -146,6 +146,9 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toContain("didaTaskDetailDraft");
     expect(localTasks).toContain("byRemoteParentTaskId");
     expect(css).toContain(".helix-task-tree .helix-task-row");
+    expect(css).toMatch(/\.helix-task-tree \.helix-task-title[\s\S]*font-size: 13px/);
+    expect(css).toMatch(/\.helix-task-summary[\s\S]*font-size: 11px/);
+    expect(css).toMatch(/\.helix-task-tree \.helix-task-meta[\s\S]*font-size: 10px/);
     expect(view).toContain('attr: { "data-task-id": task.id }');
     expect(view).toContain("collapsedTaskTreeIds");
     expect(view).toContain("taskTreeRows");

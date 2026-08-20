@@ -102,13 +102,12 @@ describe("workbench layout and navigation structure", () => {
       resolve(process.cwd(), "src/services/local-project-tasks.ts"),
       "utf8",
     );
-    expect(main).toMatch(
-      /readLocalProjectTasks[\s\S]*loadStableWorkspace\(\)[\s\S]*adoptUnmanaged: true/,
-    );
     const localRead = main.slice(
       main.indexOf("async readLocalProjectTasks"),
       main.indexOf("async createLocalProjectTask"),
     );
+    expect(localRead).toContain("this.localProjectTaskSnapshotCache");
+    expect(localRead).toContain("adoptUnmanaged: false");
     expect(localRead).toContain("this.assertWritable();");
     expect(localRead).toContain("this.withProjectWorkspaceRead");
     expect(localRead).not.toContain("withWritableProjectMutation");
@@ -116,6 +115,21 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toMatch(/localProjectTaskDidaTasks[\s\S]*this\.localProjectTaskSnapshot/);
     expect(view).toMatch(/saveLocalProjectTask[\s\S]*LocalProjectTaskEditModal/);
     expect(localTasks).not.toMatch(/data\.json|HelixDataStore|OfflineQueue/);
+  });
+
+  it("keeps task rendering read-only and shows the real Stage/action hierarchy", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    const localTasks = readFileSync(
+      resolve(process.cwd(), "src/services/local-project-tasks.ts"),
+      "utf8",
+    );
+    expect(main).toMatch(/finishProjectStartup[\s\S]*loadStableWorkspace\(\)[\s\S]*localProjectTaskSnapshotCache/);
+    expect(main).toMatch(/scheduleProjectRefresh[\s\S]*const snapshot = await this\.projectWorkspace\.loadStableWorkspace\(\)[\s\S]*repairDerivedProjectCanvasCache\(snapshot\)[\s\S]*localProjectTasks\.snapshot/);
+    expect(view).toContain("flattenTaskTree(visibleTasks)");
+    expect(view).toContain("hideCompletedTasks");
+    expect(view).toContain("renderRemoteSubtasks");
+    expect(localTasks).toContain("byRemoteParentTaskId");
+    expect(css).toContain(".helix-task-row.is-subtask");
   });
 
   it("uses one compact editor shell and exposes local subtasks without Dida writes", () => {

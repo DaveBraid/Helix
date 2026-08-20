@@ -534,6 +534,22 @@
   min-height: 66px;
 }
 
+.helix-task-row.is-subtask {
+  position: relative;
+  padding-left: calc(16px + var(--helix-task-indent));
+  background: color-mix(in srgb, var(--helix-surface-control) 34%, transparent);
+}
+
+.helix-task-row.is-subtask::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(24px + var(--helix-task-indent) - 26px);
+  width: 1px;
+  background: color-mix(in srgb, var(--helix-accent-ink) 22%, var(--helix-line));
+  content: "";
+}
+
 .helix-task-check {
   flex: 0 0 auto;
   width: 18px;
@@ -3342,6 +3358,17 @@
   color: var(--helix-muted);
   box-shadow: none;
   font-size: 11px;
+}
+
+.helix-filter-row button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.helix-filter-row button svg {
+  width: 13px;
+  height: 13px;
 }
 
 .helix-filter-row button.is-active {

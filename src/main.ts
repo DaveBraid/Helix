@@ -44,6 +44,7 @@ import type {
   ProjectWorkspaceProject,
   ProjectWorkspaceProjectStatus,
   ProjectWorkspaceProjectStatusUpdatePlan,
+  ProjectWorkspaceSnapshot,
   StageDeletionPlan,
 } from "./services/project-workspace";
 import { HelixDataStore } from "./storage/data-store";
@@ -169,6 +170,12 @@ export default class HelixPlugin extends Plugin {
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
   private projectStatusItem: HTMLElement | null = null;
   private projectStatusSignature: string | null = null;
+  /**
+   * 任务页只消费最近一次稳定项目快照的派生结果。禁止每次服务状态变化或
+   * 页面 render 都重新扫描全部 Project／Stage，更不能在 render 中补写身份。
+   */
+  private localProjectTaskSnapshotCache: LocalProjectTaskSnapshot | null = null;
+  private focusBridgeConflictCountCache = 0;
   private readonly persistentNotices = new Set<Notice>();
 
   async onload(): Promise<void> {
@@ -321,6 +328,7 @@ export default class HelixPlugin extends Plugin {
         updateLocalProjectTask: (input) => this.updateLocalProjectTask(input),
         saveLocalProjectTask: (input) => this.saveLocalProjectTask(input),
         deleteLocalProjectTask: (input) => this.deleteLocalProjectTask(input),
+        readFocusBridgeConflictCount: () => this.readFocusBridgeConflictCount(),
         readProjectWorkspace: (operation) => this.withProjectWorkspaceRead(operation),
         mutateProjectWorkspace: (operation) => this.withWritableProjectMutation(operation),
         repairProjectCanvas: () => this.repairProjectCanvas(),
@@ -526,7 +534,17 @@ export default class HelixPlugin extends Plugin {
         await this.projectWorkspace.loadStableWorkspace();
         await this.store.resolveRecoveryIssuesAfterValidation(staleFocusBridgeIssues);
       }
-      if (!this.recoveryMode) await this.projectWorkspace.initializeFocusBridgeState();
+      if (!this.recoveryMode) {
+        await this.projectWorkspace.initializeFocusBridgeState();
+        const snapshot = await this.projectWorkspace.loadStableWorkspace();
+        await this.repairDerivedProjectCanvasCache(snapshot);
+        this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+          snapshot,
+          { adoptUnmanaged: true },
+        );
+        this.focusBridgeConflictCountCache =
+          (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+      }
     } catch (error) {
       const message = `${FOCUS_BRIDGE_RECOVERY_PREFIX}${
         error instanceof Error ? error.message : String(error)}`;
@@ -536,7 +554,7 @@ export default class HelixPlugin extends Plugin {
       this.projectStartupReady = true;
     }
     await this.service.refreshPersistedEvents();
-    if (!this.recoveryMode) this.scheduleProjectRefresh();
+    if (!this.recoveryMode) this.projectAutoSync.request();
   }
 
   private activeHelixStatusTarget(): ActiveHelixStatusTarget | null {
@@ -922,11 +940,19 @@ export default class HelixPlugin extends Plugin {
 
   async readLocalProjectTasks(): Promise<LocalProjectTaskSnapshot> {
     this.assertWritable();
-    return this.withProjectWorkspaceRead(async () =>
-      this.localProjectTasks.snapshot(
+    if (this.localProjectTaskSnapshotCache) return this.localProjectTaskSnapshotCache;
+    return this.withProjectWorkspaceRead(async () => {
+      if (this.localProjectTaskSnapshotCache) return this.localProjectTaskSnapshotCache;
+      this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
         await this.projectWorkspace.loadStableWorkspace(),
-        { adoptUnmanaged: true },
-      ));
+        { adoptUnmanaged: false },
+      );
+      return this.localProjectTaskSnapshotCache;
+    });
+  }
+
+  readFocusBridgeConflictCount(): number {
+    return this.focusBridgeConflictCountCache;
   }
 
   async createLocalProjectTask(input: {
@@ -1828,19 +1854,29 @@ export default class HelixPlugin extends Plugin {
       const markdownPaths = [...this.projectMarkdownRefreshPaths];
       this.projectMarkdownRefreshPaths.clear();
       void this.projectMutationRunner.run(async () => {
-        if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
-        if (!this.recoveryMode && markdownPaths.length > 0) {
-          await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
+        this.projectRefreshBatch.begin();
+        try {
+          if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
+          if (!this.recoveryMode && markdownPaths.length > 0) {
+            await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
+          }
+          if (!this.recoveryMode) {
+            // 本轮只读取一次稳定工作区，供 Canvas 派生修复和任务派生共同使用。
+            // 任务身份补写也纳入同一 quiet-window，避免每个 marker 再触发一轮全量扫描。
+            const snapshot = await this.projectWorkspace.loadStableWorkspace();
+            await this.repairDerivedProjectCanvasCache(snapshot);
+            this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+              snapshot,
+              { adoptUnmanaged: markdownPaths.length > 0 },
+            );
+            this.focusBridgeConflictCountCache =
+              (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+          }
+          await this.service.refreshPersistedEvents();
+          this.projectAutoSync.request();
+        } finally {
+          this.projectRefreshBatch.end();
         }
-        if (!this.recoveryMode) await this.repairDerivedProjectCanvasCache();
-        if (!this.recoveryMode && markdownPaths.length > 0) {
-          await this.localProjectTasks.snapshot(
-            await this.projectWorkspace.loadStableWorkspace(),
-            { adoptUnmanaged: true },
-          );
-        }
-        await this.service.refreshPersistedEvents();
-        this.projectAutoSync.request();
       }).catch(async (error) => {
         const recoveryIssue = this.projectWorkspace.recoveryIssueMessage();
         const message = error instanceof Error ? error.message : String(error);
@@ -1880,12 +1916,14 @@ export default class HelixPlugin extends Plugin {
   }
 
   /** 已持有 projectMutationRunner；只对可重建派生字段开启自写事件批次。 */
-  private async repairDerivedProjectCanvasCache(): Promise<void> {
-    const snapshot = await this.projectWorkspace.loadStableWorkspace();
-    if (!canSilentlyRepairProjectCanvas(snapshot)) return;
+  private async repairDerivedProjectCanvasCache(
+    snapshot?: ProjectWorkspaceSnapshot,
+  ): Promise<void> {
+    const stable = snapshot ?? await this.projectWorkspace.loadStableWorkspace();
+    if (!canSilentlyRepairProjectCanvas(stable)) return;
     this.projectRefreshBatch.begin();
     try {
-      await this.projectWorkspace.repairDerivedCanvasCache(snapshot);
+      await this.projectWorkspace.repairDerivedCanvasCache(stable);
     } finally {
       this.projectRefreshBatch.end();
     }

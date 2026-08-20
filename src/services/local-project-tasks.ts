@@ -4,6 +4,7 @@ import {
   assertProjectionStageIdentity,
   parseManagedPlanActions,
   patchManagedPlanAction,
+  readProjectProjectionIdentity,
   reconcileLocalPlanActionCheckboxes,
   removeManagedPlanAction,
   reorderManagedPlanChildren,
@@ -48,12 +49,26 @@ export interface LocalProjectTaskSnapshot {
   issues: string[];
   byId: Map<string, LocalProjectTask>;
   byUuid: Map<string, LocalProjectTask>;
+  stageParents: LocalProjectStageTaskParent[];
+  byRemoteParentTaskId: Map<string, LocalProjectStageTaskParent>;
   destinations: Array<{
     projectId: string;
     projectTitle: string;
     projectColor?: string;
     stages: Array<{ stageId: string; stageTitle: string; stageCode: string; status: string }>;
   }>;
+}
+
+export interface LocalProjectStageTaskParent {
+  remoteTaskId: string;
+  projectId: string;
+  projectTitle: string;
+  projectColor?: string;
+  stageId: string;
+  stageTitle: string;
+  stageCode: string;
+  stageStatus: string;
+  notePath: string;
 }
 
 export interface LocalProjectTaskDraft {
@@ -93,6 +108,7 @@ export class LocalProjectTaskService {
     options: { adoptUnmanaged?: boolean } = {},
   ): Promise<LocalProjectTaskSnapshot> {
     const tasks: LocalProjectTask[] = [];
+    const stageParents: LocalProjectStageTaskParent[] = [];
     const issues: string[] = [];
     const globalUuids = new Map<string, string>();
     for (const project of workspace.projects) {
@@ -108,6 +124,20 @@ export class LocalProjectTaskService {
             }
           }
           const parsed = parseManagedPlanActions(revision.content);
+          const parentTaskId = readProjectProjectionIdentity(revision.content).parentTaskId;
+          if (parentTaskId) {
+            stageParents.push({
+              remoteTaskId: parentTaskId,
+              projectId: project.id,
+              projectTitle: project.title,
+              ...(project.color ? { projectColor: project.color } : {}),
+              stageId: stage.id,
+              stageTitle: stage.title,
+              stageCode: stage.stageCode,
+              stageStatus: stage.status,
+              notePath: stage.notePath,
+            });
+          }
           for (const action of parsed.actions) {
             const owner = globalUuids.get(action.uuid);
             if (owner) throw new Error(`任务 UUID 与 ${owner} 重复：${action.uuid}`);
@@ -158,6 +188,8 @@ export class LocalProjectTaskService {
       issues,
       byId: new Map(tasks.map((task) => [task.id, task])),
       byUuid,
+      stageParents,
+      byRemoteParentTaskId: new Map(stageParents.map((parent) => [parent.remoteTaskId, parent])),
       destinations: workspace.projects.map((project) => ({
         projectId: project.id,
         projectTitle: project.title,

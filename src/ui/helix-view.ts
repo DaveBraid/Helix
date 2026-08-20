@@ -82,6 +82,12 @@ import {
   type TaskViewMode,
 } from "../domain/task-views";
 import { homeGreeting } from "../domain/home-dashboard";
+import {
+  completionLast,
+  flattenTaskTree,
+  isTaskCompleted,
+  withTaskDescendants,
+} from "../domain/task-tree";
 import { requestStageBoardStatusChange } from "../domain/stage-board";
 import type {
   ProjectionProjectReadModel,
@@ -210,6 +216,7 @@ export class HelixView extends ItemView {
   private section: Section = "today";
   private expandedInProgress = false;
   private taskFilter: "all" | ProjectionActionState = "all";
+  private hideCompletedTasks = false;
   private taskViewMode: TaskViewMode = "list";
   private taskViewModeSyncStatus: DidaProjectViewModeSyncStatus | null = null;
   private taskViewModeSyncingProjectId: string | null = null;
@@ -308,6 +315,7 @@ export class HelixView extends ItemView {
         uuid: string;
         expectedHash: string;
       }) => Promise<void>;
+      readFocusBridgeConflictCount: () => number;
       readProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       mutateProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       repairProjectCanvas: () => Promise<void>;
@@ -396,12 +404,7 @@ export class HelixView extends ItemView {
   private async render(): Promise<void> {
     if (!this.state || this.closed) return;
     const token = ++this.renderToken;
-    try {
-      this.focusBridgeConflictCount = (await this.actions.readProjectWorkspace(() =>
-        this.actions.projectWorkspace.listFocusBridgeConflicts())).length;
-    } catch {
-      this.focusBridgeConflictCount = 0;
-    }
+    this.focusBridgeConflictCount = this.actions.readFocusBridgeConflictCount();
     await this.refreshLocalProjectTaskSnapshot(token);
     if (token !== this.renderToken || this.closed) return;
     if (this.section === "projects") {
@@ -793,10 +796,16 @@ export class HelixView extends ItemView {
     task: DidaTask,
     project: DidaProject | undefined,
     prominent: boolean,
+    depth = 0,
   ): void {
     const localTask = this.localProjectTaskSnapshot?.byId.get(task.id);
+    const stageParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id);
     const row = parent.createDiv({ cls: `helix-task-row${prominent ? " is-prominent" : ""}` });
     if (localTask) row.addClass("is-local-project-task");
+    if (depth > 0) {
+      row.addClass("is-subtask");
+      row.style.setProperty("--helix-task-indent", `${Math.min(depth, 6) * 26}px`);
+    }
     const completed = localTask
       ? localTask.state === "completed" || localTask.state === "terminated"
       : task.status === 2;
@@ -836,10 +845,17 @@ export class HelixView extends ItemView {
       meta.createSpan({ text: localTask.projectTitle });
       meta.createSpan({ text: `阶段 ${localTask.stageCode} · ${localTask.stageTitle}` });
       meta.createSpan({
-        cls: `helix-chip is-soft is-${localTask.state}`,
-        text: localTaskStateLabel(localTask.state),
+        cls: `helix-chip is-soft${task.parentId ? "" : ` is-${localTask.state}`}`,
+        text: task.parentId ? "子任务" : localTaskStateLabel(localTask.state),
       });
       if (localTask.childCount > 0) meta.createSpan({ text: `${localTask.childCount} 个子任务` });
+    } else if (stageParent) {
+      meta.createSpan({ text: stageParent.projectTitle });
+      meta.createSpan({ text: `阶段 ${stageParent.stageCode} · ${stageParent.stageTitle}` });
+      meta.createSpan({
+        cls: `helix-chip is-soft is-${stageParent.stageStatus}`,
+        text: localTaskStateLabel(stageParent.stageStatus as ProjectionActionState),
+      });
     } else if (reference?.issues.length) {
       meta.createSpan({
         text: reference.project
@@ -894,7 +910,12 @@ export class HelixView extends ItemView {
           state: localTask.state === "active" ? "idea" : "active",
         }).then(() => this.render()).catch((error) => new Notice(messageOf(error), 8_000));
       });
-      edit.addEventListener("click", () => this.openLocalProjectTaskEditor(localTask));
+      edit.addEventListener("click", () => {
+        const editorTask = localTask.parentUuid
+          ? this.localProjectTaskSnapshot?.byUuid.get(localTask.parentUuid)
+          : localTask;
+        if (editorTask) this.openLocalProjectTaskEditor(editorTask);
+      });
     } else if (!task.id.startsWith("sample-")) {
       const canWriteTask = DIDA_TASK_WRITE_AVAILABLE && (this.state?.taskCrudVerified ?? false);
       if (!canWriteTask) {
@@ -1090,6 +1111,8 @@ export class HelixView extends ItemView {
         issues: [messageOf(error)],
         byId: new Map(),
         byUuid: new Map(),
+        stageParents: [],
+        byRemoteParentTaskId: new Map(),
         destinations: [],
       };
     }
@@ -1098,34 +1121,48 @@ export class HelixView extends ItemView {
   private localProjectTaskDidaTasks(): DidaTask[] {
     const snapshot = this.localProjectTaskSnapshot;
     if (!snapshot) return [];
-    return snapshot.roots.map((task) => ({
-      id: task.id,
-      projectId: `helix-project:${task.projectId}`,
-      title: task.title,
-      content: task.content ?? "",
-      desc: `${task.projectTitle} · 阶段 ${task.stageCode} ${task.stageTitle}`,
-      startDate: task.startDate ?? null,
-      dueDate: task.dueDate ?? null,
-      timeZone: task.timeZone,
-      isAllDay: task.isAllDay ?? false,
-      status: task.state === "completed" || task.state === "terminated" ? 2 : 0,
-      priority: task.priority,
-      tags: [...task.tags],
-      kind: "CHECKLIST",
-      items: snapshot.tasks
-        .filter((candidate) => candidate.parentUuid === task.uuid)
-        .map((child) => ({
-          id: child.id,
-          title: child.title,
-          status: child.state === "completed" || child.state === "terminated" ? 2 : 0,
-        })),
-    }));
+    return snapshot.tasks.map((task) => {
+      const localParent = task.parentUuid ? snapshot.byUuid.get(task.parentUuid) : undefined;
+      const stageParent = !localParent
+        ? snapshot.stageParents.find((parent) => parent.stageId === task.stageId)
+        : undefined;
+      return {
+        id: task.id,
+        projectId: `helix-project:${task.projectId}`,
+        ...(localParent
+          ? { parentId: localParent.id }
+          : stageParent ? { parentId: stageParent.remoteTaskId } : {}),
+        title: task.title,
+        content: task.content ?? "",
+        desc: `${task.projectTitle} · 阶段 ${task.stageCode} ${task.stageTitle}`,
+        startDate: task.startDate ?? null,
+        dueDate: task.dueDate ?? null,
+        timeZone: task.timeZone,
+        isAllDay: task.isAllDay ?? false,
+        status: task.state === "completed" || task.state === "terminated" ? 2 : 0,
+        priority: task.priority,
+        tags: [...task.tags],
+        kind: task.childCount > 0 ? "CHECKLIST" : "TASK",
+        ...(task.childCount > 0 ? {
+          items: snapshot.tasks
+            .filter((candidate) => candidate.parentUuid === task.uuid)
+            .map((child) => ({
+              id: child.id,
+              title: child.title,
+              status: child.state === "completed" || child.state === "terminated" ? 2 : 0,
+            })),
+        } : {}),
+      };
+    });
   }
 
   private async openTaskEditor(
     task: DidaTask,
     didaProjects: DidaProject[],
   ): Promise<void> {
+    const childIds = new Set(task.childIds ?? []);
+    const childTasks = (this.state?.tasks ?? []).filter((candidate) =>
+      candidate.parentId === task.id || childIds.has(candidate.id));
     const [workspaceResult, referencesResult] = await Promise.allSettled([
       this.actions.projectWorkspace.snapshot(),
       this.actions.taskReferences.snapshot(),
@@ -1183,6 +1220,12 @@ export class HelixView extends ItemView {
         );
         await this.refreshTaskReferencesAfterCommit("Helix 关联");
         return result.reference;
+      },
+      false,
+      childTasks,
+      async (child) => {
+        if (child.status === 2) await this.service.reopenTask(child.id);
+        else await this.service.completeTask(child.id);
       },
     ).open();
   }
@@ -1614,13 +1657,16 @@ export class HelixView extends ItemView {
         reference.projectId,
       ]),
     );
-    for (const task of this.localProjectTaskSnapshot?.roots ?? []) {
+    for (const task of this.localProjectTaskSnapshot?.tasks ?? []) {
       helixProjectByTaskId.set(task.id, task.projectId);
     }
-    const visibleTasks = filterTaskCollection(this.filterTasks(tasks), this.taskCollectionFilters, {
+    let visibleTasks = filterTaskCollection(this.filterTasks(tasks), this.taskCollectionFilters, {
       anchor: new Date(),
       helixProjectByTaskId,
     });
+    if (this.hideCompletedTasks) {
+      visibleTasks = visibleTasks.filter((task) => !isTaskCompleted(task));
+    }
     const panel = content.createDiv({
       cls: "helix-task-view-panel",
       attr: {
@@ -1642,8 +1688,14 @@ export class HelixView extends ItemView {
     } else if (this.taskViewMode === "list") {
       const card = panel.createDiv({ cls: "helix-card helix-table-card" });
       if (visibleTasks.length === 0) card.createDiv({ cls: "helix-empty", text: "当前筛选没有任务。" });
-      for (const task of visibleTasks) {
-        this.renderTaskRow(card, task, taskProjects.find((project) => project.id === task.projectId), false);
+      for (const row of flattenTaskTree(visibleTasks)) {
+        this.renderTaskRow(
+          card,
+          row.task,
+          taskProjects.find((project) => project.id === row.task.projectId),
+          false,
+          row.depth,
+        );
       }
     } else {
       this.renderTaskCalendar(panel, visibleTasks, taskProjects, this.taskViewMode);
@@ -1836,9 +1888,27 @@ export class HelixView extends ItemView {
       });
       button.addEventListener("click", () => {
         this.taskFilter = id;
+        if (id === "completed") this.hideCompletedTasks = false;
         this.renderAndRestoreFocus(`helix-task-status-filter-${id}`);
       });
     }
+    const completedVisibility = statuses.createEl("button", {
+      cls: this.hideCompletedTasks ? "is-active" : "",
+      attr: {
+        id: "helix-task-hide-completed",
+        "aria-pressed": String(this.hideCompletedTasks),
+        title: this.hideCompletedTasks ? "显示已完成任务" : "隐藏已完成任务",
+      },
+    });
+    const completedVisibilityIcon = completedVisibility.createSpan();
+    setIcon(completedVisibilityIcon, this.hideCompletedTasks ? "eye" : "eye-off");
+    completedVisibility.createSpan({
+      text: this.hideCompletedTasks ? "显示已完成" : "隐藏已完成",
+    });
+    completedVisibility.addEventListener("click", () => {
+      this.hideCompletedTasks = !this.hideCompletedTasks;
+      this.renderAndRestoreFocus("helix-task-hide-completed");
+    });
     const searchWrap = toolbar.createDiv({ cls: "helix-task-search" });
     const searchIcon = searchWrap.createSpan();
     setIcon(searchIcon, "search");
@@ -4248,17 +4318,31 @@ export class HelixView extends ItemView {
   }
 
   private filterTasks(tasks: DidaTask[]): DidaTask[] {
-    if (this.taskFilter === "all") return tasks;
+    if (this.taskFilter === "all") return completionLast(tasks);
     const inProgressIds = new Set(this.state?.inProgress.map((entry) => entry.taskId) ?? []);
+    for (const parent of this.localProjectTaskSnapshot?.stageParents ?? []) {
+      if (parent.stageStatus === "active") inProgressIds.add(parent.remoteTaskId);
+    }
+    if (this.taskFilter === "active") {
+      for (const task of tasks) {
+        if (this.localProjectTaskSnapshot?.byId.get(task.id)?.state === "active") {
+          inProgressIds.add(task.id);
+        }
+      }
+      const visibleIds = withTaskDescendants(tasks, inProgressIds);
+      return completionLast(tasks.filter((task) => visibleIds.has(task.id) && task.status !== 2));
+    }
     return tasks.filter((task) => {
       const localState = this.localProjectTaskSnapshot?.byId.get(task.id)?.state;
       if (localState) return localState === this.taskFilter;
+      const stageState = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id)?.stageStatus;
+      if (stageState) return stageState === this.taskFilter;
       if (this.taskFilter === "completed") return task.status === 2;
       if (task.status === 2) return false;
-      if (this.taskFilter === "active") return inProgressIds.has(task.id);
       if (this.taskFilter === "idea") return !inProgressIds.has(task.id);
       return false;
-    });
+    }).sort((left, right) =>
+      Number(isTaskCompleted(left)) - Number(isTaskCompleted(right)));
   }
 
   private hasHabitCheckin(label: string, date: string): boolean {
@@ -5452,6 +5536,8 @@ class TaskEditModal extends Modal {
       expected: TaskReferenceExpectedRevision,
     ) => Promise<TaskReferenceResolved | undefined>,
     private readonly preview = false,
+    private childTasks: DidaTask[] = [],
+    private readonly toggleChild?: (task: DidaTask) => Promise<void>,
   ) {
     super(app);
     this.title = task.title;
@@ -5613,6 +5699,7 @@ class TaskEditModal extends Modal {
       this.tags = [...new Set(denseTags.value.split(/[\s,，]+/u).map((tag) => tag.trim()).filter(Boolean))];
     });
     tagsInputEl = denseTags;
+    this.renderRemoteSubtasks();
     const properties = this.contentEl.createEl("details", {
       cls: "helix-task-editor-details",
     });
@@ -5887,6 +5974,74 @@ class TaskEditModal extends Modal {
     });
 
     globalThis.setTimeout(() => title.focus(), 0);
+  }
+
+  private renderRemoteSubtasks(): void {
+    if (this.childTasks.length === 0) return;
+    const section = this.contentEl.createDiv({ cls: "helix-task-editor-subtasks" });
+    const heading = section.createDiv({ cls: "helix-task-editor-section-head" });
+    heading.createEl("strong", { text: "子任务" });
+    const summary = heading.createSpan();
+    const body = section.createDiv({ cls: "helix-task-editor-subtask-body" });
+    const progress = body.createDiv({ cls: "helix-task-editor-progress" });
+    const ring = progress.createDiv({
+      cls: "helix-task-editor-progress-ring",
+      attr: { role: "progressbar", "aria-label": "子任务进度" },
+    });
+    const percentText = ring.createSpan();
+    const countText = progress.createSpan({ cls: "helix-task-editor-progress-count" });
+    const listWrap = body.createDiv({ cls: "helix-task-editor-subtask-list-wrap" });
+    const list = listWrap.createDiv({ cls: "helix-task-editor-subtask-list" });
+    const render = (): void => {
+      list.empty();
+      const completed = this.childTasks.filter(isTaskCompleted).length;
+      const percent = Math.round(completed / this.childTasks.length * 100);
+      summary.setText(`${completed}/${this.childTasks.length} 已完成`);
+      ring.style.setProperty("--helix-task-progress", `${percent}%`);
+      ring.setAttribute("aria-valuenow", String(percent));
+      ring.setAttribute("aria-valuemin", "0");
+      ring.setAttribute("aria-valuemax", "100");
+      percentText.setText(`${percent}%`);
+      countText.setText(`${completed} / ${this.childTasks.length}`);
+      for (const child of completionLast(this.childTasks)) {
+        const row = list.createDiv({ cls: "helix-task-editor-subtask" });
+        const toggle = row.createEl("button", {
+          cls: `helix-task-check${isTaskCompleted(child) ? " is-completed" : ""}`,
+          attr: {
+            "aria-label": isTaskCompleted(child) ? `重新打开 ${child.title}` : `完成 ${child.title}`,
+            title: this.toggleChild ? "切换子任务完成状态" : "子任务状态只读",
+          },
+        });
+        if (isTaskCompleted(child)) setIcon(toggle, "check");
+        toggle.disabled = !this.toggleChild;
+        toggle.addEventListener("click", () => {
+          if (!this.toggleChild) return;
+          toggle.disabled = true;
+          void this.toggleChild(child)
+            .then(() => {
+              this.childTasks = this.childTasks.map((candidate) =>
+                candidate.id === child.id
+                  ? { ...candidate, status: child.status === 2 ? 0 : 2 }
+                  : candidate);
+              render();
+            })
+            .catch((error) => {
+              toggle.disabled = false;
+              new Notice(messageOf(error), 8_000);
+            });
+        });
+        row.createDiv({ cls: "helix-task-editor-subtask-title", text: child.title });
+        const meta = row.createDiv({ cls: "helix-task-editor-subtask-meta" });
+        if (child.dueDate) meta.createSpan({ text: formatShortTime(child.dueDate) });
+        if (child.priority) {
+          meta.createSpan({
+            cls: `is-priority-${child.priority}`,
+            text: child.priority === 5 ? "高" : child.priority === 3 ? "中" : "低",
+          });
+        }
+      }
+    };
+    render();
   }
 
   private renderReferenceEditor(): void {

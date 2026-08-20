@@ -109,6 +109,7 @@ interface WorkbenchOptions {
   ) => Promise<void>;
   onToggleCompletedCollapse: (projectId: string, collapsed: boolean) => void;
   onExpandCompletedProjects: (projectIds: string[]) => void;
+  onStatusPopoverChange?: (open: boolean) => void;
   onError: (error: unknown) => void;
 }
 
@@ -961,6 +962,10 @@ export class ProjectLineageWorkbench {
     }
   }
 
+  hasOpenStatusPopover(): boolean {
+    return this.statusPopover !== null;
+  }
+
   camera(): LineageCamera | undefined {
     if (this.pendingCamera) return { ...this.pendingCamera };
     if (!this.viewport) return this.options.initialCamera
@@ -1755,6 +1760,7 @@ export class ProjectLineageWorkbench {
     });
     this.statusPopover = popover;
     this.statusPopoverAnchor = anchor;
+    this.options.onStatusPopoverChange?.(true);
     anchor.setAttribute("aria-expanded", "true");
     const abort = new AbortController();
     this.statusPopoverAbort = abort;
@@ -1832,6 +1838,7 @@ export class ProjectLineageWorkbench {
   }
 
   private closeStatusPopover(restoreFocus = false): void {
+    const wasOpen = this.statusPopover !== null;
     if (this.statusPopoverListenerTimer !== null) {
       window.clearTimeout(this.statusPopoverListenerTimer);
       this.statusPopoverListenerTimer = null;
@@ -1844,6 +1851,7 @@ export class ProjectLineageWorkbench {
     this.statusPopoverAnchor = null;
     anchor?.setAttribute("aria-expanded", "false");
     if (restoreFocus && anchor?.isConnected) anchor.focus({ preventScroll: true });
+    if (wasOpen) this.options.onStatusPopoverChange?.(false);
   }
 
   private renderCycleActions(

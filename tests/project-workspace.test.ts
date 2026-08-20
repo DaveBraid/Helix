@@ -33,6 +33,21 @@ describe("ProjectWorkspaceService", () => {
     expect((await repo.read(path))?.content).toBe(ordinary);
   });
 
+  it("does not read unrelated Vault Markdown during a project snapshot", async () => {
+    const repo = baseRepository();
+    for (let index = 0; index < 200; index += 1) {
+      repo.set(`Knowledge/Note-${index}.md`, `# 普通笔记 ${index}`);
+    }
+    let unrelatedReads = 0;
+    repo.beforeRead = (path) => {
+      if (path.startsWith("Knowledge/")) unrelatedReads += 1;
+    };
+
+    await workspace(repo).snapshot();
+
+    expect(unrelatedReads).toBe(0);
+  });
+
   it("keeps Helix identity fields strict after the non-Helix prefilter", async () => {
     const repo = baseRepository();
     repo.set("Helix/Projects/Broken/Stage-02.md", [
@@ -3662,6 +3677,13 @@ function workspace(repo: MemoryRepository): ProjectWorkspaceService {
           .filter((path) => path.endsWith(".md"))
           .map(fileFromPath),
       },
+      metadataCache: {
+        getFileCache: (file: { path: string }) => {
+          const kind = /^helix-kind:\s*(helix-(?:project|stage|cycle))\s*$/m
+            .exec(repo.text(file.path) ?? "")?.[1];
+          return kind ? { frontmatter: { "helix-kind": kind } } : null;
+        },
+      },
     } as never,
     repo as never,
     () => "Helix",
@@ -3843,6 +3865,10 @@ class MemoryRepository {
 
   paths(): string[] {
     return [...this.files.keys()];
+  }
+
+  text(path: string): string | undefined {
+    return this.files.get(path);
   }
 
   set(path: string, content: string): void {

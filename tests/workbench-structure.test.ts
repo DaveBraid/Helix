@@ -83,6 +83,7 @@ describe("workbench layout and navigation structure", () => {
       /metadataCache\.on\("changed", \(file\) => \{\s*this\.refreshActiveStatusForPaths\(file\.path\)/,
     );
     expect(main).toContain("if (signature === this.projectStatusSignature) return;");
+    expect(main).toMatch(/editingInsideView[\s\S]*view\.contentEl\.contains\(activeElement\)/);
     expect(view).toMatch(
       /service\.subscribe[\s\S]*activeLeaf === this\.leaf[\s\S]*renderPendingWhileInactive = true/,
     );
@@ -91,6 +92,15 @@ describe("workbench layout and navigation structure", () => {
     );
     expect(view).toMatch(
       /requestAnimationFrame[\s\S]*activeLeaf !== this\.leaf[\s\S]*renderPendingWhileInactive[\s\S]*this\.render\(\)/,
+    );
+  });
+
+  it("keeps the project status popover open across unrelated service broadcasts", () => {
+    expect(view).toMatch(
+      /requestServiceRender\(\)[\s\S]*hasOpenStatusPopover\(\)[\s\S]*renderPendingWhileProjectPopover = true/,
+    );
+    expect(view).toMatch(
+      /onStatusPopoverChange: \(open\)[\s\S]*renderPendingWhileProjectPopover = false[\s\S]*requestServiceRender\(\)/,
     );
   });
 
@@ -339,6 +349,13 @@ describe("workbench layout and navigation structure", () => {
       /withProjectMutation<T>[\s\S]*projectRefreshBatch\.begin\(\)[\s\S]*try[\s\S]*finally[\s\S]*projectRefreshBatch\.end\(\)/,
     );
     expect(main).toMatch(/onunload[\s\S]*projectRefreshBatch\?\.dispose\(\)/);
+    const refreshBody = main.slice(
+      main.indexOf("private scheduleProjectRefresh"),
+      main.indexOf("private deferProjectRefreshForActiveEditor"),
+    );
+    const refreshRunner = refreshBody.slice(refreshBody.indexOf("projectMutationRunner.run"));
+    expect(refreshRunner).not.toContain("projectRefreshBatch.begin()");
+    expect(refreshRunner).not.toContain("projectRefreshBatch.end()");
   });
 
   it("persists focus startup failures into the generic recovery center", () => {

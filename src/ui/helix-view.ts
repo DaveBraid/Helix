@@ -247,6 +247,7 @@ export class HelixView extends ItemView {
   private state: HelixRuntimeState | null = null;
   private unsubscribe: (() => void) | null = null;
   private renderPendingWhileInactive = false;
+  private renderPendingWhileProjectPopover = false;
   private serviceRenderFrame: number | null = null;
   private lastServicePresentationSignature: string | null = null;
   private committedSection: Section | null = null;
@@ -401,6 +402,10 @@ export class HelixView extends ItemView {
 
   private requestServiceRender(): void {
     if (this.closed || this.serviceRenderFrame !== null) return;
+    if (this.section === "projects" && this.projectWorkbench?.hasOpenStatusPopover()) {
+      this.renderPendingWhileProjectPopover = true;
+      return;
+    }
     const ownerWindow = this.containerEl.ownerDocument.defaultView ?? window;
     this.serviceRenderFrame = ownerWindow.requestAnimationFrame(() => {
       this.serviceRenderFrame = null;
@@ -2908,6 +2913,11 @@ export class HelixView extends ItemView {
           .then(() => this.render())
           .catch((error) =>
             new Notice(error instanceof Error ? error.message : String(error), 8_000));
+      },
+      onStatusPopoverChange: (open) => {
+        if (open || !this.renderPendingWhileProjectPopover) return;
+        this.renderPendingWhileProjectPopover = false;
+        this.requestServiceRender();
       },
       onError: (error) =>
         new Notice(error instanceof Error ? error.message : String(error), 8_000),

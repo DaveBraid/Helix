@@ -1831,30 +1831,27 @@ export default class HelixPlugin extends Plugin {
       const markdownPaths = [...this.projectMarkdownRefreshPaths];
       this.projectMarkdownRefreshPaths.clear();
       void this.projectMutationRunner.run(async () => {
-        this.projectRefreshBatch.begin();
-        try {
-          if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
-          if (!this.recoveryMode && markdownPaths.length > 0) {
-            await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
-          }
-          if (!this.recoveryMode) {
-            // 本轮只读取一次稳定工作区，供 Canvas 派生修复和任务派生共同使用。
-            // 任务身份补写也纳入同一 quiet-window，避免每个 marker 再触发一轮全量扫描。
-            const snapshot = await this.projectWorkspace.loadStableWorkspace();
-            await this.repairDerivedProjectCanvasCache(snapshot);
-            this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
-              snapshot,
-              { adoptUnmanaged: markdownPaths.length > 0 },
-            );
-            this.focusBridgeConflictCountCache =
-              (await this.projectWorkspace.listFocusBridgeConflicts()).length;
-            this.projectViewRevision += 1;
-          }
-          await this.service.refreshPersistedEvents();
-          this.projectAutoSync.request();
-        } finally {
-          this.projectRefreshBatch.end();
+        // 扫描本身不是自写事务，禁止 begin/end：end 会安排下一轮扫描，
+        // 进而形成无限刷新。真正的 Markdown/Canvas 写入仍由各 mutation
+        // 或 repairDerivedProjectCanvasCache 单独进入 quiet-window。
+        if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
+        if (!this.recoveryMode && markdownPaths.length > 0) {
+          await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
         }
+        if (!this.recoveryMode) {
+          // 本轮只读取一次稳定工作区，供 Canvas 派生修复和任务派生共同使用。
+          const snapshot = await this.projectWorkspace.loadStableWorkspace();
+          await this.repairDerivedProjectCanvasCache(snapshot);
+          this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+            snapshot,
+            { adoptUnmanaged: markdownPaths.length > 0 },
+          );
+          this.focusBridgeConflictCountCache =
+            (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+          this.projectViewRevision += 1;
+        }
+        await this.service.refreshPersistedEvents();
+        this.projectAutoSync.request();
       }).catch(async (error) => {
         const recoveryIssue = this.projectWorkspace.recoveryIssueMessage();
         const message = error instanceof Error ? error.message : String(error);
@@ -1871,7 +1868,11 @@ export default class HelixPlugin extends Plugin {
   private deferProjectRefreshForActiveEditor(path: string): boolean {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     const normalized = normalizePath(path);
-    if (!view || normalizePath(view.file?.path ?? "") !== normalized || !view.editor.hasFocus()) {
+    const activeElement = view?.contentEl.ownerDocument.activeElement;
+    const editingInsideView = !!view && (
+      view.editor.hasFocus() || (!!activeElement && view.contentEl.contains(activeElement))
+    );
+    if (!view || normalizePath(view.file?.path ?? "") !== normalized || !editingInsideView) {
       return false;
     }
     this.deferredProjectEditorRefreshPaths.add(normalized);
@@ -1880,7 +1881,9 @@ export default class HelixPlugin extends Plugin {
     const ownerWindow = element.ownerDocument.defaultView ?? window;
     const listener: EventListener = () => {
       ownerWindow.requestAnimationFrame(() => {
-        if (this.unloaded || view.editor.hasFocus()) return;
+        const nextActiveElement = view.contentEl.ownerDocument.activeElement;
+        if (this.unloaded || view.editor.hasFocus() ||
+          (!!nextActiveElement && view.contentEl.contains(nextActiveElement))) return;
         element.removeEventListener("focusout", listener, true);
         this.deferredProjectEditorBlurListeners.delete(element);
         const paths = [...this.deferredProjectEditorRefreshPaths];

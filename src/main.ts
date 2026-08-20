@@ -176,6 +176,8 @@ export default class HelixPlugin extends Plugin {
    */
   private localProjectTaskSnapshotCache: LocalProjectTaskSnapshot | null = null;
   private focusBridgeConflictCountCache = 0;
+  /** 派生项目视图缓存每次完成一致性重建后递增，供 UI 区分真实变化与无状态广播。 */
+  private projectViewRevision = 0;
   private readonly persistentNotices = new Set<Notice>();
 
   async onload(): Promise<void> {
@@ -329,6 +331,7 @@ export default class HelixPlugin extends Plugin {
         saveLocalProjectTask: (input) => this.saveLocalProjectTask(input),
         deleteLocalProjectTask: (input) => this.deleteLocalProjectTask(input),
         readFocusBridgeConflictCount: () => this.readFocusBridgeConflictCount(),
+        readProjectViewRevision: () => this.projectViewRevision,
         readProjectWorkspace: (operation) => this.withProjectWorkspaceRead(operation),
         mutateProjectWorkspace: (operation) => this.withWritableProjectMutation(operation),
         repairProjectCanvas: () => this.repairProjectCanvas(),
@@ -544,6 +547,7 @@ export default class HelixPlugin extends Plugin {
         );
         this.focusBridgeConflictCountCache =
           (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+        this.projectViewRevision += 1;
       }
     } catch (error) {
       const message = `${FOCUS_BRIDGE_RECOVERY_PREFIX}${
@@ -1871,6 +1875,7 @@ export default class HelixPlugin extends Plugin {
             );
             this.focusBridgeConflictCountCache =
               (await this.projectWorkspace.listFocusBridgeConflicts()).length;
+            this.projectViewRevision += 1;
           }
           await this.service.refreshPersistedEvents();
           this.projectAutoSync.request();

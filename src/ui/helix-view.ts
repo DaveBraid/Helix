@@ -88,6 +88,7 @@ import {
   isTaskCompleted,
   withTaskDescendants,
 } from "../domain/task-tree";
+import { stableHash } from "../domain/stable";
 import { requestStageBoardStatusChange } from "../domain/stage-board";
 import type {
   ProjectionProjectReadModel,
@@ -245,6 +246,9 @@ export class HelixView extends ItemView {
   private state: HelixRuntimeState | null = null;
   private unsubscribe: (() => void) | null = null;
   private renderPendingWhileInactive = false;
+  private serviceRenderFrame: number | null = null;
+  private lastServicePresentationSignature: string | null = null;
+  private committedSection: Section | null = null;
   private charts: echarts.ECharts[] = [];
   private chartObservers: ResizeObserver[] = [];
   private taskBoardDrag: { taskId: string; sourceColumnId?: string | null } | null = null;
@@ -316,6 +320,7 @@ export class HelixView extends ItemView {
         expectedHash: string;
       }) => Promise<void>;
       readFocusBridgeConflictCount: () => number;
+      readProjectViewRevision: () => number;
       readProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       mutateProjectWorkspace: <T>(operation: () => Promise<T>) => Promise<T>;
       repairProjectCanvas: () => Promise<void>;
@@ -359,10 +364,17 @@ export class HelixView extends ItemView {
     this.viewGeneration += 1;
     this.contentEl.addClass("helix-root");
     this.unsubscribe = this.service.subscribe((state) => {
+      const signature = stableHash({
+        state,
+        projectViewRevision: this.actions.readProjectViewRevision(),
+        focusBridgeConflictCount: this.actions.readFocusBridgeConflictCount(),
+      });
+      if (signature === this.lastServicePresentationSignature) return;
+      this.lastServicePresentationSignature = signature;
       this.state = state;
       if (this.app.workspace.activeLeaf === this.leaf) {
         this.renderPendingWhileInactive = false;
-        void this.render();
+        this.requestServiceRender();
       } else {
         this.renderPendingWhileInactive = true;
       }
@@ -370,7 +382,7 @@ export class HelixView extends ItemView {
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
       if (leaf !== this.leaf || !this.renderPendingWhileInactive) return;
       this.renderPendingWhileInactive = false;
-      void this.render();
+      this.requestServiceRender();
     }));
     // 工作区恢复时 active-leaf-change 可能早于 ItemView.onOpen；下一帧补一次
     // 当前叶子检查，避免活动的 Helix 标签永远停在空白页。
@@ -379,6 +391,19 @@ export class HelixView extends ItemView {
       if (this.closed || this.app.workspace.activeLeaf !== this.leaf ||
           !this.renderPendingWhileInactive) return;
       this.renderPendingWhileInactive = false;
+      this.requestServiceRender();
+    });
+  }
+
+  private requestServiceRender(): void {
+    if (this.closed || this.serviceRenderFrame !== null) return;
+    const ownerWindow = this.containerEl.ownerDocument.defaultView ?? window;
+    this.serviceRenderFrame = ownerWindow.requestAnimationFrame(() => {
+      this.serviceRenderFrame = null;
+      if (this.closed || this.app.workspace.activeLeaf !== this.leaf) {
+        this.renderPendingWhileInactive = true;
+        return;
+      }
       void this.render();
     });
   }
@@ -386,8 +411,14 @@ export class HelixView extends ItemView {
   async onClose(): Promise<void> {
     this.closed = true;
     this.renderPendingWhileInactive = false;
+    this.lastServicePresentationSignature = null;
     this.viewGeneration += 1;
     this.renderToken += 1;
+    if (this.serviceRenderFrame !== null) {
+      const ownerWindow = this.containerEl.ownerDocument.defaultView ?? window;
+      ownerWindow.cancelAnimationFrame(this.serviceRenderFrame);
+      this.serviceRenderFrame = null;
+    }
     this.unsubscribe?.();
     if (this.taskSearchTimer !== null) {
       window.clearTimeout(this.taskSearchTimer);
@@ -426,13 +457,27 @@ export class HelixView extends ItemView {
       this.projectWorkbench = nextWorkbench;
       this.disposeCharts();
       this.contentEl.replaceChildren(shell);
+      this.committedSection = this.section;
       return;
     }
-    this.projectWorkbench?.destroy();
-    this.projectWorkbench = null;
-    this.disposeCharts();
-    this.contentEl.empty();
-    const shell = this.contentEl.createDiv({ cls: "helix-shell" });
+    const previousWorkbench = this.projectWorkbench;
+    const previousContent = this.contentEl.querySelector<HTMLElement>(".helix-content");
+    const preserveScroll = this.committedSection === this.section;
+    const previousScrollTop = preserveScroll ? previousContent?.scrollTop ?? 0 : 0;
+    const previousScrollLeft = preserveScroll ? previousContent?.scrollLeft ?? 0 : 0;
+    // 复盘页需要在已挂载节点内初始化 ECharts；其他页面先离屏完整构建，
+    // 异步读取期间继续显示旧页面，完成后一次替换，避免短暂空白闪烁。
+    const atomic = this.section !== "reviews";
+    if (!atomic) {
+      previousWorkbench?.destroy();
+      this.projectWorkbench = null;
+      this.disposeCharts();
+      this.contentEl.empty();
+    }
+    const shell = atomic
+      ? this.contentEl.ownerDocument.createElement("div")
+      : this.contentEl.createDiv({ cls: "helix-shell" });
+    if (atomic) shell.addClass("helix-shell");
     this.renderSidebar(shell);
     const main = shell.createDiv({ cls: "helix-main" });
     this.renderHeader(main);
@@ -442,6 +487,16 @@ export class HelixView extends ItemView {
     else if (this.section === "reviews") this.renderReviews(content);
     else if (this.section === "challenges") this.renderChallenges(content);
     else await this.renderConflicts(content, token);
+    if (token !== this.renderToken || this.closed) return;
+    if (atomic) {
+      previousWorkbench?.destroy();
+      this.projectWorkbench = null;
+      this.disposeCharts();
+      this.contentEl.replaceChildren(shell);
+      content.scrollTop = previousScrollTop;
+      content.scrollLeft = previousScrollLeft;
+    }
+    this.committedSection = this.section;
   }
 
   private renderSidebar(shell: HTMLElement): void {

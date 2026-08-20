@@ -91,6 +91,19 @@ describe("workbench layout and navigation structure", () => {
     );
   });
 
+  it("deduplicates service broadcasts and swaps async pages atomically", () => {
+    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(view).toMatch(
+      /lastServicePresentationSignature[\s\S]*stableHash\(\{[\s\S]*projectViewRevision/,
+    );
+    expect(view).toMatch(/requestServiceRender[\s\S]*requestAnimationFrame/);
+    expect(view).toMatch(
+      /const atomic = this\.section !== "reviews"[\s\S]*this\.contentEl\.replaceChildren\(shell\)/,
+    );
+    expect(view).toMatch(/previousScrollTop[\s\S]*content\.scrollTop = previousScrollTop/);
+    expect(main.match(/projectViewRevision \+= 1/g)).toHaveLength(2);
+  });
+
   it("does not render the retired project-linked-task panel", () => {
     expect(view).not.toContain("renderProjectLinkedTasks");
     expect(view).not.toContain("项目关联任务");

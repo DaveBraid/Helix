@@ -5,6 +5,10 @@ import { WORKBENCH_NAVIGATION } from "../src/domain/workbench-navigation";
 
 describe("workbench layout and navigation structure", () => {
   const view = readFileSync(resolve(process.cwd(), "src/ui/helix-view.ts"), "utf8");
+  const unifiedTaskEditor = readFileSync(
+    resolve(process.cwd(), "src/ui/unified-task-detail-modal.ts"),
+    "utf8",
+  );
   const css = readFileSync(resolve(process.cwd(), "styles.css"), "utf8");
   const projectWorkspace = readFileSync(
     resolve(process.cwd(), "src/services/project-workspace.ts"),
@@ -31,7 +35,6 @@ describe("workbench layout and navigation structure", () => {
     readFileSync(resolve(process.cwd(), "src/services/dida-project-projection-coordinator.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/domain/dida-project-projection.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/storage/model.ts"), "utf8"),
-    readFileSync(resolve(process.cwd(), "src/services/task-references.ts"), "utf8"),
     readFileSync(resolve(process.cwd(), "src/domain/stage-focus-bridge.ts"), "utf8"),
     projectWorkspace,
   ].join("\n");
@@ -126,7 +129,7 @@ describe("workbench layout and navigation structure", () => {
     expect(localRead).not.toContain("withWritableProjectMutation");
     expect(view).toMatch(/render\(\)[\s\S]*refreshLocalProjectTaskSnapshot\(token\)/);
     expect(view).toMatch(/localProjectTaskDidaTasks[\s\S]*this\.localProjectTaskSnapshot/);
-    expect(view).toMatch(/saveLocalProjectTask[\s\S]*LocalProjectTaskEditModal/);
+    expect(view).toMatch(/saveLocalProjectTask[\s\S]*UnifiedTaskDetailModal/);
     expect(localTasks).not.toMatch(/data\.json|HelixDataStore|OfflineQueue/);
   });
 
@@ -140,53 +143,39 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*const snapshot = await this\.projectWorkspace\.loadStableWorkspace\(\)[\s\S]*repairDerivedProjectCanvasCache\(snapshot\)[\s\S]*localProjectTasks\.snapshot/);
     expect(view).toContain("flattenTaskTree(visibleTasks)");
     expect(view).toContain("hideCompletedTasks");
-    expect(view).toContain("renderRemoteSubtasks");
+    expect(view).toContain("didaTaskDetailDraft");
     expect(localTasks).toContain("byRemoteParentTaskId");
     expect(css).toContain(".helix-task-row.is-subtask");
   });
 
-  it("uses one compact editor shell and exposes local subtasks without Dida writes", () => {
-    const localEditor = view.slice(
-      view.indexOf("class LocalProjectTaskEditModal"),
-      view.indexOf("function knownReminderPreset"),
-    );
-    expect(view).toContain('class LocalProjectTaskEditModal extends Modal');
-    expect(view).toContain('class TaskEditModal extends Modal');
-    expect(view.match(/addClass\("helix-task-editor-modal"\)/g)).toHaveLength(2);
-    expect(localEditor).toContain('addClass("helix-task-editor", "is-local-task-editor")');
-    expect(view.slice(view.indexOf("class TaskEditModal"))).toMatch(
-      /addClass\([\s\S]*?"helix-task-editor"[\s\S]*?"is-dida-task-editor"/,
-    );
-    expect(view).toMatch(/LocalProjectTaskEditModal[\s\S]*添加子任务[\s\S]*void this\.save\(/);
-    expect(localEditor).toMatch(/const properties = this\.contentEl\.createDiv\(\{ cls: "helix-task-editor-properties" \}\)/);
+  it("uses one compact editor shell for all task sources", () => {
+    expect(view).not.toContain("class LocalProjectTaskEditModal");
+    expect(view).not.toContain("class TaskEditModal");
+    expect(unifiedTaskEditor).toContain("export class UnifiedTaskDetailModal extends Modal");
+    expect(unifiedTaskEditor.match(/addClass\("helix-task-editor-modal"/g)).toHaveLength(1);
+    expect(view.match(/new UnifiedTaskDetailModal/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(unifiedTaskEditor).toContain('placeholder: "添加子任务"');
+    expect(unifiedTaskEditor).toContain('cls: "helix-task-editor-properties"');
     expect(css).toMatch(/\.helix-task-editor-modal[\s\S]*\.helix-task-editor-properties/);
-    expect(localEditor).toMatch(/helix-task-editor-title-row[\s\S]*helix-task-editor-properties/);
-    expect(localEditor).toMatch(/timeMode[\s\S]*"none"[\s\S]*"point"[\s\S]*"range"/);
     expect(css).toMatch(/\.helix-task-editor-time-inputs input \{[\s\S]*width: 70px;[\s\S]*min-width: 70px;[\s\S]*padding: 0;/);
-    expect(localEditor).toMatch(/openTimePicker[\s\S]*showPicker\(\)/);
-    expect(localEditor).toMatch(/helix-task-editor-date-picker[\s\S]*上个月[\s\S]*下个月[\s\S]*helix-task-editor-calendar-grid/);
-    expect(localEditor).not.toContain('type: "date",\n      value: this.scheduleDate');
-    expect(localEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
-    expect(localEditor).toMatch(/helix-task-editor-subtask-grip[\s\S]*draggable: "true"[\s\S]*dragstart[\s\S]*drop/);
-    expect(localEditor).not.toContain('placeholder: "添加备注…"');
-    expect(localEditor).not.toContain('text: "时区"');
-    expect(css).toMatch(/Dense task canvas[\s\S]*grid-template-columns: repeat\(3/);
+    expect(unifiedTaskEditor).toMatch(/helix-task-editor-date-picker[\s\S]*上个月[\s\S]*下个月[\s\S]*helix-task-editor-calendar-grid/);
+    expect(unifiedTaskEditor).toMatch(/helix-task-editor-progress-ring[\s\S]*aria-valuenow/);
+    expect(unifiedTaskEditor).toMatch(/helix-task-editor-subtask-grip[\s\S]*dragstart[\s\S]*drop/);
+    expect(unifiedTaskEditor).not.toContain('placeholder: "添加备注…"');
+    expect(unifiedTaskEditor).not.toContain('text: "时区"');
   });
 
-  it("reuses the Dense task shell for Dida details without a duplicate notes surface", () => {
-    const didaEditor = view.slice(
-      view.indexOf("class TaskEditModal"),
-      view.indexOf("private renderReferenceEditor", view.indexOf("class TaskEditModal")),
-    );
-    expect(didaEditor).toMatch(/is-local-task-editor[\s\S]*is-dida-task-editor/);
-    expect(didaEditor).toMatch(/helix-task-editor-context[\s\S]*helix-task-editor-title-row[\s\S]*helix-task-editor-properties[\s\S]*helix-task-editor-details/);
-    expect(didaEditor).toMatch(/denseProperty\("状态"[\s\S]*denseProperty\("优先级"[\s\S]*denseProperty\("日期"[\s\S]*denseProperty\("时间"[\s\S]*denseProperty\("标签"/);
-    expect(didaEditor).toContain('propertiesSummary.createSpan({ text: "滴答扩展" })');
-    expect(didaEditor).not.toContain("helix-task-editor-content");
-    expect(didaEditor).not.toContain('.setName("时区")');
-    expect(didaEditor).not.toContain('.setName("开始时间")');
-    expect(didaEditor).not.toContain('.setName("截止时间")');
-    expect(css).toMatch(/is-dida-task-editor[\s\S]*grid-template-columns: repeat\(2/);
+  it("keeps source differences in adapters and removes Task Reference runtime support", () => {
+    expect(view).toContain('source: "stage-action"');
+    expect(view).toContain('source: "stage-projection"');
+    expect(view).toContain('source: "dida"');
+    expect(unifiedTaskEditor).toContain('text: "更多属性"');
+    expect(unifiedTaskEditor).not.toContain("滴答扩展");
+    expect(unifiedTaskEditor).not.toContain("Helix 关联");
+    expect(view).not.toContain("saveTaskReference(");
+    expect(view).not.toContain("TaskReferenceRebindModal");
+    expect(view).not.toContain("TaskReference");
+    expect(view).not.toContain("关联诊断");
   });
 
   it("renders remote completion truth before allowing the completion control to reopen it", () => {
@@ -390,8 +379,6 @@ describe("workbench layout and navigation structure", () => {
     const diagnosticOldTerms = /(?:new (?:Error|FocusBridgeError)|corrupt\(|issues\.push\(|reasons\.add\(|message:\s*)[^\n]*(?:投影|受管链接区块|托管|非托管|受管(?:引用|标记|包络|块))/u;
     expect(userReachableDiagnostics).not.toMatch(diagnosticOldTerms);
     expect(userReachableDiagnostics).toContain("滴答项目同步分栏创建");
-    expect(userReachableDiagnostics).toContain("Helix 自动链接区块无效");
-    expect(userReachableDiagnostics).toContain("自动引用区域缺失、重复或顺序错误");
     expect(userReachableDiagnostics).toContain("尚未交由 Helix 管理");
   });
 

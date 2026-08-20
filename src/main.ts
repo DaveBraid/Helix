@@ -33,7 +33,6 @@ import {
   canSilentlyRepairProjectCanvas,
   ProjectWorkspaceService,
 } from "./services/project-workspace";
-import { TaskReferenceService } from "./services/task-references";
 import { SerializedRunner } from "./services/serialized-runner";
 import { TaskMatrixRuleUpdater } from "./services/task-view-settings";
 import { autoSyncPlan } from "./services/auto-sync";
@@ -141,7 +140,6 @@ export default class HelixPlugin extends Plugin {
   vaultRepository!: HelixVaultRepository;
   templateManager!: HelixTemplateManager;
   projectWorkspace!: ProjectWorkspaceService;
-  taskReferences!: TaskReferenceService;
   localProjectTasks!: LocalProjectTaskService;
   projectProjection!: DidaProjectProjectionService;
   private projectAutoSync!: ProjectAutoSyncCoordinator;
@@ -206,12 +204,6 @@ export default class HelixPlugin extends Plugin {
       () => this.settings.rootFolder,
       () => this.settings.lineageCanvasPath,
       (requests) => this.templateManager.renderMany(requests),
-    );
-    this.taskReferences = new TaskReferenceService(
-      this.app,
-      this.vaultRepository,
-      this.projectWorkspace,
-      () => this.settings.rootFolder,
     );
     this.localProjectTasks = new LocalProjectTaskService(
       new VaultProjectionMarkdownAdapter(this.vaultRepository),
@@ -324,7 +316,6 @@ export default class HelixPlugin extends Plugin {
           this.showManageRelationModal(relationId, onChanged),
         openProjectFile: (path) => this.openFile(path),
         projectWorkspace: this.projectWorkspace,
-        taskReferences: this.taskReferences,
         readLocalProjectTasks: () => this.readLocalProjectTasks(),
         createLocalProjectTask: (input) => this.createLocalProjectTask(input),
         updateLocalProjectTask: (input) => this.updateLocalProjectTask(input),
@@ -452,10 +443,6 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(file.path);
           return;
         }
-        if (this.taskReferences.isKnownTaskReferencePath(file.path)) {
-          this.scheduleProjectRefresh();
-          return;
-        }
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
@@ -471,20 +458,13 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(file.path);
           return;
         }
-        if (this.taskReferences.isKnownTaskReferencePath(file.path)) {
-          this.scheduleProjectRefresh();
-          return;
-        }
         this.scheduleProjectIdentityProbe(file.path);
       }),
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
         this.refreshActiveStatusForPaths(file.path);
-        if (
-          this.isProjectWorkspaceFile(file.path) ||
-          this.taskReferences.isKnownTaskReferencePath(file.path)
-        ) {
+        if (this.isProjectWorkspaceFile(file.path)) {
           this.scheduleProjectRefresh(file.path);
         }
       }),
@@ -499,13 +479,6 @@ export default class HelixPlugin extends Plugin {
           this.scheduleProjectRefresh(
             this.isProjectWorkspaceFile(file.path) ? file.path : oldPath,
           );
-          return;
-        }
-        if (
-          this.taskReferences.isKnownTaskReferencePath(file.path) ||
-          this.taskReferences.isKnownTaskReferencePath(oldPath)
-        ) {
-          this.scheduleProjectRefresh();
           return;
         }
         this.scheduleProjectIdentityProbe(file.path);
@@ -1942,14 +1915,9 @@ export default class HelixPlugin extends Plugin {
     const timer = window.setTimeout(() => {
       this.projectIdentityProbeTimers.delete(normalized);
       if (this.unloaded || this.isProjectWorkspaceFile(normalized)) return;
-      void Promise.all([
-        this.projectWorkspace.hasProjectWorkspaceIdentity(normalized),
-        this.taskReferences.hasTaskReferenceIdentity(normalized),
-      ])
-        .then(([isProjectWorkspaceMarkdown, isTaskReferenceMarkdown]) => {
-          if (isProjectWorkspaceMarkdown || isTaskReferenceMarkdown) {
-            this.scheduleProjectRefresh(normalized);
-          }
+      void this.projectWorkspace.hasProjectWorkspaceIdentity(normalized)
+        .then((isProjectWorkspaceMarkdown) => {
+          if (isProjectWorkspaceMarkdown) this.scheduleProjectRefresh(normalized);
         })
         .catch((error) => {
           console.warn("Helix 无法检查 Markdown 的项目身份", error);

@@ -1,7 +1,7 @@
 {
   "id": "helix-productivity",
   "name": "Helix",
-  "version": "1.0.2",
+  "version": "2.0.0",
   "minAppVersion": "1.12.2",
   "description": "面向科研工作的任务、项目阶段、复盘、分析与挑战工作台。",
   "author": "Ethan Lee",

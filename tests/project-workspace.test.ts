@@ -558,7 +558,7 @@ describe("ProjectWorkspaceService", () => {
     )).rejects.toThrow(/已经变化/);
   });
 
-  it("keeps the configured project order after creating a stage", async () => {
+  it("keeps every existing project node fixed after creating a stage", async () => {
     const repo = baseRepository();
     repo.set("Helix/Projects/Beta/Project.md", project("project-2", "Beta"));
     repo.set("Helix/Projects/Beta/Cycle-01.md", cycle("cycle-2", "project-2", 1)
@@ -583,6 +583,8 @@ describe("ProjectWorkspaceService", () => {
       },
     );
     repo.set(CANVAS, JSON.stringify(canvas));
+    const beforePositions = new Map(canvas.nodes.map((node: { id: string; x: number; y: number }) =>
+      [node.id, { x: node.x, y: node.y }] as const));
 
     await workspace(repo).createCycle(
       "project-1",
@@ -596,18 +598,10 @@ describe("ProjectWorkspaceService", () => {
       version: 1,
       projectIds: ["project-1", "project-2"],
     });
-    const stageNodes = next.nodes.filter((node: {
-      helixNodeKind?: string;
-      helixProjectId?: string;
-      y: number;
-    }) => node.helixNodeKind === "cycle");
-    const firstTop = Math.min(...stageNodes
-      .filter((node: { helixProjectId?: string }) => node.helixProjectId === "project-1")
-      .map((node: { y: number }) => node.y));
-    const secondTop = Math.min(...stageNodes
-      .filter((node: { helixProjectId?: string }) => node.helixProjectId === "project-2")
-      .map((node: { y: number }) => node.y));
-    expect(firstTop).toBeLessThan(secondTop);
+    for (const node of next.nodes) {
+      const before = beforePositions.get(node.id);
+      if (before) expect({ x: node.x, y: node.y }).toEqual(before);
+    }
   });
 
   it("undoes and redoes exact Canvas move bytes and rejects an external edit", async () => {
@@ -2415,8 +2409,8 @@ describe("ProjectWorkspaceService", () => {
       "project-1": ["1", "2.1", "2.2"],
     });
     expect(repo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ helixStageId: first.id, x: 816, y: 300 }),
-      expect.objectContaining({ helixStageId: second.id, x: 816, y: 500 }),
+      expect.objectContaining({ helixStageId: first.id, x: 408, y: 300 }),
+      expect.objectContaining({ helixStageId: second.id, x: 408, y: 500 }),
     ]));
   });
 
@@ -2494,6 +2488,10 @@ describe("ProjectWorkspaceService", () => {
       helixRelation: "inherit",
     });
     repo.set(CANVAS, JSON.stringify(canvas));
+    const beforeMergePositions = new Map(canvas.nodes.map(
+      (node: { id: string; x: number; y: number }) =>
+        [node.id, { x: node.x, y: node.y }] as const,
+    ));
 
     const merged = await workspace(repo).createCycle(
       "project-1",
@@ -2524,9 +2522,13 @@ describe("ProjectWorkspaceService", () => {
     );
     expect(repo.json(CANVAS).nodes).toContainEqual(expect.objectContaining({
       helixStageId: merged.id,
-      x: 816,
-      y: 200,
+      x: 408,
+      y: 450,
     }));
+    for (const node of repo.json(CANVAS).nodes) {
+      const before = beforeMergePositions.get(node.id);
+      if (before) expect({ x: node.x, y: node.y }).toEqual(before);
+    }
     expect((await repo.read(merged.notePath))?.content)
       .toContain('helix-stage-code: "4"');
   });
@@ -2651,8 +2653,8 @@ describe("ProjectWorkspaceService", () => {
       (node: Record<string, unknown>) => node.helixNodeKind === "stage",
     );
     expect(stages).toEqual([
-      expect.objectContaining({ x: 816, y: 300 }),
-      expect.objectContaining({ x: 816, y: 500 }),
+      expect.objectContaining({ x: 408, y: 300 }),
+      expect.objectContaining({ x: 408, y: 500 }),
     ]);
   });
 
@@ -2669,17 +2671,29 @@ describe("ProjectWorkspaceService", () => {
         secondaryStageTitle: "下方分支",
       },
     );
+    const coordinates = (): Map<string, { x: unknown; y: unknown }> => new Map(
+      repo.json(CANVAS).nodes.map((node: Record<string, unknown>) => [
+        String(node.id),
+        { x: node.x, y: node.y },
+      ]),
+    );
+    const expectCoordinatesUnchanged = (
+      before: ReadonlyMap<string, { x: unknown; y: unknown }>,
+    ): void => {
+      const after = coordinates();
+      for (const [id, position] of before) expect(after.get(id)).toEqual(position);
+    };
     const lower = (await service.snapshot()).projects[0]!.cycles.find((cycle) =>
       cycle.title === "下方分支")!;
+    const beforeFirstSuccessor = coordinates();
     const successor = await service.createCycle(
       "project-1",
       "inherit",
       [lower.id],
       { stageTitle: "下方后继" },
     );
-    const beforeContinuation = new Map(repo.json(CANVAS).nodes
-      .filter((node: Record<string, unknown>) => node.helixNodeKind !== "project")
-      .map((node: Record<string, unknown>) => [node.id, node.y]));
+    expectCoordinatesUnchanged(beforeFirstSuccessor);
+    const beforeContinuation = coordinates();
     const nextSuccessor = await service.createCycle(
       "project-1",
       "inherit",
@@ -2693,11 +2707,9 @@ describe("ProjectWorkspaceService", () => {
       node.helixStageId === successor.id);
     const nextSuccessorNode = nodes.find((node: Record<string, unknown>) =>
       node.helixStageId === nextSuccessor.id);
-    for (const [id, y] of beforeContinuation) {
-      expect(nodes.find((node: Record<string, unknown>) => node.id === id)?.y).toBe(y);
-    }
-    expect(successorNode).toMatchObject({ x: 1_224, y: lowerNode.y });
-    expect(nextSuccessorNode).toMatchObject({ x: 1_632, y: lowerNode.y });
+    expectCoordinatesUnchanged(beforeContinuation);
+    expect(successorNode).toMatchObject({ x: 816, y: lowerNode.y });
+    expect(nextSuccessorNode).toMatchObject({ x: 1_224, y: lowerNode.y });
     expect(successorNode.y).toBe(lowerNode.y);
   });
 
@@ -2712,7 +2724,7 @@ describe("ProjectWorkspaceService", () => {
     );
     expect(repo.json(CANVAS).nodes).toContainEqual(expect.objectContaining({
       helixStageId: expect.any(String),
-      x: 816,
+      x: 408,
       y: 300,
     }));
     await expect(service.createCycle(
@@ -3260,7 +3272,7 @@ describe("ProjectWorkspaceService", () => {
     ]));
     expect(next.nodes).toContainEqual(expect.objectContaining({
       helixStageId: created.id,
-      x: 816,
+      x: 408,
       y: 650,
     }));
     await expect(workspace(repo).snapshot()).resolves.toMatchObject({

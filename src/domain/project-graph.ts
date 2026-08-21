@@ -45,6 +45,7 @@ const Y_GAP = 72;
 const CARD_WIDTH = 248;
 const CARD_HEIGHT = 128;
 export const PROJECT_GRAPH_ROW_STEP = CARD_HEIGHT + Y_GAP;
+export const PROJECT_GRAPH_COLUMN_STEP = CARD_WIDTH + X_GAP;
 const PROJECT_TO_STAGE_GAP = 160;
 const PROJECT_SIDE_PADDING = 28;
 const PROJECT_TOP_PADDING = 58;
@@ -165,7 +166,6 @@ export function planProjectGraphLayout(
   stages: StageLayoutNode[],
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
-  preferredYByStage?: ReadonlyMap<string, number>,
 ): ProjectGraphLayout {
   const stagesByProject = new Map<string, StageLayoutNode[]>();
   for (const stage of stages) {
@@ -242,16 +242,10 @@ export function planProjectGraphLayout(
     return {
       ...stage,
       x: CARD_WIDTH + PROJECT_TO_STAGE_GAP +
-        (depth(stage.id) - 1) * (CARD_WIDTH + X_GAP),
+        (depth(stage.id) - 1) * PROJECT_GRAPH_COLUMN_STEP,
       y: (laneStart.get(stage.projectId) ?? 0) + row * PROJECT_GRAPH_ROW_STEP,
     };
   });
-  if (preferredYByStage && preferredYByStage.size > 0) {
-    nextStages = nextStages.map((stage) => {
-      const preferredY = preferredYByStage.get(stage.id);
-      return preferredY === undefined ? stage : { ...stage, y: preferredY };
-    });
-  }
   let nextProjects = projectOrder.map((project) => {
     const projectStages = nextStages.filter((stage) => stage.projectId === project.id);
     if (scope) return { ...project };

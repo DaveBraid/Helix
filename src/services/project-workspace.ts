@@ -33,6 +33,7 @@ import {
   normalizeProjectGraph,
   planDeletionBridges,
   planProjectGraphLayout,
+  PROJECT_GRAPH_COLUMN_STEP,
   PROJECT_GRAPH_ROW_STEP,
   type ProjectGraphEdge,
 } from "../domain/project-graph";
@@ -4473,18 +4474,21 @@ export class ProjectWorkspaceService {
         ...before,
         projects: [...before.projects, plannedProject],
       });
-      const plannedProjects = [...before.projects, plannedProject];
-      const plannedSnapshot: ProjectWorkspaceSnapshot = {
-        ...before,
-        projects: plannedProjects,
-        canvasNodes: managedCanvasNodeViews(canvas.document, plannedProjects),
-      };
-      applyManagedLayout(
-        canvas.document,
-        plannedSnapshot,
-        physicalManagedEdges(canvas.document),
-        new Set([cycleId]),
-      );
+      const initialY = before.canvasNodes.some((node) => node.kind === "cycle")
+        ? Math.max(...before.canvasNodes
+          .filter((node) => node.kind === "cycle")
+          .map((node) => node.y)) + PROJECT_GRAPH_ROW_STEP
+        : 0;
+      const projectNode = canvas.document.nodes.find((node) =>
+        node.helixManaged === true &&
+        node.helixNodeKind === "project" &&
+        node.helixProjectId === projectId);
+      const stageNode = canvas.document.nodes.find((node) => managedStageId(node) === cycleId);
+      if (!projectNode || !stageNode) throw new Error("新项目的 Canvas 节点补齐失败");
+      projectNode.x = 0;
+      projectNode.y = Math.round(initialY);
+      stageNode.x = PROJECT_GRAPH_COLUMN_STEP;
+      stageNode.y = Math.round(initialY);
       canvas.document.helixStageSequences = {
         ...validatedStageSequenceLedger(canvas.document),
         [projectId]: 1,
@@ -4788,25 +4792,18 @@ export class ProjectWorkspaceService {
       if (sourceNodes.some((node) => !node)) {
         throw new Error("Canvas 中缺少合并关系的前置阶段");
       }
-      const right = Math.max(...sourceNodes.map((node) =>
-        canvasNumber(node!.x, 0) + canvasNumber(node!.width, 360)));
-      const centers = sourceNodes.map((node) =>
-        canvasNumber(node!.y, 0) + canvasNumber(node!.height, 220) / 2);
+      const rightmostX = Math.max(...sourceNodes.map((node) => canvasNumber(node!.x, 0)));
+      const sourceYs = sourceNodes.map((node) => canvasNumber(node!.y, 0));
       const target = targetNodes[0]!;
-      target.x = Math.round(right + 160);
-      target.y = Math.round(
-        centers.reduce((sum, value) => sum + value, 0) / centers.length -
-        canvasNumber(target.height, 220) / 2,
-      );
+      target.x = Math.round(rightmostX + PROJECT_GRAPH_COLUMN_STEP);
+      target.y = Math.round(sourceYs.reduce((sum, value) => sum + value, 0) / sourceYs.length);
       } else {
       const sourceId = predecessors[0]!;
       const source = canvasNodeByCycle.get(sourceId);
       if (!source) throw new Error("Canvas 中缺少前置阶段");
       const sourceX = canvasNumber(source.x, 0);
       const sourceY = canvasNumber(source.y, 0);
-      const sourceWidth = canvasNumber(source.width, 360);
-      const sourceHeight = canvasNumber(source.height, 220);
-      const targetX = sourceX + sourceWidth + 160;
+      const targetX = sourceX + PROJECT_GRAPH_COLUMN_STEP;
       if (relationKind === "inherit") {
         targetNodes[0]!.x = Math.round(targetX);
         targetNodes[0]!.y = Math.round(sourceY);
@@ -4817,13 +4814,11 @@ export class ProjectWorkspaceService {
           .filter((node): node is CanvasNode => Boolean(node));
         const nextBranchY = existingTargets.length === 0
           ? sourceY
-          : Math.max(...existingTargets.map((node) =>
-              canvasNumber(node.y, sourceY) + canvasNumber(node.height, 220))) + 80;
+          : Math.max(...existingTargets.map((node) => canvasNumber(node.y, sourceY))) +
+            PROJECT_GRAPH_ROW_STEP;
         targetNodes.forEach((target, index) => {
           target.x = Math.round(targetX);
-          target.y = Math.round(
-            nextBranchY + index * (canvasNumber(target.height, sourceHeight) + 80),
-          );
+          target.y = Math.round(nextBranchY + index * PROJECT_GRAPH_ROW_STEP);
         });
       }
       }
@@ -4908,80 +4903,6 @@ export class ProjectWorkspaceService {
         physical,
       );
       applyNormalizedManagedEdges(canvas.document, normalized.edges);
-      const plannedProjects = snapshot.projects.map((candidate) =>
-        candidate.id !== projectId
-          ? candidate
-          : {
-              ...candidate,
-              cycles: [
-                ...candidate.cycles,
-                ...specs.map((spec) => ({
-                  id: spec.id,
-                  title: spec.stageTitle,
-                  notePath: spec.path,
-                  sequence: spec.sequence,
-                  stageCode: spec.stageCode,
-                  status: "idea" as const,
-                })),
-              ],
-            });
-      const plannedNodes = [
-        ...snapshot.canvasNodes,
-        ...specs.map((spec) => {
-          const node = canvas.document.nodes.find((candidate) =>
-            managedStageId(candidate) === spec.id);
-          if (!node) throw new Error("Canvas 中缺少新建阶段节点");
-          return canvasNodeView(node, {
-            entityId: spec.id,
-            projectId,
-            kind: "cycle",
-            notePath: spec.path,
-            title: spec.stageTitle,
-          });
-        }),
-      ];
-      const layoutSnapshot: ProjectWorkspaceSnapshot = {
-        ...snapshot,
-        projects: plannedProjects,
-        canvasNodes: plannedNodes,
-        relations: normalized.relations,
-      };
-      const preferredYByStage = new Map(snapshot.canvasNodes
-        .filter((node) => node.kind === "cycle")
-        .map((node) => [node.entityId, node.y] as const));
-      if (relationKind === "inherit") {
-        const parentY = snapshot.canvasNodes.find((node) =>
-          node.kind === "cycle" && node.entityId === predecessors[0])?.y;
-        if (parentY !== undefined) {
-          for (const spec of specs) preferredYByStage.set(spec.id, parentY);
-        }
-      } else if (relationKind === "branch") {
-        const parentId = predecessors[0]!;
-        const parentY = snapshot.canvasNodes.find((node) =>
-          node.kind === "cycle" && node.entityId === parentId)?.y;
-        if (parentY !== undefined) {
-          const existingSuccessorIds = new Set(physical
-            .filter((edge) => edge.fromCycleId === parentId)
-            .map((edge) => edge.toCycleId)
-            .filter((id) => !specs.some((spec) => spec.id === id)));
-          const existingSuccessorYs = snapshot.canvasNodes
-            .filter((node) => node.kind === "cycle" && existingSuccessorIds.has(node.entityId))
-            .map((node) => node.y);
-          const firstY = existingSuccessorYs.length === 0
-            ? parentY
-            : Math.max(parentY, ...existingSuccessorYs) + PROJECT_GRAPH_ROW_STEP;
-          specs.forEach((spec, index) => {
-            preferredYByStage.set(spec.id, firstY + index * PROJECT_GRAPH_ROW_STEP);
-          });
-        }
-      }
-      applyManagedLayout(
-        canvas.document,
-        layoutSnapshot,
-        physical,
-        affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
-        preferredYByStage,
-      );
       this.assertActive(generation);
       await this.applyAtomicWorkspaceChange({
         label: specs.length > 1 ? `创建 ${specs.length} 个阶段` : "创建阶段",
@@ -5502,7 +5423,6 @@ function applyManagedLayout(
   snapshot: ProjectWorkspaceSnapshot,
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
-  preferredYByStage?: ReadonlyMap<string, number>,
 ): void {
   const viewByEntity = new Map(snapshot.canvasNodes.map((node) => [node.entityId, node]));
   const layout = planProjectGraphLayout(
@@ -5523,7 +5443,6 @@ function applyManagedLayout(
       })),
     edges,
     scope,
-    preferredYByStage,
   );
   const position = new Map([
     ...layout.projects.map((node) => [node.id, node] as const),

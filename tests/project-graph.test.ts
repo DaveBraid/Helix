@@ -259,6 +259,27 @@ describe("project graph presentation", () => {
     expect(secondTop).toBeGreaterThan(firstTop);
   });
 
+  it("keeps a newly inherited successor on its direct parent's row", () => {
+    const layout = planProjectGraphLayout(
+      [{ id: "project", x: 0, y: 0 }],
+      [
+        { id: "root", projectId: "project", sequence: 1, x: 408, y: 0 },
+        { id: "upper", projectId: "project", sequence: 2, x: 816, y: 0 },
+        { id: "lower", projectId: "project", sequence: 3, x: 816, y: 200 },
+        { id: "successor", projectId: "project", sequence: 4, x: 1_224, y: 0 },
+      ],
+      [
+        edge("root-upper", "root", "upper"),
+        edge("root-lower", "root", "lower"),
+        edge("lower-successor", "lower", "successor"),
+      ],
+      new Set(["root", "upper", "lower", "successor"]),
+      new Map([["successor", "lower"]]),
+    );
+    expect(layout.stages.find((stage) => stage.id === "successor")?.y)
+      .toBe(layout.stages.find((stage) => stage.id === "lower")?.y);
+  });
+
   it("sizes project lanes by the busiest depth row instead of total stage count", () => {
     const layout = planProjectGraphLayout(
       [

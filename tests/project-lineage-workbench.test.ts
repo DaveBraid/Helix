@@ -6,6 +6,7 @@ import type {
 import {
   completedLineageProjection,
   creationSourcesFromSelection,
+  lineageAncestorHighlight,
   lineageCardDragAllowed,
   lineageCameraFrame,
   lineageFocusBehavior,
@@ -37,6 +38,31 @@ import {
   lineageZoomLabel,
   projectedLineageRelations,
 } from "../src/ui/project-lineage-workbench";
+
+describe("Project Lineage ancestor hover highlight", () => {
+  it("keeps every upstream merge branch but excludes descendants and unrelated nodes", () => {
+    const highlight = lineageAncestorHighlight("merge", [
+      { sourceId: "root", targetId: "upper" },
+      { sourceId: "root", targetId: "lower" },
+      { sourceId: "upper", targetId: "merge" },
+      { sourceId: "lower", targetId: "merge" },
+      { sourceId: "merge", targetId: "descendant" },
+      { sourceId: "unrelated", targetId: "unrelated-child" },
+    ]);
+    expect([...highlight.entityIds].sort()).toEqual([
+      "lower",
+      "merge",
+      "root",
+      "upper",
+    ]);
+    expect([...highlight.edgeKeys].sort()).toEqual([
+      "lower\u0000merge",
+      "root\u0000lower",
+      "root\u0000upper",
+      "upper\u0000merge",
+    ]);
+  });
+});
 
 describe("Project Lineage arrange scope", () => {
   const nodes = [

@@ -982,6 +982,35 @@ export function projectedLineageRelations(
   }));
 }
 
+export function lineageProjectedEdgeKey(sourceId: string, targetId: string): string {
+  return `${sourceId}\u0000${targetId}`;
+}
+
+export function lineageAncestorHighlight(
+  hoveredStageId: string,
+  relations: ReadonlyArray<Pick<LineageProjectedRelation, "sourceId" | "targetId">>,
+): { entityIds: Set<string>; edgeKeys: Set<string> } {
+  const entityIds = new Set([hoveredStageId]);
+  const edgeKeys = new Set<string>();
+  const incoming = new Map<string, Array<{ sourceId: string; targetId: string }>>();
+  for (const relation of relations) {
+    const group = incoming.get(relation.targetId) ?? [];
+    group.push(relation);
+    incoming.set(relation.targetId, group);
+  }
+  const queue = [hoveredStageId];
+  while (queue.length > 0) {
+    const targetId = queue.shift()!;
+    for (const relation of incoming.get(targetId) ?? []) {
+      edgeKeys.add(lineageProjectedEdgeKey(relation.sourceId, relation.targetId));
+      if (entityIds.has(relation.sourceId)) continue;
+      entityIds.add(relation.sourceId);
+      queue.push(relation.sourceId);
+    }
+  }
+  return { entityIds, edgeKeys };
+}
+
 export function lineageConnectionTargetIds(
   snapshot: ProjectWorkspaceSnapshot,
   sourceCycleId: string,
@@ -1030,6 +1059,7 @@ export class ProjectLineageWorkbench {
   private nodeLayer: HTMLElement | null = null;
   private relationPanel: HTMLElement | null = null;
   private selectedRelationId: string | null = null;
+  private hoveredStageId: string | null = null;
   private width = 960;
   private height = 640;
   private pan:
@@ -1532,6 +1562,15 @@ export class ProjectLineageWorkbench {
     if (node.kind === "cycle" && !this.collapseCountByHead.has(node.entityId)) {
       this.renderCycleActions(card, node);
     }
+    card.addEventListener("pointerenter", () => {
+      this.hoveredStageId = node.entityId;
+      this.updateLineageHoverFocus();
+    });
+    card.addEventListener("pointerleave", () => {
+      if (this.hoveredStageId !== node.entityId) return;
+      this.hoveredStageId = null;
+      this.updateLineageHoverFocus();
+    });
     let drag:
       | {
           pointerId: number;
@@ -2455,6 +2494,8 @@ export class ProjectLineageWorkbench {
             : []),
         );
         path.setAttribute("data-relation-id", item.aggregate ? "" : relation.id);
+        path.setAttribute("data-source-id", item.sourceId);
+        path.setAttribute("data-target-id", item.targetId);
         path.setAttribute("role", "button");
         path.setAttribute("tabindex", "0");
         path.setAttribute(
@@ -2477,6 +2518,8 @@ export class ProjectLineageWorkbench {
           const hitPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
           hitPath.classList.add("helix-lineage-edge-hit");
           hitPath.setAttribute("d", pathData);
+          hitPath.setAttribute("data-source-id", item.sourceId);
+          hitPath.setAttribute("data-target-id", item.targetId);
           hitPath.addEventListener("click", selectEdge);
           this.svg.appendChild(hitPath);
         }
@@ -2495,6 +2538,8 @@ export class ProjectLineageWorkbench {
           insert.setAttribute("role", "button");
           insert.setAttribute("tabindex", "0");
           insert.setAttribute("aria-label", "在这条关系中插入新阶段");
+          insert.setAttribute("data-source-id", item.sourceId);
+          insert.setAttribute("data-target-id", item.targetId);
           insert.setAttribute("transform", `translate(${(start.x + end.x) / 2} ${(start.y + end.y) / 2})`);
           const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
           circle.setAttribute("r", "9");
@@ -2548,6 +2593,42 @@ export class ProjectLineageWorkbench {
       line.setAttribute("x2", String(guide.end.x));
       line.setAttribute("y2", String(guide.end.y));
       this.svg.appendChild(line);
+    }
+    this.updateLineageHoverFocus();
+  }
+
+  private updateLineageHoverFocus(): void {
+    if (!this.nodeLayer || !this.svg) return;
+    const projection: LineageCompletedProjection = {
+      hiddenByCollapseHead: this.hiddenByCollapseHead,
+      collapseHeadByMember: this.collapseHeadByMember,
+      collapseCountByHead: this.collapseCountByHead,
+    };
+    const highlight = this.hoveredStageId
+      ? lineageAncestorHighlight(
+          this.hoveredStageId,
+          projectedLineageRelations(this.options.snapshot, projection),
+        )
+      : null;
+    for (const card of this.nodeLayer.querySelectorAll<HTMLElement>(
+      ".helix-lineage-card[data-entity-id]",
+    )) {
+      card.toggleClass(
+        "is-lineage-dimmed",
+        Boolean(highlight && !highlight.entityIds.has(card.dataset.entityId ?? "")),
+      );
+    }
+    for (const edge of this.svg.querySelectorAll<SVGElement>(
+      ".helix-lineage-edge, .helix-lineage-edge-hit, .helix-lineage-edge-insert",
+    )) {
+      const key = lineageProjectedEdgeKey(
+        edge.dataset.sourceId ?? "",
+        edge.dataset.targetId ?? "",
+      );
+      edge.classList.toggle(
+        "is-lineage-dimmed",
+        Boolean(highlight && !highlight.edgeKeys.has(key)),
+      );
     }
   }
 

@@ -2656,6 +2656,35 @@ describe("ProjectWorkspaceService", () => {
     ]);
   });
 
+  it("places an inherited successor on its lower branch parent's row", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    await service.createCycle(
+      "project-1",
+      "branch",
+      ["cycle-1"],
+      {
+        confirmBranchConversion: true,
+        stageTitle: "上方分支",
+        secondaryStageTitle: "下方分支",
+      },
+    );
+    const lower = (await service.snapshot()).projects[0]!.cycles.find((cycle) =>
+      cycle.title === "下方分支")!;
+    const successor = await service.createCycle(
+      "project-1",
+      "inherit",
+      [lower.id],
+      { stageTitle: "下方后继" },
+    );
+    const nodes = repo.json(CANVAS).nodes;
+    const lowerNode = nodes.find((node: Record<string, unknown>) =>
+      node.helixStageId === lower.id);
+    const successorNode = nodes.find((node: Record<string, unknown>) =>
+      node.helixStageId === successor.id);
+    expect(successorNode).toMatchObject({ x: 1_224, y: lowerNode.y });
+  });
+
   it("places an inherited child on the same row and rejects multiline titles", async () => {
     const repo = baseRepository();
     const service = workspace(repo);

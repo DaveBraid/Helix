@@ -4950,6 +4950,9 @@ export class ProjectWorkspaceService {
         layoutSnapshot,
         physical,
         affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
+        relationKind === "inherit"
+          ? new Map(specs.map((spec) => [spec.id, predecessors[0]!] as const))
+          : undefined,
       );
       this.assertActive(generation);
       await this.applyAtomicWorkspaceChange({
@@ -5471,6 +5474,7 @@ function applyManagedLayout(
   snapshot: ProjectWorkspaceSnapshot,
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
+  verticalParentByStage?: ReadonlyMap<string, string>,
 ): void {
   const viewByEntity = new Map(snapshot.canvasNodes.map((node) => [node.entityId, node]));
   const layout = planProjectGraphLayout(
@@ -5491,6 +5495,7 @@ function applyManagedLayout(
       })),
     edges,
     scope,
+    verticalParentByStage,
   );
   const position = new Map([
     ...layout.projects.map((node) => [node.id, node] as const),

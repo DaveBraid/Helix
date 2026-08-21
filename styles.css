@@ -5133,6 +5133,7 @@
   stroke-width: 2.2;
   pointer-events: stroke;
   cursor: pointer;
+  transition: opacity .16s ease;
 }
 .helix-lineage-edge.is-selected { stroke-width: 4; }
 .helix-lineage-edge.is-other-project { opacity: .28; }
@@ -5203,7 +5204,7 @@
   pointer-events: auto;
   user-select: none;
   cursor: grab;
-  transition: border-color .12s, box-shadow .12s;
+  transition: border-color .12s, box-shadow .12s, opacity .16s ease, filter .16s ease;
   overflow: visible;
 }
 
@@ -5226,6 +5227,13 @@
 .helix-lineage-card.is-current-project { box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 16%, transparent); }
 .helix-lineage-card.is-other-project { opacity: .48; }
 .helix-lineage-card.is-other-project:hover { opacity: .84; }
+.helix-lineage-card.is-lineage-dimmed {
+  opacity: .18;
+  filter: saturate(.55);
+}
+.helix-lineage-edge.is-lineage-dimmed { opacity: .12; }
+.helix-lineage-edge-hit.is-lineage-dimmed,
+.helix-lineage-edge-insert.is-lineage-dimmed { pointer-events: none; }
 .helix-lineage-card.is-connection-target {
   opacity: 1;
   border-color: #2f9b67;

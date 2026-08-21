@@ -243,6 +243,11 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
     expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
     expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000;[\s\S]*gap: 4px/);
+    expect(lineage).toMatch(/pointerenter[\s\S]*hoveredStageId = node\.entityId[\s\S]*updateLineageHoverFocus/);
+    expect(lineage).toMatch(/pointerleave[\s\S]*hoveredStageId = null[\s\S]*updateLineageHoverFocus/);
+    expect(lineage).toMatch(/data-source-id[\s\S]*data-target-id[\s\S]*is-lineage-dimmed/);
+    expect(css).toMatch(/\.helix-lineage-card\.is-lineage-dimmed[\s\S]*opacity: \.18/);
+    expect(css).toMatch(/\.helix-lineage-edge\.is-lineage-dimmed[\s\S]*opacity: \.12/);
   });
 
   it("keeps project focus incremental and swaps structural project renders atomically", () => {

@@ -164,6 +164,7 @@ export function planProjectGraphLayout(
   stages: StageLayoutNode[],
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
+  verticalParentByStage?: ReadonlyMap<string, string>,
 ): ProjectGraphLayout {
   const stagesByProject = new Map<string, StageLayoutNode[]>();
   for (const stage of stages) {
@@ -244,6 +245,16 @@ export function planProjectGraphLayout(
       y: (laneStart.get(stage.projectId) ?? 0) + row * (CARD_HEIGHT + Y_GAP),
     };
   });
+  if (verticalParentByStage && verticalParentByStage.size > 0) {
+    const byId = new Map(nextStages.map((stage) => [stage.id, stage]));
+    nextStages = nextStages.map((stage) => {
+      const parentId = verticalParentByStage.get(stage.id);
+      const parent = parentId ? byId.get(parentId) : undefined;
+      return parent && parent.projectId === stage.projectId
+        ? { ...stage, y: parent.y }
+        : stage;
+    });
+  }
   let nextProjects = projectOrder.map((project) => {
     const projectStages = nextStages.filter((stage) => stage.projectId === project.id);
     if (scope) return { ...project };

@@ -261,15 +261,28 @@ export function planProjectGraphLayout(
       group.push(stage);
       fixedByProject.set(stage.projectId, group);
     }
-    const occupied = [...fixedByProject.values()].flatMap((projectStages) => {
-      const box = projectStageContainerBox(projectStages);
-      return box ? [box] : [];
-    });
+    const placedMovingProjectBoxes: Array<{
+      projectId: string;
+      box: { x: number; y: number; right: number; bottom: number };
+    }> = [];
     for (const project of projectOrder.filter((item) => movingProjectIds.has(item.id))) {
       const movingStages = nextStages.filter((stage) =>
         stage.projectId === project.id && effectiveScope?.has(stage.id));
       const original = projectStageContainerBox(movingStages);
       if (!original) continue;
+      const projectRank = ownerRank.get(project.id) ?? Number.MAX_SAFE_INTEGER;
+      const occupied = [
+        ...[...fixedByProject.entries()].flatMap(([fixedProjectId, projectStages]) => {
+          const fixedRank = ownerRank.get(fixedProjectId) ?? Number.MAX_SAFE_INTEGER;
+          if (fixedProjectId !== project.id && fixedRank > projectRank) return [];
+          const box = projectStageContainerBox(projectStages);
+          return box ? [box] : [];
+        }),
+        ...placedMovingProjectBoxes
+          .filter(({ projectId }) =>
+            (ownerRank.get(projectId) ?? Number.MAX_SAFE_INTEGER) <= projectRank)
+          .map(({ box }) => box),
+      ];
       let shift = 0;
       for (;;) {
         const shifted = {
@@ -280,7 +293,7 @@ export function planProjectGraphLayout(
         const conflicts = occupied.filter((fixed) =>
           containerBoxesOverlap(shifted, fixed));
         if (conflicts.length === 0) {
-          occupied.push(shifted);
+          placedMovingProjectBoxes.push({ projectId: project.id, box: shifted });
           break;
         }
         shift = Math.max(
@@ -295,6 +308,31 @@ export function planProjectGraphLayout(
             ? { ...stage, y: stage.y + shift }
             : stage);
       }
+    }
+
+    // 局部整理可以扩大一个项目容器，但不得改变显式项目顺序。按调用方
+    // 提供的 helixProjectOrder 逐项向下避让；较晚项目可以移动，较早项目
+    // 不会因为新增 Stage 被推到队尾。
+    let previousBottom: number | undefined;
+    for (const project of projectOrder) {
+      const projectStages = nextStages.filter((stage) => stage.projectId === project.id);
+      const box = projectStageContainerBox(projectStages);
+      if (!box) continue;
+      const minimumTop = previousBottom === undefined
+        ? box.y
+        : previousBottom + PROJECT_LANE_GAP;
+      const shift = Math.max(0, minimumTop - box.y);
+      if (shift > 0) {
+        nextStages = nextStages.map((stage) =>
+          stage.projectId === project.id
+            ? { ...stage, y: stage.y + shift }
+            : stage);
+        nextProjects = nextProjects.map((candidate) =>
+          candidate.id === project.id
+            ? { ...candidate, y: candidate.y + shift }
+            : candidate);
+      }
+      previousBottom = box.bottom + shift;
     }
   }
   return { projects: nextProjects, stages: nextStages };

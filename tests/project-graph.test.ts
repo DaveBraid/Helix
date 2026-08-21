@@ -236,6 +236,29 @@ describe("project graph presentation", () => {
       .toBeLessThan(layout.stages.find((stage) => stage.id === "second-stage")!.y);
   });
 
+  it("keeps explicit project order when a scoped project grows", () => {
+    const layout = planProjectGraphLayout(
+      [
+        { id: "first", x: 0, y: 900 },
+        { id: "second", x: 0, y: 0 },
+      ],
+      [
+        { id: "first-a", projectId: "first", sequence: 1, x: 408, y: 900 },
+        { id: "first-b", projectId: "first", sequence: 2, x: 816, y: 900 },
+        { id: "second-a", projectId: "second", sequence: 1, x: 408, y: 0 },
+      ],
+      [edge("first-edge", "first-a", "first-b")],
+      new Set(["first-a", "first-b"]),
+    );
+    const firstTop = Math.min(...layout.stages
+      .filter((stage) => stage.projectId === "first")
+      .map((stage) => stage.y));
+    const secondTop = Math.min(...layout.stages
+      .filter((stage) => stage.projectId === "second")
+      .map((stage) => stage.y));
+    expect(secondTop).toBeGreaterThan(firstTop);
+  });
+
   it("sizes project lanes by the busiest depth row instead of total stage count", () => {
     const layout = planProjectGraphLayout(
       [

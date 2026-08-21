@@ -558,6 +558,58 @@ describe("ProjectWorkspaceService", () => {
     )).rejects.toThrow(/已经变化/);
   });
 
+  it("keeps the configured project order after creating a stage", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Beta/Project.md", project("project-2", "Beta"));
+    repo.set("Helix/Projects/Beta/Cycle-01.md", cycle("cycle-2", "project-2", 1)
+      .replace("[[Project]]", "[[Helix/Projects/Beta/Project]]"));
+    const canvas = repo.json(CANVAS);
+    canvas.helixProjectOrder = {
+      version: 1,
+      projectIds: ["project-1", "project-2"],
+    };
+    canvas.nodes.find((node: { id: string }) => node.id === "project-node").y = 700;
+    canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").y = 900;
+    canvas.nodes.push(
+      {
+        ...card("project-2-node", "project", "project-2", undefined, 0, 0),
+        helixFilePath: "Helix/Projects/Beta/Project.md",
+        text: "[[Helix/Projects/Beta/Project|Beta]]\n\n项目",
+      },
+      {
+        ...card("cycle-2-node", "cycle", "project-2", "cycle-2", 0, 300),
+        helixFilePath: "Helix/Projects/Beta/Cycle-01.md",
+        text: "[[Helix/Projects/Beta/Cycle-01|阶段标题 1]]\n\n进行中",
+      },
+    );
+    repo.set(CANVAS, JSON.stringify(canvas));
+
+    await workspace(repo).createCycle(
+      "project-1",
+      "inherit",
+      ["cycle-1"],
+      { stageTitle: "保持项目顺序" },
+    );
+
+    const next = repo.json(CANVAS);
+    expect(next.helixProjectOrder).toEqual({
+      version: 1,
+      projectIds: ["project-1", "project-2"],
+    });
+    const stageNodes = next.nodes.filter((node: {
+      helixNodeKind?: string;
+      helixProjectId?: string;
+      y: number;
+    }) => node.helixNodeKind === "cycle");
+    const firstTop = Math.min(...stageNodes
+      .filter((node: { helixProjectId?: string }) => node.helixProjectId === "project-1")
+      .map((node: { y: number }) => node.y));
+    const secondTop = Math.min(...stageNodes
+      .filter((node: { helixProjectId?: string }) => node.helixProjectId === "project-2")
+      .map((node: { y: number }) => node.y));
+    expect(firstTop).toBeLessThan(secondTop);
+  });
+
   it("undoes and redoes exact Canvas move bytes and rejects an external edit", async () => {
     const repo = baseRepository();
     const service = workspace(repo);

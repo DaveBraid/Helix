@@ -41,10 +41,16 @@ interface LineageGraphBox extends LineagePoint {
   centerY: number;
 }
 
-interface LineageAlignmentGuide {
+export interface LineageAlignmentGuide {
   axis: "x" | "y";
   start: LineagePoint;
   end: LineagePoint;
+}
+
+export interface LineageAlignmentBox extends LineagePoint {
+  id: string;
+  width: number;
+  height: number;
 }
 
 export interface LineageProjectContainerBox extends LineagePoint {
@@ -113,6 +119,111 @@ export function lineageShiftAlignedPoint(
     fixed.map((point, index) => ({ ...point, id: String(index) })),
     threshold,
   ).point;
+}
+
+export function lineageShiftBoxAlignment(
+  moving: LineageAlignmentBox,
+  fixed: readonly LineageAlignmentBox[],
+  threshold = 10,
+): LineageShiftAlignment & { guides: LineageAlignmentGuide[] } {
+  type Candidate = {
+    value: number;
+    distance: number;
+    guides: LineageAlignmentGuide[];
+  };
+  const axisCandidate = (axis: "x" | "y"): Candidate | undefined => {
+    const size = axis === "x" ? "width" : "height";
+    const cross = axis === "x" ? "y" : "x";
+    const crossSize = axis === "x" ? "height" : "width";
+    const point = (primary: number, secondary: number): LineagePoint =>
+      axis === "x" ? { x: primary, y: secondary } : { x: secondary, y: primary };
+    const candidates: Candidate[] = [];
+    for (const target of fixed) {
+      const value = target[axis];
+      candidates.push({
+        value,
+        distance: Math.abs(value - moving[axis]),
+        guides: [{
+          axis,
+          start: point(value, moving[cross] + moving[crossSize] / 2),
+          end: point(value, target[cross] + target[crossSize] / 2),
+        }],
+      });
+    }
+    const ordered = [...fixed].sort((left, right) => left[axis] - right[axis]);
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      const first = ordered[index]!;
+      const second = ordered[index + 1]!;
+      const firstEnd = first[axis] + first[size];
+      const gap = second[axis] - firstEnd;
+      if (gap < 0) continue;
+      const between = firstEnd + (gap - moving[size]) / 2;
+      if (between >= firstEnd && between + moving[size] <= second[axis]) {
+        const crossValue = moving[cross] + moving[crossSize] / 2;
+        candidates.push({
+          value: between,
+          distance: Math.abs(between - moving[axis]),
+          guides: [
+            {
+              axis,
+              start: point(firstEnd, crossValue),
+              end: point(between, crossValue),
+            },
+            {
+              axis,
+              start: point(between + moving[size], crossValue),
+              end: point(second[axis], crossValue),
+            },
+          ],
+        });
+      }
+      const after = second[axis] + second[size] + gap;
+      const afterCross = moving[cross] + moving[crossSize] / 2;
+      candidates.push({
+        value: after,
+        distance: Math.abs(after - moving[axis]),
+        guides: [
+          {
+            axis,
+            start: point(firstEnd, afterCross),
+            end: point(second[axis], afterCross),
+          },
+          {
+            axis,
+            start: point(second[axis] + second[size], afterCross),
+            end: point(after, afterCross),
+          },
+        ],
+      });
+      const before = first[axis] - gap - moving[size];
+      const beforeCross = moving[cross] + moving[crossSize] / 2;
+      candidates.push({
+        value: before,
+        distance: Math.abs(before - moving[axis]),
+        guides: [
+          {
+            axis,
+            start: point(before + moving[size], beforeCross),
+            end: point(first[axis], beforeCross),
+          },
+          {
+            axis,
+            start: point(firstEnd, beforeCross),
+            end: point(second[axis], beforeCross),
+          },
+        ],
+      });
+    }
+    const best = candidates.reduce<Candidate | undefined>((current, candidate) =>
+      !current || candidate.distance < current.distance ? candidate : current, undefined);
+    return best && best.distance <= threshold ? best : undefined;
+  };
+  const x = axisCandidate("x");
+  const y = axisCandidate("y");
+  return {
+    point: { x: x?.value ?? moving.x, y: y?.value ?? moving.y },
+    guides: [...(x?.guides ?? []), ...(y?.guides ?? [])],
+  };
 }
 
 export interface LineageLayoutDraft {
@@ -1193,10 +1304,9 @@ export class ProjectLineageWorkbench {
     addProject.addEventListener("click", this.options.onCreateProject);
     const reorder = actions.createEl("button", {
       cls: "helix-secondary-button helix-lineage-project-order-button",
+      text: "项目排序",
       attr: { "aria-label": "调整项目顺序", title: "拖动调整项目顺序" },
     });
-    setIcon(reorder.createSpan(), "list-ordered");
-    reorder.createSpan({ text: "项目排序" });
     reorder.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1219,6 +1329,18 @@ export class ProjectLineageWorkbench {
     popover.createDiv({ cls: "helix-lineage-project-order-title", text: "拖动调整项目顺序" });
     const list = popover.createDiv({ cls: "helix-lineage-project-order-list" });
     let dragged: HTMLElement | null = null;
+    let submitted = false;
+    const initialOrder = this.options.snapshot.projects.map((project) => project.id);
+    const submitOrder = (): void => {
+      if (submitted) return;
+      const projectIds = [...list.querySelectorAll<HTMLElement>("[data-project-id]")]
+        .map((row) => row.dataset.projectId!)
+        .filter(Boolean);
+      if (projectIds.every((projectId, index) => projectId === initialOrder[index])) return;
+      submitted = true;
+      this.closeProjectOrderPopover();
+      void this.options.onReorderProjects(projectIds).catch(this.options.onError);
+    };
     for (const project of this.options.snapshot.projects) {
       const row = list.createDiv({
         cls: "helix-lineage-project-order-row",
@@ -1238,6 +1360,7 @@ export class ProjectLineageWorkbench {
       row.addEventListener("dragend", () => {
         row.removeClass("is-dragging");
         dragged = null;
+        window.setTimeout(submitOrder, 0);
       });
       row.addEventListener("dragover", (event) => {
         if (!dragged || dragged === row) return;
@@ -1248,11 +1371,7 @@ export class ProjectLineageWorkbench {
     }
     list.addEventListener("drop", (event) => {
       event.preventDefault();
-      const projectIds = [...list.querySelectorAll<HTMLElement>("[data-project-id]")]
-        .map((row) => row.dataset.projectId!)
-        .filter(Boolean);
-      this.closeProjectOrderPopover();
-      void this.options.onReorderProjects(projectIds).catch(this.options.onError);
+      submitOrder();
     });
     const rect = anchor.getBoundingClientRect();
     popover.style.left = `${Math.max(12, Math.min(rect.right - 272, window.innerWidth - 284))}px`;
@@ -1481,29 +1600,26 @@ export class ProjectLineageWorkbench {
           .filter((item) => !movingIds.has(item.entityId))
           .flatMap((item) => {
             const point = this.layout.get(item.entityId);
-            return point ? [{ id: item.entityId, ...point }] : [];
+            return point ? [{
+              id: item.entityId,
+              ...point,
+              width: GRAPH_CARD_WIDTH,
+              height: GRAPH_CARD_HEIGHT,
+            }] : [];
           });
-        const alignment = lineageShiftAlignment({
+        const alignment = lineageShiftBoxAlignment({
+          id: drag.starts[0].node.entityId,
           x: drag.starts[0].point.x + dx,
           y: drag.starts[0].point.y + dy,
+          width: GRAPH_CARD_WIDTH,
+          height: GRAPH_CARD_HEIGHT,
         }, fixed, 12 / this.zoom);
         const candidate = alignment.point;
         alignedDx = candidate.x - drag.starts[0].point.x;
         alignedDy = candidate.y - drag.starts[0].point.y;
         card.toggleClass("is-shift-aligned", candidate.x !== drag.starts[0].point.x + dx ||
           candidate.y !== drag.starts[0].point.y + dy);
-        this.alignmentGuides = [
-          ...(alignment.xTarget ? [{
-            axis: "x" as const,
-            start: { x: candidate.x, y: candidate.y },
-            end: { x: alignment.xTarget.x, y: alignment.xTarget.y },
-          }] : []),
-          ...(alignment.yTarget ? [{
-            axis: "y" as const,
-            start: { x: candidate.x, y: candidate.y },
-            end: { x: alignment.yTarget.x, y: alignment.yTarget.y },
-          }] : []),
-        ];
+        this.alignmentGuides = alignment.guides;
       } else {
         card.removeClass("is-shift-aligned");
         this.alignmentGuides = [];
@@ -1744,27 +1860,28 @@ export class ProjectLineageWorkbench {
           .filter((candidate) => candidate.id !== project.id)
           .flatMap((candidate) => {
             const box = this.projectContainerBox(candidate.id);
-            return box ? [{ id: candidate.id, x: box.x, y: box.y }] : [];
+            return box ? [{
+              id: candidate.id,
+              x: box.x,
+              y: box.y,
+              width: box.width,
+              height: box.height,
+            }] : [];
           });
-        const alignment = lineageShiftAlignment(
-          { x: drag.box.x + dx, y: drag.box.y + dy },
+        const alignment = lineageShiftBoxAlignment(
+          {
+            id: project.id,
+            x: drag.box.x + dx,
+            y: drag.box.y + dy,
+            width: drag.box.width,
+            height: drag.box.height,
+          },
           fixed,
           12 / this.zoom,
         );
         alignedDx = alignment.point.x - drag.box.x;
         alignedDy = alignment.point.y - drag.box.y;
-        this.alignmentGuides = [
-          ...(alignment.xTarget ? [{
-            axis: "x" as const,
-            start: { x: alignment.point.x, y: alignment.point.y },
-            end: { x: alignment.xTarget.x, y: alignment.xTarget.y },
-          }] : []),
-          ...(alignment.yTarget ? [{
-            axis: "y" as const,
-            start: { x: alignment.point.x, y: alignment.point.y },
-            end: { x: alignment.yTarget.x, y: alignment.yTarget.y },
-          }] : []),
-        ];
+        this.alignmentGuides = alignment.guides;
       } else {
         this.alignmentGuides = [];
       }
@@ -2306,18 +2423,6 @@ export class ProjectLineageWorkbench {
       marker.appendChild(path);
       defs.appendChild(marker);
     }
-    const alignmentMarker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-    alignmentMarker.id = `${this.markerId}-alignment`;
-    alignmentMarker.setAttribute("viewBox", "0 0 10 10");
-    alignmentMarker.setAttribute("refX", "5");
-    alignmentMarker.setAttribute("refY", "5");
-    alignmentMarker.setAttribute("markerWidth", "6");
-    alignmentMarker.setAttribute("markerHeight", "6");
-    alignmentMarker.setAttribute("orient", "auto-start-reverse");
-    const alignmentArrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    alignmentArrow.setAttribute("d", "M 9 1 L 2 5 L 9 9");
-    alignmentMarker.appendChild(alignmentArrow);
-    defs.appendChild(alignmentMarker);
     this.svg.appendChild(defs);
     const projection: LineageCompletedProjection = {
       hiddenByCollapseHead: this.hiddenByCollapseHead,
@@ -2442,8 +2547,6 @@ export class ProjectLineageWorkbench {
       line.setAttribute("y1", String(guide.start.y));
       line.setAttribute("x2", String(guide.end.x));
       line.setAttribute("y2", String(guide.end.y));
-      line.setAttribute("marker-start", `url(#${this.markerId}-alignment)`);
-      line.setAttribute("marker-end", `url(#${this.markerId}-alignment)`);
       this.svg.appendChild(line);
     }
   }

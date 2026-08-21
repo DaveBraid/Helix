@@ -29,6 +29,7 @@ import {
   lineageShouldFocusOnDoubleClick,
   lineageShiftAlignedPoint,
   lineageShiftAlignment,
+  lineageShiftBoxAlignment,
   lineageStructuralEntityIds,
   lineageViewportPointerIntent,
   lineageVirtualExpansionPlan,
@@ -101,6 +102,32 @@ describe("Project Lineage Shift alignment", () => {
     expect(result.point).toEqual({ x: 100, y: 400 });
     expect(result.xTarget?.id).toBe("x-anchor");
     expect(result.yTarget?.id).toBe("y-anchor");
+  });
+
+  it("snaps a card to equal horizontal and vertical gaps", () => {
+    const horizontal = lineageShiftBoxAlignment(
+      { id: "moving", x: 144, y: 80, width: 100, height: 50 },
+      [
+        { id: "left", x: 0, y: 0, width: 100, height: 50 },
+        { id: "right", x: 300, y: 0, width: 100, height: 50 },
+      ],
+      10,
+    );
+    expect(horizontal.point).toEqual({ x: 150, y: 80 });
+    expect(horizontal.guides).toHaveLength(2);
+    expect(horizontal.guides.every(({ axis }) => axis === "x")).toBe(true);
+
+    const vertical = lineageShiftBoxAlignment(
+      { id: "moving", x: 80, y: 71, width: 100, height: 50 },
+      [
+        { id: "top", x: 0, y: 0, width: 100, height: 50 },
+        { id: "bottom", x: 0, y: 150, width: 100, height: 50 },
+      ],
+      10,
+    );
+    expect(vertical.point).toEqual({ x: 80, y: 75 });
+    expect(vertical.guides).toHaveLength(2);
+    expect(vertical.guides.every(({ axis }) => axis === "y")).toBe(true);
   });
 });
 

@@ -5148,13 +5148,6 @@
 .helix-lineage-edges marker[id$="inherit"] path { fill: var(--helix-relation-inherit); }
 .helix-lineage-edges marker[id$="branch"] path { fill: var(--helix-relation-branch); }
 .helix-lineage-edges marker[id$="merge"] path { fill: var(--helix-relation-merge); }
-.helix-lineage-edges marker[id$="alignment"] path {
-  fill: none;
-  stroke: var(--interactive-accent);
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.8;
-}
 .helix-lineage-alignment-guide {
   stroke: color-mix(in srgb, var(--interactive-accent) 82%, var(--text-normal));
   stroke-width: 1.4;

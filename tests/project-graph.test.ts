@@ -220,15 +220,15 @@ describe("project graph presentation", () => {
       .toBeGreaterThan(728);
   });
 
-  it("orders visible project lanes from stage positions, never hidden project anchors", () => {
+  it("uses the explicit project order for full-layout lanes", () => {
     const layout = planProjectGraphLayout(
       [
         { id: "first", x: 0, y: 90_000 },
         { id: "second", x: 0, y: -90_000 },
       ],
       [
-        { id: "first-stage", projectId: "first", sequence: 1, x: 200, y: 0 },
-        { id: "second-stage", projectId: "second", sequence: 1, x: 200, y: 500 },
+        { id: "first-stage", projectId: "first", sequence: 1, x: 200, y: 500 },
+        { id: "second-stage", projectId: "second", sequence: 1, x: 200, y: 0 },
       ],
       [],
     );

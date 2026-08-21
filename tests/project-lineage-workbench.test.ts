@@ -28,6 +28,7 @@ import {
   lineageSelectionBox,
   lineageShouldFocusOnDoubleClick,
   lineageShiftAlignedPoint,
+  lineageShiftAlignment,
   lineageStructuralEntityIds,
   lineageViewportPointerIntent,
   lineageVirtualExpansionPlan,
@@ -86,6 +87,20 @@ describe("Project Lineage Shift alignment", () => {
       { x: 120, y: 280 },
       [{ x: 100, y: 300 }],
     )).toEqual({ x: 120, y: 280 });
+  });
+
+  it("reports the independent alignment anchors used by visual guides", () => {
+    const result = lineageShiftAlignment(
+      { x: 108, y: 394 },
+      [
+        { id: "x-anchor", x: 100, y: 20 },
+        { id: "y-anchor", x: 700, y: 400 },
+      ],
+      10,
+    );
+    expect(result.point).toEqual({ x: 100, y: 400 });
+    expect(result.xTarget?.id).toBe("x-anchor");
+    expect(result.yTarget?.id).toBe("y-anchor");
   });
 });
 

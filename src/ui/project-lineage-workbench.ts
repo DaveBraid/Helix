@@ -41,6 +41,12 @@ interface LineageGraphBox extends LineagePoint {
   centerY: number;
 }
 
+interface LineageAlignmentGuide {
+  axis: "x" | "y";
+  start: LineagePoint;
+  end: LineagePoint;
+}
+
 export interface LineageProjectContainerBox extends LineagePoint {
   width: number;
   height: number;
@@ -60,22 +66,53 @@ export interface LineageLayoutSnapshot {
   [entityId: string]: LineagePoint;
 }
 
+export interface LineageAlignmentTarget extends LineagePoint {
+  id: string;
+}
+
+export interface LineageShiftAlignment {
+  point: LineagePoint;
+  xTarget?: LineageAlignmentTarget;
+  yTarget?: LineageAlignmentTarget;
+}
+
+export function lineageShiftAlignment(
+  moving: LineagePoint,
+  fixed: readonly LineageAlignmentTarget[],
+  threshold = 10,
+): LineageShiftAlignment {
+  const nearest = (axis: "x" | "y"): LineageAlignmentTarget | undefined => {
+    const candidate = fixed.reduce<{ target: LineageAlignmentTarget; distance: number } | null>(
+      (best, target) => {
+        const distance = Math.abs(target[axis] - moving[axis]);
+        return !best || distance < best.distance ? { target, distance } : best;
+      },
+      null,
+    );
+    return candidate && candidate.distance <= threshold ? candidate.target : undefined;
+  };
+  const xTarget = nearest("x");
+  const yTarget = nearest("y");
+  return {
+    point: {
+      x: xTarget?.x ?? moving.x,
+      y: yTarget?.y ?? moving.y,
+    },
+    ...(xTarget ? { xTarget } : {}),
+    ...(yTarget ? { yTarget } : {}),
+  };
+}
+
 export function lineageShiftAlignedPoint(
   moving: LineagePoint,
   fixed: readonly LineagePoint[],
   threshold = 10,
 ): LineagePoint {
-  const snap = (value: number, candidates: number[]): number => {
-    const nearest = candidates.reduce<{ value: number; distance: number } | null>((best, item) => {
-      const distance = Math.abs(item - value);
-      return !best || distance < best.distance ? { value: item, distance } : best;
-    }, null);
-    return nearest && nearest.distance <= threshold ? nearest.value : value;
-  };
-  return {
-    x: snap(moving.x, fixed.map((point) => point.x)),
-    y: snap(moving.y, fixed.map((point) => point.y)),
-  };
+  return lineageShiftAlignment(
+    moving,
+    fixed.map((point, index) => ({ ...point, id: String(index) })),
+    threshold,
+  ).point;
 }
 
 export interface LineageLayoutDraft {
@@ -105,6 +142,7 @@ interface WorkbenchOptions {
   onRenameCycle: (cycleId: string, currentTitle: string) => void;
   onOpenNote: (path: string) => void;
   onSaveLayout: (moves: ProjectWorkspaceNodeMove[]) => Promise<void>;
+  onReorderProjects: (projectIds: string[]) => Promise<void>;
   onManageRelation: (relationId: string) => void;
   onInsertCycle: (
     relationId: string,
@@ -870,6 +908,7 @@ export class ProjectLineageWorkbench {
   private readonly collapseCountByHead = new Map<string, number>();
   private readonly visibleStageIdsByProject = new Map<string, string[]>();
   private readonly markerId = `helix-lineage-arrow-${crypto.randomUUID()}`;
+  private alignmentGuides: LineageAlignmentGuide[] = [];
   private zoom = 1;
   private viewport: HTMLElement | null = null;
   private plane: HTMLElement | null = null;
@@ -921,6 +960,8 @@ export class ProjectLineageWorkbench {
   private statusPopoverAnchor: HTMLButtonElement | null = null;
   private statusPopoverAbort: AbortController | null = null;
   private statusPopoverListenerTimer: number | null = null;
+  private projectOrderPopover: HTMLElement | null = null;
+  private projectOrderPopoverAbort: AbortController | null = null;
   private readonly persistedLayout: LineageLayoutSnapshot;
   private layoutUndo: LineageLayoutSnapshot[] = [];
   private layoutRedo: LineageLayoutSnapshot[] = [];
@@ -970,6 +1011,7 @@ export class ProjectLineageWorkbench {
   destroy(): void {
     this.destroyed = true;
     this.closeStatusPopover();
+    this.closeProjectOrderPopover();
     this.boardDrag = null;
     this.clearBoardEscapeListener();
     this.moveVersion += 1;
@@ -1149,12 +1191,92 @@ export class ProjectLineageWorkbench {
       text: "新建项目",
     });
     addProject.addEventListener("click", this.options.onCreateProject);
+    const reorder = actions.createEl("button", {
+      cls: "helix-secondary-button helix-lineage-project-order-button",
+      attr: { "aria-label": "调整项目顺序", title: "拖动调整项目顺序" },
+    });
+    setIcon(reorder.createSpan(), "list-ordered");
+    reorder.createSpan({ text: "项目排序" });
+    reorder.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.openProjectOrderPopover(reorder);
+    });
     this.undoButton = undo;
     this.redoButton = redo;
     this.arrangeButton = arrange;
     this.restoreLayoutButton = restore;
     this.saveLayoutButton = save;
     this.updateLayoutControls();
+  }
+
+  private openProjectOrderPopover(anchor: HTMLButtonElement): void {
+    this.closeProjectOrderPopover();
+    const popover = document.body.createDiv({
+      cls: "helix-lineage-project-order-popover",
+      attr: { role: "dialog", "aria-label": "项目排序" },
+    });
+    popover.createDiv({ cls: "helix-lineage-project-order-title", text: "拖动调整项目顺序" });
+    const list = popover.createDiv({ cls: "helix-lineage-project-order-list" });
+    let dragged: HTMLElement | null = null;
+    for (const project of this.options.snapshot.projects) {
+      const row = list.createDiv({
+        cls: "helix-lineage-project-order-row",
+        attr: { draggable: "true", "data-project-id": project.id },
+      });
+      row.style.setProperty("--helix-project-color", this.projectColor(project));
+      const grip = row.createSpan({ cls: "helix-lineage-project-order-grip" });
+      setIcon(grip, "grip-vertical");
+      row.createSpan({ cls: "helix-lineage-project-order-swatch" });
+      row.createSpan({ cls: "helix-lineage-project-order-name", text: project.title });
+      row.addEventListener("dragstart", (event) => {
+        dragged = row;
+        row.addClass("is-dragging");
+        event.dataTransfer?.setData("text/plain", project.id);
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+      });
+      row.addEventListener("dragend", () => {
+        row.removeClass("is-dragging");
+        dragged = null;
+      });
+      row.addEventListener("dragover", (event) => {
+        if (!dragged || dragged === row) return;
+        event.preventDefault();
+        const before = event.clientY < row.getBoundingClientRect().top + row.offsetHeight / 2;
+        list.insertBefore(dragged, before ? row : row.nextSibling);
+      });
+    }
+    list.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const projectIds = [...list.querySelectorAll<HTMLElement>("[data-project-id]")]
+        .map((row) => row.dataset.projectId!)
+        .filter(Boolean);
+      this.closeProjectOrderPopover();
+      void this.options.onReorderProjects(projectIds).catch(this.options.onError);
+    });
+    const rect = anchor.getBoundingClientRect();
+    popover.style.left = `${Math.max(12, Math.min(rect.right - 272, window.innerWidth - 284))}px`;
+    popover.style.top = `${Math.min(rect.bottom + 8, window.innerHeight - popover.offsetHeight - 12)}px`;
+    this.projectOrderPopover = popover;
+    const abort = new AbortController();
+    this.projectOrderPopoverAbort = abort;
+    window.setTimeout(() => {
+      document.addEventListener("pointerdown", (event) => {
+        if (!popover.contains(event.target as Node) && event.target !== anchor) {
+          this.closeProjectOrderPopover();
+        }
+      }, { capture: true, signal: abort.signal });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") this.closeProjectOrderPopover();
+      }, { signal: abort.signal });
+    }, 0);
+  }
+
+  private closeProjectOrderPopover(): void {
+    this.projectOrderPopoverAbort?.abort();
+    this.projectOrderPopoverAbort = null;
+    this.projectOrderPopover?.remove();
+    this.projectOrderPopover = null;
   }
 
   private renderProjectStrip(parent: HTMLElement): void {
@@ -1355,19 +1477,36 @@ export class ProjectLineageWorkbench {
       let alignedDy = dy;
       if (event.shiftKey && drag.starts[0]) {
         const movingIds = new Set(drag.starts.map((item) => item.node.entityId));
-        const fixed = [...this.layout.entries()]
-          .filter(([id]) => !movingIds.has(id))
-          .map(([, point]) => point);
-        const candidate = lineageShiftAlignedPoint({
+        const fixed = this.structuralNodes()
+          .filter((item) => !movingIds.has(item.entityId))
+          .flatMap((item) => {
+            const point = this.layout.get(item.entityId);
+            return point ? [{ id: item.entityId, ...point }] : [];
+          });
+        const alignment = lineageShiftAlignment({
           x: drag.starts[0].point.x + dx,
           y: drag.starts[0].point.y + dy,
         }, fixed, 12 / this.zoom);
+        const candidate = alignment.point;
         alignedDx = candidate.x - drag.starts[0].point.x;
         alignedDy = candidate.y - drag.starts[0].point.y;
         card.toggleClass("is-shift-aligned", candidate.x !== drag.starts[0].point.x + dx ||
           candidate.y !== drag.starts[0].point.y + dy);
+        this.alignmentGuides = [
+          ...(alignment.xTarget ? [{
+            axis: "x" as const,
+            start: { x: candidate.x, y: candidate.y },
+            end: { x: alignment.xTarget.x, y: alignment.xTarget.y },
+          }] : []),
+          ...(alignment.yTarget ? [{
+            axis: "y" as const,
+            start: { x: candidate.x, y: candidate.y },
+            end: { x: alignment.yTarget.x, y: alignment.yTarget.y },
+          }] : []),
+        ];
       } else {
         card.removeClass("is-shift-aligned");
+        this.alignmentGuides = [];
       }
       for (const item of drag.starts) {
         const next = {
@@ -1392,6 +1531,8 @@ export class ProjectLineageWorkbench {
       if (card.hasPointerCapture(event.pointerId)) card.releasePointerCapture(event.pointerId);
       for (const item of completed.starts) item.el.removeClass("is-dragging");
       card.removeClass("is-shift-aligned");
+      this.alignmentGuides = [];
+      this.renderEdges();
       if (!completed.moved || this.destroyed || this.movePending) return;
       this.recordLayoutChange(completed.beforeLayout);
     };
@@ -1407,6 +1548,7 @@ export class ProjectLineageWorkbench {
         item.el.style.top = `${item.point.y}px`;
       }
       card.removeClass("is-shift-aligned");
+      this.alignmentGuides = [];
       this.updateProjectContainerGeometry(
         new Set(canceled.starts.map((item) => item.node.projectId)),
       );
@@ -1560,6 +1702,7 @@ export class ProjectLineageWorkbench {
       moved: boolean;
       before: LineageLayoutSnapshot;
       starts: Array<{ entityId: string; point: LineagePoint }>;
+      box: LineageProjectContainerBox;
     } | null = null;
     let suppressClick = false;
     button.title = "单击打开项目；按住拖动整个项目";
@@ -1572,6 +1715,8 @@ export class ProjectLineageWorkbench {
           return point ? [{ entityId: node.entityId, point: { ...point } }] : [];
         });
       if (starts.length === 0) return;
+      const box = this.projectContainerBox(project.id);
+      if (!box) return;
       event.preventDefault();
       event.stopPropagation();
       drag = {
@@ -1581,6 +1726,7 @@ export class ProjectLineageWorkbench {
         moved: false,
         before: this.captureRawLayout(),
         starts,
+        box,
       };
       button.setPointerCapture(event.pointerId);
     });
@@ -1591,18 +1737,57 @@ export class ProjectLineageWorkbench {
       if (!drag.moved && Math.hypot(dx, dy) < 5) return;
       drag.moved = true;
       suppressClick = true;
+      let alignedDx = dx;
+      let alignedDy = dy;
+      if (event.shiftKey) {
+        const fixed = this.options.snapshot.projects
+          .filter((candidate) => candidate.id !== project.id)
+          .flatMap((candidate) => {
+            const box = this.projectContainerBox(candidate.id);
+            return box ? [{ id: candidate.id, x: box.x, y: box.y }] : [];
+          });
+        const alignment = lineageShiftAlignment(
+          { x: drag.box.x + dx, y: drag.box.y + dy },
+          fixed,
+          12 / this.zoom,
+        );
+        alignedDx = alignment.point.x - drag.box.x;
+        alignedDy = alignment.point.y - drag.box.y;
+        this.alignmentGuides = [
+          ...(alignment.xTarget ? [{
+            axis: "x" as const,
+            start: { x: alignment.point.x, y: alignment.point.y },
+            end: { x: alignment.xTarget.x, y: alignment.xTarget.y },
+          }] : []),
+          ...(alignment.yTarget ? [{
+            axis: "y" as const,
+            start: { x: alignment.point.x, y: alignment.point.y },
+            end: { x: alignment.yTarget.x, y: alignment.yTarget.y },
+          }] : []),
+        ];
+      } else {
+        this.alignmentGuides = [];
+      }
       for (const start of drag.starts) {
         this.layout.set(start.entityId, {
-          x: Math.max(16, start.point.x + dx),
-          y: Math.max(16, start.point.y + dy),
+          x: Math.max(16, start.point.x + alignedDx),
+          y: Math.max(16, start.point.y + alignedDy),
         });
       }
       this.renderLayoutPositions();
+      const aligned = this.alignmentGuides.length > 0;
+      this.projectLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-project-container[data-project-id="${CSS.escape(project.id)}"]`,
+      )?.toggleClass("is-shift-aligned", aligned);
+      this.projectHeaderLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-project-container-header[data-project-id="${CSS.escape(project.id)}"]`,
+      )?.toggleClass("is-shift-aligned", aligned);
     });
     const finish = (event: PointerEvent, canceled: boolean): void => {
       if (!drag || drag.pointerId !== event.pointerId) return;
       const completed = drag;
       drag = null;
+      this.alignmentGuides = [];
       if (button.hasPointerCapture(event.pointerId)) button.releasePointerCapture(event.pointerId);
       if (canceled) {
         this.applyRawLayout(completed.before);
@@ -1610,6 +1795,13 @@ export class ProjectLineageWorkbench {
       } else if (completed.moved) {
         this.recordLayoutChange(completed.before);
       }
+      this.projectLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-project-container[data-project-id="${CSS.escape(project.id)}"]`,
+      )?.removeClass("is-shift-aligned");
+      this.projectHeaderLayer?.querySelector<HTMLElement>(
+        `.helix-lineage-project-container-header[data-project-id="${CSS.escape(project.id)}"]`,
+      )?.removeClass("is-shift-aligned");
+      this.renderEdges();
     };
     button.addEventListener("pointerup", (event) => finish(event, false));
     button.addEventListener("pointercancel", (event) => finish(event, true));
@@ -2114,6 +2306,18 @@ export class ProjectLineageWorkbench {
       marker.appendChild(path);
       defs.appendChild(marker);
     }
+    const alignmentMarker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    alignmentMarker.id = `${this.markerId}-alignment`;
+    alignmentMarker.setAttribute("viewBox", "0 0 10 10");
+    alignmentMarker.setAttribute("refX", "5");
+    alignmentMarker.setAttribute("refY", "5");
+    alignmentMarker.setAttribute("markerWidth", "6");
+    alignmentMarker.setAttribute("markerHeight", "6");
+    alignmentMarker.setAttribute("orient", "auto-start-reverse");
+    const alignmentArrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    alignmentArrow.setAttribute("d", "M 9 1 L 2 5 L 9 9");
+    alignmentMarker.appendChild(alignmentArrow);
+    defs.appendChild(alignmentMarker);
     this.svg.appendChild(defs);
     const projection: LineageCompletedProjection = {
       hiddenByCollapseHead: this.hiddenByCollapseHead,
@@ -2230,6 +2434,17 @@ export class ProjectLineageWorkbench {
         );
         this.svg.appendChild(preview);
       }
+    }
+    for (const guide of this.alignmentGuides) {
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.classList.add("helix-lineage-alignment-guide", `is-${guide.axis}`);
+      line.setAttribute("x1", String(guide.start.x));
+      line.setAttribute("y1", String(guide.start.y));
+      line.setAttribute("x2", String(guide.end.x));
+      line.setAttribute("y2", String(guide.end.y));
+      line.setAttribute("marker-start", `url(#${this.markerId}-alignment)`);
+      line.setAttribute("marker-end", `url(#${this.markerId}-alignment)`);
+      this.svg.appendChild(line);
     }
   }
 

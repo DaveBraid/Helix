@@ -2855,6 +2855,17 @@ export class HelixView extends ItemView {
         new Notice("当前布局已保存");
         await this.render();
       },
+      onReorderProjects: async (projectIds) => {
+        if (!workspace.canvasRevisionHash) throw new Error("项目 Canvas 不存在");
+        await this.actions.mutateProjectWorkspace(() =>
+          this.actions.projectWorkspace.reorderProjects(
+            projectIds,
+            workspace.canvasRevisionHash!,
+          ));
+        this.lineageLayoutDraft = undefined;
+        new Notice("项目顺序已更新");
+        await this.render();
+      },
       onManageRelation: (relationId) => this.actions.manageRelation(
         relationId,
         (nextFocusEntityId) =>

@@ -516,6 +516,48 @@ describe("ProjectWorkspaceService", () => {
     expect((await bounded.read(CANVAS))!.content).toBe(boundedBefore);
   });
 
+  it("persists project order and reflows full-layout lanes in that order", async () => {
+    const repo = baseRepository();
+    repo.set("Helix/Projects/Beta/Project.md", project("project-2", "Beta"));
+    repo.set("Helix/Projects/Beta/Cycle-01.md", cycle("cycle-2", "project-2", 1)
+      .replace("[[Project]]", "[[Helix/Projects/Beta/Project]]"));
+    const canvas = repo.json(CANVAS);
+    canvas.nodes.push(
+      {
+        ...card("project-2-node", "project", "project-2", undefined, 0, 900),
+        helixFilePath: "Helix/Projects/Beta/Project.md",
+        text: "[[Helix/Projects/Beta/Project|Beta]]\n\n项目",
+      },
+      {
+        ...card("cycle-2-node", "cycle", "project-2", "cycle-2", 0, 1200),
+        helixFilePath: "Helix/Projects/Beta/Cycle-01.md",
+        text: "[[Helix/Projects/Beta/Cycle-01|阶段标题 1]]\n\n进行中",
+      },
+    );
+    repo.set(CANVAS, JSON.stringify(canvas));
+    const service = workspace(repo);
+    const before = await service.snapshot();
+
+    const reordered = await service.reorderProjects(
+      ["project-2", "project-1"],
+      before.canvasRevisionHash!,
+    );
+
+    expect(reordered.projects.map(({ id }) => id)).toEqual(["project-2", "project-1"]);
+    expect(repo.json(CANVAS).helixProjectOrder).toEqual({
+      version: 1,
+      projectIds: ["project-2", "project-1"],
+    });
+    const nodeById = new Map<string, { id: string; y: number }>(
+      repo.json(CANVAS).nodes.map((node: { id: string; y: number }) => [node.id, node]),
+    );
+    expect(nodeById.get("cycle-2-node")!.y).toBeLessThan(nodeById.get("cycle-node")!.y);
+    await expect(service.reorderProjects(
+      ["project-1", "project-2"],
+      before.canvasRevisionHash!,
+    )).rejects.toThrow(/已经变化/);
+  });
+
   it("undoes and redoes exact Canvas move bytes and rejects an external edit", async () => {
     const repo = baseRepository();
     const service = workspace(repo);

@@ -83,6 +83,10 @@ interface CanvasEdge {
 interface CanvasDocument {
   nodes: CanvasNode[];
   edges: CanvasEdge[];
+  helixProjectOrder?: {
+    version: 1;
+    projectIds: string[];
+  };
   helixStageSequences?: Record<string, number>;
   /** 当前阶段展示编号索引；可由 Markdown 与关系图重建，不承载真值。 */
   helixStageCodes?: Record<string, string[]>;
@@ -2084,6 +2088,12 @@ export class ProjectWorkspaceService {
     const pendingMigrationItems = deduplicateMigrationItems(migrationItems).filter(
       (item) => !acknowledgedMigrationItems.has(item.id),
     );
+    const projectOrder = resolvedProjectOrder(canvas.document, projects, canvasNodes);
+    const projectRank = new Map(projectOrder.map((projectId, index) => [projectId, index]));
+    projects.sort((left, right) =>
+      (projectRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+        (projectRank.get(right.id) ?? Number.MAX_SAFE_INTEGER) ||
+      left.title.localeCompare(right.title, "zh-CN"));
     const nextStageSequenceByProject = Object.fromEntries(
       projects.map((project) => [
         project.id,
@@ -3057,6 +3067,52 @@ export class ProjectWorkspaceService {
             markdownTransitions: [],
           },
     );
+    return this.snapshot();
+  }
+
+  async reorderProjects(
+    projectIds: string[],
+    expectedCanvasRevisionHash: string,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    const snapshot = await this.snapshot();
+    const currentIds = snapshot.projects.map((project) => project.id);
+    const requested = [...projectIds];
+    if (
+      requested.length !== currentIds.length ||
+      new Set(requested).size !== requested.length ||
+      requested.some((projectId) => !currentIds.includes(projectId))
+    ) {
+      throw new Error("项目排序必须完整且不能重复");
+    }
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision) throw new Error("项目 Canvas 不存在");
+    if (
+      !expectedCanvasRevisionHash ||
+      canvas.revision.hash !== expectedCanvasRevisionHash ||
+      snapshot.canvasRevisionHash !== expectedCanvasRevisionHash
+    ) {
+      throw new Error("Canvas 在项目排序期间已经变化，请重试");
+    }
+    canvas.document.helixProjectOrder = {
+      version: 1,
+      projectIds: requested,
+    };
+    const projectById = new Map(snapshot.projects.map((project) => [project.id, project]));
+    const orderedSnapshot: ProjectWorkspaceSnapshot = {
+      ...snapshot,
+      projects: requested.map((projectId) => projectById.get(projectId)!),
+    };
+    applyManagedLayout(
+      canvas.document,
+      orderedSnapshot,
+      physicalManagedEdges(canvas.document),
+    );
+    this.assertActive(generation);
+    await this.writeCanvas(canvas, generation, {
+      label: "调整项目顺序",
+      markdownTransitions: [],
+    });
     return this.snapshot();
   }
 
@@ -5159,6 +5215,38 @@ function cycleOwnerMap(
 ): Map<string, string> {
   return new Map(projects.flatMap((project) =>
     project.cycles.map((cycle) => [cycle.id, project.id] as const)));
+}
+
+function resolvedProjectOrder(
+  document: CanvasDocument,
+  projects: ProjectWorkspaceProject[],
+  canvasNodes: ProjectWorkspaceCanvasNode[],
+): string[] {
+  const liveIds = new Set(projects.map((project) => project.id));
+  const ledger = document.helixProjectOrder;
+  if (
+    ledger !== undefined &&
+    (!ledger || ledger.version !== 1 || !Array.isArray(ledger.projectIds) ||
+      ledger.projectIds.some((id) => typeof id !== "string") ||
+      new Set(ledger.projectIds).size !== ledger.projectIds.length)
+  ) {
+    throw new Error("Canvas 项目排序账本无效");
+  }
+  const fallback = [...projects].sort((left, right) => {
+    const positions = (projectId: string) => canvasNodes
+      .filter((node) => node.kind === "cycle" && node.projectId === projectId);
+    const leftNodes = positions(left.id);
+    const rightNodes = positions(right.id);
+    const leftY = Math.min(...leftNodes.map((node) => node.y), Number.MAX_SAFE_INTEGER);
+    const rightY = Math.min(...rightNodes.map((node) => node.y), Number.MAX_SAFE_INTEGER);
+    const leftX = Math.min(...leftNodes.map((node) => node.x), Number.MAX_SAFE_INTEGER);
+    const rightX = Math.min(...rightNodes.map((node) => node.x), Number.MAX_SAFE_INTEGER);
+    return leftY - rightY || leftX - rightX ||
+      left.title.localeCompare(right.title, "zh-CN") || left.id.localeCompare(right.id);
+  }).map((project) => project.id);
+  const explicit = (ledger?.projectIds ?? []).filter((id) => liveIds.has(id));
+  const explicitIds = new Set(explicit);
+  return [...explicit, ...fallback.filter((id) => !explicitIds.has(id))];
 }
 
 function physicalManagedEdges(document: CanvasDocument): ProjectGraphEdge[] {

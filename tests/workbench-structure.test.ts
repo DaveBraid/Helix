@@ -303,6 +303,24 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-lineage-viewport \{[\s\S]*overflow: auto;/);
   });
 
+  it("persists draggable project order and renders Shift alignment guides for cards and containers", () => {
+    const lineage = readFileSync(
+      resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"),
+      "utf8",
+    );
+    expect(lineage).toMatch(/text: "新建项目"[\s\S]*"项目排序"/);
+    expect(lineage).toMatch(/helix-lineage-project-order-row[\s\S]*draggable: "true"/);
+    expect(lineage).toMatch(/addEventListener\("drop"[\s\S]*onReorderProjects\(projectIds\)/);
+    expect(view).toMatch(/onReorderProjects:[\s\S]*reorderProjects\([\s\S]*canvasRevisionHash/);
+    expect(projectWorkspace).toContain("helixProjectOrder");
+    expect(projectWorkspace).toContain("async reorderProjects(");
+    expect(lineage).toMatch(/bindProjectTitleDrag[\s\S]*event\.shiftKey[\s\S]*lineageShiftAlignment/);
+    expect(lineage).toContain("helix-lineage-alignment-guide");
+    expect(lineage).toMatch(/marker-start[\s\S]*marker-end/);
+    expect(css).toMatch(/\.helix-lineage-alignment-guide \{[\s\S]*stroke-dasharray/);
+    expect(css).toMatch(/\.helix-lineage-project-container\.is-shift-aligned/);
+  });
+
   it("routes Canvas repair through the dedicated write-gated action", () => {
     const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(view).toMatch(/this\.actions\.repairProjectCanvas\(\)/);

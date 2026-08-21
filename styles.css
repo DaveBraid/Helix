@@ -4977,6 +4977,10 @@
 .helix-lineage-project-container.is-operation-focus {
   animation: helix-lineage-container-focus 1.55s ease-out;
 }
+.helix-lineage-project-container.is-shift-aligned {
+  outline: 1px dashed color-mix(in srgb, var(--interactive-accent) 75%, transparent);
+  outline-offset: 5px;
+}
 
 .helix-lineage-project-container-header {
   position: absolute;
@@ -5144,6 +5148,19 @@
 .helix-lineage-edges marker[id$="inherit"] path { fill: var(--helix-relation-inherit); }
 .helix-lineage-edges marker[id$="branch"] path { fill: var(--helix-relation-branch); }
 .helix-lineage-edges marker[id$="merge"] path { fill: var(--helix-relation-merge); }
+.helix-lineage-edges marker[id$="alignment"] path {
+  fill: none;
+  stroke: var(--interactive-accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+.helix-lineage-alignment-guide {
+  stroke: color-mix(in srgb, var(--interactive-accent) 82%, var(--text-normal));
+  stroke-width: 1.4;
+  stroke-dasharray: 6 5;
+  pointer-events: none;
+}
 
 .helix-lineage-edge-insert {
   opacity: 0;
@@ -5699,6 +5716,54 @@
 .helix-lineage-status-popover-icon svg,
 .helix-lineage-status-popover-check svg { width: 14px; height: 14px; }
 .helix-lineage-status-popover-check { justify-self: end; }
+
+.helix-lineage-project-order-popover {
+  position: fixed;
+  z-index: 10000;
+  width: 272px;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 11px;
+  background: var(--background-primary);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .2);
+}
+.helix-lineage-project-order-title {
+  padding: 5px 8px 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+.helix-lineage-project-order-list { display: grid; gap: 5px; }
+.helix-lineage-project-order-row {
+  display: grid;
+  min-height: 38px;
+  grid-template-columns: 18px 10px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  border: 1px solid color-mix(in srgb, var(--helix-project-color) 18%, var(--background-modifier-border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--helix-project-color) 6%, var(--background-secondary));
+  color: var(--text-normal);
+  cursor: grab;
+}
+.helix-lineage-project-order-row:hover { background: var(--background-modifier-hover); }
+.helix-lineage-project-order-row.is-dragging { opacity: .48; cursor: grabbing; }
+.helix-lineage-project-order-grip { display: inline-flex; color: var(--text-faint); }
+.helix-lineage-project-order-grip svg { width: 15px; height: 15px; }
+.helix-lineage-project-order-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--helix-project-color);
+}
+.helix-lineage-project-order-name {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .helix-lineage-card-relations {
   min-height: 28px;

@@ -171,23 +171,8 @@ export function planProjectGraphLayout(
     group.push(stage);
     stagesByProject.set(stage.projectId, group);
   }
-  const projectOrder = [...projects].sort((left, right) => {
-    const leftStages = stagesByProject.get(left.id) ?? [];
-    const rightStages = stagesByProject.get(right.id) ?? [];
-    const leftY = leftStages.length > 0
-      ? Math.min(...leftStages.map((stage) => stage.y))
-      : 0;
-    const rightY = rightStages.length > 0
-      ? Math.min(...rightStages.map((stage) => stage.y))
-      : 0;
-    const leftX = leftStages.length > 0
-      ? Math.min(...leftStages.map((stage) => stage.x))
-      : 0;
-    const rightX = rightStages.length > 0
-      ? Math.min(...rightStages.map((stage) => stage.x))
-      : 0;
-    return leftY - rightY || leftX - rightX || left.id.localeCompare(right.id);
-  });
+  // 调用方传入的项目顺序是完整布局的显式 lane 顺序；局部布局仍只移动 scope。
+  const projectOrder = [...projects];
   const ownerRank = new Map(projectOrder.map((project, index) => [project.id, index]));
   const incoming = new Map<string, string[]>();
   for (const edge of edges) {

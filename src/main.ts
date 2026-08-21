@@ -116,6 +116,7 @@ import {
 import { helixMarkerVisibilityExtension } from "./editor/helix-marker-visibility";
 import { ProjectRefreshBatch } from "./services/project-refresh-batch";
 import {
+  derivedLocalProjectStageStatus,
   LocalProjectTaskService,
   type LocalProjectTaskDraft,
   type LocalProjectTaskSnapshot,
@@ -521,12 +522,17 @@ export default class HelixPlugin extends Plugin {
       }
       if (!this.recoveryMode) {
         await this.projectWorkspace.initializeFocusBridgeState();
-        const snapshot = await this.projectWorkspace.loadStableWorkspace();
+        let snapshot = await this.projectWorkspace.loadStableWorkspace();
         await this.repairDerivedProjectCanvasCache(snapshot);
-        this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+        let localTasks = await this.localProjectTasks.snapshot(
           snapshot,
           { adoptUnmanaged: true },
         );
+        if (await this.reconcileLocalProjectStageStatuses(snapshot, localTasks)) {
+          snapshot = await this.projectWorkspace.loadStableWorkspace();
+          localTasks = await this.localProjectTasks.snapshot(snapshot);
+        }
+        this.localProjectTaskSnapshotCache = localTasks;
         this.focusBridgeConflictCountCache =
           (await this.projectWorkspace.listFocusBridgeConflicts()).length;
         this.projectViewRevision += 1;
@@ -947,11 +953,12 @@ export default class HelixPlugin extends Plugin {
     title: string;
     parentUuid?: string;
   }): Promise<string> {
-    return this.withWritableProjectMutation(async () =>
-      this.localProjectTasks.createTask(
-        await this.projectWorkspace.loadStableWorkspace(),
-        input,
-      ));
+    return this.withWritableProjectMutation(async () => {
+      const workspace = await this.projectWorkspace.loadStableWorkspace();
+      const taskId = await this.localProjectTasks.createTask(workspace, input);
+      await this.reconcileLocalProjectStageCompletion(workspace, input.projectId, input.stageId);
+      return taskId;
+    });
   }
 
   async updateLocalProjectTask(input: {
@@ -962,11 +969,11 @@ export default class HelixPlugin extends Plugin {
     title?: string;
     state?: ProjectionActionState;
   }): Promise<void> {
-    await this.withWritableProjectMutation(async () =>
-      this.localProjectTasks.updateTask(
-        await this.projectWorkspace.loadStableWorkspace(),
-        input,
-      ));
+    await this.withWritableProjectMutation(async () => {
+      const workspace = await this.projectWorkspace.loadStableWorkspace();
+      await this.localProjectTasks.updateTask(workspace, input);
+      await this.reconcileLocalProjectStageCompletion(workspace, input.projectId, input.stageId);
+    });
   }
 
   async deleteLocalProjectTask(input: {
@@ -975,11 +982,11 @@ export default class HelixPlugin extends Plugin {
     uuid: string;
     expectedHash: string;
   }): Promise<void> {
-    await this.withWritableProjectMutation(async () =>
-      this.localProjectTasks.deleteTask(
-        await this.projectWorkspace.loadStableWorkspace(),
-        input,
-      ));
+    await this.withWritableProjectMutation(async () => {
+      const workspace = await this.projectWorkspace.loadStableWorkspace();
+      await this.localProjectTasks.deleteTask(workspace, input);
+      await this.reconcileLocalProjectStageCompletion(workspace, input.projectId, input.stageId);
+    });
   }
 
   async saveLocalProjectTask(input: {
@@ -989,11 +996,46 @@ export default class HelixPlugin extends Plugin {
     expectedHash: string;
     draft: LocalProjectTaskDraft;
   }): Promise<void> {
-    await this.withWritableProjectMutation(async () =>
-      this.localProjectTasks.saveTask(
-        await this.projectWorkspace.loadStableWorkspace(),
-        input,
-      ));
+    await this.withWritableProjectMutation(async () => {
+      const workspace = await this.projectWorkspace.loadStableWorkspace();
+      await this.localProjectTasks.saveTask(workspace, input);
+      await this.reconcileLocalProjectStageCompletion(workspace, input.projectId, input.stageId);
+    });
+  }
+
+  private async reconcileLocalProjectStageCompletion(
+    workspace: ProjectWorkspaceSnapshot,
+    projectId: string,
+    stageId: string,
+  ): Promise<void> {
+    const snapshot = await this.localProjectTasks.snapshot(workspace);
+    const project = workspace.projects.find((candidate) => candidate.id === projectId);
+    if (!project?.cycles.some((cycle) => cycle.id === stageId)) {
+      throw new Error("找不到需要更新完成状态的阶段");
+    }
+    await this.reconcileLocalProjectStageStatuses(workspace, snapshot, new Set([stageId]));
+  }
+
+  private async reconcileLocalProjectStageStatuses(
+    workspace: ProjectWorkspaceSnapshot,
+    snapshot: LocalProjectTaskSnapshot,
+    stageIds?: ReadonlySet<string>,
+  ): Promise<boolean> {
+    let changed = false;
+    for (const project of workspace.projects) {
+      for (const stage of project.cycles) {
+        if (stageIds && !stageIds.has(stage.id)) continue;
+        const nextStatus = derivedLocalProjectStageStatus(
+          stage.status,
+          snapshot.roots.filter((task) => task.stageId === stage.id),
+        );
+        if (!nextStatus) continue;
+        const plan = await this.projectWorkspace.prepareCycleStatusUpdate(stage.id);
+        await this.projectWorkspace.updateCycleStatus(plan, nextStatus);
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   async readProjectProjectionConfiguration(): Promise<ProjectionPersistentState> {
@@ -1944,12 +1986,17 @@ export default class HelixPlugin extends Plugin {
         }
         if (!this.recoveryMode) {
           // 本轮只读取一次稳定工作区，供 Canvas 派生修复和任务派生共同使用。
-          const snapshot = await this.projectWorkspace.loadStableWorkspace();
+          let snapshot = await this.projectWorkspace.loadStableWorkspace();
           await this.repairDerivedProjectCanvasCache(snapshot);
-          this.localProjectTaskSnapshotCache = await this.localProjectTasks.snapshot(
+          let localTasks = await this.localProjectTasks.snapshot(
             snapshot,
             { adoptUnmanaged: markdownPaths.length > 0 },
           );
+          if (await this.reconcileLocalProjectStageStatuses(snapshot, localTasks)) {
+            snapshot = await this.projectWorkspace.loadStableWorkspace();
+            localTasks = await this.localProjectTasks.snapshot(snapshot);
+          }
+          this.localProjectTaskSnapshotCache = localTasks;
           this.focusBridgeConflictCountCache =
             (await this.projectWorkspace.listFocusBridgeConflicts()).length;
           this.projectViewRevision += 1;

@@ -894,18 +894,24 @@ export class HelixView extends ItemView {
       : stageParent
         ? stageParent.stageStatus === "completed" || stageParent.stageStatus === "terminated"
         : task.status === 2;
+    const completionIsDerived = Boolean(stageParent || (localTask && tree?.hasChildren));
     const leading = row.createDiv({ cls: "helix-task-tree-leading" });
     const check = leading.createEl("button", {
       cls: `${tree?.hasChildren ? "helix-task-tree-progress" : "helix-task-check"}${completed ? " is-completed" : ""}`,
       attr: {
-        "aria-label": tree?.hasChildren
-          ? `${task.title}：直属子任务完成 ${tree.completedDirectChildCount}/${tree.directChildCount}；${completed ? "重新打开父任务" : "完成父任务"}`
+        "aria-label": completionIsDerived
+          ? `${task.title}：完成状态由子任务自动决定`
+          : tree?.hasChildren
+            ? `${task.title}：直属子任务完成 ${tree.completedDirectChildCount}/${tree.directChildCount}；${completed ? "重新打开父任务" : "完成父任务"}`
           : completed ? `重新打开 ${task.title}` : `完成 ${task.title}`,
-        title: tree?.hasChildren
-          ? `直属子任务 ${tree.completedDirectChildCount}/${tree.directChildCount}；点击只切换父任务本身`
+        title: completionIsDerived
+          ? "子任务全部完成后自动完成主任务"
+          : tree?.hasChildren
+            ? `直属子任务 ${tree.completedDirectChildCount}/${tree.directChildCount}；点击只切换父任务本身`
           : completed ? "重新打开任务" : "完成任务",
       },
     });
+    if (completionIsDerived) check.disabled = true;
     if (tree?.hasChildren) {
       const childRatio = tree.directChildCount > 0
         ? tree.completedDirectChildCount / tree.directChildCount
@@ -980,19 +986,21 @@ export class HelixView extends ItemView {
     let editTask: (() => void) | undefined;
     let toggleActive: (() => void) | undefined;
     if (localTask) {
-      check.addEventListener("click", () => {
-        check.disabled = true;
-        void this.actions.updateLocalProjectTask({
-          projectId: localTask.projectId,
-          stageId: localTask.stageId,
-          uuid: localTask.uuid,
-          expectedHash: localTask.revisionHash,
-          state: completed ? "idea" : "completed",
-        }).then(() => this.render()).catch((error) => {
-          check.disabled = false;
-          new Notice(messageOf(error), 8_000);
+      if (!completionIsDerived) {
+        check.addEventListener("click", () => {
+          check.disabled = true;
+          void this.actions.updateLocalProjectTask({
+            projectId: localTask.projectId,
+            stageId: localTask.stageId,
+            uuid: localTask.uuid,
+            expectedHash: localTask.revisionHash,
+            state: completed ? "idea" : "completed",
+          }).then(() => this.render()).catch((error) => {
+            check.disabled = false;
+            new Notice(messageOf(error), 8_000);
+          });
         });
-      });
+      }
       toggleActive = () => {
         void this.actions.updateLocalProjectTask({
           projectId: localTask.projectId,
@@ -1009,17 +1017,6 @@ export class HelixView extends ItemView {
         if (editorTask) this.openLocalProjectTaskEditor(editorTask);
       };
     } else if (stageParent) {
-      check.addEventListener("click", () => {
-        check.disabled = true;
-        void this.actions.readProjectWorkspace(() =>
-          this.actions.projectWorkspace.prepareCycleStatusUpdate(stageParent.stageId))
-          .then((plan) => this.actions.updateCycleStatus(plan, completed ? "idea" : "completed"))
-          .then(() => this.render())
-          .catch((error) => {
-            check.disabled = false;
-            new Notice(messageOf(error), 8_000);
-          });
-      });
       toggleActive = () => {
         void this.actions.readProjectWorkspace(() =>
           this.actions.projectWorkspace.prepareCycleStatusUpdate(stageParent.stageId))
@@ -1261,7 +1258,7 @@ export class HelixView extends ItemView {
     const adapter: TaskDetailAdapter = {
       read: async () => ({
         draft: localTaskDetailDraft(task, children),
-        capabilities: localTaskDetailCapabilities(),
+        capabilities: localTaskDetailCapabilities(children.length > 0),
       }),
       save: async (draft) => {
         await this.actions.saveLocalProjectTask({
@@ -5130,12 +5127,13 @@ function localTaskDetailDraft(task: LocalProjectTask, children: LocalProjectTask
   };
 }
 
-function localTaskDetailCapabilities(): TaskDetailCapabilities {
+function localTaskDetailCapabilities(completionDerivedFromSubtasks = false): TaskDetailCapabilities {
   return {
     delete: true,
     editTitle: true,
     editStatus: true,
     statusOptions: ["idea", "active", "completed", "paused", "terminated"],
+    completionDerivedFromSubtasks,
     editPriority: true,
     editSchedule: true,
     editTags: true,
@@ -5153,7 +5151,7 @@ function localTaskDetailCapabilities(): TaskDetailCapabilities {
 
 function stageTaskDetailCapabilities(): TaskDetailCapabilities {
   return {
-    ...localTaskDetailCapabilities(),
+    ...localTaskDetailCapabilities(true),
     delete: false,
     editPriority: false,
     editSchedule: false,

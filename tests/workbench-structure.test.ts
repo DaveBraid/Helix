@@ -140,6 +140,9 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(
       /withProjectMutation[\s\S]*const result = await operation\(\)[\s\S]*localProjectTaskSnapshotCache = null/,
     );
+    expect(main).toMatch(/createLocalProjectTask[\s\S]*reconcileLocalProjectStageCompletion/);
+    expect(main).toMatch(/updateLocalProjectTask[\s\S]*reconcileLocalProjectStageCompletion/);
+    expect(main).toMatch(/saveLocalProjectTask[\s\S]*reconcileLocalProjectStageCompletion/);
     expect(view).toMatch(/render\(\)[\s\S]*refreshLocalProjectTaskSnapshot\(token\)/);
     expect(view).toMatch(/localProjectTaskDidaTasks[\s\S]*this\.localProjectTaskSnapshot/);
     expect(view).toMatch(/renderSidebar[\s\S]*mergeProjectTaskCollections\([\s\S]*sidebarRemoteTasks[\s\S]*localProjectTaskDidaTasks\(\)/);
@@ -169,7 +172,13 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-task-tree \.helix-task-check\.is-completed[\s\S]*background: var\(--color-green\) !important/);
     expect(view).toMatch(/const leading[\s\S]*const check[\s\S]*const body[\s\S]*const toggle = row\.createEl/);
     expect(view).toContain('state: completed ? "idea" : "completed"');
-    expect(view).toMatch(/else if \(stageParent\)[\s\S]*prepareCycleStatusUpdate\(stageParent\.stageId\)[\s\S]*completed \? "idea" : "completed"/);
+    expect(view).toContain("const completionIsDerived = Boolean(stageParent || (localTask && tree?.hasChildren))");
+    expect(view).toContain("if (completionIsDerived) check.disabled = true");
+    expect(view).toContain("子任务全部完成后自动完成主任务");
+    expect(view).toContain("localTaskDetailCapabilities(children.length > 0)");
+    expect(view).toContain("localTaskDetailCapabilities(true)");
+    expect(unifiedTaskEditor).toContain("capabilities.completionDerivedFromSubtasks");
+    expect(unifiedTaskEditor).toContain("主任务将在全部子任务完成后自动完成");
     expect(view).toContain('attr: { "data-task-id": task.id }');
     expect(view).toContain("collapsedTaskTreeIds");
     expect(view).toContain("taskTreeRows");

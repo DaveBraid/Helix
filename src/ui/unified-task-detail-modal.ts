@@ -97,10 +97,16 @@ export class UnifiedTaskDetailModal extends Modal {
     const statusField = property("状态", "circle-dot");
     const status = statusField.createEl("select", { attr: { "aria-label": "任务状态" } });
     for (const value of capabilities.statusOptions) {
-      status.createEl("option", { value, text: STATUS_LABELS[value] });
+      const option = status.createEl("option", { value, text: STATUS_LABELS[value] });
+      if (value === "completed" && capabilities.completionDerivedFromSubtasks) {
+        option.disabled = true;
+      }
     }
     status.value = draft.status;
     status.disabled = !capabilities.editStatus;
+    if (capabilities.completionDerivedFromSubtasks) {
+      status.title = "主任务将在全部子任务完成后自动完成";
+    }
     status.addEventListener("change", () => { draft.status = status.value as TaskDetailStatus; });
 
     const priorityField = property("优先级", "flag");

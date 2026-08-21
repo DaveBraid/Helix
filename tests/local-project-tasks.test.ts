@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
+import {
+  adoptAllPlanActions,
+  parseManagedPlanActions,
+} from "../src/domain/dida-project-projection";
 import { stableHash } from "../src/domain/stable";
 import {
+  derivedLocalProjectStageStatus,
   LocalProjectTaskService,
   isLocalProjectTaskId,
   localProjectTaskPresentationTasks,
+  reconcileLocalPlanParentCompletion,
   type LocalProjectTaskSnapshot,
 } from "../src/services/local-project-tasks";
 import type {
@@ -216,6 +222,47 @@ describe("LocalProjectTaskService", () => {
     });
     expect((await service.snapshot(workspace())).tasks).toEqual([]);
     expect(markdown.value()).toContain("用户正文");
+  });
+
+  it("derives parent completion from children and reopens it when a child reopens", async () => {
+    const markdown = new MemoryMarkdown();
+    const service = new LocalProjectTaskService(markdown);
+    let snapshot = await service.snapshot(workspace(), { adoptUnmanaged: true });
+    const child = snapshot.tasks.find((task) => task.parentUuid)!;
+    await service.updateTask(workspace(), {
+      projectId: child.projectId,
+      stageId: child.stageId,
+      uuid: child.uuid,
+      expectedHash: child.revisionHash,
+      state: "completed",
+    });
+    snapshot = await service.snapshot(workspace());
+    expect(snapshot.roots[0]?.state).toBe("completed");
+    expect(markdown.value()).toContain("- [x] 根任务");
+
+    const reopened = snapshot.byUuid.get(child.uuid)!;
+    await service.updateTask(workspace(), {
+      projectId: reopened.projectId,
+      stageId: reopened.stageId,
+      uuid: reopened.uuid,
+      expectedHash: reopened.revisionHash,
+      state: "idea",
+    });
+    snapshot = await service.snapshot(workspace());
+    expect(snapshot.roots[0]?.state).toBe("idea");
+    expect(markdown.value()).toContain("- [ ] 根任务");
+  });
+
+  it("reconciles nested parents to a fixed point and derives the Stage parent status", () => {
+    const nested = adoptAllPlanActions(`---\nhelix-kind: helix-stage\nhelix-id: stage-1\n---\n\n# 计划行动\n\n- [ ] 根\n  - [ ] 中\n    - [x] 叶\n`);
+    const reconciled = reconcileLocalPlanParentCompletion(nested);
+    const actions = parseManagedPlanActions(reconciled).actions;
+    expect(actions.find((action) => action.title === "中")?.state).toBe("completed");
+    expect(actions.find((action) => action.title === "根")?.state).toBe("completed");
+    expect(derivedLocalProjectStageStatus("active", actions.filter((action) => !action.parentUuid))).toBe("completed");
+    expect(derivedLocalProjectStageStatus("completed", [{ state: "idea" }])).toBe("idea");
+    expect(derivedLocalProjectStageStatus("active", [{ state: "terminated" }])).toBeUndefined();
+    expect(derivedLocalProjectStageStatus("paused", [{ state: "completed" }])).toBeUndefined();
   });
 
   it("refuses stale writes without changing Markdown", async () => {

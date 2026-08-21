@@ -11,7 +11,10 @@ import {
   type ProjectionActionState,
 } from "../domain/dida-project-projection";
 import type { DidaTask } from "../domain/entities";
-import type { ProjectWorkspaceSnapshot } from "./project-workspace";
+import type {
+  ProjectWorkspaceCycleStatus,
+  ProjectWorkspaceSnapshot,
+} from "./project-workspace";
 import type {
   ProjectionMarkdownPort,
   ProjectionMarkdownRevision,
@@ -159,6 +162,58 @@ export function localProjectTaskPresentationTasks(
   return [...stageParents, ...localTasks];
 }
 
+function isCompletedActionState(state: ProjectionActionState): boolean {
+  return state === "completed";
+}
+
+/**
+ * 父行动的完成状态只由直接子任务派生。由最深层向上反复收敛，保证
+ * 任意深度任务树在同一次 Stage Markdown CAS 中得到一致状态。
+ */
+export function reconcileLocalPlanParentCompletion(markdown: string): string {
+  let next = markdown;
+  const actionCount = parseManagedPlanActions(markdown).actions.length;
+  for (let pass = 0; pass <= actionCount; pass += 1) {
+    const parsed = parseManagedPlanActions(next);
+    const childrenByParent = new Map<string, typeof parsed.actions>();
+    for (const action of parsed.actions) {
+      if (!action.parentUuid) continue;
+      const children = childrenByParent.get(action.parentUuid) ?? [];
+      children.push(action);
+      childrenByParent.set(action.parentUuid, children);
+    }
+    let changed = false;
+    for (const parent of parsed.actions) {
+      const children = childrenByParent.get(parent.uuid);
+      if (!children?.length || parent.state === "terminated") continue;
+      const allCompleted = children.every((child) => isCompletedActionState(child.state));
+      const nextState = allCompleted
+        ? "completed"
+        : parent.state === "completed"
+          ? children.some((child) => child.state !== "idea") ? "active" : "idea"
+          : parent.state;
+      if (nextState === parent.state) continue;
+      next = patchManagedPlanAction(next, { uuid: parent.uuid, state: nextState });
+      changed = true;
+    }
+    if (!changed) return next;
+  }
+  throw new Error("本地父子任务完成状态无法稳定收敛");
+}
+
+/** Stage 父任务只在存在根行动时派生完成；暂停和终止仍由用户显式控制。 */
+export function derivedLocalProjectStageStatus(
+  current: ProjectWorkspaceCycleStatus,
+  roots: readonly Pick<LocalProjectTask, "state">[],
+): ProjectWorkspaceCycleStatus | undefined {
+  if (roots.length === 0 || current === "paused" || current === "terminated") return undefined;
+  if (roots.every((task) => isCompletedActionState(task.state))) {
+    return current === "completed" ? undefined : "completed";
+  }
+  if (current !== "completed") return undefined;
+  return roots.some((task) => task.state !== "idea") ? "active" : "idea";
+}
+
 export class LocalProjectTaskService {
   constructor(private readonly markdown: ProjectionMarkdownPort) {}
 
@@ -175,9 +230,9 @@ export class LocalProjectTaskService {
         try {
           let revision = await this.requireStage(stage.notePath, stage.id);
           if (options.adoptUnmanaged) {
-            const adopted = adoptAllPlanActions(
+            const adopted = reconcileLocalPlanParentCompletion(adoptAllPlanActions(
               reconcileLocalPlanActionCheckboxes(revision.content),
-            );
+            ));
             if (adopted !== revision.content) {
               revision = await this.markdown.compareAndWrite(revision, adopted);
             }
@@ -273,12 +328,12 @@ export class LocalProjectTaskService {
     const stage = requireStage(workspace, input.projectId, input.stageId);
     const revision = await this.requireStage(stage.notePath, stage.id);
     const uuid = crypto.randomUUID();
-    const content = appendManagedPlanAction(revision.content, {
+    const content = reconcileLocalPlanParentCompletion(appendManagedPlanAction(revision.content, {
       uuid,
       title: input.title.trim(),
       state: input.state,
       parentUuid: input.parentUuid,
-    });
+    }));
     await this.markdown.compareAndWrite(revision, content);
     return localProjectTaskId(uuid);
   }
@@ -293,11 +348,11 @@ export class LocalProjectTaskService {
   }): Promise<void> {
     const stage = requireStage(workspace, input.projectId, input.stageId);
     const revision = await this.requireExpectedStage(stage.notePath, stage.id, input.expectedHash);
-    const content = patchManagedPlanAction(revision.content, {
+    const content = reconcileLocalPlanParentCompletion(patchManagedPlanAction(revision.content, {
       uuid: input.uuid,
       title: input.title?.trim(),
       state: input.state,
-    });
+    }));
     await this.markdown.compareAndWrite(revision, content);
   }
 
@@ -309,10 +364,9 @@ export class LocalProjectTaskService {
   }): Promise<void> {
     const stage = requireStage(workspace, input.projectId, input.stageId);
     const revision = await this.requireExpectedStage(stage.notePath, stage.id, input.expectedHash);
-    await this.markdown.compareAndWrite(
-      revision,
+    await this.markdown.compareAndWrite(revision, reconcileLocalPlanParentCompletion(
       removeManagedPlanAction(revision.content, input.uuid),
-    );
+    ));
   }
 
   async saveTask(workspace: ProjectWorkspaceSnapshot, input: {
@@ -375,7 +429,9 @@ export class LocalProjectTaskService {
         });
       }
     }
-    content = reorderManagedPlanChildren(content, root.uuid, orderedChildUuids);
+    content = reconcileLocalPlanParentCompletion(
+      reorderManagedPlanChildren(content, root.uuid, orderedChildUuids),
+    );
     await this.markdown.compareAndWrite(revision, content);
   }
 

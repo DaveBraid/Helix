@@ -39,6 +39,8 @@ export interface TaskDetailCapabilities {
   editTitle: boolean;
   editStatus: boolean;
   statusOptions: TaskDetailStatus[];
+  /** 已完成只能由全部直属子任务完成后派生，不能由状态控件主动选择。 */
+  completionDerivedFromSubtasks?: boolean;
   editPriority: boolean;
   editSchedule: boolean;
   editTags: boolean;

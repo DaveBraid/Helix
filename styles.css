@@ -748,6 +748,12 @@
   outline-offset: 3px;
 }
 
+.helix-root button.helix-task-tree-progress:disabled,
+.helix-task-tree .helix-task-check:disabled {
+  opacity: 1;
+  cursor: default;
+}
+
 .helix-root button.helix-task-tree-progress.is-completed {
   background: var(--color-green) !important;
   color: var(--text-on-accent);

@@ -2685,6 +2685,12 @@ describe("ProjectWorkspaceService", () => {
     };
     const lower = (await service.snapshot()).projects[0]!.cycles.find((cycle) =>
       cycle.title === "下方分支")!;
+    const lowerCanvasNode = repo.json(CANVAS).nodes.find((node: Record<string, unknown>) =>
+      node.helixStageId === lower.id);
+    await service.moveCanvasNodes(
+      [{ nodeId: String(lowerCanvasNode.id), x: 1_010, y: 743 }],
+      (await service.snapshot()).canvasRevisionHash!,
+    );
     const beforeFirstSuccessor = coordinates();
     const successor = await service.createCycle(
       "project-1",
@@ -2708,8 +2714,9 @@ describe("ProjectWorkspaceService", () => {
     const nextSuccessorNode = nodes.find((node: Record<string, unknown>) =>
       node.helixStageId === nextSuccessor.id);
     expectCoordinatesUnchanged(beforeContinuation);
-    expect(successorNode).toMatchObject({ x: 816, y: lowerNode.y });
-    expect(nextSuccessorNode).toMatchObject({ x: 1_224, y: lowerNode.y });
+    expect(lowerNode).toMatchObject({ x: 1_010, y: 743 });
+    expect(successorNode).toMatchObject({ x: 1_418, y: lowerNode.y });
+    expect(nextSuccessorNode).toMatchObject({ x: 1_826, y: lowerNode.y });
     expect(successorNode.y).toBe(lowerNode.y);
   });
 

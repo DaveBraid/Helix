@@ -37,7 +37,118 @@ import {
   lineageVisibleStageIdsByProject,
   lineageZoomLabel,
   projectedLineageRelations,
+  reconcileLineageLayoutDraft,
 } from "../src/ui/project-lineage-workbench";
+
+describe("Project Lineage layout draft reconciliation", () => {
+  it("keeps an unsaved parent position and rebases only its new successor", () => {
+    const reconciled = reconcileLineageLayoutDraft({
+      canvasRevisionHash: "before",
+      basePositions: {
+        parent: { x: 100, y: 120 },
+        unrelated: { x: 40, y: 700 },
+      },
+      positions: {
+        parent: { x: 260, y: 480 },
+        unrelated: { x: 40, y: 700 },
+      },
+      undo: [{
+        parent: { x: 100, y: 120 },
+        unrelated: { x: 40, y: 700 },
+      }],
+      redo: [],
+      dirty: true,
+    }, {
+      parent: { x: 100, y: 120 },
+      unrelated: { x: 40, y: 700 },
+      child: { x: 508, y: 120 },
+    }, "after", [{
+      id: "parent-child",
+      kind: "inherit",
+      fromCycleIds: ["parent"],
+      toCycleId: "child",
+    }]);
+
+    expect(reconciled?.positions).toEqual({
+      parent: { x: 260, y: 480 },
+      unrelated: { x: 40, y: 700 },
+      child: { x: 668, y: 480 },
+    });
+    expect(reconciled?.undo[0]).toEqual({
+      parent: { x: 100, y: 120 },
+      unrelated: { x: 40, y: 700 },
+      child: { x: 508, y: 120 },
+    });
+    expect(reconciled?.dirty).toBe(true);
+  });
+
+  it("does not restore a stale draft over an externally moved Canvas node", () => {
+    const reconciled = reconcileLineageLayoutDraft({
+      canvasRevisionHash: "before",
+      basePositions: {
+        parent: { x: 100, y: 120 },
+        stable: { x: 0, y: 0 },
+      },
+      positions: {
+        parent: { x: 260, y: 480 },
+        stable: { x: 0, y: 0 },
+      },
+      undo: [],
+      redo: [],
+      dirty: true,
+    }, {
+      parent: { x: 180, y: 220 },
+      stable: { x: 0, y: 0 },
+      child: { x: 588, y: 220 },
+    }, "after", [{
+      id: "parent-child",
+      kind: "inherit",
+      fromCycleIds: ["parent"],
+      toCycleId: "child",
+    }]);
+
+    expect(reconciled?.positions.parent).toEqual({ x: 180, y: 220 });
+    expect(reconciled?.positions.child).toEqual({ x: 588, y: 220 });
+  });
+
+  it("preserves the moved branch row through a later successor creation", () => {
+    const firstCanvas = {
+      branch: { x: 816, y: 1172 },
+      child: { x: 1224, y: 1572 },
+    };
+    const firstSession = {
+      branch: { x: 559, y: 1298 },
+      child: { x: 967, y: 1698 },
+    };
+    const reconciled = reconcileLineageLayoutDraft({
+      canvasRevisionHash: "first",
+      basePositions: firstCanvas,
+      positions: firstSession,
+      undo: [],
+      redo: [],
+      dirty: true,
+    }, {
+      ...firstCanvas,
+      grandchild: { x: 1632, y: 1572 },
+    }, "second", [{
+      id: "branch-child",
+      kind: "branch",
+      fromCycleIds: ["branch"],
+      toCycleId: "child",
+    }, {
+      id: "child-grandchild",
+      kind: "inherit",
+      fromCycleIds: ["child"],
+      toCycleId: "grandchild",
+    }]);
+
+    expect(reconciled?.positions).toEqual({
+      branch: { x: 559, y: 1298 },
+      child: { x: 967, y: 1698 },
+      grandchild: { x: 1375, y: 1698 },
+    });
+  });
+});
 
 describe("Project Lineage ancestor hover highlight", () => {
   it("keeps every upstream merge branch but excludes descendants and unrelated nodes", () => {

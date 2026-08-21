@@ -228,10 +228,72 @@ export function lineageShiftBoxAlignment(
 
 export interface LineageLayoutDraft {
   canvasRevisionHash: string;
+  /** 生成草稿时读取到的 Canvas 坐标，用于区分新增节点和外部布局竞争。 */
+  basePositions: LineageLayoutSnapshot;
   positions: LineageLayoutSnapshot;
   undo: LineageLayoutSnapshot[];
   redo: LineageLayoutSnapshot[];
   dirty: boolean;
+}
+
+export interface ReconciledLineageLayoutDraft {
+  positions: LineageLayoutSnapshot;
+  undo: LineageLayoutSnapshot[];
+  redo: LineageLayoutSnapshot[];
+  dirty: boolean;
+}
+
+/**
+ * 结构写入新增节点后保留尚未保存的会话布局。只有 Canvas 中仍与旧 Base
+ * 一致的既有节点才继承草稿；发生外部移动的节点始终采用新的权威坐标。
+ */
+export function reconcileLineageLayoutDraft(
+  draft: LineageLayoutDraft,
+  currentPositions: LineageLayoutSnapshot,
+  currentCanvasRevisionHash: string | null,
+  relations: readonly CycleRelation[],
+): ReconciledLineageLayoutDraft | undefined {
+  if (!currentCanvasRevisionHash) return undefined;
+  const currentIds = Object.keys(currentPositions);
+  const sameEntities = currentIds.length === Object.keys(draft.positions).length &&
+    currentIds.every((id) => draft.positions[id] !== undefined);
+  if (draft.canvasRevisionHash === currentCanvasRevisionHash && sameEntities) {
+    return {
+      positions: cloneLayoutSnapshot(draft.positions),
+      undo: draft.undo
+        .filter((item) => currentIds.every((id) => item[id] !== undefined))
+        .map((item) => cloneLayoutSnapshot(item)),
+      redo: draft.redo
+        .filter((item) => currentIds.every((id) => item[id] !== undefined))
+        .map((item) => cloneLayoutSnapshot(item)),
+      dirty: draft.dirty,
+    };
+  }
+
+  const base = draft.basePositions;
+  if (!base) return undefined;
+  const safeExistingIds = new Set(currentIds.filter((id) =>
+    draft.positions[id] !== undefined &&
+    base[id] !== undefined &&
+    sameLineagePoint(currentPositions[id]!, base[id]!)));
+  if (safeExistingIds.size === 0) return undefined;
+  const addedIds = new Set(currentIds.filter((id) => base[id] === undefined));
+  const merge = (source: LineageLayoutSnapshot): LineageLayoutSnapshot => {
+    const next = cloneLayoutSnapshot(currentPositions);
+    for (const id of safeExistingIds) {
+      const point = source[id];
+      if (point) next[id] = { ...point };
+    }
+    rebaseAddedLineageTargets(next, currentPositions, addedIds, relations);
+    return next;
+  };
+  const positions = merge(draft.positions);
+  return {
+    positions,
+    undo: draft.undo.map(merge),
+    redo: draft.redo.map(merge),
+    dirty: !sameLineageLayout(positions, currentPositions),
+  };
 }
 
 interface WorkbenchOptions {
@@ -1130,15 +1192,19 @@ export class ProjectLineageWorkbench {
     }
     this.persistedLayout = this.captureRawLayout();
     const draft = options.initialLayoutDraft;
-    if (
-      draft &&
-      draft.canvasRevisionHash === options.snapshot.canvasRevisionHash &&
-      this.sameLayoutEntities(draft.positions)
-    ) {
-      this.applyRawLayout(draft.positions);
-      this.layoutUndo = draft.undo.filter((item) => this.sameLayoutEntities(item));
-      this.layoutRedo = draft.redo.filter((item) => this.sameLayoutEntities(item));
-      this.layoutDirty = draft.dirty;
+    const reconciledDraft = draft
+      ? reconcileLineageLayoutDraft(
+          draft,
+          this.persistedLayout,
+          options.snapshot.canvasRevisionHash,
+          options.snapshot.relations,
+        )
+      : undefined;
+    if (reconciledDraft) {
+      this.applyRawLayout(reconciledDraft.positions);
+      this.layoutUndo = reconciledDraft.undo;
+      this.layoutRedo = reconciledDraft.redo;
+      this.layoutDirty = reconciledDraft.dirty;
     }
     this.prepareCompletedProjection();
     for (const [projectId, entityIds] of lineageVisibleStageIdsByProject(
@@ -1197,6 +1263,7 @@ export class ProjectLineageWorkbench {
     }
     return {
       canvasRevisionHash: this.options.snapshot.canvasRevisionHash,
+      basePositions: cloneLayoutSnapshot(this.persistedLayout),
       positions: this.captureRawLayout(),
       undo: this.layoutUndo.map((item) => cloneLayoutSnapshot(item)),
       redo: this.layoutRedo.map((item) => cloneLayoutSnapshot(item)),
@@ -3956,4 +4023,47 @@ function cloneLayoutSnapshot(snapshot: LineageLayoutSnapshot): LineageLayoutSnap
     entityId,
     { ...point },
   ]));
+}
+
+function sameLineagePoint(left: LineagePoint, right: LineagePoint): boolean {
+  return left.x === right.x && left.y === right.y;
+}
+
+function sameLineageLayout(
+  left: LineageLayoutSnapshot,
+  right: LineageLayoutSnapshot,
+): boolean {
+  const leftIds = Object.keys(left);
+  return leftIds.length === Object.keys(right).length && leftIds.every((id) =>
+    right[id] !== undefined && sameLineagePoint(left[id]!, right[id]!));
+}
+
+function rebaseAddedLineageTargets(
+  positions: LineageLayoutSnapshot,
+  currentPositions: LineageLayoutSnapshot,
+  addedIds: ReadonlySet<string>,
+  relations: readonly CycleRelation[],
+): void {
+  for (const relation of relations) {
+    if (!addedIds.has(relation.toCycleId)) continue;
+    const currentTarget = currentPositions[relation.toCycleId];
+    const currentSources = relation.fromCycleIds
+      .map((id) => currentPositions[id])
+      .filter((point): point is LineagePoint => point !== undefined);
+    const nextSources = relation.fromCycleIds
+      .map((id) => positions[id])
+      .filter((point): point is LineagePoint => point !== undefined);
+    if (!currentTarget || currentSources.length !== relation.fromCycleIds.length ||
+      nextSources.length !== relation.fromCycleIds.length) continue;
+    const currentRight = Math.max(...currentSources.map((point) => point.x));
+    const nextRight = Math.max(...nextSources.map((point) => point.x));
+    const currentAverageY = currentSources.reduce((sum, point) => sum + point.y, 0) /
+      currentSources.length;
+    const nextAverageY = nextSources.reduce((sum, point) => sum + point.y, 0) /
+      nextSources.length;
+    positions[relation.toCycleId] = {
+      x: currentTarget.x + nextRight - currentRight,
+      y: currentTarget.y + nextAverageY - currentAverageY,
+    };
+  }
 }

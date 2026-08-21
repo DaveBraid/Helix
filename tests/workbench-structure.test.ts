@@ -137,8 +137,12 @@ describe("workbench layout and navigation structure", () => {
     expect(localRead).toContain("this.assertWritable();");
     expect(localRead).toContain("this.withProjectWorkspaceRead");
     expect(localRead).not.toContain("withWritableProjectMutation");
+    expect(main).toMatch(
+      /withProjectMutation[\s\S]*const result = await operation\(\)[\s\S]*localProjectTaskSnapshotCache = null/,
+    );
     expect(view).toMatch(/render\(\)[\s\S]*refreshLocalProjectTaskSnapshot\(token\)/);
     expect(view).toMatch(/localProjectTaskDidaTasks[\s\S]*this\.localProjectTaskSnapshot/);
+    expect(view).toMatch(/renderSidebar[\s\S]*mergeProjectTaskCollections\([\s\S]*sidebarRemoteTasks[\s\S]*localProjectTaskDidaTasks\(\)/);
     expect(view).toMatch(/saveLocalProjectTask[\s\S]*UnifiedTaskDetailModal/);
     expect(localTasks).not.toMatch(/data\.json|HelixDataStore|OfflineQueue/);
   });
@@ -159,8 +163,13 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-task-tree \.helix-task-title[\s\S]*font-size: 13px/);
     expect(css).toMatch(/\.helix-task-summary[\s\S]*font-size: 11px/);
     expect(css).toMatch(/\.helix-task-tree \.helix-task-meta[\s\S]*font-size: 10px/);
-    expect(css).toMatch(/button\.helix-task-tree-progress[\s\S]*min-width: 48px[\s\S]*max-width: 48px[\s\S]*border-radius: 50% !important/);
-    expect(css).toMatch(/button\.helix-task-tree-progress:hover[\s\S]*background: transparent !important/);
+    expect(css).toMatch(/button\.helix-task-tree-progress[\s\S]*aspect-ratio: 1 \/ 1[\s\S]*border-radius: 999px !important[\s\S]*conic-gradient/);
+    expect(css).toMatch(/button\.helix-task-tree-progress\.is-completed[\s\S]*background: var\(--color-green\) !important/);
+    expect(css).toMatch(/\.helix-task-tree \.helix-task-check[\s\S]*aspect-ratio: 1 \/ 1[\s\S]*border-radius: 999px !important/);
+    expect(css).toMatch(/\.helix-task-tree \.helix-task-check\.is-completed[\s\S]*background: var\(--color-green\) !important/);
+    expect(view).toMatch(/const leading[\s\S]*const check[\s\S]*const body[\s\S]*const toggle = row\.createEl/);
+    expect(view).toContain('state: completed ? "idea" : "completed"');
+    expect(view).toMatch(/else if \(stageParent\)[\s\S]*prepareCycleStatusUpdate\(stageParent\.stageId\)[\s\S]*completed \? "idea" : "completed"/);
     expect(view).toContain('attr: { "data-task-id": task.id }');
     expect(view).toContain("collapsedTaskTreeIds");
     expect(view).toContain("taskTreeRows");

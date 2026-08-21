@@ -2042,7 +2042,11 @@ export default class HelixPlugin extends Plugin {
       this.projectRefreshBatch.begin();
       this.projectMutationDepth += 1;
       try {
-        return await operation();
+        const result = await operation();
+        // 项目写入返回后，详情页或任务页可能立即复读。不能等待 watcher 的
+        // quiet-window 才更新，否则会再次拿到旧 Stage 行动快照。
+        this.localProjectTaskSnapshotCache = null;
+        return result;
       } finally {
         this.projectMutationDepth -= 1;
         this.projectRefreshBatch.end();

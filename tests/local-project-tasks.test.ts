@@ -3,6 +3,7 @@ import { stableHash } from "../src/domain/stable";
 import {
   LocalProjectTaskService,
   isLocalProjectTaskId,
+  localProjectTaskPresentationTasks,
   type LocalProjectTaskSnapshot,
 } from "../src/services/local-project-tasks";
 import type {
@@ -135,6 +136,46 @@ describe("LocalProjectTaskService", () => {
       stageStatus: "active",
     })]);
     expect(snapshot.byRemoteParentTaskId.get("remote-stage-1")?.stageTitle).toBe("验收");
+  });
+
+  it("keeps newly edited Stage actions visible inside the remote Helix Projects filter", async () => {
+    const content = stage.replace(
+      "helix-id: stage-1",
+      "helix-id: stage-1\nhelix-dida-parent-task-id: remote-stage-1",
+    );
+    const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(content))
+      .snapshot(workspace(), { adoptUnmanaged: true });
+    const displayed = localProjectTaskPresentationTasks(snapshot, [{
+      id: "remote-stage-1",
+      projectId: "helix-projects",
+      title: "阶段父任务",
+      status: 0,
+      priority: 0,
+    }]);
+    expect(displayed).toHaveLength(3);
+    expect(displayed.every((task) => task.projectId === "helix-projects")).toBe(true);
+    const root = displayed.find((task) => task.title === "根任务")!;
+    const child = displayed.find((task) => task.title === "子任务")!;
+    expect(root).toMatchObject({ parentId: "remote-stage-1" });
+    expect(child).toMatchObject({ parentId: root.id });
+  });
+
+  it("uses the Stage Markdown status as completion truth for its remote parent row", async () => {
+    const content = stage
+      .replace("helix-id: stage-1", "helix-id: stage-1\nhelix-dida-parent-task-id: remote-stage-1")
+      .replace("helix-status: active", "helix-status: completed");
+    const completedWorkspace = workspace();
+    completedWorkspace.projects[0]!.cycles[0]!.status = "completed";
+    const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(content))
+      .snapshot(completedWorkspace, { adoptUnmanaged: true });
+    const displayed = localProjectTaskPresentationTasks(snapshot, [{
+      id: "remote-stage-1",
+      projectId: "helix-projects",
+      title: "阶段父任务",
+      status: 0,
+      priority: 0,
+    }]);
+    expect(displayed.find((task) => task.id === "remote-stage-1")?.status).toBe(2);
   });
 
   it("creates a root and child, updates the child, then deletes the subtree with CAS", async () => {

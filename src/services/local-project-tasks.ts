@@ -10,6 +10,7 @@ import {
   reorderManagedPlanChildren,
   type ProjectionActionState,
 } from "../domain/dida-project-projection";
+import type { DidaTask } from "../domain/entities";
 import type { ProjectWorkspaceSnapshot } from "./project-workspace";
 import type {
   ProjectionMarkdownPort,
@@ -98,6 +99,64 @@ export function localProjectTaskId(uuid: string): string {
 
 export function isLocalProjectTaskId(id: string): boolean {
   return id.startsWith(LOCAL_PROJECT_TASK_PREFIX);
+}
+
+/**
+ * 把 Stage Markdown 行动投影为任务页模型。已存在远端 Stage 父任务时，
+ * 尚未同步的本地行动也沿用父任务所在的滴答清单，使其不会在选中
+ * `Helix Projects` 时被清单筛选隐藏；远端 ID 和父子关系仍以精确身份为准。
+ */
+export function localProjectTaskPresentationTasks(
+  snapshot: LocalProjectTaskSnapshot,
+  remoteTasks: readonly DidaTask[],
+): DidaTask[] {
+  const remoteById = new Map(remoteTasks.map((task) => [task.id, task]));
+  const stageParentByStageId = new Map(
+    snapshot.stageParents.map((parent) => [parent.stageId, parent]),
+  );
+  const stageParents = snapshot.stageParents.flatMap((parent) => {
+    const remote = remoteById.get(parent.remoteTaskId);
+    if (!remote) return [];
+    return [{
+      ...remote,
+      status: parent.stageStatus === "completed" || parent.stageStatus === "terminated" ? 2 : 0,
+    }];
+  });
+  const localTasks = snapshot.tasks.map((task) => {
+    const localParent = task.parentUuid ? snapshot.byUuid.get(task.parentUuid) : undefined;
+    const stageParent = stageParentByStageId.get(task.stageId);
+    const remoteStageParent = stageParent
+      ? remoteById.get(stageParent.remoteTaskId)
+      : undefined;
+    return {
+      id: task.id,
+      projectId: remoteStageParent?.projectId ?? `helix-project:${task.projectId}`,
+      ...(localParent
+        ? { parentId: localParent.id }
+        : stageParent ? { parentId: stageParent.remoteTaskId } : {}),
+      title: task.title,
+      content: task.content ?? "",
+      desc: `${task.projectTitle} · 阶段 ${task.stageCode} ${task.stageTitle}`,
+      startDate: task.startDate ?? null,
+      dueDate: task.dueDate ?? null,
+      timeZone: task.timeZone,
+      isAllDay: task.isAllDay ?? false,
+      status: task.state === "completed" || task.state === "terminated" ? 2 : 0,
+      priority: task.priority,
+      tags: [...task.tags],
+      kind: task.childCount > 0 ? "CHECKLIST" : "TASK",
+      ...(task.childCount > 0 ? {
+        items: snapshot.tasks
+          .filter((candidate) => candidate.parentUuid === task.uuid)
+          .map((child) => ({
+            id: child.id,
+            title: child.title,
+            status: child.state === "completed" || child.state === "terminated" ? 2 : 0,
+          })),
+      } : {}),
+    };
+  });
+  return [...stageParents, ...localTasks];
 }
 
 export class LocalProjectTaskService {

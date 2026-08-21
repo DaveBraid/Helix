@@ -33,6 +33,7 @@ import {
   normalizeProjectGraph,
   planDeletionBridges,
   planProjectGraphLayout,
+  PROJECT_GRAPH_ROW_STEP,
   type ProjectGraphEdge,
 } from "../domain/project-graph";
 import { assertProjectMappingsUnique } from "../domain/project-mapping";
@@ -4945,14 +4946,41 @@ export class ProjectWorkspaceService {
         canvasNodes: plannedNodes,
         relations: normalized.relations,
       };
+      const preferredYByStage = new Map(snapshot.canvasNodes
+        .filter((node) => node.kind === "cycle")
+        .map((node) => [node.entityId, node.y] as const));
+      if (relationKind === "inherit") {
+        const parentY = snapshot.canvasNodes.find((node) =>
+          node.kind === "cycle" && node.entityId === predecessors[0])?.y;
+        if (parentY !== undefined) {
+          for (const spec of specs) preferredYByStage.set(spec.id, parentY);
+        }
+      } else if (relationKind === "branch") {
+        const parentId = predecessors[0]!;
+        const parentY = snapshot.canvasNodes.find((node) =>
+          node.kind === "cycle" && node.entityId === parentId)?.y;
+        if (parentY !== undefined) {
+          const existingSuccessorIds = new Set(physical
+            .filter((edge) => edge.fromCycleId === parentId)
+            .map((edge) => edge.toCycleId)
+            .filter((id) => !specs.some((spec) => spec.id === id)));
+          const existingSuccessorYs = snapshot.canvasNodes
+            .filter((node) => node.kind === "cycle" && existingSuccessorIds.has(node.entityId))
+            .map((node) => node.y);
+          const firstY = existingSuccessorYs.length === 0
+            ? parentY
+            : Math.max(parentY, ...existingSuccessorYs) + PROJECT_GRAPH_ROW_STEP;
+          specs.forEach((spec, index) => {
+            preferredYByStage.set(spec.id, firstY + index * PROJECT_GRAPH_ROW_STEP);
+          });
+        }
+      }
       applyManagedLayout(
         canvas.document,
         layoutSnapshot,
         physical,
         affectedWeakComponent([...predecessors, ...specs.map((spec) => spec.id)], physical),
-        relationKind === "inherit"
-          ? new Map(specs.map((spec) => [spec.id, predecessors[0]!] as const))
-          : undefined,
+        preferredYByStage,
       );
       this.assertActive(generation);
       await this.applyAtomicWorkspaceChange({
@@ -5474,7 +5502,7 @@ function applyManagedLayout(
   snapshot: ProjectWorkspaceSnapshot,
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
-  verticalParentByStage?: ReadonlyMap<string, string>,
+  preferredYByStage?: ReadonlyMap<string, number>,
 ): void {
   const viewByEntity = new Map(snapshot.canvasNodes.map((node) => [node.entityId, node]));
   const layout = planProjectGraphLayout(
@@ -5495,7 +5523,7 @@ function applyManagedLayout(
       })),
     edges,
     scope,
-    verticalParentByStage,
+    preferredYByStage,
   );
   const position = new Map([
     ...layout.projects.map((node) => [node.id, node] as const),

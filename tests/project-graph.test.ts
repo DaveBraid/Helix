@@ -274,7 +274,12 @@ describe("project graph presentation", () => {
         edge("lower-successor", "lower", "successor"),
       ],
       new Set(["root", "upper", "lower", "successor"]),
-      new Map([["successor", "lower"]]),
+      new Map([
+        ["root", 0],
+        ["upper", 0],
+        ["lower", 200],
+        ["successor", 200],
+      ]),
     );
     expect(layout.stages.find((stage) => stage.id === "successor")?.y)
       .toBe(layout.stages.find((stage) => stage.id === "lower")?.y);

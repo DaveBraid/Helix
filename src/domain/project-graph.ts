@@ -44,6 +44,7 @@ const X_GAP = 160;
 const Y_GAP = 72;
 const CARD_WIDTH = 248;
 const CARD_HEIGHT = 128;
+export const PROJECT_GRAPH_ROW_STEP = CARD_HEIGHT + Y_GAP;
 const PROJECT_TO_STAGE_GAP = 160;
 const PROJECT_SIDE_PADDING = 28;
 const PROJECT_TOP_PADDING = 58;
@@ -164,7 +165,7 @@ export function planProjectGraphLayout(
   stages: StageLayoutNode[],
   edges: ProjectGraphEdge[],
   scope?: ReadonlySet<string>,
-  verticalParentByStage?: ReadonlyMap<string, string>,
+  preferredYByStage?: ReadonlyMap<string, number>,
 ): ProjectGraphLayout {
   const stagesByProject = new Map<string, StageLayoutNode[]>();
   for (const stage of stages) {
@@ -226,7 +227,7 @@ export function planProjectGraphLayout(
     for (const project of projectOrder) {
       const count = Math.max(1, laneRowsByProject.get(project.id) ?? 0);
       laneStart.set(project.id, nextLaneY);
-      nextLaneY += count * (CARD_HEIGHT + Y_GAP) + PROJECT_LANE_GAP;
+      nextLaneY += count * PROJECT_GRAPH_ROW_STEP + PROJECT_LANE_GAP;
     }
   } else {
     for (const projectId of movingProjectIds) {
@@ -242,17 +243,13 @@ export function planProjectGraphLayout(
       ...stage,
       x: CARD_WIDTH + PROJECT_TO_STAGE_GAP +
         (depth(stage.id) - 1) * (CARD_WIDTH + X_GAP),
-      y: (laneStart.get(stage.projectId) ?? 0) + row * (CARD_HEIGHT + Y_GAP),
+      y: (laneStart.get(stage.projectId) ?? 0) + row * PROJECT_GRAPH_ROW_STEP,
     };
   });
-  if (verticalParentByStage && verticalParentByStage.size > 0) {
-    const byId = new Map(nextStages.map((stage) => [stage.id, stage]));
+  if (preferredYByStage && preferredYByStage.size > 0) {
     nextStages = nextStages.map((stage) => {
-      const parentId = verticalParentByStage.get(stage.id);
-      const parent = parentId ? byId.get(parentId) : undefined;
-      return parent && parent.projectId === stage.projectId
-        ? { ...stage, y: parent.y }
-        : stage;
+      const preferredY = preferredYByStage.get(stage.id);
+      return preferredY === undefined ? stage : { ...stage, y: preferredY };
     });
   }
   let nextProjects = projectOrder.map((project) => {

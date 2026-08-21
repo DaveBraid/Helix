@@ -2415,8 +2415,8 @@ describe("ProjectWorkspaceService", () => {
       "project-1": ["1", "2.1", "2.2"],
     });
     expect(repo.json(CANVAS).nodes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ helixStageId: first.id, x: 816, y: 0 }),
-      expect.objectContaining({ helixStageId: second.id, x: 816, y: 200 }),
+      expect.objectContaining({ helixStageId: first.id, x: 816, y: 300 }),
+      expect.objectContaining({ helixStageId: second.id, x: 816, y: 500 }),
     ]));
   });
 
@@ -2651,12 +2651,12 @@ describe("ProjectWorkspaceService", () => {
       (node: Record<string, unknown>) => node.helixNodeKind === "stage",
     );
     expect(stages).toEqual([
-      expect.objectContaining({ x: 816, y: 0 }),
-      expect.objectContaining({ x: 816, y: 200 }),
+      expect.objectContaining({ x: 816, y: 300 }),
+      expect.objectContaining({ x: 816, y: 500 }),
     ]);
   });
 
-  it("places an inherited successor on its lower branch parent's row", async () => {
+  it("keeps an inherited successor chain on its lower branch parent's row", async () => {
     const repo = baseRepository();
     const service = workspace(repo);
     await service.createCycle(
@@ -2677,12 +2677,28 @@ describe("ProjectWorkspaceService", () => {
       [lower.id],
       { stageTitle: "下方后继" },
     );
+    const beforeContinuation = new Map(repo.json(CANVAS).nodes
+      .filter((node: Record<string, unknown>) => node.helixNodeKind !== "project")
+      .map((node: Record<string, unknown>) => [node.id, node.y]));
+    const nextSuccessor = await service.createCycle(
+      "project-1",
+      "inherit",
+      [successor.id],
+      { stageTitle: "再次推进" },
+    );
     const nodes = repo.json(CANVAS).nodes;
     const lowerNode = nodes.find((node: Record<string, unknown>) =>
       node.helixStageId === lower.id);
     const successorNode = nodes.find((node: Record<string, unknown>) =>
       node.helixStageId === successor.id);
+    const nextSuccessorNode = nodes.find((node: Record<string, unknown>) =>
+      node.helixStageId === nextSuccessor.id);
+    for (const [id, y] of beforeContinuation) {
+      expect(nodes.find((node: Record<string, unknown>) => node.id === id)?.y).toBe(y);
+    }
     expect(successorNode).toMatchObject({ x: 1_224, y: lowerNode.y });
+    expect(nextSuccessorNode).toMatchObject({ x: 1_632, y: lowerNode.y });
+    expect(successorNode.y).toBe(lowerNode.y);
   });
 
   it("places an inherited child on the same row and rejects multiline titles", async () => {
@@ -2697,7 +2713,7 @@ describe("ProjectWorkspaceService", () => {
     expect(repo.json(CANVAS).nodes).toContainEqual(expect.objectContaining({
       helixStageId: expect.any(String),
       x: 816,
-      y: 0,
+      y: 300,
     }));
     await expect(service.createCycle(
       "project-1",
@@ -3245,7 +3261,7 @@ describe("ProjectWorkspaceService", () => {
     expect(next.nodes).toContainEqual(expect.objectContaining({
       helixStageId: created.id,
       x: 816,
-      y: 200,
+      y: 650,
     }));
     await expect(workspace(repo).snapshot()).resolves.toMatchObject({
       relations: expect.arrayContaining([

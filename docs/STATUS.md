@@ -1,8 +1,8 @@
 # 当前开发状态
 
 最后更新：2026-08-22
-当前基线提交：`2c7ec26 test: cover growth from a moved branch`
-工作树状态：有尚未提交的会话布局增量合并修复、回归测试与文档更新。
+当前基线提交：`cdd751e fix: preserve draft layout across stage creation`
+工作树状态：工作树干净。
 当前阶段：`dev` 上继续打磨项目关系图；`main` 与正式版仍停留在 `2.1.0`。
 
 ## 本轮目标
@@ -27,9 +27,7 @@
 
 ## 本轮改动
 
-- `src/ui/project-lineage-workbench.ts`：布局草稿增加 Canvas Base；实体新增后按 Base 逐节点合并既有会话坐标，并把新节点相对显示父节点平移。
-- `tests/project-lineage-workbench.test.ts`：覆盖未保存父节点移动、外部 Canvas 竞争与分支后继续推进三类回归。
-- `docs/ARCHITECTURE.md`：补充结构写入与未保存会话布局并存时的合并合同。
+- 工作树干净；本轮功能与测试已提交于 `cdd751e`。
 
 ## 相关约束
 

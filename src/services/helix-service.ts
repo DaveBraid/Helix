@@ -1334,6 +1334,8 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       const project = normalizeProject(projectResponse);
       const detailProject = normalizeProject(detailResponse.project);
       const detailColumns = normalizeColumns(detailResponse.columns);
+      if (!Array.isArray(detailResponse.tasks)) throw new Error("同步目标清单任务详情不是数组");
+      const detailTasks = detailResponse.tasks.map(normalizeTask);
       const endpointColumns = normalizeColumns(columnsResponse);
       if (project.id !== projectId || detailProject.id !== projectId) {
         throw new Error("同步目标清单精确复读身份不一致");
@@ -1345,7 +1347,15 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
         endpointColumns.some((column) => column.projectId !== projectId)) {
         throw new Error("同步目标看板列双源复读不一致");
       }
+      if (detailTasks.some((task) => task.projectId !== projectId)) {
+        throw new Error("同步目标清单任务身份不一致");
+      }
       const data = await this.store.snapshot();
+      // 清单详情只覆盖未完成任务；合并普通拉取缓存中的已完成任务，详情中的重开状态优先。
+      const catalogTasks = deduplicateTasks([
+        ...cachedTaskValues(data).filter((task) => task.projectId === projectId),
+        ...detailTasks,
+      ]);
       const unknownOperationIds = new Set([
         ...data.queue.filter((operation) =>
           operation.status === "reconciliation" || operation.remoteOutcomeUnknown)
@@ -1356,6 +1366,7 @@ export class HelixService implements ExistingHelixTaskQueuePort, ExistingHelixPr
       return {
         projects: [project],
         columns: endpointColumns,
+        tasks: catalogTasks,
         readiness: {
           writable: !this.contractTestRunning && data.recoveryIssues.length === 0,
           queueEmpty: data.queue.length === 0,

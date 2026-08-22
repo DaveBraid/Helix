@@ -482,19 +482,24 @@ function makeHarness(
   markdown.failNextCas = failFirstCas;
   const pipeline = new FakePipeline();
   const state = new MemoryState({ enabled: false, ledger: [], parentCheckpoints: [] });
+  let catalogReads = 0;
   const catalog: ProjectionCatalogPort = {
-    read: async () => ({
-      projects: [project],
-      columns: [column],
-      readiness: { ...ready, taskReopenVerified },
-    }),
+    read: async () => {
+      catalogReads += 1;
+      return {
+        projects: [project],
+        columns: [column],
+        tasks: [...pipeline.tasks.values()].map((task) => structuredClone(task)),
+        readiness: { ...ready, taskReopenVerified },
+      };
+    },
   };
   const service = new DidaProjectProjectionService(markdown, pipeline, state, catalog, () => "2026-08-05T00:00:00.000Z");
   if (activate) {
     const preview = buildProjectionActivationPreview({ target: { targetProjectId: "list-1", targetColumnId }, projects: [project], columns: [column], readiness: ready, projectCount: 1, actionCount: 1 });
     state.value = { enabled: true, activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION, target: preview.target, confirmedPreviewHash: preview.previewHash, ledger: [], parentCheckpoints: [] };
   }
-  return { markdown, pipeline, state, service };
+  return { markdown, pipeline, state, service, catalogReads: () => catalogReads };
 }
 
 class MemoryMarkdown implements ProjectionMarkdownPort {
@@ -907,6 +912,123 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       parentId: "remote-1",
       content: "",
     });
+  });
+
+  it("pulls a remote child completion into Stage Markdown without writing it back", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    const writesBefore = harness.pipeline.updateAttempts.length;
+    harness.pipeline.tasks.set("remote-2", {
+      ...harness.pipeline.tasks.get("remote-2")!,
+      status: 2,
+      completedTime: "2026-08-05T01:00:00.000Z",
+    });
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ completedActions: 1, frozen: [] });
+    expect(harness.pipeline.updateAttempts).toHaveLength(writesBefore);
+    expect(harness.markdown.content("Stage.md")).toContain("[x] 行动");
+    expect(harness.markdown.content("Stage.md")).toContain("state=completed");
+    expect(harness.state.value.ledger[0]).toMatchObject({ state: "completed", remoteId: "remote-2" });
+  });
+
+  it("pulls child status while an unresolved parent conflict blocks outbound writes", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.tasks.set("remote-1", {
+      ...harness.pipeline.tasks.get("remote-1")!,
+      title: "远端竞争标题",
+    });
+    harness.pipeline.tasks.set("remote-2", {
+      ...harness.pipeline.tasks.get("remote-2")!,
+      status: 2,
+      completedTime: "2026-08-05T01:00:00.000Z",
+    });
+    harness.state.value.parentCheckpoints = [{
+      projectId: "project-1",
+      remoteId: "remote-1",
+      marker: "helix-project-projection:project-1",
+      frozen: "conflict",
+    }];
+    const writesBefore = harness.pipeline.updateAttempts.length;
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ completedActions: 1 });
+    expect(summary.frozen).toContainEqual(expect.objectContaining({
+      uuid: "project:project-1", reason: "conflict",
+    }));
+    expect(harness.pipeline.updateAttempts).toHaveLength(writesBefore);
+    expect(harness.markdown.content("Stage.md")).toContain("[x] 行动");
+    expect(harness.state.value.ledger[0]).toMatchObject({ state: "completed" });
+  });
+
+  it("clears a stale parent conflict after the remote parent matches Helix again", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.state.value.parentCheckpoints = [{
+      projectId: "project-1",
+      remoteId: "remote-1",
+      marker: "helix-project-projection:project-1",
+      frozen: "conflict",
+    }];
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary.frozen).toEqual([]);
+    expect(harness.state.value.parentCheckpoints).toEqual([]);
+  });
+
+  it("shares one target catalog snapshot across a multi-Stage synchronization batch", async () => {
+    const harness = makeHarness(true);
+
+    const summary = await harness.service.synchronizeProjects([input(), input()]);
+
+    expect(harness.catalogReads()).toBe(1);
+    expect(summary).toMatchObject({ createdParents: 1, createdActions: 1, frozen: [] });
+  });
+
+  it("pulls a remote child reopen into Stage Markdown without requiring reopen write capability", async () => {
+    const harness = makeHarness(true);
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", state: "completed" },
+    ));
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.tasks.set("remote-2", {
+      ...harness.pipeline.tasks.get("remote-2")!,
+      status: 0,
+      completedTime: null,
+    });
+    const writesBefore = harness.pipeline.updateAttempts.length;
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary).toMatchObject({ updatedActions: 1, frozen: [] });
+    expect(harness.pipeline.updateAttempts).toHaveLength(writesBefore);
+    expect(harness.markdown.content("Stage.md")).toContain("[ ] 行动");
+    expect(harness.markdown.content("Stage.md")).toContain("state=active");
+    expect(harness.state.value.ledger[0]).toMatchObject({ state: "active" });
+  });
+
+  it("stages a status conflict when local and remote diverge from the same Base", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.markdown.set("Stage.md", patchManagedPlanAction(
+      harness.markdown.content("Stage.md"), { uuid: "uuid-1", state: "paused" },
+    ));
+    harness.pipeline.tasks.set("remote-2", {
+      ...harness.pipeline.tasks.get("remote-2")!,
+      status: 2,
+      completedTime: "2026-08-05T01:00:00.000Z",
+    });
+
+    const summary = await harness.service.synchronizeProject(input());
+
+    expect(summary.frozen).toContainEqual(expect.objectContaining({ uuid: "uuid-1", reason: "conflict" }));
+    expect(harness.pipeline.stagedConflicts).toBe(1);
+    expect(harness.markdown.content("Stage.md")).toContain("state=paused");
+    expect(harness.pipeline.tasks.get("remote-2")?.status).toBe(2);
   });
 
   it("projects note, schedule, priority and tags through ordinary task fields", async () => {

@@ -166,6 +166,8 @@ export default class HelixPlugin extends Plugin {
   private readonly projectIdentityProbeTimers = new Map<string, number>();
   private readonly projectMutationRunner = new SerializedRunner();
   private readonly projectProjectionBootstrapRunner = new SerializedRunner();
+  /** 远端投影单独串行；网络等待不得占用项目工作区锁并阻塞 UI。 */
+  private readonly projectProjectionSyncRunner = new SerializedRunner();
   private readonly settingsMutationRunner = new SerializedRunner();
   private readonly taskMatrixRuleUpdater = new TaskMatrixRuleUpdater(this.settingsMutationRunner);
   private projectStatusItem: HTMLElement | null = null;
@@ -276,13 +278,22 @@ export default class HelixPlugin extends Plugin {
       report: (report) => this.reportProjectAutoSync(report),
     });
     const projectionReadinessRunner = new SerializedRunner();
-    this.register(this.service.subscribe(() => {
+    let observedDidaPullAt: string | undefined;
+    this.register(this.service.subscribe((state) => {
       void projectionReadinessRunner.run(async () => {
+        const didCompletePull = Boolean(state.lastSyncAt && state.lastSyncAt !== observedDidaPullAt);
+        if (didCompletePull) {
+          observedDidaPullAt = state.lastSyncAt;
+          // 服务状态会在授权租约 finally 释放前发布；延后一拍，避免把瞬时 inProgress 锁死为长期未就绪。
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+        }
         await this.ensureAutomaticProjectProjection();
         const readiness = await this.service.projectProjectionWriteReadiness();
         this.projectAutoSync.updateReadiness(
           PROJECT_DIDA_PROJECTION_AVAILABLE && this.settings.autoSync && readiness.ready,
         );
+        // 普通滴答拉取完成后重新比较候选指纹；只有远端状态变化的项目会进入同步。
+        if (didCompletePull) this.projectAutoSync.request();
       }).catch((error) => console.warn("Helix 无法刷新滴答项目后台写入条件", error));
     }));
     await this.projectProjection.retryReceiptCleanup();
@@ -1248,12 +1259,10 @@ export default class HelixPlugin extends Plugin {
 
   async syncProjectProjection(projectId: string): Promise<ProjectionSyncSummary> {
     this.assertProjectProjectionAvailable();
-    return this.withWritableProjectMutation(async () => {
+    return this.projectProjectionSyncRunner.run(async () => {
       const inputs = await this.projectionInputs(projectId);
-      const summary = emptyProjectionSummary();
-      for (const input of inputs) {
-        mergeProjectionSummary(summary, await this.projectProjection.synchronizeProject(input));
-      }
+      const summary = await this.projectProjection.synchronizeProjects(inputs);
+      if (projectionSummaryMutationCount(summary) > 0) this.localProjectTaskSnapshotCache = null;
       return summary;
     });
   }
@@ -1270,6 +1279,7 @@ export default class HelixPlugin extends Plugin {
         return { candidates: [], failures: [] };
       }
       const snapshot = await this.projectWorkspace.snapshot();
+      const remoteTasks = new Map(this.service.snapshot().tasks.map((task) => [task.id, task]));
       const candidates = [];
       const failures = [];
       for (const project of snapshot.projects) {
@@ -1284,6 +1294,12 @@ export default class HelixPlugin extends Plugin {
               stages: models.flatMap((model) => model.stages.map((stage) => ({
                 id: stage.id, path: stage.path, revisionHash: stage.revisionHash,
                 parentTaskId: stage.parentTaskId,
+                remoteStatuses: stage.managed
+                  .filter((action) => action.remoteId)
+                  .map((action) => ({
+                    id: action.remoteId,
+                    status: remoteTasks.get(action.remoteId!)?.status ?? null,
+                  })),
               }))),
             }),
           });
@@ -3077,31 +3093,9 @@ class LegacyMigrationModal extends Modal {
   }
 }
 
-function emptyProjectionSummary(): ProjectionSyncSummary {
-  return {
-    createdParents: 0,
-    updatedParents: 0,
-    completedParents: 0,
-    createdActions: 0,
-    updatedActions: 0,
-    completedActions: 0,
-    deletedActions: 0,
-    frozen: [],
-  };
-}
-
-function mergeProjectionSummary(
-  target: ProjectionSyncSummary,
-  source: ProjectionSyncSummary,
-): void {
-  target.createdParents += source.createdParents;
-  target.updatedParents += source.updatedParents;
-  target.completedParents += source.completedParents;
-  target.createdActions += source.createdActions;
-  target.updatedActions += source.updatedActions;
-  target.completedActions += source.completedActions;
-  target.deletedActions += source.deletedActions;
-  target.frozen.push(...source.frozen);
+function projectionSummaryMutationCount(summary: ProjectionSyncSummary): number {
+  return summary.createdParents + summary.updatedParents + summary.completedParents +
+    summary.createdActions + summary.updatedActions + summary.completedActions + summary.deletedActions;
 }
 
 function formatDate(date: Date): string {

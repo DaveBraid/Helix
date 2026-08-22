@@ -2178,6 +2178,18 @@ describe("HelixService runtime recovery", () => {
     const data = createDefaultData("device-projection-catalog");
     grantTaskCrud(data);
     data.didaContractCapabilities!.taskReopenVerified = true;
+    const completedTask: DidaTask = {
+      id: "completed-child", projectId: "projection-list", parentId: "parent-1",
+      title: "已完成行动", status: 2, completedTime: "2026-08-22T00:00:00.000Z",
+    };
+    const reopenedTask: DidaTask = {
+      id: "reopened-child", projectId: "projection-list", parentId: "parent-1",
+      title: "已重新打开", status: 0,
+    };
+    data.localSnapshots[`task:${completedTask.id}`] = createSnapshot("task", completedTask.id, completedTask);
+    data.localSnapshots[`task:${reopenedTask.id}`] = createSnapshot("task", reopenedTask.id, {
+      ...reopenedTask, status: 2,
+    });
     const service = new HelixService(
       new HelixDataStore({
         async loadData() { return structuredClone(data); },
@@ -2198,7 +2210,7 @@ describe("HelixService runtime recovery", () => {
       value: {
         async getProject() { return project; },
         async getProjectData() {
-          return { project, tasks: [], columns };
+          return { project, tasks: [reopenedTask], columns };
         },
         async getColumns() {
           return mismatch ? [{ ...columns[0], name: "竞争改名" }] : columns;
@@ -2209,6 +2221,10 @@ describe("HelixService runtime recovery", () => {
     await expect(service.readProjectionCatalog(project.id)).resolves.toMatchObject({
       projects: [project],
       columns,
+      tasks: expect.arrayContaining([
+        expect.objectContaining({ id: completedTask.id, status: 2 }),
+        expect.objectContaining({ id: reopenedTask.id, status: 0 }),
+      ]),
       readiness: {
         writable: true,
         queueEmpty: true,

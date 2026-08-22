@@ -89,6 +89,8 @@ export interface ExistingHelixTaskQueuePort {
 export interface ProjectionCatalogSnapshot {
   projects: DidaProject[];
   columns: DidaColumn[];
+  /** 同一次清单详情复读取得的任务；反向状态同步复用它，避免逐任务串行请求。 */
+  tasks?: DidaTask[];
   readiness: ProjectionReadiness;
 }
 
@@ -973,7 +975,23 @@ export class DidaProjectProjectionService {
     });
   }
 
-  async synchronizeProject(input: ProjectionProjectInput): Promise<ProjectionSyncSummary> {
+  /** 同一 Helix 项目的多个 Stage 共享一次目标清单快照，避免重复远端读取。 */
+  async synchronizeProjects(inputs: ProjectionProjectInput[]): Promise<ProjectionSyncSummary> {
+    if (inputs.length === 0) return emptyProjectionSyncSummary();
+    const state = await this.state.read();
+    if (!state.target) throw new Error("Helix→滴答同步尚未配置目标清单");
+    const catalog = await this.catalog.read(state.target.targetProjectId);
+    const total = emptyProjectionSyncSummary();
+    for (const input of inputs) {
+      mergeProjectionSyncSummary(total, await this.synchronizeProject(input, catalog));
+    }
+    return total;
+  }
+
+  async synchronizeProject(
+    input: ProjectionProjectInput,
+    catalogSnapshot?: ProjectionCatalogSnapshot,
+  ): Promise<ProjectionSyncSummary> {
     const initialState = await this.state.read();
     if (!initialState.enabled ||
       initialState.activationVersion !== PROJECT_PROJECTION_ACTIVATION_VERSION ||
@@ -983,7 +1001,7 @@ export class DidaProjectProjectionService {
     if (initialState.parentCheckpoints.some((item) => item.projectId === input.projectId && item.tombstone)) {
       throw new Error("项目正在执行安全删除，禁止后台同步重新创建远端对象");
     }
-    const catalog = await this.catalog.read(initialState.target.targetProjectId);
+    const catalog = catalogSnapshot ?? await this.catalog.read(initialState.target.targetProjectId);
     const readiness = catalog.readiness;
     const currentPreview = buildProjectionActivationPreview({
       target: initialState.target,
@@ -1029,13 +1047,25 @@ export class DidaProjectProjectionService {
       frozen: [],
     };
     const storedParent = initialState.parentCheckpoints.find((item) => item.projectId === projectIdentity.projectId);
+    let parentOutboundBlocked = false;
     if (projectIdentity.parentTaskId && storedParent?.frozen) {
-      summary.frozen.push({
-        uuid: `project:${projectIdentity.projectId}`,
-        reason: storedParent.frozen,
-        message: "父任务同步已冻结，必须先核对远端结果或竞争",
-      });
-      return summary;
+      const remoteParent = catalog.tasks?.find((task) => task.id === projectIdentity.parentTaskId);
+      const desiredStatus = input.projectStatus === "completed" ? 2 : 0;
+      const conflictAlreadySettled = storedParent.frozen === "conflict" && remoteParent &&
+        this.sameParentIdentity(remoteParent, projectIdentity.projectId, projectIdentity.parentTaskId, initialState.target) &&
+        remoteParent.title === input.projectTitle && remoteParent.status === desiredStatus;
+      if (conflictAlreadySettled) {
+        // 远端已经回到 Helix 期望值时，清除没有待处理记录的幽灵冻结。
+        await this.clearParentCheckpoint(await this.state.read(), projectIdentity.projectId);
+        await this.saveParentBase(await this.state.read(), projectIdentity.projectId, remoteParent);
+      } else {
+        parentOutboundBlocked = true;
+        summary.frozen.push({
+          uuid: `project:${projectIdentity.projectId}`,
+          reason: storedParent.frozen,
+          message: "父任务同步已冻结；子任务仅允许安全读取远端状态",
+        });
+      }
     }
     if (projectIdentity.parentTaskId && storedParent && !storedParent.frozen) {
       if (storedParent.remoteId !== projectIdentity.parentTaskId) {
@@ -1052,7 +1082,7 @@ export class DidaProjectProjectionService {
       summary,
     );
     if (!parentTaskId) return summary;
-    if (!await this.synchronizeParent(
+    if (!parentOutboundBlocked && !await this.synchronizeParent(
       await this.state.read(),
       projectIdentity.projectId,
       parentTaskId,
@@ -1139,6 +1169,8 @@ export class DidaProjectProjectionService {
       working,
       summary,
       taskReopenVerified: readiness.taskReopenVerified,
+      remoteTasks: catalog.tasks ?? [],
+      outboundBlocked: parentOutboundBlocked,
     });
   }
 
@@ -1153,6 +1185,8 @@ export class DidaProjectProjectionService {
     working: ProjectionLedgerEntry[];
     summary: ProjectionSyncSummary;
     taskReopenVerified: boolean;
+    remoteTasks: DidaTask[];
+    outboundBlocked?: boolean;
   }): Promise<ProjectionSyncSummary> {
     let working = params.working;
     const markerFor = (entry: ProjectionLedgerEntry) => projectionMarker(entry.uuid);
@@ -1193,7 +1227,18 @@ export class DidaProjectProjectionService {
       await this.writeLatestState((current) => ledgerState(current), proof);
     };
 
-    for (const intent of planProjectionChanges(params.managedPrevious, params.managedWorking, {
+    const inbound = await this.reconcileRemoteActionStatuses({
+      ...params,
+      working,
+    });
+    working = inbound.working;
+    if (params.outboundBlocked) {
+      // 父任务冻结只阻止远端写入；已验证身份的子任务状态仍可安全回写 Markdown。
+      await persist();
+      return params.summary;
+    }
+
+    for (const intent of planProjectionChanges(inbound.previous, inbound.current, {
       taskReopenVerified: params.taskReopenVerified,
     })) {
       const entry = intent.entry;
@@ -1423,6 +1468,121 @@ export class DidaProjectProjectionService {
     }
     await persist();
     return params.summary;
+  }
+
+  /**
+   * 把同一轮清单详情中的远端完成／重开状态合并回 Stage Markdown。
+   * Base 来自投影账本；本地未改时接受远端，本地与远端同向时收口，
+   * 双方异向时进入既有逐字段冲突，绝不静默覆盖。
+   */
+  private async reconcileRemoteActionStatuses(params: {
+    input: ProjectionProjectInput;
+    initialState: ProjectionPersistentState;
+    projectId: string;
+    parentTaskId: string;
+    stageRevisions: Map<string, ProjectionMarkdownRevision>;
+    managedPrevious: ProjectionLedgerEntry[];
+    managedWorking: ProjectionLedgerEntry[];
+    working: ProjectionLedgerEntry[];
+    summary: ProjectionSyncSummary;
+    remoteTasks: DidaTask[];
+  }): Promise<{
+    previous: ProjectionLedgerEntry[];
+    current: ProjectionLedgerEntry[];
+    working: ProjectionLedgerEntry[];
+  }> {
+    let previous = [...params.managedPrevious];
+    let current = [...params.managedWorking];
+    let working = [...params.working];
+    const remoteById = new Map(params.remoteTasks.map((task) => [task.id, task]));
+    const acceptedByStage = new Map<string, Map<string, ProjectionLedgerEntry["state"]>>();
+    const replaceIdentity = (
+      entries: ProjectionLedgerEntry[],
+      next: ProjectionLedgerEntry,
+    ): ProjectionLedgerEntry[] => {
+      const identity = projectionLedgerIdentity(next);
+      return entries.map((entry) =>
+        projectionLedgerIdentity(entry) === identity ? next : entry);
+    };
+
+    for (const entry of current) {
+      if (!entry.remoteId || entry.frozen) continue;
+      const old = previous.find((candidate) =>
+        projectionLedgerIdentity(candidate) === projectionLedgerIdentity(entry));
+      const remote = remoteById.get(entry.remoteId);
+      if (!old || old.frozen || !remote || (remote.status !== 0 && remote.status !== 2)) continue;
+      try {
+        verifyProjectedTask(remote, entry, projectionMarker(entry.uuid), {
+          title: false,
+          state: false,
+          attributes: false,
+        });
+      } catch {
+        // 身份异常仍交给既有精确复读路径处理，批量快照不直接冻结。
+        continue;
+      }
+      const baseCompleted = old.state === "completed";
+      const remoteCompleted = remote.status === 2;
+      if (baseCompleted === remoteCompleted) continue;
+      const localChanged = entry.state !== old.state;
+      const localCompleted = entry.state === "completed";
+      if (localChanged && localCompleted !== remoteCompleted) {
+        const operationId = `op-projection-task-pull-conflict-${crypto.randomUUID()}`;
+        const result = await this.pipeline.stageTaskConflict(
+          projectionTaskFromEntry(remote, entry, localCompleted ? 2 : 0),
+          remote,
+          projectionTaskFromEntry(remote, old, baseCompleted ? 2 : 0),
+          operationId,
+          ["status"],
+        );
+        working = freezeEntry(
+          working,
+          entry,
+          "conflict",
+          params.summary,
+          "Helix 与滴答同时修改了任务完成状态，等待逐字段选择",
+          result,
+        );
+        continue;
+      }
+      if (localChanged) {
+        // 双方完成位一致时保留本地更丰富的暂停／终止语义，并推进 Base。
+        previous = replaceIdentity(previous, entry);
+        continue;
+      }
+      const nextState = projectionStateForRemoteStatus(entry.state, remote.status);
+      const stageChanges = acceptedByStage.get(entry.stageId) ?? new Map();
+      stageChanges.set(entry.uuid, nextState);
+      acceptedByStage.set(entry.stageId, stageChanges);
+    }
+
+    for (const [stageId, changes] of acceptedByStage) {
+      const revision = params.stageRevisions.get(stageId);
+      const stage = params.input.stages.find((candidate) => candidate.stageId === stageId);
+      if (!revision || !stage) throw new Error(`找不到远端状态回写阶段：${stageId}`);
+      let content = revision.content;
+      for (const [uuid, state] of changes) {
+        content = patchManagedPlanAction(content, { uuid, state });
+      }
+      const updated = await this.markdown.compareAndWrite(revision, content);
+      params.stageRevisions.set(stageId, updated);
+      const rebuilt = buildProjectionLedger({
+        projectId: params.projectId,
+        stageId,
+        stagePath: stage.path,
+        parentTaskId: params.parentTaskId,
+        target: params.initialState.target!,
+        actions: parseManagedPlanActions(updated.content).actions,
+      });
+      for (const next of rebuilt.filter((entry) => changes.has(entry.uuid))) {
+        current = replaceIdentity(current, next);
+        previous = replaceIdentity(previous, next);
+        working = replaceIdentity(working, next);
+        if (next.state === "completed") params.summary.completedActions += 1;
+        else params.summary.updatedActions += 1;
+      }
+    }
+    return { previous, current, working };
   }
 
   private async replaceProjectLedgerEntry(entry: ProjectionLedgerEntry): Promise<void> {
@@ -2415,6 +2575,30 @@ function freezeEntry(
     conflictId: receipt?.conflictId ?? entry.conflictId,
   };
   return entries.some((item) => item.uuid === entry.uuid) ? replaceEntry(entries, frozen) : [...entries, frozen];
+}
+
+function emptyProjectionSyncSummary(): ProjectionSyncSummary {
+  return {
+    createdParents: 0,
+    updatedParents: 0,
+    completedParents: 0,
+    createdActions: 0,
+    updatedActions: 0,
+    completedActions: 0,
+    deletedActions: 0,
+    frozen: [],
+  };
+}
+
+function mergeProjectionSyncSummary(target: ProjectionSyncSummary, source: ProjectionSyncSummary): void {
+  target.createdParents += source.createdParents;
+  target.updatedParents += source.updatedParents;
+  target.completedParents += source.completedParents;
+  target.createdActions += source.createdActions;
+  target.updatedActions += source.updatedActions;
+  target.completedActions += source.completedActions;
+  target.deletedActions += source.deletedActions;
+  target.frozen.push(...source.frozen);
 }
 
 function resultReason(result: { outcome: string }): ProjectionFreezeReason {

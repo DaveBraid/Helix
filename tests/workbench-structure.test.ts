@@ -521,6 +521,7 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/editProjectAction[\s\S]*projectAutoSync\.invalidate\(input\.projectId\)/);
     expect(main).toMatch(/previewProjectProjection[\s\S]*localProjectTasks\.snapshot\(snapshot, \{ adoptUnmanaged: true \}\)[\s\S]*projectionCounts/);
     expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && this\.settings\.autoSync && readiness\.ready/);
+    expect(main).toMatch(/didCompletePull[\s\S]*window\.setTimeout\(resolve, 0\)[\s\S]*projectProjectionWriteReadiness\(\)[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*PROJECTION_PROJECT_NAME[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)[\s\S]*PROJECTION_NO_COLUMN_ID[\s\S]*confirmProjectionActivationWithLease/);
     const automaticBootstrap = main.slice(
       main.indexOf("private ensureAutomaticProjectProjection"),
@@ -530,6 +531,14 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/refreshAutoSync[\s\S]*!this\.settings\.autoSync\) this\.projectAutoSync\.updateReadiness\(false\)/);
     expect(main).toMatch(/reportProjectAutoSync[\s\S]*report\.mutations > 0[\s\S]*滴答项目同步完成/);
     expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*!PROJECT_DIDA_PROJECTION_AVAILABLE \|\| !this\.settings\.autoSync[\s\S]*candidates: \[\], failures: \[\]/);
+    expect(main).toMatch(/projectAutoSyncScan\(\)[\s\S]*remoteStatuses[\s\S]*remoteTasks\.get/);
+    expect(main).toMatch(/syncProjectProjection[\s\S]*projectProjectionSyncRunner\.run[\s\S]*synchronizeProjects\(inputs\)/);
+    const projectionSync = main.slice(
+      main.indexOf("async syncProjectProjection"),
+      main.indexOf("private async projectAutoSyncScan"),
+    );
+    expect(projectionSync).not.toContain("withWritableProjectMutation");
+    expect(service).toMatch(/readProjectionCatalogWithLeaseHeld[\s\S]*detailResponse\.tasks[\s\S]*cachedTaskValues\(data\)[\s\S]*detailTasks[\s\S]*tasks: catalogTasks/);
     const readiness = service.slice(
       service.indexOf("async projectProjectionWriteReadiness"),
       service.indexOf("async replaceDidaToken"),

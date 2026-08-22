@@ -70,6 +70,7 @@ class ContractApiFake {
   forcedNewChecklistItemId?: string;
   reorderNewChecklistItem = false;
   regenerateChecklistIdsEveryWrite = false;
+  omitChecklistCompletedTime = false;
   ownedAppendMutation?: "parent-fields" | "kind" | "baseline-missing" | "id-regenerated" |
     "added-zero" | "added-multiple" | "id-unstable" | "client-id-changed" | "semantics" | "existing-fields";
   rejectPlacementWrites: false | string = false;
@@ -439,7 +440,9 @@ class ContractApiFake {
       }).map((item) => {
         const before = current.items?.find((candidate) => candidate.id === item.id);
         if (before?.status === 0 && item.status === 2) {
-          return { ...item, completedTime: "2026-07-31T00:00:00.000Z" };
+          return this.omitChecklistCompletedTime
+            ? { ...item, completedTime: undefined }
+            : { ...item, completedTime: "2026-07-31T00:00:00.000Z" };
         }
         if (before?.status === 2 && item.status === 0) {
           const reopened = { ...item };
@@ -786,6 +789,29 @@ describe("DidaWriteContractRunner", () => {
     });
     expect([...api.projects.keys()]).toEqual(["original-project"]);
     expect([...api.tasks.keys()]).toEqual(["original-task"]);
+  });
+
+  it("accepts accounts that omit derived completedTime for completed checklist items", async () => {
+    const api = new ContractApiFake();
+    api.omitChecklistCompletedTime = true;
+    const report = await new DidaWriteContractRunner(
+      api,
+      () => "run-items-without-completed-time",
+      fixedNow,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      api,
+      runDidaProjectProjectionContractProbe,
+    ).run();
+    expect(report).toMatchObject({
+      status: "passed",
+      itemsRoundTripVerified: true,
+      projectProjectionVerified: true,
+      remoteArtifactsRemaining: false,
+      cleanupErrors: [],
+    });
   });
 
   it("accepts server defaults on a newly created checklist item and preserves them afterward", async () => {

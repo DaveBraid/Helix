@@ -203,10 +203,22 @@ export class HelixSettingTab extends PluginSettingTab {
    */
   private renderDidaWriteEnablementGuide(): void {
     if (this.didaWriteReady()) {
-      new Setting(this.containerEl)
+      const ready = new Setting(this.containerEl)
         .setName("滴答写入已就绪")
-        .setDesc("当前 Vault、API 口令与合同版本的写入能力已经验证；开启自动同步后可后台创建和更新 Helix Projects 任务。")
-        .setDisabled(true);
+        .setDesc(this.plugin.settings.autoSync
+          ? "当前 Vault、API 口令与合同版本已验证；Helix Projects 正在后台自动同步。"
+          : "写入能力已经验证；开启自动同步后会立即生成并持续更新 Helix Projects 任务。");
+      if (!this.plugin.settings.autoSync) {
+        ready.addButton((button) => button.setButtonText("开启自动同步").setCta().onClick(async () => {
+          button.setDisabled(true).setButtonText("启动中…");
+          this.plugin.settings.autoSync = true;
+          await this.plugin.saveSettings(true);
+          new Notice("滴答自动同步已开启，Helix Projects 将在后台更新。", 8_000);
+          this.display();
+        }));
+      } else {
+        ready.setDisabled(true);
+      }
       return;
     }
     const authorized = Boolean(this.plugin.secrets.getDidaToken());
@@ -214,13 +226,15 @@ export class HelixSettingTab extends PluginSettingTab {
       .setName("启用滴答写入")
       .setDesc(authorized
         ? `API 口令目前只允许读取。首次在此 Vault 写入前需完成一次 ${DIDA_WRITE_CONTRACT_VERSION_LABEL} 验证；测试只操作带唯一标记的临时对象并安全清理。`
-        : "第一步先保存 API 口令；连接成功只开放读取，随后还需验证写入能力。")
-      .addButton((button) => this.bindWriteContractButton(
-        setting,
-        button,
-        "验证写入能力",
-        () => this.writeEnablementDescription(authorized),
-      ));
+        : "第一步先保存 API 口令；连接成功只开放读取，随后还需验证写入能力。");
+    // Setting 的构造回调同步执行，声明完成后再绑定，避免暂时性死区中断整个设置页。
+    setting.addButton((button) => this.bindWriteContractButton(
+      setting,
+      button,
+      "验证写入能力",
+      () => this.writeEnablementDescription(authorized),
+      true,
+    ));
   }
 
   private didaWriteReady(): boolean {
@@ -235,6 +249,7 @@ export class HelixSettingTab extends PluginSettingTab {
     button: ButtonComponent,
     idleText: string,
     description: () => string = () => this.writeTestDescription(),
+    enableAutoSyncOnPass = false,
   ): void {
     button
       .setButtonText(this.plugin.didaWriteContractSettingsConfirmation.isArmed()
@@ -277,6 +292,11 @@ export class HelixSettingTab extends PluginSettingTab {
           button.setDisabled(!preflight.ready).setButtonText(idleText);
           setting.setDesc(description());
         }
+        if (passed && enableAutoSyncOnPass) {
+          this.plugin.settings.autoSync = true;
+          await this.plugin.saveSettings(true);
+          new Notice("写入验证通过；滴答自动同步已开启。", 8_000);
+        }
         if (passed) this.display();
       });
     void this.plugin.service.didaWriteContractPreflight().then((preflight) => {
@@ -301,12 +321,12 @@ export class HelixSettingTab extends PluginSettingTab {
     });
     const writeTestSetting = new Setting(developmentContent)
       .setName("写入合同测试")
-      .setDesc(this.writeTestDescription())
-      .addButton((button) => this.bindWriteContractButton(
-        writeTestSetting,
-        button,
-        "运行专用测试",
-      ));
+      .setDesc(this.writeTestDescription());
+    writeTestSetting.addButton((button) => this.bindWriteContractButton(
+      writeTestSetting,
+      button,
+      "运行专用测试",
+    ));
 
     new Setting(developmentContent)
       .setName("任务时间能力")

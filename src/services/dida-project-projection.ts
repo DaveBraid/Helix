@@ -2058,18 +2058,25 @@ function assertOnlyOwnedChecklistItemChanged(
   const actualOwned = ownedCandidates[0]!;
   if (beforeOwned.status !== expectedOwned.status) {
     if (beforeOwned.status === 0 && expectedOwned.status === 2) {
-      if (actualOwned.completedTime === undefined || actualOwned.completedTime === null) {
-        throw new Error("完成 owned 检查项后服务端未生成 completedTime");
-      }
-      if (!Number.isFinite(new Date(actualOwned.completedTime).getTime())) {
+      if (actualOwned.completedTime !== undefined && actualOwned.completedTime !== null &&
+        !Number.isFinite(new Date(actualOwned.completedTime).getTime())) {
         throw new Error("完成 owned 检查项后服务端 completedTime 无效");
       }
-      expectedOwnedForCompare.completedTime = actualOwned.completedTime;
-    } else if (beforeOwned.status === 2 && expectedOwned.status !== 2) {
-      if (actualOwned.completedTime !== undefined && actualOwned.completedTime !== null) {
-        throw new Error("重开 owned 检查项后服务端未移除 completedTime");
+      if (actualOwned.completedTime === undefined || actualOwned.completedTime === null) {
+        delete expectedOwnedForCompare.completedTime;
+      } else {
+        expectedOwnedForCompare.completedTime = actualOwned.completedTime;
       }
-      delete expectedOwnedForCompare.completedTime;
+    } else if (beforeOwned.status === 2 && expectedOwned.status !== 2) {
+      if (actualOwned.completedTime !== undefined && actualOwned.completedTime !== null &&
+        !Number.isFinite(new Date(actualOwned.completedTime).getTime())) {
+        throw new Error("重开 owned 检查项后服务端 completedTime 无效");
+      }
+      if (actualOwned.completedTime === undefined || actualOwned.completedTime === null) {
+        delete expectedOwnedForCompare.completedTime;
+      } else {
+        expectedOwnedForCompare.completedTime = actualOwned.completedTime;
+      }
     } else {
       throw new Error("owned 检查项 status 发生不受支持的转换");
     }
@@ -2098,13 +2105,15 @@ function sameOwnedTargetExceptIdAndDerivedTime(
   delete actualCopy.id;
   if (before.status === expected.status) return stableHash(actualCopy) === stableHash(expectedCopy);
   if (before.status === 0 && expected.status === 2) {
-    if (typeof actual.completedTime !== "string" || !Number.isFinite(new Date(actual.completedTime).getTime())) return false;
+    if (actual.completedTime !== undefined && actual.completedTime !== null &&
+      (typeof actual.completedTime !== "string" || !Number.isFinite(new Date(actual.completedTime).getTime()))) return false;
     delete expectedCopy.completedTime;
     delete actualCopy.completedTime;
     return stableHash(actualCopy) === stableHash(expectedCopy);
   }
   if (before.status === 2 && expected.status === 0) {
-    if (actual.completedTime !== undefined && actual.completedTime !== null) return false;
+    if (actual.completedTime !== undefined && actual.completedTime !== null &&
+      (typeof actual.completedTime !== "string" || !Number.isFinite(new Date(actual.completedTime).getTime()))) return false;
     delete expectedCopy.completedTime;
     delete actualCopy.completedTime;
     return stableHash(actualCopy) === stableHash(expectedCopy);

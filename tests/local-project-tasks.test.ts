@@ -6,6 +6,7 @@ import {
 import { stableHash } from "../src/domain/stable";
 import {
   derivedLocalProjectStageStatus,
+  inheritedLocalProjectActionState,
   LocalProjectTaskService,
   isLocalProjectTaskId,
   localProjectTaskPresentationTasks,
@@ -112,10 +113,18 @@ describe("LocalProjectTaskService", () => {
       stageStatus: "active",
     })]);
     expect(first.tasks[1]?.parentUuid).toBe(first.tasks[0]?.uuid);
+    expect(first.tasks.every((task) => task.state === "active")).toBe(true);
     expect(markdown.writes).toBe(1);
     await service.snapshot(workspace(), { adoptUnmanaged: true });
     expect(markdown.writes).toBe(1);
     expect(markdown.value()).toContain("- [ ]\n\n# 行动结果");
+  });
+
+  it("inherits the active Stage status for open actions without changing terminal states", () => {
+    expect(inheritedLocalProjectActionState("active", "idea")).toBe("active");
+    expect(inheritedLocalProjectActionState("active", "paused")).toBe("paused");
+    expect(inheritedLocalProjectActionState("active", "completed")).toBe("completed");
+    expect(inheritedLocalProjectActionState("idea", "idea")).toBe("idea");
   });
 
   it("uses the stable remote task identity after an action is synchronized", async () => {
@@ -131,6 +140,32 @@ describe("LocalProjectTaskService", () => {
       title: "已同步任务",
     });
     expect(snapshot.byId.get("remote-task-1")?.uuid).toBe("uuid-remote");
+  });
+
+  it("repairs orphaned legacy parent markers without hiding the Stage task tree", async () => {
+    const content = stage.replace(
+      "- [ ] 根任务\n  - [ ] 子任务",
+      [
+        "- [ ] 独立任务 <!-- helix-dida-action:v1 uuid=uuid-root remoteId=- state=idea -->",
+        "- [x] 旧子任务 <!-- helix-dida-action:v2 uuid=uuid-orphan parent=missing-parent remoteId=- state=idea -->",
+      ].join("\n"),
+    );
+    const markdown = new MemoryMarkdown(content);
+    const snapshot = await new LocalProjectTaskService(markdown).snapshot(
+      workspace(),
+      { adoptUnmanaged: true },
+    );
+    expectClean(snapshot);
+    expect(snapshot.roots.map((task) => task.title)).toEqual(["独立任务", "旧子任务"]);
+    expect(snapshot.stageParents).toEqual([expect.objectContaining({
+      taskId: localProjectStageTaskId("stage-1"),
+      stageStatus: "active",
+    })]);
+    expect(markdown.value()).toContain(
+      "helix-dida-action:v1 uuid=uuid-orphan remoteId=- state=completed",
+    );
+    expect(markdown.value()).not.toContain("parent=missing-parent");
+    expect(markdown.writes).toBe(1);
   });
 
   it("maps the synchronized Stage parent without guessing from its title", async () => {
@@ -274,7 +309,7 @@ describe("LocalProjectTaskService", () => {
       state: "idea",
     });
     snapshot = await service.snapshot(workspace());
-    expect(snapshot.roots[0]?.state).toBe("idea");
+    expect(snapshot.roots[0]?.state).toBe("active");
     expect(markdown.value()).toContain("- [ ] 根任务");
   });
 
@@ -355,7 +390,7 @@ describe("LocalProjectTaskService", () => {
     expect(saved.tasks.filter((task) => task.parentUuid === root.uuid)).toEqual([
       expect.objectContaining({
         title: "新增子任务",
-        state: "idea",
+        state: "active",
         startDate: "2026-08-11T01:00:00.000Z",
         dueDate: "2026-08-11T02:00:00.000Z",
         priority: 3,

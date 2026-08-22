@@ -6,6 +6,7 @@ import {
   patchManagedPlanAction,
   readProjectProjectionIdentity,
   reconcileLocalPlanActionCheckboxes,
+  repairOrphanedPlanActionParents,
   removeManagedPlanAction,
   reorderManagedPlanChildren,
   type ProjectionActionState,
@@ -111,6 +112,14 @@ export function localProjectStageTaskId(stageId: string): string {
 
 export function isLocalProjectTaskId(id: string): boolean {
   return id.startsWith(LOCAL_PROJECT_TASK_PREFIX);
+}
+
+/** 进行中 Stage 的待办行动继承父任务状态；显式完成、暂停和终止保持原值。 */
+export function inheritedLocalProjectActionState(
+  stageStatus: ProjectWorkspaceCycleStatus,
+  actionState: ProjectionActionState,
+): ProjectionActionState {
+  return stageStatus === "active" && actionState === "idea" ? "active" : actionState;
 }
 
 /**
@@ -246,8 +255,12 @@ export class LocalProjectTaskService {
         try {
           let revision = await this.requireStage(stage.notePath, stage.id);
           if (options.adoptUnmanaged) {
+            // 先按原生复选框修本地状态，再修失联 parent，最后由 adoptAll 严格校验。
+            const repaired = repairOrphanedPlanActionParents(
+              reconcileLocalPlanActionCheckboxes(revision.content, { deferValidation: true }),
+            );
             const adopted = reconcileLocalPlanParentCompletion(adoptAllPlanActions(
-              reconcileLocalPlanActionCheckboxes(revision.content),
+              repaired,
             ));
             if (adopted !== revision.content) {
               revision = await this.markdown.compareAndWrite(revision, adopted);
@@ -278,7 +291,7 @@ export class LocalProjectTaskService {
               uuid: action.uuid,
               ...(action.remoteId ? { remoteId: action.remoteId } : {}),
               title: action.title,
-              state: action.state,
+              state: inheritedLocalProjectActionState(stage.status, action.state),
               ...(action.content ? { content: action.content } : {}),
               ...(action.startDate ? { startDate: action.startDate } : {}),
               ...(action.dueDate ? { dueDate: action.dueDate } : {}),

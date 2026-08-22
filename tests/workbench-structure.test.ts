@@ -510,6 +510,7 @@ describe("workbench layout and navigation structure", () => {
     const service = readFileSync(resolve(process.cwd(), "src/services/helix-service.ts"), "utf8");
     expect(main).toContain("this.registerEditorExtension(helixMarkerVisibilityExtension)");
     expect(main).toMatch(/new ProjectAutoSyncCoordinator[\s\S]*scan: \(\) => this\.projectAutoSyncScan\(\)[\s\S]*synchronize: \(projectId\) => this\.syncProjectProjection\(projectId\)/);
+    expect(main).toMatch(/runVaultProjectProjectionContractProbe[\s\S]*prepareCycleStatusUpdate\(stage\.id\)[\s\S]*updateCycleStatus\(statusPlan, "active"\)[\s\S]*contractProjection\.synchronizeProject\(input\)/);
     expect(main).toMatch(/runVaultProjectProjectionContractProbe[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(input\)[\s\S]*withWritableProjectMutation\(\(\) =>[\s\S]*contractProjection\.synchronizeProject\(secondInput\)/);
     expect(main).toMatch(/hasUntrackedIdentity[\s\S]*ownedRemoteIds\.every\(\(id\) => trackedRemoteIds\.has\(id\)\)[\s\S]*data\.queue = data\.queue\.filter[\s\S]*projectWorkspace\.deleteProject/);
     expect(main).toMatch(/scheduleProjectRefresh[\s\S]*refreshPersistedEvents\(\)[\s\S]*projectAutoSync\.request\(\)/);

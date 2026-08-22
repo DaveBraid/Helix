@@ -741,6 +741,9 @@ export default class HelixPlugin extends Plugin {
       const stage = created.cycles[0]!;
       projectionUnitId = stage.id;
       await this.withWritableProjectMutation(async () => {
+        // 生产投影只首次创建“进行中” Stage；合同夹具必须先进入同一真实前置状态。
+        const statusPlan = await this.projectWorkspace.prepareCycleStatusUpdate(stage.id);
+        await this.projectWorkspace.updateCycleStatus(statusPlan, "active");
         await this.localProjectTasks.createTask(
           await this.projectWorkspace.loadStableWorkspace(),
           { projectId: created!.id, stageId: stage.id, title: `${context.marker} Vault 行动` },

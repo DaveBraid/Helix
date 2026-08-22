@@ -1988,14 +1988,16 @@ function sameChecklistOwnedExceptDerivedTime(
   const statusChanged = before.status !== expected.status;
   if (!statusChanged) return deepEqual(actualCopy, expectedCopy);
   if (before.status === 0 && expected.status === 2) {
-    if (actual.completedTime === undefined ||
+    // 滴答部分账号不会为检查项返回 completedTime；它是服务端派生元数据，不参与完成真值。
+    if (actual.completedTime !== undefined && actual.completedTime !== null &&
       !Number.isFinite(new Date(actual.completedTime).getTime())) return false;
     delete expectedCopy.completedTime;
     delete actualCopy.completedTime;
     return deepEqual(actualCopy, expectedCopy);
   }
   if (before.status === 2 && expected.status !== 2) {
-    if (actual.completedTime !== undefined && actual.completedTime !== null) return false;
+    if (actual.completedTime !== undefined && actual.completedTime !== null &&
+      !Number.isFinite(new Date(actual.completedTime).getTime())) return false;
     delete expectedCopy.completedTime;
     delete actualCopy.completedTime;
     return deepEqual(actualCopy, expectedCopy);

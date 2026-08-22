@@ -106,6 +106,12 @@ export interface ParsedPlanActions {
   section: { start: number; end: number; eol: "\n" | "\r\n" };
 }
 
+interface ParseManagedPlanActionOptions {
+  /** 本地修复读取可把失联父引用暂视为根；远端投影仍使用默认严格模式。 */
+  orphanParentPolicy?: "error" | "root";
+  onOrphanParent?: (input: { line: number; uuid: string; parentUuid: string }) => void;
+}
+
 export interface ProjectionLedgerEntry {
   uuid: string;
   projectId: string;
@@ -222,7 +228,10 @@ export function assertProjectionActivation(preview: ProjectionActivationPreview,
   if (preview.blockers.length > 0) throw new Error(`滴答项目同步尚不可启用：${preview.blockers.join("；")}`);
 }
 
-export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
+export function parseManagedPlanActions(
+  markdown: string,
+  options: ParseManagedPlanActionOptions = {},
+): ParsedPlanActions {
   const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
   const lines = markdown.split(/\r?\n/);
   const section = exactHeadingSection(lines, PLAN_ACTION_HEADING, 1);
@@ -256,11 +265,16 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     const markerText = line.slice(markerStart).trim();
     const marker = parseActionMarker(markerText);
     if (!marker) throw new Error(`计划行动同步标记损坏：第 ${index + 1} 行`);
-    const { uuid, parentUuid, remoteId: remote, state } = marker;
+    const { uuid, parentUuid: declaredParentUuid, remoteId: remote, state } = marker;
     assertStableId(uuid, "行动 UUID");
     if (uuids.has(uuid)) throw new Error(`计划行动 UUID 重复：${uuid}`);
+    let parentUuid = declaredParentUuid;
     if (parentUuid && !uuids.has(parentUuid)) {
-      throw new Error(`计划行动父任务必须位于子任务之前：第 ${index + 1} 行`);
+      if (options.orphanParentPolicy !== "root") {
+        throw new Error(`计划行动父任务必须位于子任务之前：第 ${index + 1} 行`);
+      }
+      options.onOrphanParent?.({ line: index + 1, uuid, parentUuid });
+      parentUuid = undefined;
     }
     if (remote && remoteIds.has(remote)) throw new Error(`计划行动远端 ID 重复：${remote}`);
     uuids.add(uuid);
@@ -288,6 +302,33 @@ export function parseManagedPlanActions(markdown: string): ParsedPlanActions {
     });
   }
   return { actions, unmanagedChecklistLines, section: { ...section, eol } };
+}
+
+/**
+ * 修复旧版或已删除父任务遗留的失联 parent 引用。只修改 Helix 管理标记，
+ * 保留复选框、标题、远端身份和任务属性；修复后行动提升为 Stage 根任务。
+ */
+export function repairOrphanedPlanActionParents(markdown: string): string {
+  const orphanLines = new Set<number>();
+  const parsed = parseManagedPlanActions(markdown, {
+    orphanParentPolicy: "root",
+    onOrphanParent: ({ line }) => orphanLines.add(line),
+  });
+  if (orphanLines.size === 0) return markdown;
+  const actionsByLine = new Map(parsed.actions.map((action) => [action.line, action]));
+  const lines = markdown.split(/\r?\n/);
+  for (const lineNumber of orphanLines) {
+    const action = actionsByLine.get(lineNumber);
+    const line = lines[lineNumber - 1] ?? "";
+    const markerStart = line.indexOf("<!-- helix-dida-action:");
+    if (!action || markerStart < 0) throw new Error(`失联父任务修复目标已变化：第 ${lineNumber} 行`);
+    lines[lineNumber - 1] = `${line.slice(0, markerStart).trimEnd()} ${
+      renderActionMarker(action.uuid, action.remoteId, action.state, undefined, action)
+    }`;
+  }
+  const repaired = lines.join(parsed.section.eol);
+  parseManagedPlanActions(repaired);
+  return repaired;
 }
 
 /** Live Preview 复用完整领域校验；任一损坏、编码或状态不一致均由调用方保持可见。 */
@@ -373,7 +414,10 @@ export function adoptAllPlanActions(
 }
 
 /** 原生勾选只驱动尚未绑定远端的本地任务；远端身份存在时仍保持严格冲突检查。 */
-export function reconcileLocalPlanActionCheckboxes(markdown: string): string {
+export function reconcileLocalPlanActionCheckboxes(
+  markdown: string,
+  options: { deferValidation?: boolean } = {},
+): string {
   const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
   const lines = markdown.split(/\r?\n/);
   const section = exactHeadingSection(lines, PLAN_ACTION_HEADING, 1);
@@ -410,7 +454,8 @@ export function reconcileLocalPlanActionCheckboxes(markdown: string): string {
     changed = true;
   }
   const next = changed ? lines.join(eol) : markdown;
-  if (changed) parseManagedPlanActions(next);
+  // 本地启动迁移可能还需继续修失联 parent；全部修复完成后由调用方统一严格校验。
+  if (changed && !options.deferValidation) parseManagedPlanActions(next);
   return next;
 }
 

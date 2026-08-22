@@ -14,6 +14,20 @@ import { resolveMacDefaultBrowserBundleId } from "../src/ui/default-browser";
 import { DIDA_CONTRACT_PROBE_VERSION } from "../src/domain/task-schedule";
 
 describe("Dida settings contract", () => {
+  it("binds write-contract buttons after their Setting declarations complete", () => {
+    const source = readFileSync(resolve(process.cwd(), "src/ui/settings-tab.ts"), "utf8");
+    expect(source).toContain("setting.addButton((button) => this.bindWriteContractButton(");
+    expect(source).toContain("writeTestSetting.addButton((button) => this.bindWriteContractButton(");
+    expect(source).toContain("开启自动同步");
+    expect(source).toContain("if (passed && enableAutoSyncOnPass)");
+    expect(source).not.toContain(".setDesc(this.writeTestDescription())\n      .addButton");
+    const guideDeclaration = source.slice(
+      source.indexOf("const setting = new Setting(this.containerEl)"),
+      source.indexOf("setting.addButton((button) => this.bindWriteContractButton("),
+    );
+    expect(guideDeclaration).toContain("随后还需验证写入能力。\");");
+  });
+
   it("keeps the account entry and token menu path visible", () => {
     expect(DIDA_WEB_URL).toBe("https://dida365.com/webapp/");
     expect(DIDA_TOKEN_MENU_PATH).toBe("头像 → 设置 → 账户与安全 → API 口令");

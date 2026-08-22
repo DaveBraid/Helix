@@ -876,7 +876,7 @@ export class HelixView extends ItemView {
     tree?: TaskTreeRow,
   ): HTMLElement {
     const localTask = this.localProjectTaskSnapshot?.byId.get(task.id);
-    const stageParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id);
+    const stageParent = this.localProjectTaskSnapshot?.byStageParentTaskId.get(task.id);
     const summary = taskSummary(task, Boolean(localTask));
     const row = parent.createDiv({
       cls: `helix-task-row${prominent ? " is-prominent" : ""}${summary ? " has-summary" : ""}`,
@@ -1206,6 +1206,7 @@ export class HelixView extends ItemView {
         byId: new Map(),
         byUuid: new Map(),
         stageParents: [],
+        byStageParentTaskId: new Map(),
         byRemoteParentTaskId: new Map(),
         destinations: [],
       };
@@ -1225,7 +1226,7 @@ export class HelixView extends ItemView {
     const childIds = new Set(task.childIds ?? []);
     const childTasks = (this.state?.tasks ?? []).filter((candidate) =>
       candidate.parentId === task.id || childIds.has(candidate.id));
-    const stageParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id);
+    const stageParent = this.localProjectTaskSnapshot?.byStageParentTaskId.get(task.id);
     if (stageParent) {
       this.openStageProjectionTaskEditor(task, stageParent, childTasks);
       return;
@@ -1793,6 +1794,9 @@ export class HelixView extends ItemView {
     for (const task of this.localProjectTaskSnapshot?.tasks ?? []) {
       helixProjectByTaskId.set(task.id, task.projectId);
     }
+    for (const parent of this.localProjectTaskSnapshot?.stageParents ?? []) {
+      helixProjectByTaskId.set(parent.taskId, parent.projectId);
+    }
     let visibleTasks = filterTaskCollection(this.filterTasks(tasks), this.taskCollectionFilters, {
       anchor: new Date(),
       helixProjectByTaskId,
@@ -1857,7 +1861,7 @@ export class HelixView extends ItemView {
     for (const item of rows) {
       const project = projectById.get(item.task.projectId);
       const localTask = this.localProjectTaskSnapshot?.byId.get(item.task.id);
-      const stageParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(item.task.id);
+      const stageParent = this.localProjectTaskSnapshot?.byStageParentTaskId.get(item.task.id);
       const signature = stableHash({ item, project, localTask, stageParent });
       let cached = this.taskTreeRows.get(item.task.id);
       if (!cached || cached.signature !== signature) {
@@ -1881,7 +1885,7 @@ export class HelixView extends ItemView {
 
   private bindTaskTreeDrag(row: HTMLElement, task: DidaTask): void {
     const localTask = this.localProjectTaskSnapshot?.byId.get(task.id);
-    const projectionParent = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id);
+    const projectionParent = this.localProjectTaskSnapshot?.byStageParentTaskId.get(task.id);
     const writable = task.id.startsWith("sample-") || (
       !localTask && !projectionParent && DIDA_TASK_WRITE_AVAILABLE &&
       (this.state?.taskCrudVerified ?? false) && (this.state?.taskParentingVerified ?? false)
@@ -4488,7 +4492,7 @@ export class HelixView extends ItemView {
     if (this.taskFilter === "all") return completionLast(tasks);
     const inProgressIds = new Set(this.state?.inProgress.map((entry) => entry.taskId) ?? []);
     for (const parent of this.localProjectTaskSnapshot?.stageParents ?? []) {
-      if (parent.stageStatus === "active") inProgressIds.add(parent.remoteTaskId);
+      if (parent.stageStatus === "active") inProgressIds.add(parent.taskId);
     }
     if (this.taskFilter === "active") {
       for (const task of tasks) {
@@ -4502,7 +4506,7 @@ export class HelixView extends ItemView {
     return tasks.filter((task) => {
       const localState = this.localProjectTaskSnapshot?.byId.get(task.id)?.state;
       if (localState) return localState === this.taskFilter;
-      const stageState = this.localProjectTaskSnapshot?.byRemoteParentTaskId.get(task.id)?.stageStatus;
+      const stageState = this.localProjectTaskSnapshot?.byStageParentTaskId.get(task.id)?.stageStatus;
       if (stageState) return stageState === this.taskFilter;
       if (this.taskFilter === "completed") return task.status === 2;
       if (task.status === 2) return false;
@@ -5176,7 +5180,7 @@ function stageTaskDetailDraft(
   roots: LocalProjectTask[],
 ): TaskDetailDraft {
   return {
-    id: stage.remoteTaskId,
+    id: stage.taskId,
     source: "stage-projection",
     breadcrumb: ["Helix", stage.projectTitle, `阶段 ${stage.stageCode}`],
     syncLabel: "Markdown 权威 · 后台同步滴答",

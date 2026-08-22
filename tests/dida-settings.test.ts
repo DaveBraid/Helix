@@ -40,7 +40,10 @@ describe("Dida settings contract", () => {
     expect(source).toMatch(/createEl\("details",\s*\{[\s\S]*helix-settings-development-tests/);
     expect(source).toMatch(/createEl\("summary",\s*\{ text: HELIX_DEVELOPMENT_TESTS_LABEL \}\)/);
     expect(source).toMatch(/new Setting\(developmentContent\)[\s\S]*\.setName\("写入合同测试"\)/);
-    expect(source).toMatch(/scheduleModeSetting = new Setting\(developmentContent\)/);
+    expect(source).toMatch(/new Setting\(developmentContent\)[\s\S]*\.setName\("任务时间能力"\)/);
+    expect(source).toMatch(/renderDidaWriteEnablementGuide\(\)[\s\S]*\.setName\("启用滴答写入"\)/);
+    expect(source).toContain("API 口令目前只允许读取");
+    expect(source).toContain("远端写入仍保持只读，请先完成上方写入验证");
     expect(source).toMatch(/new Setting\(this\.containerEl\)[\s\S]*\.setName\("自动同步"\)/);
     expect(source).toMatch(/\.setName\("Helix 模板目录"\)[\s\S]*保存并补齐默认模板/);
   });

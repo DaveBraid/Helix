@@ -9,6 +9,7 @@ import {
   LocalProjectTaskService,
   isLocalProjectTaskId,
   localProjectTaskPresentationTasks,
+  localProjectStageTaskId,
   reconcileLocalPlanParentCompletion,
   type LocalProjectTaskSnapshot,
 } from "../src/services/local-project-tasks";
@@ -106,6 +107,10 @@ describe("LocalProjectTaskService", () => {
       stageTitle: "验收",
       childCount: 1,
     });
+    expect(first.stageParents).toEqual([expect.objectContaining({
+      taskId: localProjectStageTaskId("stage-1"),
+      stageStatus: "active",
+    })]);
     expect(first.tasks[1]?.parentUuid).toBe(first.tasks[0]?.uuid);
     expect(markdown.writes).toBe(1);
     await service.snapshot(workspace(), { adoptUnmanaged: true });
@@ -135,6 +140,7 @@ describe("LocalProjectTaskService", () => {
     );
     const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(content)).snapshot(workspace());
     expect(snapshot.stageParents).toEqual([expect.objectContaining({
+      taskId: "remote-stage-1",
       remoteTaskId: "remote-stage-1",
       projectId: "project-1",
       stageId: "stage-1",
@@ -142,6 +148,25 @@ describe("LocalProjectTaskService", () => {
       stageStatus: "active",
     })]);
     expect(snapshot.byRemoteParentTaskId.get("remote-stage-1")?.stageTitle).toBe("验收");
+    expect(snapshot.byStageParentTaskId.get("remote-stage-1")?.stageTitle).toBe("验收");
+  });
+
+  it("shows an active local Stage parent before any remote projection exists", async () => {
+    const snapshot = await new LocalProjectTaskService(new MemoryMarkdown(stage))
+      .snapshot(workspace(), { adoptUnmanaged: true });
+    const displayed = localProjectTaskPresentationTasks(snapshot, []);
+    const parentId = localProjectStageTaskId("stage-1");
+    expect(displayed.find((task) => task.id === parentId)).toMatchObject({
+      title: "验收",
+      status: 0,
+      projectId: "helix-project:project-1",
+    });
+    expect(displayed.find((task) => task.title === "根任务")).toMatchObject({
+      parentId,
+      status: 0,
+    });
+    expect(snapshot.byStageParentTaskId.get(parentId)?.stageStatus).toBe("active");
+    expect(snapshot.byRemoteParentTaskId.size).toBe(0);
   });
 
   it("keeps newly edited Stage actions visible inside the remote Helix Projects filter", async () => {

@@ -98,6 +98,8 @@ export class HelixSettingTab extends PluginSettingTab {
         }),
       );
 
+    if (DIDA_CONTRACT_TEST_AVAILABLE) this.renderDidaWriteEnablementGuide();
+
     new Setting(this.containerEl)
       .setName("只读拉取测试")
       .setDesc("拉取并显示真实清单与任务；不会发送待处理写入，也不会修改远端。")
@@ -132,6 +134,9 @@ export class HelixSettingTab extends PluginSettingTab {
         toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
           this.plugin.settings.autoSync = value;
           await this.plugin.saveSettings(value);
+          if (value && this.plugin.secrets.getDidaToken() && !this.didaWriteReady()) {
+            new Notice("自动同步已开启，读取可用；远端写入仍保持只读，请先完成上方写入验证。", 10_000);
+          }
         }),
       );
     new Setting(this.containerEl)
@@ -191,6 +196,96 @@ export class HelixSettingTab extends PluginSettingTab {
     }).catch(() => undefined);
   }
 
+  /**
+   * 在正常设置区展示首次写入引导。API 口令只建立读取连接；写入能力必须
+   * 由当前 Vault、当前授权和当前合同版本共同验证，避免用户误以为保存口令
+   * 已经开放远端写入。
+   */
+  private renderDidaWriteEnablementGuide(): void {
+    if (this.didaWriteReady()) {
+      new Setting(this.containerEl)
+        .setName("滴答写入已就绪")
+        .setDesc("当前 Vault、API 口令与合同版本的写入能力已经验证；开启自动同步后可后台创建和更新 Helix Projects 任务。")
+        .setDisabled(true);
+      return;
+    }
+    const authorized = Boolean(this.plugin.secrets.getDidaToken());
+    const setting = new Setting(this.containerEl)
+      .setName("启用滴答写入")
+      .setDesc(authorized
+        ? `API 口令目前只允许读取。首次在此 Vault 写入前需完成一次 ${DIDA_WRITE_CONTRACT_VERSION_LABEL} 验证；测试只操作带唯一标记的临时对象并安全清理。`
+        : "第一步先保存 API 口令；连接成功只开放读取，随后还需验证写入能力。")
+      .addButton((button) => this.bindWriteContractButton(
+        setting,
+        button,
+        "验证写入能力",
+        () => this.writeEnablementDescription(authorized),
+      ));
+  }
+
+  private didaWriteReady(): boolean {
+    const state = this.plugin.service.snapshot();
+    return state.authorizationConfigured && state.taskCrudVerified &&
+      state.taskParentingVerified && state.projectProjectionVerified;
+  }
+
+  /** 设置区与开发诊断区共用同一合同运行入口，避免安全流程分叉。 */
+  private bindWriteContractButton(
+    setting: Setting,
+    button: ButtonComponent,
+    idleText: string,
+    description: () => string = () => this.writeTestDescription(),
+  ): void {
+    button
+      .setButtonText(this.plugin.didaWriteContractSettingsConfirmation.isArmed()
+        ? "再次点击开始"
+        : idleText)
+      .onClick(async () => {
+        const confirmation = this.plugin.didaWriteContractSettingsConfirmation.request(() => {
+          button.buttonEl.removeClass("mod-warning");
+          button.setButtonText(idleText);
+          new Notice("写入验证的二次确认已超时失效。", 6_000);
+        });
+        if (confirmation === "armed") {
+          button.setButtonText("再次点击开始").setWarning();
+          new Notice("请在 15 秒内再次点击；随后只会创建并清理专用临时对象。", 8_000);
+          return;
+        }
+        this.writeTestResult = "最近结果：测试运行中，其他远端写入与口令变更已冻结。";
+        setting.setDesc(description());
+        button.setDisabled(true).setButtonText("验证中…");
+        let passed = false;
+        try {
+          const report = await this.plugin.service.runDidaWriteContractTest((progress) => {
+            const attempt = progress.attempt && progress.maxAttempts
+              ? `（${progress.attempt}/${progress.maxAttempts}）`
+              : "";
+            this.writeTestResult = `最近结果：测试运行中 · ${progress.stage}${attempt}。其他远端写入与口令变更已冻结。`;
+            setting.setDesc(description());
+          });
+          const summary = didaWriteContractSafeSummary(report);
+          this.writeTestResult = `最近结果：${summary}`;
+          passed = report.status === "passed";
+          new Notice(summary, passed ? 12_000 : 20_000);
+        } catch {
+          this.writeTestResult = `最近结果：${DIDA_WRITE_CONTRACT_SAFE_FAILURE}`;
+          new Notice(DIDA_WRITE_CONTRACT_SAFE_FAILURE, 12_000);
+        } finally {
+          button.buttonEl.removeClass("mod-warning");
+          const preflight = await this.plugin.service.didaWriteContractPreflight();
+          this.writeTestPreflight = preflight.reason;
+          button.setDisabled(!preflight.ready).setButtonText(idleText);
+          setting.setDesc(description());
+        }
+        if (passed) this.display();
+      });
+    void this.plugin.service.didaWriteContractPreflight().then((preflight) => {
+      this.writeTestPreflight = preflight.reason;
+      setting.setDesc(description());
+      button.setDisabled(!preflight.ready);
+    });
+  }
+
   private renderContractTests(): void {
     const developmentTests = this.containerEl.createEl("details", {
       cls: "helix-settings-development-tests",
@@ -204,59 +299,16 @@ export class HelixSettingTab extends PluginSettingTab {
     const developmentContent = developmentTests.createDiv({
       cls: "helix-settings-development-content",
     });
-    let scheduleModeSetting: Setting | null = null;
-    let writeTestButton: ButtonComponent | null = null;
     const writeTestSetting = new Setting(developmentContent)
       .setName("写入合同测试")
       .setDesc(this.writeTestDescription())
-      .addButton((button) =>
-        (writeTestButton = button).setButtonText(this.plugin.didaWriteContractSettingsConfirmation.isArmed() ? "再次点击开始" : "运行专用测试").onClick(async () => {
-          const confirmation = this.plugin.didaWriteContractSettingsConfirmation.request(() => {
-            button.buttonEl.removeClass("mod-warning");
-            button.setButtonText("运行专用测试");
-            new Notice("写入合同测试的二次确认已超时失效。", 6_000);
-          });
-          if (confirmation === "armed") {
-            button.setButtonText("再次点击开始").setWarning();
-            new Notice("已武装：请在 15 秒内再次点击，才会创建并清理专用测试对象。", 8_000);
-            return;
-          }
-          this.writeTestResult = "最近结果：测试运行中，其他远端写入与口令变更已冻结。";
-          writeTestSetting.setDesc(this.writeTestDescription());
-          button.setDisabled(true).setButtonText("测试中…");
-          try {
-            const report = await this.plugin.service.runDidaWriteContractTest((progress) => {
-              const attempt = progress.attempt && progress.maxAttempts
-                ? `（${progress.attempt}/${progress.maxAttempts}）`
-                : "";
-              this.writeTestResult = `最近结果：测试运行中 · ${progress.stage}${attempt}。其他远端写入与口令变更已冻结。`;
-              writeTestSetting.setDesc(this.writeTestDescription());
-            });
-            const summary = didaWriteContractSafeSummary(report);
-            this.writeTestResult = `最近结果：${summary}`;
-            new Notice(summary, report.status === "passed" ? 12_000 : 20_000);
-          } catch (error) {
-            this.writeTestResult = `最近结果：${DIDA_WRITE_CONTRACT_SAFE_FAILURE}`;
-            new Notice(DIDA_WRITE_CONTRACT_SAFE_FAILURE, 12_000);
-          } finally {
-            writeTestSetting.setDesc(this.writeTestDescription());
-            scheduleModeSetting?.setDesc(this.scheduleModeDescription());
-            button.buttonEl.removeClass("mod-warning");
-            const preflight = await this.plugin.service.didaWriteContractPreflight();
-            this.writeTestPreflight = preflight.reason;
-            writeTestSetting.setDesc(this.writeTestDescription());
-            button.setDisabled(!preflight.ready).setButtonText("运行专用测试");
-          }
-        }),
-      );
+      .addButton((button) => this.bindWriteContractButton(
+        writeTestSetting,
+        button,
+        "运行专用测试",
+      ));
 
-    void this.plugin.service.didaWriteContractPreflight().then((preflight) => {
-      this.writeTestPreflight = preflight.reason;
-      writeTestSetting.setDesc(this.writeTestDescription());
-      writeTestButton?.setDisabled(!preflight.ready);
-    });
-
-    scheduleModeSetting = new Setting(developmentContent)
+    new Setting(developmentContent)
       .setName("任务时间能力")
       .setDesc(this.scheduleModeDescription());
 
@@ -286,6 +338,15 @@ export class HelixSettingTab extends PluginSettingTab {
     const scope = `${DIDA_WRITE_CONTRACT_VERSION_LABEL}。只创建带唯一标记的两个临时清单和按能力隔离的临时任务；逐项验证后按身份安全清理，绝不操作既有数据。`;
     const status = this.writeTestResult ?? (this.writeTestPreflight ? `启动条件：${this.writeTestPreflight}。` : null);
     return status ? `${scope} ${status}` : scope;
+  }
+
+  private writeEnablementDescription(authorized: boolean): string {
+    const guide = authorized
+      ? `API 口令目前只允许读取。首次在此 Vault 写入前需完成一次 ${DIDA_WRITE_CONTRACT_VERSION_LABEL} 验证；测试只操作带唯一标记的临时对象并安全清理。`
+      : "第一步先保存 API 口令；连接成功只开放读取，随后还需验证写入能力。";
+    const status = this.writeTestResult ??
+      (this.writeTestPreflight ? `启动条件：${this.writeTestPreflight}。` : null);
+    return status ? `${guide} ${status}` : guide;
   }
 
   private scheduleModeDescription(): string {

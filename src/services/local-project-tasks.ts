@@ -21,6 +21,7 @@ import type {
 } from "./dida-project-projection";
 
 export const LOCAL_PROJECT_TASK_PREFIX = "helix-local-task:";
+export const LOCAL_PROJECT_STAGE_TASK_PREFIX = "helix-local-stage:";
 
 export interface LocalProjectTask {
   id: string;
@@ -54,6 +55,7 @@ export interface LocalProjectTaskSnapshot {
   byId: Map<string, LocalProjectTask>;
   byUuid: Map<string, LocalProjectTask>;
   stageParents: LocalProjectStageTaskParent[];
+  byStageParentTaskId: Map<string, LocalProjectStageTaskParent>;
   byRemoteParentTaskId: Map<string, LocalProjectStageTaskParent>;
   destinations: Array<{
     projectId: string;
@@ -64,7 +66,10 @@ export interface LocalProjectTaskSnapshot {
 }
 
 export interface LocalProjectStageTaskParent {
-  remoteTaskId: string;
+  /** 任务页稳定身份；远端父任务存在时直接复用其 ID。 */
+  taskId: string;
+  /** 只有项目投影已创建远端父任务时才存在。 */
+  remoteTaskId?: string;
   projectId: string;
   projectTitle: string;
   projectColor?: string;
@@ -100,14 +105,18 @@ export function localProjectTaskId(uuid: string): string {
   return `${LOCAL_PROJECT_TASK_PREFIX}${uuid}`;
 }
 
+export function localProjectStageTaskId(stageId: string): string {
+  return `${LOCAL_PROJECT_STAGE_TASK_PREFIX}${stageId}`;
+}
+
 export function isLocalProjectTaskId(id: string): boolean {
   return id.startsWith(LOCAL_PROJECT_TASK_PREFIX);
 }
 
 /**
- * 把 Stage Markdown 行动投影为任务页模型。已存在远端 Stage 父任务时，
- * 尚未同步的本地行动也沿用父任务所在的滴答清单，使其不会在选中
- * `Helix Projects` 时被清单筛选隐藏；远端 ID 和父子关系仍以精确身份为准。
+ * 把 Stage Markdown 行动投影为任务页模型。Stage 父任务始终由本地权威
+ * 状态生成；远端身份存在时复用远端任务和清单，尚未验证滴答写入时也
+ * 能正确展示阶段状态与本地父子关系。
  */
 export function localProjectTaskPresentationTasks(
   snapshot: LocalProjectTaskSnapshot,
@@ -117,18 +126,25 @@ export function localProjectTaskPresentationTasks(
   const stageParentByStageId = new Map(
     snapshot.stageParents.map((parent) => [parent.stageId, parent]),
   );
-  const stageParents = snapshot.stageParents.flatMap((parent) => {
-    const remote = remoteById.get(parent.remoteTaskId);
-    if (!remote) return [];
-    return [{
-      ...remote,
+  const stageParents = snapshot.stageParents.map((parent) => {
+    const remote = parent.remoteTaskId ? remoteById.get(parent.remoteTaskId) : undefined;
+    return {
+      ...(remote ?? {
+        id: parent.taskId,
+        projectId: `helix-project:${parent.projectId}`,
+        title: parent.stageTitle,
+        content: "",
+        desc: `${parent.projectTitle} · 阶段 ${parent.stageCode}`,
+        priority: 0 as const,
+        kind: "CHECKLIST" as const,
+      }),
       status: parent.stageStatus === "completed" || parent.stageStatus === "terminated" ? 2 : 0,
-    }];
+    };
   });
   const localTasks = snapshot.tasks.map((task) => {
     const localParent = task.parentUuid ? snapshot.byUuid.get(task.parentUuid) : undefined;
     const stageParent = stageParentByStageId.get(task.stageId);
-    const remoteStageParent = stageParent
+    const remoteStageParent = stageParent?.remoteTaskId
       ? remoteById.get(stageParent.remoteTaskId)
       : undefined;
     return {
@@ -136,7 +152,7 @@ export function localProjectTaskPresentationTasks(
       projectId: remoteStageParent?.projectId ?? `helix-project:${task.projectId}`,
       ...(localParent
         ? { parentId: localParent.id }
-        : stageParent ? { parentId: stageParent.remoteTaskId } : {}),
+        : stageParent ? { parentId: stageParent.taskId } : {}),
       title: task.title,
       content: task.content ?? "",
       desc: `${task.projectTitle} · 阶段 ${task.stageCode} ${task.stageTitle}`,
@@ -239,9 +255,10 @@ export class LocalProjectTaskService {
           }
           const parsed = parseManagedPlanActions(revision.content);
           const parentTaskId = readProjectProjectionIdentity(revision.content).parentTaskId;
-          if (parentTaskId) {
+          if (parentTaskId || parsed.actions.some((action) => !action.parentUuid)) {
             stageParents.push({
-              remoteTaskId: parentTaskId,
+              taskId: parentTaskId ?? localProjectStageTaskId(stage.id),
+              ...(parentTaskId ? { remoteTaskId: parentTaskId } : {}),
               projectId: project.id,
               projectTitle: project.title,
               ...(project.color ? { projectColor: project.color } : {}),
@@ -303,7 +320,9 @@ export class LocalProjectTaskService {
       byId: new Map(tasks.map((task) => [task.id, task])),
       byUuid,
       stageParents,
-      byRemoteParentTaskId: new Map(stageParents.map((parent) => [parent.remoteTaskId, parent])),
+      byStageParentTaskId: new Map(stageParents.map((parent) => [parent.taskId, parent])),
+      byRemoteParentTaskId: new Map(stageParents.flatMap((parent) =>
+        parent.remoteTaskId ? [[parent.remoteTaskId, parent] as const] : [])),
       destinations: workspace.projects.map((project) => ({
         projectId: project.id,
         projectTitle: project.title,

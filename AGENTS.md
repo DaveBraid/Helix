@@ -26,11 +26,12 @@ Helix 是桌面优先的 Obsidian 插件，将滴答清单的任务、清单、�
 - `docs/ARCHITECTURE.md`：权威边界、模块结构、数据流和关键边界情况。
 - `docs/DEVELOPMENT.md`：环境、命令、Git 阶段提交、测试与 BRAT 发布流程。
 - `docs/STATUS.md`：当前事实、工作树、验证、风险和下一步的跨对话接手快照；每次工作必须读取。
+- `docs/经验.md`：高复发且会影响安全、验证有效性或开发效率的实战经验；每次工作必须读取并按需维护。
 - `docs/history/`：按日期保存历史状态，仅在追溯回归或历史决策时读取，日常开发不得默认加载。
 
 ## 每次工作的固定流程
 
-1. 阅读本文件和 `docs/STATUS.md`；涉及结构或同步时再读 `docs/ARCHITECTURE.md`。
+1. 阅读本文件、`docs/STATUS.md` 和 `docs/经验.md`；涉及结构或同步时再读 `docs/ARCHITECTURE.md`。
 2. 检查工作树，保护用户已有修改。
 3. 用最新事实更新 `docs/STATUS.md`；阶段完成后替换旧状态，不追加永久流水账。已提交阶段的详细证据进入 Git 历史，必要时按日期归档到 `docs/history/`。
 4. 实现并运行与风险相称的测试。

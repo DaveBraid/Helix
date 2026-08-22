@@ -1,8 +1,8 @@
 # 当前开发状态
 
 最后更新：2026-08-22
-当前基线提交：`c60ad71 docs: refresh experience document snapshot`
-工作树状态：存在本轮业务修复、测试与文档改动，尚未提交。
+当前基线提交：`472355c fix: restore formal project task projection`
+工作树状态：工作树干净。
 当前阶段：修复正式 Vault 的项目任务状态、认证引导与 Helix Projects 自动投影。
 
 ## 本轮目标
@@ -48,7 +48,7 @@
 ## 未关闭问题
 
 - 需要恢复 Obsidian CLI 连接后，核验任务页刷新后 Stage-04 子任务显示“进行中”且清单为 `Helix Projects`。
-- 当前修复尚未提交、推送或发布；BRAT 仍不会获得本轮修复。
+- 当前修复已提交至 `dev`，尚未推送或发布；BRAT 仍不会获得本轮修复。
 
 ## 下一步
 

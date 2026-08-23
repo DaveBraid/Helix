@@ -92,6 +92,8 @@ import {
 
 import {
   PROJECT_PROJECTION_ACTIVATION_VERSION,
+  hasProjectionActivationFootprint,
+  isCurrentProjectionTargetResume,
   PROJECTION_NO_COLUMN_ID,
   PROJECTION_PROJECT_NAME,
   type DidaProjectionTarget,
@@ -1072,12 +1074,29 @@ export default class HelixPlugin extends Plugin {
       const hasRecoveryIdentity = configuration.ledger.length > 0 ||
         configuration.parentCheckpoints.length > 0 ||
         (configuration.parentBases?.length ?? 0) > 0 ||
-        (configuration.receiptCleanupPending?.length ?? 0) > 0;
-      if (hasRecoveryIdentity) {
-        throw new Error("旧版项目任务同步仍有身份记录，必须先在冲突中心完成收口");
+        (configuration.receiptCleanupPending?.length ?? 0) > 0 ||
+        configuration.columnCreation !== undefined;
+      const remoteProjects = this.service.snapshot().projects.filter((project) =>
+        !project.id.startsWith("local-project-"));
+      const retainedProjects = configuration.target
+        ? remoteProjects.filter((project) => project.id === configuration.target!.targetProjectId)
+        : [];
+      const retainedTarget = retainedProjects.length === 1 ? {
+        targetProjectId: retainedProjects[0]!.id,
+        targetColumnId: PROJECTION_NO_COLUMN_ID,
+      } : undefined;
+      const sameTargetResume = retainedTarget !== undefined &&
+        isCurrentProjectionTargetResume(configuration, retainedTarget);
+      if (hasRecoveryIdentity && !sameTargetResume) {
+        throw new Error("旧版或异目标项目任务同步仍有身份记录，必须先在冲突中心完成收口");
       }
-      let matches = this.service.snapshot().projects.filter((project) =>
-        project.name === PROJECTION_PROJECT_NAME && !project.id.startsWith("local-project-"));
+      if (hasProjectionActivationFootprint(configuration) && !sameTargetResume) {
+        throw new Error("停用的项目任务同步仍保留旧目标；请先显式清理停用配置");
+      }
+      // 已持久化的精确清单 ID 优先于展示名；用户改名后也不能另建第二个目标。
+      let matches = sameTargetResume
+        ? retainedProjects
+        : remoteProjects.filter((project) => project.name === PROJECTION_PROJECT_NAME);
       if (matches.length > 1) throw new Error(`存在多个“${PROJECTION_PROJECT_NAME}”清单，已停止自动选择`);
       if (matches.length === 0) {
         await this.service.createDidaProject(PROJECTION_PROJECT_NAME);

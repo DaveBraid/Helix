@@ -168,6 +168,26 @@ describe("LocalProjectTaskService", () => {
     expect(markdown.writes).toBe(1);
   });
 
+  it("moves a trailing visible suffix before its valid managed marker during adoption", async () => {
+    const content = stage.replace(
+      "- [ ] 根任务\n  - [ ] 子任务",
+      "- [ ] 旧行动 <!-- helix-dida-action:v1 uuid=uuid-trailing remoteId=- state=idea --> ⚪",
+    );
+    const markdown = new MemoryMarkdown(content);
+
+    const snapshot = await new LocalProjectTaskService(markdown).snapshot(
+      workspace(),
+      { adoptUnmanaged: true },
+    );
+
+    expectClean(snapshot);
+    expect(snapshot.roots[0]).toMatchObject({ uuid: "uuid-trailing", title: "旧行动 ⚪" });
+    expect(markdown.value()).toContain(
+      "- [ ] 旧行动 ⚪ <!-- helix-dida-action:v1 uuid=uuid-trailing remoteId=- state=idea -->",
+    );
+    expect(markdown.writes).toBe(1);
+  });
+
   it("maps the synchronized Stage parent without guessing from its title", async () => {
     const content = stage.replace(
       "helix-id: stage-1",

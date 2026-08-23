@@ -9,6 +9,7 @@ import {
   assertProjectionActivation,
   buildProjectionActivationPreview,
   buildProjectionLedger,
+  isCurrentProjectionTargetResume,
   parseManagedPlanActions,
   patchManagedPlanAction,
   patchProjectParentTaskId,
@@ -960,11 +961,17 @@ export class DidaProjectProjectionService {
     const current = await this.state.read();
     if (current.target && (current.target.targetProjectId !== fresh.target.targetProjectId ||
       current.target.targetColumnId !== fresh.target.targetColumnId) &&
-      (current.ledger.length > 0 || current.parentCheckpoints.length > 0 || (current.parentBases?.length ?? 0) > 0)) {
+      (current.ledger.length > 0 || current.parentCheckpoints.length > 0 ||
+        (current.parentBases?.length ?? 0) > 0 ||
+        (current.receiptCleanupPending?.length ?? 0) > 0 || current.columnCreation !== undefined)) {
       throw new Error("已有同步身份时禁止切换目标清单或分栏");
     }
-    if (current.ledger.some((entry) => entry.frozen) || current.parentCheckpoints.some((item) => item.frozen)) {
-      throw new Error("滴答项目同步仍有冻结对象，禁止启用");
+    const sameTargetResume = isCurrentProjectionTargetResume(current, fresh.target);
+    const hasRecoveryIdentity = current.ledger.length > 0 || current.parentCheckpoints.length > 0 ||
+      (current.parentBases?.length ?? 0) > 0 || (current.receiptCleanupPending?.length ?? 0) > 0 ||
+      current.columnCreation !== undefined;
+    if (hasRecoveryIdentity && !sameTargetResume) {
+      throw new Error("旧版或异目标项目任务同步仍有恢复身份，禁止启用");
     }
     await this.state.write(current, {
       ...current,

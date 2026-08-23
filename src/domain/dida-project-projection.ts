@@ -25,6 +25,32 @@ export interface DidaProjectionTarget {
   targetColumnId: string;
 }
 
+export function isCurrentProjectionTargetResume(
+  state: {
+    enabled: boolean;
+    activationVersion?: number;
+    target?: DidaProjectionTarget;
+    confirmedPreviewHash?: string;
+  },
+  target: DidaProjectionTarget,
+): boolean {
+  return state.enabled === false &&
+    state.activationVersion === PROJECT_PROJECTION_ACTIVATION_VERSION &&
+    typeof state.confirmedPreviewHash === "string" && state.confirmedPreviewHash.length > 0 &&
+    state.target?.targetProjectId === target.targetProjectId &&
+    state.target.targetColumnId === target.targetColumnId;
+}
+
+export function hasProjectionActivationFootprint(state: {
+  enabled?: boolean;
+  activationVersion?: number;
+  target?: DidaProjectionTarget;
+  confirmedPreviewHash?: string;
+}): boolean {
+  return state.enabled === true || state.activationVersion !== undefined || state.target !== undefined ||
+    state.confirmedPreviewHash !== undefined;
+}
+
 export interface ProjectionReadiness {
   writable: boolean;
   queueEmpty: boolean;
@@ -328,6 +354,43 @@ export function repairOrphanedPlanActionParents(markdown: string): string {
   }
   const repaired = lines.join(parsed.section.eol);
   parseManagedPlanActions(repaired);
+  return repaired;
+}
+
+/** 把合法但后方遗留可见文本的旧 marker 移到行尾；只移动 Helix 标记，不丢用户文本。 */
+export function repairTrailingPlanActionMarkers(markdown: string): string {
+  const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
+  const lines = markdown.split(/\r?\n/);
+  const section = exactHeadingSection(lines, PLAN_ACTION_HEADING, 1);
+  let changed = false;
+  let fence: { char: "`" | "~"; length: number } | undefined;
+  for (let index = section.start + 1; index < section.end; index += 1) {
+    const line = lines[index] ?? "";
+    const fenceMarker = /^( {0,3})(`{3,}|~{3,})/.exec(line)?.[2];
+    if (fenceMarker) {
+      const char = fenceMarker[0] as "`" | "~";
+      if (!fence) fence = { char, length: fenceMarker.length };
+      else if (char === fence.char && fenceMarker.length >= fence.length &&
+        new RegExp(`^ {0,3}${char === "`" ? "`" : "~"}{${fence.length},}\\s*$`).test(line)) {
+        fence = undefined;
+      }
+      continue;
+    }
+    if (fence || !CHECKBOX.test(line)) continue;
+    const markerStart = line.indexOf("<!-- helix-dida-action:");
+    if (markerStart < 0) continue;
+    const markerEnd = line.indexOf("-->", markerStart);
+    if (markerEnd < 0) continue;
+    const suffix = line.slice(markerEnd + 3).trim();
+    if (!suffix) continue;
+    const marker = line.slice(markerStart, markerEnd + 3);
+    if (!parseActionMarker(marker)) continue;
+    // 后缀仍按原字节顺序保留为可见标题内容，只有 Helix 管理标记移动到末尾。
+    lines[index] = `${line.slice(0, markerStart).trimEnd()} ${suffix} ${marker}`;
+    changed = true;
+  }
+  const repaired = changed ? lines.join(eol) : markdown;
+  if (changed) parseManagedPlanActions(repaired);
   return repaired;
 }
 

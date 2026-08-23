@@ -8,9 +8,12 @@ import {
   assertProjectionActivation,
   buildProjectionActivationPreview,
   buildProjectionLedger,
+  hasProjectionActivationFootprint,
+  isCurrentProjectionTargetResume,
   parseManagedPlanActions,
   patchManagedPlanAction,
   removeManagedPlanAction,
+  repairTrailingPlanActionMarkers,
   reconcileLocalPlanActionCheckboxes,
   patchProjectParentTaskId,
   planProjectionChanges,
@@ -275,6 +278,24 @@ describe("Dida project projection domain", () => {
     expect(() => parseManagedPlanActions(stage("- [ ]  <!-- helix-dida-action:v1 uuid=u1 remoteId=- state=active -->"))).toThrow();
   });
 
+  it("repairs a valid legacy marker followed by visible title text without dropping that text", () => {
+    const source = stage(
+      "- [ ] 行动 <!-- helix-dida-action:v1 uuid=u1 remoteId=- state=idea --> ⚪",
+    );
+    expect(() => parseManagedPlanActions(source)).toThrow(/标记损坏/);
+
+    const repaired = repairTrailingPlanActionMarkers(source);
+
+    expect(repaired).toContain(
+      "- [ ] 行动 ⚪ <!-- helix-dida-action:v1 uuid=u1 remoteId=- state=idea -->",
+    );
+    expect(parseManagedPlanActions(repaired).actions[0]).toMatchObject({
+      uuid: "u1",
+      title: "行动 ⚪",
+      state: "idea",
+    });
+  });
+
   it("stores the parent task in an independent field while preserving the legacy mapping and CRLF", () => {
     const source = projectMarkdown("\r\n");
     const patched = patchProjectParentTaskId(source, "parent-1");
@@ -335,6 +356,125 @@ describe("Dida project projection domain", () => {
       targetProjectId: "list-1",
       targetColumnId: "column-1",
     });
+  });
+
+  it("recognizes only a disabled current-version activation for the exact retained target", () => {
+    const target = { targetProjectId: "list-1", targetColumnId: "column-1" };
+    const retained = {
+      enabled: false,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
+      confirmedPreviewHash: "confirmed",
+      target,
+    };
+    expect(isCurrentProjectionTargetResume(retained, target)).toBe(true);
+    expect(isCurrentProjectionTargetResume({ ...retained, enabled: true }, target)).toBe(false);
+    expect(isCurrentProjectionTargetResume({ ...retained, activationVersion: 1 }, target)).toBe(false);
+    expect(isCurrentProjectionTargetResume(retained, {
+      targetProjectId: "other-list",
+      targetColumnId: "column-1",
+    })).toBe(false);
+  });
+
+  it("recognizes every retained activation field as an activation footprint", () => {
+    expect(hasProjectionActivationFootprint({})).toBe(false);
+    expect(hasProjectionActivationFootprint({ enabled: false })).toBe(false);
+    expect(hasProjectionActivationFootprint({ enabled: true })).toBe(true);
+    expect(hasProjectionActivationFootprint({ activationVersion: 3 })).toBe(true);
+    expect(hasProjectionActivationFootprint({
+      target: { targetProjectId: "list-1", targetColumnId: "column-1" },
+    })).toBe(true);
+    expect(hasProjectionActivationFootprint({ confirmedPreviewHash: "confirmed" })).toBe(true);
+  });
+
+  it("resumes the exact retained target while preserving an unrelated frozen object", async () => {
+    const harness = makeHarness();
+    const target = { targetProjectId: "list-1", targetColumnId: "column-1" };
+    const preview = await harness.service.previewActivation(target, {
+      projectCount: 1,
+      actionCount: 1,
+    });
+    harness.state.value = {
+      enabled: false,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
+      target,
+      confirmedPreviewHash: "old-preview",
+      ledger: [ledger({ remoteId: "task-frozen", frozen: "conflict" })],
+      parentCheckpoints: [],
+    };
+
+    await harness.service.activateVerifiedPreview(preview, preview.previewHash);
+
+    expect(harness.state.value).toMatchObject({
+      enabled: true,
+      activationVersion: PROJECT_PROJECTION_ACTIVATION_VERSION,
+      target,
+      confirmedPreviewHash: preview.previewHash,
+      ledger: [expect.objectContaining({ remoteId: "task-frozen", frozen: "conflict" })],
+    });
+  });
+
+  it("still rejects frozen identities from an old or unversioned activation", async () => {
+    const harness = makeHarness();
+    const target = { targetProjectId: "list-1", targetColumnId: "column-1" };
+    const preview = await harness.service.previewActivation(target, {
+      projectCount: 1,
+      actionCount: 1,
+    });
+    harness.state.value = {
+      enabled: false,
+      target,
+      confirmedPreviewHash: "old-preview",
+      ledger: [ledger({ remoteId: "task-frozen", frozen: "conflict" })],
+      parentCheckpoints: [],
+    };
+
+    await expect(harness.service.activateVerifiedPreview(preview, preview.previewHash))
+      .rejects.toThrow(/恢复身份/);
+  });
+
+  it("rejects a non-frozen identity from an old or unversioned activation", async () => {
+    const harness = makeHarness();
+    const target = { targetProjectId: "list-1", targetColumnId: "column-1" };
+    const preview = await harness.service.previewActivation(target, {
+      projectCount: 1,
+      actionCount: 1,
+    });
+    harness.state.value = {
+      enabled: false,
+      target,
+      confirmedPreviewHash: "old-preview",
+      ledger: [ledger({ remoteId: "task-active" })],
+      parentCheckpoints: [],
+    };
+
+    await expect(harness.service.activateVerifiedPreview(preview, preview.previewHash))
+      .rejects.toThrow(/恢复身份/);
+  });
+
+  it("treats an unfinished column creation as recovery identity", async () => {
+    const harness = makeHarness();
+    const target = { targetProjectId: "list-1", targetColumnId: "column-1" };
+    const preview = await harness.service.previewActivation(target, {
+      projectCount: 1,
+      actionCount: 1,
+    });
+    harness.state.value = {
+      enabled: false,
+      ledger: [],
+      parentCheckpoints: [],
+      columnCreation: {
+        operationId: "column-operation",
+        targetProjectId: "list-1",
+        desiredName: "Helix项目",
+        baselineColumns: [],
+        baselineHash: "a".repeat(64),
+        previewHash: "b".repeat(64),
+        status: "unknown",
+      },
+    };
+
+    await expect(harness.service.activateVerifiedPreview(preview, preview.previewHash))
+      .rejects.toThrow(/恢复身份/);
   });
 
   it("verifies every remote identity field without exposing an identity marker", () => {

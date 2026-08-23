@@ -530,6 +530,10 @@ describe("workbench layout and navigation structure", () => {
     expect(main).toMatch(/projectProjectionWriteReadiness\(\)[\s\S]*PROJECT_DIDA_PROJECTION_AVAILABLE && this\.settings\.autoSync && readiness\.ready/);
     expect(main).toMatch(/didCompletePull[\s\S]*window\.setTimeout\(resolve, 0\)[\s\S]*projectProjectionWriteReadiness\(\)[\s\S]*projectAutoSync\.request\(\)/);
     expect(main).toMatch(/ensureAutomaticProjectProjection[\s\S]*PROJECTION_PROJECT_NAME[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)[\s\S]*PROJECTION_NO_COLUMN_ID[\s\S]*confirmProjectionActivationWithLease/);
+    expect(main).toMatch(/hasRecoveryIdentity[\s\S]*isCurrentProjectionTargetResume\(configuration, retainedTarget\)[\s\S]*hasRecoveryIdentity && !sameTargetResume/);
+    expect(main).toMatch(/receiptCleanupPending[\s\S]*configuration\.columnCreation !== undefined[\s\S]*hasRecoveryIdentity && !sameTargetResume/);
+    expect(main).toMatch(/hasProjectionActivationFootprint\(configuration\) && !sameTargetResume[\s\S]*let matches[\s\S]*createDidaProject\(PROJECTION_PROJECT_NAME\)/);
+    expect(main).toMatch(/retainedProjects[\s\S]*project\.id === configuration\.target![.]targetProjectId[\s\S]*sameTargetResume[\s\S]*\? retainedProjects/);
     const automaticBootstrap = main.slice(
       main.indexOf("private ensureAutomaticProjectProjection"),
       main.indexOf("readProjectProjectionWriteReadiness"),

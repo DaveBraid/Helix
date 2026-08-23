@@ -7,6 +7,7 @@ import {
   readProjectProjectionIdentity,
   reconcileLocalPlanActionCheckboxes,
   repairOrphanedPlanActionParents,
+  repairTrailingPlanActionMarkers,
   removeManagedPlanAction,
   reorderManagedPlanChildren,
   type ProjectionActionState,
@@ -260,9 +261,12 @@ export class LocalProjectTaskService {
         try {
           let revision = await this.requireStage(stage.notePath, stage.id);
           if (options.adoptUnmanaged) {
-            // 先按原生复选框修本地状态，再修失联 parent，最后由 adoptAll 严格校验。
+            // 先收口旧 marker 位置，再修复选框和失联 parent，最后由 adoptAll 严格校验。
             const repaired = repairOrphanedPlanActionParents(
-              reconcileLocalPlanActionCheckboxes(revision.content, { deferValidation: true }),
+              reconcileLocalPlanActionCheckboxes(
+                repairTrailingPlanActionMarkers(revision.content),
+                { deferValidation: true },
+              ),
             );
             const adopted = reconcileLocalPlanParentCompletion(adoptAllPlanActions(
               repaired,

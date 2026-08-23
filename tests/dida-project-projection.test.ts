@@ -661,7 +661,15 @@ class FakePipeline implements ProjectionTaskPipeline {
       this.receipts.set(clientIdentity, result);
       return result;
     }
-    const remote = { ...task, id: `remote-${this.created.length}` };
+    const siblingCount = task.parentId
+      ? [...this.tasks.values()].filter((candidate) => candidate.parentId === task.parentId).length
+      : 0;
+    // 滴答默认把后创建的子任务放到更小的 sortOrder，界面因此显示在更上方。
+    const remote = {
+      ...task,
+      id: `remote-${this.created.length}`,
+      ...(task.parentId && task.sortOrder === undefined ? { sortOrder: -(siblingCount + 1) * 100 } : {}),
+    };
     this.tasks.set(remote.id, remote);
     const receiptTask = structuredClone(remote);
     if (this.stripBoardFromReceipts) delete receiptTask.columnId;
@@ -835,6 +843,54 @@ describe("DidaProjectProjectionService with real child tasks", () => {
       remoteId: "remote-2",
       parentTaskId: "remote-1",
     });
+  });
+
+  it("creates a batch in reverse request order so Dida displays children in Helix order", async () => {
+    const harness = makeHarness(true);
+    let sequence = 0;
+    harness.markdown.set("Stage.md", adoptAllPlanActions(stage(
+      "- [ ] 第一行动\n- [ ] 第二行动\n- [ ] 第三行动",
+    ), () => `order-${++sequence}`));
+
+    const initial = await harness.service.synchronizeProject(input());
+
+    expect(initial).toMatchObject({ createdActions: 3, frozen: [] });
+    const initialActions = parseManagedPlanActions(harness.markdown.content("Stage.md")).actions;
+    expect(initialActions.map((action) => action.title)).toEqual(["第一行动", "第二行动", "第三行动"]);
+    expect(initialActions.map((action) => harness.pipeline.tasks.get(action.remoteId!)?.sortOrder))
+      .toEqual([-300, -200, -100]);
+    expect(harness.pipeline.created.slice(1).map((task) => task.title))
+      .toEqual(["第三行动", "第二行动", "第一行动"]);
+  });
+
+  it("does not send the rest of a reversed create batch after an unsent rejection", async () => {
+    const harness = makeHarness(true);
+    harness.markdown.set("Stage.md", stage(""));
+    await harness.service.synchronizeProject(input());
+    let sequence = 0;
+    harness.markdown.set("Stage.md", adoptAllPlanActions(stage(
+      "- [ ] 第一行动\n- [ ] 第二行动\n- [ ] 第三行动",
+    ), () => `retry-order-${++sequence}`));
+    harness.pipeline.nextResult = {
+      operationId: "op-order-capability",
+      outcome: "capability",
+      message: "本次请求未发送",
+    };
+
+    const blocked = await harness.service.synchronizeProject(input());
+
+    expect(blocked.frozen).toContainEqual(expect.objectContaining({
+      uuid: "retry-order-3",
+      reason: "capability",
+    }));
+    expect(harness.pipeline.created.slice(1).map((task) => task.title)).toEqual(["第三行动"]);
+    expect(harness.state.value.ledger).toEqual([]);
+
+    harness.pipeline.receipts.clear();
+    const retried = await harness.service.synchronizeProject(input());
+    expect(retried).toMatchObject({ createdActions: 3, frozen: [] });
+    expect(harness.pipeline.created.slice(2).map((task) => task.title))
+      .toEqual(["第三行动", "第二行动", "第一行动"]);
   });
 
   it("does not persist an unsent capability rejection and retries after local input is fixed", async () => {

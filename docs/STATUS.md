@@ -1,49 +1,42 @@
 # 当前开发状态
 
 最后更新：2026-08-23
-父提交：`415ce23 docs: record Helix 2.1.2 publication`
-工作树状态：本状态快照随项目／阶段状态职责提交更新；提交后应为干净工作树。
-当前阶段：本轮开发和验证已完成，继续停留在 `dev`，尚未进入发布流程。
+父提交：`a909eb6 feat: add recording stage workflow and status visuals`
+工作树状态：本状态快照随滴答子任务创建顺序修复提交更新；提交后应为干净工作树。
+当前阶段：开发与验证已完成，继续停留在 `dev`，尚未进入发布流程。
 
 ## 本轮目标
 
-- 项目关系图容器和顶部横排项目选单均用图标、文字与颜色区分项目状态。
-- 阶段“想法”改显示为“计划中”，在“进行中”和“已完成”之间新增“待记录”。
-- 全部根行动完成后自动进入“待记录”；用户手动将 Stage 设为“已完成”。
-- 非目标：不修改 Project／Stage／Canvas 用户数据，不发布新版本，不扩大滴答写入能力。
+- Stage `# 计划行动` 批量生成滴答普通子任务后，滴答展示顺序与 Helix 行序一致。
+- Helix Markdown 继续作为计划行动顺序的权威源。
+- 非目标：不写 `task.sortOrder`，不修改用户 Project／Stage／Canvas 数据，不发布新版本。
 
 ## 当前事实
 
-- Project／Stage Markdown 仍是项目身份、状态和正文的权威源；专用 Canvas 仍是关系和布局的权威源。
-- Stage 状态为 `idea/active/recording/completed/paused/terminated`，界面依次显示“计划中／进行中／待记录／已完成／已暂停／已终止”。
-- `recording` 使用 `notebook-pen` 图标和青色视觉；阶段关系图弹出选单与六列看板复用同一呈现定义。
-- 全部根行动完成时，`idea/active` Stage 自动进入 `recording`；手动完成后保持 `completed`。根行动重新打开时，`recording/completed` 按行动状态回到 `idea/active`；暂停与终止不自动改写。
-- `recording` 只属于 Stage，不进入计划行动状态。滴答父任务将其映射为开放态，且不会为该状态首次创建远端父任务；只有手动 `completed` 才完成父任务。
-- 项目状态在关系图容器和顶部项目胶囊中均显示共享图标，并按计划中、进行中、已完成、已暂停、已终止使用独立状态色。
+- 滴答为同一父任务连续创建子任务时，后创建任务取得更小的安全 `sortOrder`，界面显示在更上方；按 Helix 正序发送会形成完整倒序。
+- 同轮待创建行动现在按 Helix 行序逆序发送，滴答逐次置顶后的最终展示顺序即为 Helix 正序。
+- 创建批次中任一请求未发送、结果未验证或 Markdown 回填竞争时，停止该轮其余创建；未发送行动不进入同步 Base，下轮可按完整顺序重新规划。
+- 现有写入合同尚未证明普通任务排序碰撞与重排语义，因此本修复不发送 `sortOrder`，也不触碰未托管远端任务。
 
 ## 本轮改动
 
-- `project-status`、`stage-board`：新增合法 `recording` 枚举、标签、图标、颜色与六列顺序；阶段 `idea` 标签改为“计划中”。
-- `local-project-tasks`：自动完成派生改为自动待记录，并保留手动完成与重新打开收敛规则。
-- `dida-project-projection-coordinator`：待记录映射为远端开放态，保持仅进行中 Stage 可首次创建父任务。
-- `project-lineage-workbench`、`styles.css`：项目容器和横排选单补状态图标、状态色；阶段待记录补完整视觉。
-- 统一任务详情允许 Stage 手动选择待记录或已完成，同时拒绝把待记录写入行动任务。
-- `docs/ARCHITECTURE.md` 已同步权威状态与派生规则；`docs/经验.md` 已按当前 Obsidian CLI 实际语法更新。
+- `dida-project-projection`：仅重排同轮 `create-action` 的执行顺序，其他更新、完成、重开与删除意图保持原顺序和既有安全队列。
+- 失败收口：逆序创建批次遇到阻断后移除尚未发送行动的临时账本项，避免把未创建对象误推进 Base。
+- 自动化测试模拟滴答“后建置顶”，覆盖三项批量创建以及首项能力拒绝后完整重试。
+- `docs/ARCHITECTURE.md` 同步记录创建顺序和零 `sortOrder` 写入边界。
 
 ## 当前验证
 
-- `npm test`：71 个测试文件、1033 项全部通过。
+- `npm test`：71 个测试文件、1035 项全部通过；其中 `tests/dida-project-projection.test.ts` 57 项通过。
 - `npm run typecheck`、`npm run build`、`git diff --check` 通过。
-- Obsidian CLI 在 `ObDevTestVault` 完成插件重载和真实 DOM 验收；错误缓冲及 error 级控制台均为空。
-- 项目横排选单实测：计划中 `circle-dashed`／灰蓝，进行中 `play-circle`／靛蓝；项目容器复用相同图标与颜色。
-- 阶段状态选单实测 6 项顺序正确；待记录为 `notebook-pen`／青色。六列看板的标签、图标和计算颜色均正确。
-- 最终看板计算样式返回 6 个显式网格列；独立项目主管审查无 P0/P1/P2/P3。
+- Obsidian CLI 已在 `ObDevTestVault` 重载插件；错误缓冲与 error 级控制台均为空。
+- 独立项目主管审查无 P0/P1/P2。
 
 ## 未关闭问题
 
-- 当前 CLI 的后台窗口在 `requestAnimationFrame` 未推进时可能先出现空白 Helix 根节点；显式前台激活并调用既有渲染后正常，未捕获运行时错误。本轮状态功能不依赖该现象，后续可单独诊断。
+- 本修复保证同一同步轮次的批量创建顺序；普通任务远端拖动及跨轮任意插入仍不由 Helix 写回，需未来隔离合同证明 `task.sortOrder` 方向、间隔、碰撞与重排语义后才能扩展。
 
 ## 下一步
 
-1. 在测试 Vault 继续观察“全部计划任务完成→待记录→手动完成”的日常交互。
+1. 在测试 Vault 后续新建 Stage 计划行动时观察滴答展示顺序。
 2. 后续修复继续在 `dev`；只有用户明确要求发布时才合入 `main`。

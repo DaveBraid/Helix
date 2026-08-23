@@ -1238,9 +1238,23 @@ export class DidaProjectProjectionService {
       return params.summary;
     }
 
-    for (const intent of planProjectionChanges(inbound.previous, inbound.current, {
+    const intents = planProjectionChanges(inbound.previous, inbound.current, {
       taskReopenVerified: params.taskReopenVerified,
-    })) {
+    });
+    const pendingCreates = intents.filter((intent) => intent.kind === "create-action").reverse();
+    let pendingCreateIndex = 0;
+    const scheduledIntents = intents.map((intent) => intent.kind === "create-action"
+      ? pendingCreates[pendingCreateIndex++]!
+      : intent);
+    let createBatchBlocked = false;
+    for (const intent of scheduledIntents) {
+      // 滴答把后创建的子任务置顶；同轮创建逆序发送，最终显示顺序才与 Helix 一致。
+      if (intent.kind === "create-action" && createBatchBlocked) {
+        // 未发送的行动不能进入 Base；下轮仍须按完整 Helix 顺序重新规划创建。
+        working = working.filter((candidate) =>
+          projectionLedgerIdentity(candidate) !== projectionLedgerIdentity(intent.entry));
+        continue;
+      }
       const entry = intent.entry;
       if (working.find((item) => projectionLedgerIdentity(item) === projectionLedgerIdentity(entry))?.frozen) continue;
       const stageRevision = params.stageRevisions.get(entry.stageId);
@@ -1280,6 +1294,7 @@ export class DidaProjectProjectionService {
         )) {
           working = freezeEntry(working, entry, "identity-mismatch", params.summary,
             "真实子任务创建前父任务身份不一致");
+          createBatchBlocked = true;
           continue;
         }
         const clientIdentity = actionCreateClientIdentity(entry);
@@ -1307,9 +1322,11 @@ export class DidaProjectProjectionService {
             working = working.filter((candidate) =>
               projectionLedgerIdentity(candidate) !== projectionLedgerIdentity(entry));
             params.summary.frozen.push({ uuid: entry.uuid, reason: "capability", message: result.message });
+            createBatchBlocked = true;
             continue;
           }
           working = freezeEntry(working, entry, resultReason(result), params.summary, result.message, result);
+          createBatchBlocked = true;
           continue;
         }
         const createdTask = await this.exactVerifiedTask(result, entry.targetProjectId);
@@ -1340,6 +1357,7 @@ export class DidaProjectProjectionService {
           params.stageRevisions.set(entry.stageId, after);
         } catch (error) {
           working = freezeEntry(working, createdEntry, "markdown-race", params.summary, message(error), result);
+          createBatchBlocked = true;
           continue;
         }
         const adopted = { ...createdEntry, frozen: undefined, operationId: undefined, conflictId: undefined };

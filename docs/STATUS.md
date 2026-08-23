@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-23
-当前基线提交：`5e5e50a fix: pull remote project task completion without blocking UI`
-工作树状态：存在 Helix `2.1.2` 版本号、README、Release 说明和本快照的待提交发布改动。
-当前阶段：`2.1.2` 发布候选已通过完整代码门禁，等待版本提交、合入 `main` 与 GitHub Release。
+当前基线提交：`8587c4e release: prepare Helix 2.1.2`
+工作树状态：仅有本状态快照的待提交更新。
+当前阶段：`2.1.2` 发布候选已通过完整代码门禁和发布产物检查，等待合入 `main` 与 GitHub Release。
 
 ## 本轮目标
 
@@ -46,7 +46,7 @@
 - 正式任务页已显示 Stage-04 父任务及 7 条行动均为“已完成”，父任务完成按钮保持自动派生禁用态。
 - 正式 Vault 队列 0、冲突 0、恢复问题 0；未产生额外远端写入测试对象。
 - 同步触发后约 1.3 秒内仍可读取完整界面状态，未复现约 10 秒完全无响应。
-- `release:check`、`git diff --check`、`main` 合并后门禁、GitHub 附件上传与哈希核对尚未执行，不得宣称 `2.1.2` 已发布。
+- `release:check` 与 `git diff --check` 已通过；`main` 合并后门禁、GitHub 附件上传与哈希核对尚未执行，不得宣称 `2.1.2` 已发布。
 
 ## 未关闭问题
 
@@ -55,7 +55,6 @@
 
 ## 下一步
 
-1. 提交 `2.1.2` 发布元数据并更新本快照基线。
-2. 在 `dev` 运行 `release:check` 与差异检查，随后合入 `main` 并复跑门禁。
-3. 推送 `main`、创建 `2.1.2` 标签与 GitHub Release，上传并核对全部 BRAT 附件。
-4. 记录发布事实并将 `main` 回合到 `dev`，保持两个分支同步。
+1. 提交本状态快照，随后将 `dev` 合入 `main` 并复跑门禁。
+2. 推送 `main`、创建 `2.1.2` 标签与 GitHub Release，上传并核对全部 BRAT 附件。
+3. 记录发布事实并将 `main` 回合到 `dev`，保持两个分支同步。

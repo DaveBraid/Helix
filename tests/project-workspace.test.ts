@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { projectTemplate, cycleTemplate } from "../src/domain/projects";
 import { stableHash } from "../src/domain/stable";
+import { parseFocusBridgeEnvelope } from "../src/domain/stage-focus-bridge";
 import {
   canSilentlyRepairProjectCanvas,
   ProjectWorkspaceService,
@@ -100,26 +101,37 @@ describe("ProjectWorkspaceService", () => {
     const repo = baseRepository();
     const service = workspace(repo);
     const projectPath = "Helix/Projects/Alpha/Project.md";
-    const stagePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const legacyStagePath = "Helix/Projects/Alpha/Cycle-01.md";
     repo.set(projectPath, `${(await repo.read(projectPath))!.content}\n\n用户项目正文`);
-    repo.set(stagePath, `${(await repo.read(stagePath))!.content}\n\n用户阶段正文`);
+    repo.set(legacyStagePath, `${(await repo.read(legacyStagePath))!.content}\n\n用户阶段正文`);
+    const migrated = await service.reconcileStageFileNames(await service.snapshot());
+    const stagePath = migrated.projects[0]!.cycles[0]!.notePath;
 
     await service.renameProject("project-1", "新项目名称");
     await service.renameCycle("cycle-1", "新阶段名称");
 
     const projectContent = (await repo.read(projectPath))!.content;
-    const stageContent = (await repo.read(stagePath))!.content;
+    const renamedStagePath = "Helix/Projects/Alpha/阶段 1 · 新阶段名称.md";
+    const stageContent = (await repo.read(renamedStagePath))!.content;
     expect(projectContent).toContain("# 新项目名称");
     expect(projectContent).toContain("helix-id: project-1");
     expect(projectContent).toContain("用户项目正文");
     expect(stageContent).toContain("# 阶段 1 · 新阶段名称");
     expect(stageContent).toContain("helix-id: cycle-1");
     expect(stageContent).toContain("用户阶段正文");
+    expect(await repo.read(stagePath)).toBeNull();
     const canvas = repo.json(CANVAS);
     expect(canvas.nodes.find((node: { id: string }) => node.id === "project-node").text)
       .toContain("|新项目名称]]");
     expect(canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").text)
       .toContain("|新阶段名称]]");
+
+    await service.undoLastWorkspaceChange();
+    expect(await repo.read(stagePath)).not.toBeNull();
+    expect(await repo.read(renamedStagePath)).toBeNull();
+    await service.redoLastWorkspaceChange();
+    expect(await repo.read(stagePath)).toBeNull();
+    expect(await repo.read(renamedStagePath)).not.toBeNull();
   });
 
   it("reads project and stage names changed directly in Markdown", async () => {
@@ -131,18 +143,77 @@ describe("ProjectWorkspaceService", () => {
       "# 阶段 1 · 阶段标题 1",
       "# 阶段 1 · Markdown 阶段名",
     ));
+    const stageBytes = (await repo.read(stagePath))!.content;
 
     const service = workspace(repo);
     const snapshot = await service.snapshot();
 
     expect(snapshot.projects[0]?.title).toBe("Markdown 项目名");
     expect(snapshot.projects[0]?.cycles[0]?.title).toBe("Markdown 阶段名");
+    const reconciled = await service.reconcileStageFileNames(snapshot);
+    const renamedPath = "Helix/Projects/Alpha/阶段 1 · Markdown 阶段名.md";
+    expect(reconciled.projects[0]?.cycles[0]?.notePath).toBe(renamedPath);
+    expect((await repo.read(renamedPath))?.content).toBe(stageBytes);
+    expect(await repo.read(stagePath)).toBeNull();
     await service.ensureCanvas();
     const canvas = repo.json(CANVAS);
     expect(canvas.nodes.find((node: { id: string }) => node.id === "project-node").text)
       .toContain("|Markdown 项目名]]");
     expect(canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").text)
       .toContain("|Markdown 阶段名]]");
+    expect(canvas.nodes.find((node: { id: string }) => node.id === "cycle-node").helixFilePath)
+      .toBe(renamedPath);
+  });
+
+  it("keeps rename history unapplied when the undo filename is occupied", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const migrated = await service.reconcileStageFileNames(await service.snapshot());
+    const originalPath = migrated.projects[0]!.cycles[0]!.notePath;
+    const renamed = await service.renameCycle("cycle-1", "新阶段名称");
+    const renamedPath = renamed.projects[0]!.cycles[0]!.notePath;
+    const renamedContent = (await repo.read(renamedPath))!.content;
+    repo.set(originalPath, "用户占用的同名普通笔记");
+
+    await expect(service.undoLastWorkspaceChange()).rejects.toThrow(/目标已被占用/);
+
+    expect((await repo.read(renamedPath))?.content).toBe(renamedContent);
+    expect((await repo.read(originalPath))?.content).toBe("用户占用的同名普通笔记");
+    expect(service.historyState()).toMatchObject({ undoCount: 1, redoCount: 0 });
+  });
+
+  it("rolls stage file renames back when the Canvas CAS loses", async () => {
+    const repo = baseRepository();
+    const service = workspace(repo);
+    const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const sourceContent = (await repo.read(sourcePath))!.content;
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    repo.beforeCompare = (path) => {
+      if (path === CANVAS) repo.set(CANVAS, `${canvasBefore}\n`);
+    };
+
+    await expect(service.reconcileStageFileNames(await service.snapshot()))
+      .rejects.toThrow(/write conflict/);
+
+    expect((await repo.read(sourcePath))?.content).toBe(sourceContent);
+    expect(await repo.read("Helix/Projects/Alpha/阶段 1 · 阶段标题 1.md")).toBeNull();
+  });
+
+  it("rejects an occupied stage-title path before moving any Markdown", async () => {
+    const repo = baseRepository();
+    const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+    const targetPath = "Helix/Projects/Alpha/阶段 1 · 阶段标题 1.md";
+    const sourceContent = (await repo.read(sourcePath))!.content;
+    const canvasBefore = (await repo.read(CANVAS))!.content;
+    repo.set(targetPath, "用户的同名普通笔记");
+    const service = workspace(repo);
+
+    await expect(service.reconcileStageFileNames(await service.snapshot()))
+      .rejects.toThrow(/目标已被占用/);
+
+    expect((await repo.read(sourcePath))?.content).toBe(sourceContent);
+    expect((await repo.read(targetPath))?.content).toBe("用户的同名普通笔记");
+    expect((await repo.read(CANVAS))?.content).toBe(canvasBefore);
   });
 
   it("requires an explicit initial stage name before creating a project", async () => {
@@ -151,6 +222,42 @@ describe("ProjectWorkspaceService", () => {
 
     await expect(workspace(repo).createProject("新项目", "   "))
       .rejects.toThrow("请输入首阶段名称");
+
+    expect(repo.paths()).toEqual(beforePaths);
+  });
+
+  it("sanitizes only the Stage filename while preserving the exact heading title", async () => {
+    const repo = baseRepository();
+    const created = await workspace(repo).createProject("跨平台命名", "模型/A:B?");
+    const stage = created.cycles[0]!;
+
+    expect(stage.notePath).toBe("Helix/Projects/跨平台命名/阶段 1 · 模型-A-B-.md");
+    expect((await repo.read(stage.notePath))?.content).toContain("# 阶段 1 · 模型/A:B?");
+  });
+
+  it("sanitizes control characters from a directly edited Stage heading path", async () => {
+    const repo = baseRepository();
+    const sourcePath = "Helix/Projects/Alpha/Cycle-01.md";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace(
+      "# 阶段 1 · 阶段标题 1",
+      "# 阶段 1 · 控制\u0001字符",
+    ));
+    const exactContent = repo.text(sourcePath)!;
+    const service = workspace(repo);
+
+    const migrated = await service.reconcileStageFileNames(await service.snapshot());
+    const targetPath = migrated.projects[0]!.cycles[0]!.notePath;
+
+    expect(targetPath).toBe("Helix/Projects/Alpha/阶段 1 · 控制-字符.md");
+    expect((await repo.read(targetPath))?.content).toBe(exactContent);
+  });
+
+  it("rejects an overlong Stage filename before creating project files", async () => {
+    const repo = baseRepository();
+    const beforePaths = repo.paths();
+
+    await expect(workspace(repo).createProject("超长阶段", "阶".repeat(80)))
+      .rejects.toThrow(/一级标题过长/);
 
     expect(repo.paths()).toEqual(beforePaths);
   });
@@ -195,8 +302,12 @@ describe("ProjectWorkspaceService", () => {
     });
 
     expect(batches).toEqual([["stage:路径 A", "stage:路径 B"]]);
-    expect((await repo.read("Helix/Projects/Alpha/Stage-02.md"))?.content).toContain("正文：路径 A");
-    expect((await repo.read("Helix/Projects/Alpha/Stage-03.md"))?.content).toContain("正文：路径 B");
+    const created = (await service.snapshot()).projects[0]!.cycles.filter((cycle) =>
+      cycle.title === "路径 A" || cycle.title === "路径 B");
+    expect((await repo.read(created.find((cycle) => cycle.title === "路径 A")!.notePath))?.content)
+      .toContain("正文：路径 A");
+    expect((await repo.read(created.find((cycle) => cycle.title === "路径 B")!.notePath))?.content)
+      .toContain("正文：路径 B");
   });
 
   it("uses stable IDs to repair renamed paths and writes real text-card summaries", async () => {
@@ -1045,7 +1156,8 @@ describe("ProjectWorkspaceService", () => {
   it("undoes and redoes a bridged stage deletion without losing the note", async () => {
     const repo = linearRepository();
     const service = workspace(repo);
-    const stagePath = "Helix/Projects/Alpha/Cycle-02.md";
+    const migrated = await service.reconcileStageFileNames(await service.snapshot());
+    const stagePath = migrated.projects[0]!.cycles.find((stage) => stage.id === "cycle-2")!.notePath;
     const stageBefore = (await repo.read(stagePath))!.content;
     const plan = await service.planCycleDeletion("cycle-2");
     const canvasBefore = (await repo.read(CANVAS))!.content;
@@ -1541,6 +1653,72 @@ describe("ProjectWorkspaceService", () => {
     expect(await restarted.listFocusBridgeConflicts()).toEqual(conflicts);
   });
 
+  it("updates downstream focus links across Stage rename undo and redo", async () => {
+    const { repo, service } = await focusBridgeWorkspace();
+    let current = await service.reconcileStageFileNames(await service.snapshot());
+    await service.initializeFocusBridgeState();
+    const stagePath = (id: string): string => current.projects[0]!.cycles.find(
+      (stage) => stage.id === id,
+    )!.notePath;
+    const originalSourcePath = stagePath("cycle-1");
+
+    current = await service.renameCycle("cycle-1", "重命名来源");
+    const renamedSourcePath = stagePath("cycle-1");
+    expect((await repo.read(stagePath("cycle-2")))!.content)
+      .toContain(renamedSourcePath.replace(/\.md$/, ""));
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+
+    current = await service.undoLastWorkspaceChange();
+    expect(stagePath("cycle-1")).toBe(originalSourcePath);
+    expect((await repo.read(stagePath("cycle-2")))!.content)
+      .toContain(originalSourcePath.replace(/\.md$/, ""));
+    current = await service.redoLastWorkspaceChange();
+    expect(stagePath("cycle-1")).toBe(renamedSourcePath);
+    expect((await repo.read(stagePath("cycle-2")))!.content)
+      .toContain(renamedSourcePath.replace(/\.md$/, ""));
+  });
+
+  it("migrates a directly edited Stage H1 before updating its downstream focus link", async () => {
+    const { repo, service, sourcePath } = await focusBridgeWorkspace();
+    repo.set(sourcePath, repo.take(sourcePath)!.replace(
+      "# 阶段 1 · 阶段标题 1",
+      "# 阶段 1 · 直接编辑标题",
+    ));
+    const before = await service.snapshot();
+    const migrated = await service.reconcileStageFileNames(before);
+    const source = migrated.projects[0]!.cycles.find((stage) => stage.id === "cycle-1")!;
+    const target = migrated.projects[0]!.cycles.find((stage) => stage.id === "cycle-2")!;
+
+    await service.observeFocusBridgeChanges([sourcePath, source.notePath]);
+
+    expect(source.notePath).toContain("阶段 1 · 直接编辑标题.md");
+    expect((await repo.read(target.notePath))!.content)
+      .toContain(source.notePath.replace(/\.md$/, ""));
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+  });
+
+  it("accepts a legacy Stage link with an explicit .md suffix through migration and rename", async () => {
+    const { repo, service, targetPath } = await focusBridgeWorkspace();
+    const targetBefore = (await repo.read(targetPath))!.content;
+    const withExtension = targetBefore.replace("Cycle-01|", "Cycle-01.md|");
+    const parsed = parseFocusBridgeEnvelope(withExtension);
+    if (parsed.kind !== "present") throw new Error("missing focus envelope");
+    repo.set(targetPath, withExtension.replace(
+      `derivedHash=${parsed.blocks[0]!.derivedHash}`,
+      `derivedHash=${parsed.blocks[0]!.currentDerivedHash}`,
+    ));
+
+    let current = await service.reconcileStageFileNames(await service.snapshot());
+    await service.initializeFocusBridgeState();
+    current = await service.renameCycle("cycle-1", "带扩展名兼容");
+    const source = current.projects[0]!.cycles.find((stage) => stage.id === "cycle-1")!;
+    const target = current.projects[0]!.cycles.find((stage) => stage.id === "cycle-2")!;
+
+    expect((await repo.read(target.notePath))!.content)
+      .toContain(source.notePath.replace(/\.md$/, ""));
+    expect(await service.listFocusBridgeConflicts()).toEqual([]);
+  });
+
   it("rechecks exact revisions before resolving a persisted focus conflict", async () => {
     const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
     repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
@@ -1671,6 +1849,28 @@ describe("ProjectWorkspaceService", () => {
     await service.observeFocusBridgeChanges([sourcePath]);
 
     expect(repo.json(statePath)).toMatchObject({ checkpoints: {}, conflicts: [] });
+  });
+
+  it("rebinds focus checkpoints and conflicts to renamed Stage paths by stable IDs", async () => {
+    const { repo, service, sourcePath, targetPath } = await focusBridgeWorkspace();
+    const statePath = "Helix/.transactions/stage-focus-bridge.json";
+    repo.set(sourcePath, repo.take(sourcePath)!.replace("Base focus", "Source focus"));
+    repo.set(targetPath, repo.take(targetPath)!.replace("> Base focus", "> Derived focus"));
+    await service.observeFocusBridgeChanges([sourcePath, targetPath]);
+    expect(await service.listFocusBridgeConflicts()).toHaveLength(1);
+
+    const migrated = await service.reconcileStageFileNames(await service.snapshot());
+    await service.initializeFocusBridgeState();
+
+    const currentPaths = new Map(migrated.projects.flatMap((project) =>
+      project.cycles.map((stage) => [stage.id, stage.notePath] as const)));
+    const state = repo.json(statePath);
+    const checkpoint = Object.values(state.checkpoints)[0] as Record<string, unknown>;
+    const conflict = state.conflicts[0] as Record<string, unknown>;
+    expect(checkpoint.sourcePath).toBe(currentPaths.get("cycle-1"));
+    expect(checkpoint.targetPath).toBe(currentPaths.get("cycle-2"));
+    expect(conflict.sourcePath).toBe(currentPaths.get("cycle-1"));
+    expect(conflict.targetPath).toBe(currentPaths.get("cycle-2"));
   });
 
   it("freezes only the structurally conflicted focus pair while updating another target", async () => {
@@ -2190,7 +2390,7 @@ describe("ProjectWorkspaceService", () => {
     await expect(service.createProject("重复映射", "首阶段", "dida-existing")).rejects.toThrow(/已映射/);
     expect(repo.paths().some((path) => path.includes("重复映射"))).toBe(false);
 
-    repo.failCreatePath = "Helix/Projects/事务失败/Stage-01.md";
+    repo.failCreatePath = "Helix/Projects/事务失败/阶段 1 · 首阶段.md";
     await expect(service.createProject("事务失败", "首阶段")).rejects.toThrow(/废纸篓/);
     expect(repo.paths().some((path) => path.includes("事务失败"))).toBe(false);
     await expect(service.createProject("临时映射", "首阶段", " local-project-pending "))
@@ -2222,7 +2422,7 @@ describe("ProjectWorkspaceService", () => {
     const repo = baseRepository();
     const service = workspace(repo);
     const created = await service.createProject("阶段元数据", "自定义首阶段");
-    const stagePath = "Helix/Projects/阶段元数据/Stage-01.md";
+    const stagePath = created.cycles[0]!.notePath;
     const stage = await repo.read(stagePath);
     expect(stage?.content).toContain("helix-kind: helix-stage");
     expect(stage?.content).not.toContain("helix-kind: helix-cycle");
@@ -2402,7 +2602,10 @@ describe("ProjectWorkspaceService", () => {
       expect.objectContaining({ kind: "branch", toCycleId: second.id }),
     ]));
     expect(outgoing).toHaveLength(2);
-    const firstContent = (await repo.read(first.notePath))!.content;
+    const currentFirst = (await service.snapshot()).projects[0]!.cycles.find(
+      (cycle) => cycle.id === first.id,
+    )!;
+    const firstContent = (await repo.read(currentFirst.notePath))!.content;
     expect(firstContent).toContain('helix-stage-code: "2.1"');
     expect(firstContent).toContain("# 阶段 2.1 · 第一条路线");
     expect(repo.json(CANVAS).helixStageCodes).toMatchObject({
@@ -2641,13 +2844,16 @@ describe("ProjectWorkspaceService", () => {
         secondaryStageTitle: "理论路线",
       },
     );
-    expect((await repo.read("Helix/Projects/Alpha/Stage-02.md"))?.content)
+    const created = (await service.snapshot()).projects[0]!.cycles;
+    const experimentPath = created.find((cycle) => cycle.title === "实验路线")!.notePath;
+    const theoryPath = created.find((cycle) => cycle.title === "理论路线")!.notePath;
+    expect((await repo.read(experimentPath))?.content)
       .toContain("# 阶段 2.1 · 实验路线");
-    expect((await repo.read("Helix/Projects/Alpha/Stage-02.md"))?.content)
+    expect((await repo.read(experimentPath))?.content)
       .toContain('helix-stage-code: "2.1"');
-    expect((await repo.read("Helix/Projects/Alpha/Stage-03.md"))?.content)
+    expect((await repo.read(theoryPath))?.content)
       .toContain("# 阶段 2.2 · 理论路线");
-    expect((await repo.read("Helix/Projects/Alpha/Stage-03.md"))?.content)
+    expect((await repo.read(theoryPath))?.content)
       .toContain('helix-stage-code: "2.2"');
     const stages = repo.json(CANVAS).nodes.filter(
       (node: Record<string, unknown>) => node.helixNodeKind === "stage",
@@ -2899,23 +3105,28 @@ describe("ProjectWorkspaceService", () => {
       "## 下一阶段聚焦问题\n来自阶段二\n",
     ));
     const service = workspace(repo);
+    let current = await service.reconcileStageFileNames(await service.snapshot());
+    const pathFor = (id: string): string => current.projects[0]!.cycles.find(
+      (stage) => stage.id === id,
+    )!.notePath;
     await service.replaceRelation("edge-23", "inherit", ["cycle-2"]);
-    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+    expect((await repo.read(pathFor("cycle-3")))!.content).toContain("sourceId=cycle-2");
 
     await service.deleteCycle("cycle-2", { bridge: true });
-    const deleted = (await repo.read(targetPath))!.content;
-    expect(await repo.read(middlePath)).toBeNull();
+    current = await service.snapshot();
+    const deleted = (await repo.read(pathFor("cycle-3")))!.content;
+    expect(current.projects[0]!.cycles.some((stage) => stage.id === "cycle-2")).toBe(false);
     expect(deleted).toContain("sourceId=cycle-1");
     expect(deleted).toContain("> 来自阶段一");
     expect(deleted).not.toContain("sourceId=cycle-2");
     expect(await repo.read(HISTORY_JOURNAL)).toBeNull();
 
-    await service.undoLastWorkspaceChange();
-    expect(await repo.read(middlePath)).not.toBeNull();
-    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
-    await service.redoLastWorkspaceChange();
-    expect(await repo.read(middlePath)).toBeNull();
-    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-1");
+    current = await service.undoLastWorkspaceChange();
+    expect((await repo.read(pathFor("cycle-2")))).not.toBeNull();
+    expect((await repo.read(pathFor("cycle-3")))!.content).toContain("sourceId=cycle-2");
+    current = await service.redoLastWorkspaceChange();
+    expect(current.projects[0]!.cycles.some((stage) => stage.id === "cycle-2")).toBe(false);
+    expect((await repo.read(pathFor("cycle-3")))!.content).toContain("sourceId=cycle-1");
   });
 
   it("does not delete a stage when a successor derived block was edited", async () => {
@@ -2934,15 +3145,18 @@ describe("ProjectWorkspaceService", () => {
 
   it("removes and restores a successor envelope in a no-bridge deletion", async () => {
     const repo = linearRepository();
-    const targetPath = "Helix/Projects/Alpha/Cycle-03.md";
     const service = workspace(repo);
+    let current = await service.reconcileStageFileNames(await service.snapshot());
+    const targetPath = (): string => current.projects[0]!.cycles.find(
+      (stage) => stage.id === "cycle-3",
+    )!.notePath;
     await service.replaceRelation("edge-23", "inherit", ["cycle-2"]);
-    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+    expect((await repo.read(targetPath()))!.content).toContain("sourceId=cycle-2");
 
-    await service.deleteCycle("cycle-2", { bridge: false });
-    expect((await repo.read(targetPath))!.content).not.toContain("helix-focus-bridge");
-    await service.undoLastWorkspaceChange();
-    expect((await repo.read(targetPath))!.content).toContain("sourceId=cycle-2");
+    current = await service.deleteCycle("cycle-2", { bridge: false });
+    expect((await repo.read(targetPath()))!.content).not.toContain("helix-focus-bridge");
+    current = await service.undoLastWorkspaceChange();
+    expect((await repo.read(targetPath()))!.content).toContain("sourceId=cycle-2");
   });
 
   it("previews and applies no-bridge branch degradation with exact edge identity", async () => {
@@ -3550,7 +3764,7 @@ describe("ProjectWorkspaceService", () => {
     await service.deleteCycle(stageThree.id);
     expect((await service.snapshot()).nextStageSequenceByProject["project-1"]).toBe(4);
 
-    await service.createCycle(
+    const replacement = await service.createCycle(
       "project-1",
       "branch",
       ["cycle-1"],
@@ -3560,8 +3774,8 @@ describe("ProjectWorkspaceService", () => {
       },
     );
 
-    expect(await repo.read("Helix/Projects/Alpha/Stage-04.md")).not.toBeNull();
-    expect((await repo.read("Helix/Projects/Alpha/Stage-04.md"))?.content)
+    expect(await repo.read(replacement.notePath)).not.toBeNull();
+    expect((await repo.read(replacement.notePath))?.content)
       .toContain('helix-stage-code: "2.2"');
     expect(repo.json(CANVAS).helixStageSequences).toMatchObject({
       "project-1": 4,
@@ -3584,7 +3798,7 @@ describe("ProjectWorkspaceService", () => {
     );
     expect(recreatedInheritance.sequence).toBe(3);
     expect(recreatedInheritance.stageCode).toBe("2");
-    expect(recreatedInheritance.notePath).toContain("Stage-03.md");
+    expect(recreatedInheritance.notePath).toContain("阶段 2 · 重新继承.md");
 
     const mergeRepo = baseRepository();
     const mergeService = workspace(mergeRepo);
@@ -3610,7 +3824,7 @@ describe("ProjectWorkspaceService", () => {
     );
     expect(recreatedMerge.sequence).toBe(5);
     expect(recreatedMerge.stageCode).toBe("3");
-    expect(recreatedMerge.notePath).toContain("Stage-05.md");
+    expect(recreatedMerge.notePath).toContain("阶段 3 · 重新合并.md");
   });
 
   it("renumbers an existing bridged successor atomically when deleting a middle stage", async () => {
@@ -3630,7 +3844,7 @@ describe("ProjectWorkspaceService", () => {
     )!;
     expect(current.sequence).toBe(3);
     expect(current.stageCode).toBe("2");
-    const content = (await repo.read(successor.notePath))!.content;
+    const content = (await repo.read(current.notePath))!.content;
     expect(content).toContain('helix-stage-code: "2"');
     expect(content).toContain("# 阶段 2 · 后继阶段");
     expect(repo.json(CANVAS).helixStageCodes["project-1"]).toEqual(["1", "2"]);
@@ -3642,7 +3856,7 @@ describe("ProjectWorkspaceService", () => {
     const inherited = await service.createCycle("project-1", "inherit", ["cycle-1"], {
       stageTitle: "原继承",
     });
-    repo.beforeCompare = () => repo.set(
+    repo.beforeRename = () => repo.set(
       inherited.notePath,
       (repo.take(inherited.notePath) ?? "").replace('helix-stage-code: "2"', 'helix-stage-code: "7"'),
     );
@@ -3666,7 +3880,10 @@ describe("ProjectWorkspaceService", () => {
       confirmBranchConversion: true,
       stageTitle: "新增分支",
     });
-    const upgraded = (await repo.read(inherited.notePath))!.content;
+    const current = (await service.snapshot()).projects[0]!.cycles.find(
+      (cycle) => cycle.id === inherited.id,
+    )!;
+    const upgraded = (await repo.read(current.notePath))!.content;
     expect(upgraded).toContain('helix-stage-code: "2.1"');
     expect(upgraded).toContain("# 阶段 2.1 · 旧阶段");
   });
@@ -4016,6 +4233,7 @@ class MemoryRepository {
   beforeCompareEvery?: (path: string) => void;
   beforeRead?: (path: string) => void;
   beforeTrash?: (revision: VaultRevision) => void;
+  beforeRename?: (sourcePath: string, targetPath: string) => void;
 
   constructor(initial: Record<string, string>) {
     for (const [path, content] of Object.entries(initial)) this.files.set(path, content);
@@ -4075,6 +4293,23 @@ class MemoryRepository {
     beforeWrite?.();
     this.files.set(revision.path, content);
     return { path: revision.path, content, hash: stableHash(content) };
+  }
+
+  async renameIfUnchanged(
+    revision: VaultRevision,
+    targetPath: string,
+    beforeWrite?: () => void,
+  ): Promise<VaultRevision> {
+    const current = await this.read(revision.path);
+    if (!current || current.hash !== revision.hash) throw new Error("rename conflict");
+    if (this.files.has(targetPath)) throw new Error(`重命名目标已经存在：${targetPath}`);
+    beforeWrite?.();
+    this.beforeRename?.(revision.path, targetPath);
+    const accepted = await this.read(revision.path);
+    if (!accepted || accepted.hash !== revision.hash) throw new Error("rename conflict");
+    this.files.delete(revision.path);
+    this.files.set(targetPath, accepted.content);
+    return { path: targetPath, content: accepted.content, hash: accepted.hash };
   }
 
   async trashIfUnchanged(

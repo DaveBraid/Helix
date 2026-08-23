@@ -271,6 +271,37 @@ describe("阶段聚焦桥接纯领域协议", () => {
       ).action).toBe("replace");
     });
 
+    it("rejects a forged derivedHash even during a controlled presentation rewrite", () => {
+      const pair = syncedPair();
+      const original = parseFocusBridgeEnvelope(pair.targetMarkdown);
+      if (original.kind !== "present") throw new Error("missing envelope");
+      const edited = pair.targetMarkdown.replace("|A]]", "|伪造标题]]");
+      const editedParsed = parseFocusBridgeEnvelope(edited);
+      if (editedParsed.kind !== "present") throw new Error("missing edited envelope");
+      const forged = edited.replace(
+        `derivedHash=${editedParsed.blocks[0]!.derivedHash}`,
+        `derivedHash=${editedParsed.blocks[0]!.currentDerivedHash}`,
+      );
+      const expected = new Set([original.blocks[0]!.currentDerivedHash]);
+
+      expect(coordinateStageFocusBridge({
+        source: pair.sourceNote,
+        targetMarkdown: forged,
+        baseContent: "Base",
+        expectedPresentationHashes: expected,
+        rewritePresentation: true,
+      })).toMatchObject({
+        action: "conflict",
+        conflict: { reason: "derived-structure-changed" },
+      });
+      expect(() => planStageFocusBridge(
+        ["a"],
+        new Map([["a", pair.sourceNote]]),
+        forged,
+        { expectedPresentationHashes: new Map([["a", expected]]) },
+      )).toThrowError(expect.objectContaining({ code: "managed-edit-would-be-lost" }));
+    });
+
     it("turns a source-only edit into one derived block update", () => {
       const pair = syncedPair();
       const changedSource = source("a", "Source changed");

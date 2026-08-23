@@ -42,6 +42,8 @@ import { stableHash } from "../domain/stable";
 import {
   coordinateStageFocusBridge,
   focusContentHash,
+  focusPresentationHash,
+  focusPresentationHashes,
   parseFocusBridgeEnvelope,
   planStageFocusBridge,
   resolveStageFocusBridge,
@@ -323,6 +325,8 @@ export interface ProjectWorkspaceMarkdownUpdate {
   projectId: string;
   beforeHash: string;
   afterContent: string;
+  /** 初次 CAS 仍使用磁盘原文；这里只替换成功后写入撤销栈的规范旧正文。 */
+  historyBeforeContent?: string;
 }
 
 export interface ProjectWorkspaceMarkdownCreation {
@@ -407,6 +411,14 @@ interface ProjectWorkspaceFocusCheckpoint {
   targetPath: string;
   baseContent: string;
   baseHash: string;
+  /** 最近一次成功同步时来源的展示标题与完整受管块哈希。 */
+  sourceTitle?: string;
+  expectedDerivedHash?: string;
+  /** 路径迁移后保留旧展示路径，直到显式改名或正文同步完成重绘。 */
+  presentationSourcePath?: string;
+  presentationSourceTitle?: string;
+  /** Stage 路径迁移后等待重绘完整且未编辑的派生展示。 */
+  presentationChanged?: true;
 }
 
 interface ProjectWorkspaceFocusState {
@@ -628,7 +640,28 @@ export class ProjectWorkspaceService {
       canvasAfterContent: change.canvasAfterContent,
       markdownTransitions: transitions,
     };
-    await this.applyHistoryEntry(entry, "redo");
+    const historyOverrides: Array<{
+      transition: ProjectWorkspaceHistoryFileTransition;
+      content: string;
+    }> = [];
+    for (const update of change.markdownUpdates) {
+      if (update.historyBeforeContent === undefined) continue;
+      const matches = entry.markdownTransitions.filter((transition) =>
+        transition.kind === update.kind &&
+        transition.entityId === update.entityId &&
+        transition.projectId === update.projectId);
+      if (matches.length !== 1 || matches[0]!.fromContent === null) {
+        throw new Error(`无法唯一定位历史规范基线：${update.entityId}`);
+      }
+      this.assertHistoryStageIdentity(update.historyBeforeContent, matches[0]!);
+      historyOverrides.push({
+        transition: matches[0]!,
+        content: update.historyBeforeContent,
+      });
+    }
+    await this.applyHistoryEntryWithStageFileNames(entry, "redo");
+    // 初次事务使用磁盘原文做 CAS；成功后才把撤销基线收口为 canonical 链接。
+    for (const override of historyOverrides) override.transition.fromContent = override.content;
     if (change.recordHistory !== false) this.recordHistoryEntry(entry);
     return this.snapshot();
   }
@@ -637,20 +670,27 @@ export class ProjectWorkspaceService {
     snapshot: ProjectWorkspaceSnapshot,
     relations: readonly CycleRelation[],
     targetCycleIds: readonly string[],
+    currentPathByCycleId: ReadonlyMap<string, string> = new Map(),
+    validationCycleById: ReadonlyMap<string, ProjectWorkspaceCycle> = new Map(),
+    allowPresentationChangeSourceIds: ReadonlySet<string> = new Set(),
   ): Promise<ProjectWorkspaceMarkdownUpdate[]> {
     const cycles = snapshot.projects.flatMap((project) => project.cycles.map((cycle) => ({
       ...cycle,
       projectId: project.id,
     })));
     const cycleById = new Map(cycles.map((cycle) => [cycle.id, cycle]));
+    const focusState = allowPresentationChangeSourceIds.size > 0
+      ? (await this.readFocusBridgeState()).state
+      : null;
     const revisionById = new Map<string, VaultRevision>();
     const readCycle = async (id: string): Promise<{ cycle: typeof cycles[number]; revision: VaultRevision }> => {
       const cycle = cycleById.get(id);
       if (!cycle) throw new Error(`找不到聚焦问题引用的阶段：${id}`);
       let revision = revisionById.get(id);
       if (!revision) {
-        const current = await this.repository.read(cycle.notePath);
-        if (!current) throw new Error(`聚焦问题引用的阶段 Markdown 已不存在：${cycle.notePath}`);
+        const currentPath = currentPathByCycleId.get(id) ?? cycle.notePath;
+        const current = await this.repository.read(currentPath);
+        if (!current) throw new Error(`聚焦问题引用的阶段 Markdown 已不存在：${currentPath}`);
         revision = current;
         revisionById.set(id, current);
       }
@@ -663,6 +703,7 @@ export class ProjectWorkspaceService {
         .filter((relation) => relation.toCycleId === targetId)
         .flatMap((relation) => relation.fromCycleIds))];
       const sources = new Map<string, FocusSource>();
+      const validationSources = new Map<string, FocusSource>();
       const existingEnvelope = parseFocusBridgeEnvelope(targetRevision.content);
       const validationSourceIds = existingEnvelope.kind === "present"
         ? existingEnvelope.blocks.map((block) => block.sourceId)
@@ -674,18 +715,76 @@ export class ProjectWorkspaceService {
           notePath: cycle.notePath.replace(/\.md$/i, ""),
           title: cycle.title,
           stageCode: cycle.stageCode,
+          sequence: cycle.sequence,
+          markdown: revision.content,
+        });
+        const validationCycle = validationCycleById.get(sourceId) ?? cycle;
+        validationSources.set(sourceId, {
+          id: validationCycle.id,
+          notePath: validationCycle.notePath.replace(/\.md$/i, ""),
+          title: validationCycle.title,
+          stageCode: validationCycle.stageCode,
+          sequence: validationCycle.sequence,
           markdown: revision.content,
         });
       }
-      const plan = planStageFocusBridge(sourceIds, sources, targetRevision.content);
+      const expectedPresentationHashes = new Map<string, ReadonlySet<string>>();
+      if (focusState) {
+        const parsed = parseFocusBridgeEnvelope(targetRevision.content);
+        if (parsed.kind === "present") {
+          for (const block of parsed.blocks) {
+            if (!allowPresentationChangeSourceIds.has(block.sourceId)) continue;
+            const checkpoint = focusState.checkpoints[`${targetId}\u0000${block.sourceId}`];
+            if (!checkpoint) continue;
+            const hashes = new Set<string>();
+            if (checkpoint.expectedDerivedHash) hashes.add(checkpoint.expectedDerivedHash);
+            const validationSource = validationSources.get(block.sourceId);
+            const oldPath = checkpoint.presentationSourcePath ?? checkpoint.sourcePath;
+            const oldTitle = checkpoint.presentationSourceTitle ??
+              checkpoint.sourceTitle ?? validationSource?.title;
+            if (validationSource && oldPath && oldTitle) {
+              for (const hash of focusPresentationHashes({
+                id: block.sourceId,
+                notePath: oldPath.replace(/\.md$/i, ""),
+                title: oldTitle,
+              }, block.content, block.baseHash, block.sourceHash, block.state)) hashes.add(hash);
+            }
+            if (validationSource) {
+              for (const legacyPath of legacyStageNotePaths(
+                validationCycleById.get(block.sourceId)?.notePath ??
+                  cycleById.get(block.sourceId)?.notePath ?? "",
+                validationSource.sequence,
+              )) {
+                for (const hash of focusPresentationHashes({
+                  id: block.sourceId,
+                  notePath: legacyPath.replace(/\.md$/i, ""),
+                  title: validationSource.title,
+                }, block.content, block.baseHash, block.sourceHash, block.state)) hashes.add(hash);
+              }
+            }
+            if (hashes.size > 0) expectedPresentationHashes.set(block.sourceId, hashes);
+          }
+        }
+      }
+      const plan = planStageFocusBridge(sourceIds, sources, targetRevision.content, {
+        validationSources,
+        expectedPresentationHashes,
+      });
       if (plan.action === "noop") continue;
+      const historyBeforeContent = allowPresentationChangeSourceIds.size > 0
+        ? planStageFocusBridge(sourceIds, validationSources, targetRevision.content, {
+            validationSources,
+            expectedPresentationHashes,
+          }).markdown
+        : undefined;
       updates.push({
-        path: target.notePath,
+        path: targetRevision.path,
         kind: "stage",
         entityId: target.id,
         projectId: target.projectId,
         beforeHash: targetRevision.hash,
         afterContent: plan.markdown,
+        ...(historyBeforeContent === undefined ? {} : { historyBeforeContent }),
       });
     }
     return updates;
@@ -708,6 +807,7 @@ export class ProjectWorkspaceService {
         notePath: cycle.notePath.replace(/\.md$/i, ""),
         title: cycle.title,
         stageCode: cycle.stageCode,
+        sequence: cycle.sequence,
         markdown: revision.content,
       });
     }
@@ -876,6 +976,14 @@ export class ProjectWorkspaceService {
             source: { ...other.source, markdown: sourceRevision.content },
             targetMarkdown: otherTarget.content,
             baseContent: otherCheckpoint.baseContent,
+            expectedPresentationHashes: this.focusCheckpointPresentationHashes(
+              otherCheckpoint,
+              other,
+            ),
+            rewritePresentation: this.focusCheckpointNeedsPresentationRewrite(
+              otherCheckpoint,
+              other,
+            ),
           });
           if (current.action === "update-source" || current.action === "conflict") {
             this.upsertFocusConflict(loaded.state, this.focusConflict(
@@ -1045,7 +1153,11 @@ export class ProjectWorkspaceService {
       );
       if (!checkpoint ||
         focusContentHash(checkpoint.baseContent) !== checkpoint.baseHash ||
-        (recoveredCheckpoint && recoveredCheckpoint.baseHash !== checkpoint.baseHash)) {
+        (recoveredCheckpoint && (
+          recoveredCheckpoint.baseHash !== checkpoint.baseHash ||
+          checkpoint.sourceTitle === undefined ||
+          checkpoint.expectedDerivedHash === undefined
+        ))) {
         checkpoint = recoveredCheckpoint;
         if (checkpoint) {
           loaded.state.checkpoints[pair.key] = checkpoint;
@@ -1067,8 +1179,18 @@ export class ProjectWorkspaceService {
           source: { ...pair.source, markdown: sourceRevision.content },
           targetMarkdown: updates.get(targetRevision.path)?.afterContent ?? targetRevision.content,
           baseContent: checkpoint.baseContent,
+          expectedPresentationHashes: this.focusCheckpointPresentationHashes(checkpoint, pair),
+          rewritePresentation: this.focusCheckpointNeedsPresentationRewrite(checkpoint, pair),
         });
-        if (result.action === "noop") continue;
+        if (result.action === "noop") {
+          if (checkpoint.presentationChanged && recoveredCheckpoint &&
+            recoveredCheckpoint.presentationChanged !== true) {
+            const refreshed = this.focusCheckpoint(pair, checkpoint.baseContent);
+            loaded.state.checkpoints[pair.key] = refreshed;
+            safeCheckpoints[pair.key] = refreshed;
+          }
+          continue;
+        }
         if (result.action === "conflict") {
           this.upsertFocusConflict(loaded.state, {
             id: `focus-${stableHash([pair.key, sourceRevision.hash, targetRevision.hash])}`,
@@ -1174,6 +1296,8 @@ export class ProjectWorkspaceService {
               source: { ...pair.source, markdown: sourceRevision.content },
               targetMarkdown: updates.get(targetRevision.path)?.afterContent ?? targetRevision.content,
               baseContent: checkpoint.baseContent,
+              expectedPresentationHashes: this.focusCheckpointPresentationHashes(checkpoint, pair),
+              rewritePresentation: this.focusCheckpointNeedsPresentationRewrite(checkpoint, pair),
             });
             if (current.action === "update-source" || current.action === "conflict") {
               this.upsertFocusConflict(loaded.state, this.focusConflict(
@@ -1281,6 +1405,7 @@ export class ProjectWorkspaceService {
             notePath: source.notePath.replace(/\.md$/i, ""),
             title: source.title,
             stageCode: source.stageCode,
+            sequence: source.sequence,
             markdown: "",
           },
           sourcePath: source.notePath,
@@ -1298,17 +1423,59 @@ export class ProjectWorkspaceService {
     state: ProjectWorkspaceFocusState,
     pairs: readonly ProjectWorkspaceFocusPair[],
   ): boolean {
-    const activeKeys = new Set(pairs.map((pair) => pair.key));
+    const pairByKey = new Map(pairs.map((pair) => [pair.key, pair]));
     let changed = false;
     for (const key of Object.keys(state.checkpoints)) {
-      if (activeKeys.has(key)) continue;
+      const pair = pairByKey.get(key);
+      if (pair) {
+        const checkpoint = state.checkpoints[key]!;
+        const sourcePath = normalizePath(pair.sourcePath);
+        const targetPath = normalizePath(pair.targetPath);
+        const sourceTitleChanged = checkpoint.sourceTitle !== undefined &&
+          checkpoint.sourceTitle !== pair.source.title;
+        if (checkpoint.sourcePath !== sourcePath || checkpoint.targetPath !== targetPath ||
+          sourceTitleChanged) {
+          const sourcePathChanged = checkpoint.sourcePath !== sourcePath;
+          const presentationChanged = sourcePathChanged || sourceTitleChanged;
+          state.checkpoints[key] = {
+            ...checkpoint,
+            sourcePath,
+            targetPath,
+            sourceTitle: pair.source.title,
+            ...(presentationChanged ? {
+              presentationChanged: true as const,
+              presentationSourcePath: checkpoint.presentationSourcePath ?? checkpoint.sourcePath,
+              ...(checkpoint.presentationSourceTitle ?? checkpoint.sourceTitle
+                ? {
+                    presentationSourceTitle:
+                      checkpoint.presentationSourceTitle ?? checkpoint.sourceTitle,
+                  }
+                : {}),
+            } : {}),
+          };
+          changed = true;
+        }
+        continue;
+      }
       delete state.checkpoints[key];
       changed = true;
     }
-    const retainedConflicts = state.conflicts.filter((conflict) => activeKeys.has(conflict.key));
+    const retainedConflicts = state.conflicts.flatMap((conflict) => {
+      const pair = pairByKey.get(conflict.key);
+      if (!pair) return [];
+      const sourcePath = normalizePath(pair.sourcePath);
+      const targetPath = normalizePath(pair.targetPath);
+      if (conflict.sourcePath !== sourcePath || conflict.targetPath !== targetPath) {
+        changed = true;
+        return [{ ...conflict, sourcePath, targetPath }];
+      }
+      return [conflict];
+    });
     if (retainedConflicts.length !== state.conflicts.length) {
       state.conflicts = retainedConflicts;
       changed = true;
+    } else if (changed) {
+      state.conflicts = retainedConflicts;
     }
     return changed;
   }
@@ -1326,7 +1493,46 @@ export class ProjectWorkspaceService {
       targetPath: normalizePath(pair.targetPath),
       baseContent: normalized,
       baseHash: focusContentHash(normalized),
+      sourceTitle: pair.source.title,
+      expectedDerivedHash: focusPresentationHash(pair.source, normalized),
     };
+  }
+
+  /** 只用持久检查点与旧 canonical 展示生成受控改名的授权哈希。 */
+  private focusCheckpointPresentationHashes(
+    checkpoint: ProjectWorkspaceFocusCheckpoint,
+    pair: ProjectWorkspaceFocusPair,
+  ): ReadonlySet<string> | undefined {
+    if (checkpoint.presentationChanged !== true) return undefined;
+    const hashes = new Set<string>();
+    if (checkpoint.expectedDerivedHash) hashes.add(checkpoint.expectedDerivedHash);
+    const oldPath = checkpoint.presentationSourcePath ?? checkpoint.sourcePath;
+    const oldTitle = checkpoint.presentationSourceTitle ?? checkpoint.sourceTitle ?? pair.source.title;
+    if (oldPath && oldTitle) {
+      for (const hash of focusPresentationHashes({
+        id: pair.source.id,
+        notePath: oldPath.replace(/\.md$/i, ""),
+        title: oldTitle,
+      }, checkpoint.baseContent, checkpoint.baseHash)) hashes.add(hash);
+    }
+    for (const legacyPath of legacyStageNotePaths(pair.sourcePath, pair.source.sequence)) {
+      for (const hash of focusPresentationHashes({
+        id: pair.source.id,
+        notePath: legacyPath.replace(/\.md$/i, ""),
+        title: checkpoint.presentationSourceTitle ?? checkpoint.sourceTitle ?? pair.source.title,
+      }, checkpoint.baseContent, checkpoint.baseHash)) hashes.add(hash);
+    }
+    return hashes.size > 0 ? hashes : undefined;
+  }
+
+  /** 标题变化需要重绘；仅路径迁移继续遵守“Markdown 原文不变”。 */
+  private focusCheckpointNeedsPresentationRewrite(
+    checkpoint: ProjectWorkspaceFocusCheckpoint,
+    pair: ProjectWorkspaceFocusPair,
+  ): boolean {
+    return checkpoint.presentationChanged === true &&
+      checkpoint.presentationSourceTitle !== undefined &&
+      checkpoint.presentationSourceTitle !== pair.source.title;
   }
 
   private recoverFocusCheckpoint(
@@ -1339,17 +1545,48 @@ export class ProjectWorkspaceService {
       if (parsed.kind !== "present") return null;
       const block = parsed.blocks.find((candidate) => candidate.sourceId === pair.source.id);
       if (!block || focusContentHash(block.content) !== block.baseHash) return null;
+      const source = { ...pair.source, markdown: sourceMarkdown };
       const result = coordinateStageFocusBridge({
-        source: { ...pair.source, markdown: sourceMarkdown },
+        source,
         targetMarkdown,
         baseContent: block.content,
       });
-      return result.action === "noop" || result.action === "update-derived"
-        ? this.focusCheckpoint(pair, block.content)
-        : null;
+      if (result.action === "noop" || result.action === "update-derived") {
+        return this.focusCheckpoint(pair, block.content);
+      }
+      throw new Error("当前展示不是现行 canonical 结构");
     } catch {
-      return null;
+      try {
+        const parsed = parseFocusBridgeEnvelope(targetMarkdown);
+        if (parsed.kind !== "present") return null;
+        const block = parsed.blocks.find((candidate) => candidate.sourceId === pair.source.id);
+        if (!block || focusContentHash(block.content) !== block.baseHash) return null;
+        const expected = new Set<string>();
+        for (const legacyPath of legacyStageNotePaths(pair.sourcePath, pair.source.sequence)) {
+          for (const hash of focusPresentationHashes({
+            id: pair.source.id,
+            notePath: legacyPath.replace(/\.md$/i, ""),
+            title: pair.source.title,
+          }, block.content, block.baseHash, block.sourceHash, block.state)) expected.add(hash);
+        }
+        const result = coordinateStageFocusBridge({
+          source: { ...pair.source, markdown: sourceMarkdown },
+          targetMarkdown,
+          baseContent: block.content,
+          expectedPresentationHashes: expected,
+        });
+        if (result.action !== "noop" && result.action !== "update-derived") return null;
+        return {
+          ...this.focusCheckpoint(pair, block.content),
+          presentationChanged: true,
+          presentationSourceTitle: pair.source.title,
+          expectedDerivedHash: block.currentDerivedHash,
+        };
+      } catch {
+        return null;
+      }
     }
+    return null;
   }
 
   private focusConflict(
@@ -1595,7 +1832,7 @@ export class ProjectWorkspaceService {
   async undoLastWorkspaceChange(): Promise<ProjectWorkspaceSnapshot> {
     const entry = this.undoStack.at(-1);
     if (!entry) throw new Error("没有可撤销的项目图谱操作");
-    await this.applyHistoryEntry(entry, "undo");
+    await this.applyHistoryEntryWithStageFileNames(entry, "undo");
     this.undoStack.pop();
     this.redoStack.push(entry);
     return this.snapshot();
@@ -1604,10 +1841,155 @@ export class ProjectWorkspaceService {
   async redoLastWorkspaceChange(): Promise<ProjectWorkspaceSnapshot> {
     const entry = this.redoStack.at(-1);
     if (!entry) throw new Error("没有可重做的项目图谱操作");
-    await this.applyHistoryEntry(entry, "redo");
+    await this.applyHistoryEntryWithStageFileNames(entry, "redo");
     this.redoStack.pop();
     this.undoStack.push(entry);
     return this.snapshot();
+  }
+
+  /**
+   * 在历史正文事务前先把 Stage 移到目标标题对应路径。
+   * 崩溃发生在日志创建前时，启动期标题收口可逆向恢复；日志创建后则由历史日志接管。
+   */
+  private async applyHistoryEntryWithStageFileNames(
+    entry: ProjectWorkspaceHistoryEntry,
+    direction: "undo" | "redo",
+  ): Promise<void> {
+    const originalPaths = new Map(entry.markdownTransitions.map((transition) =>
+      [transition, transition.path] as const));
+    const canvasSide = direction === "undo" ? "before" : "after";
+    const originalTargetCanvas = canvasSide === "before"
+      ? entry.canvasBeforeContent
+      : entry.canvasAfterContent;
+    const plans: Array<{
+      transition: ProjectWorkspaceHistoryFileTransition;
+      currentContent: string | null;
+      targetContent: string;
+      sourcePath: string;
+      targetPath: string;
+      before?: VaultRevision;
+    }> = [];
+    for (const transition of entry.markdownTransitions) {
+      if (transition.kind !== "stage") continue;
+      const currentContent = direction === "undo"
+        ? transition.toContent
+        : transition.fromContent;
+      const targetContent = direction === "undo"
+        ? transition.fromContent
+        : transition.toContent;
+      if (currentContent === null || targetContent === null) continue;
+      const sourcePath = normalizePath(transition.path);
+      const currentCanonicalPath = canonicalStageNotePath(sourcePath, currentContent);
+      const targetPath = canonicalStageNotePath(sourcePath, targetContent);
+      // 普通正文／聚焦更新不借历史事务顺带迁移旧文件；启动迁移负责旧路径收口。
+      if (currentCanonicalPath === targetPath) continue;
+      plans.push({ transition, currentContent, targetContent, sourcePath, targetPath });
+    }
+    const moves = plans.filter((plan) =>
+      plan.currentContent !== null && plan.sourcePath !== plan.targetPath);
+    const sources = new Set(moves.map((plan) => plan.sourcePath));
+    const targets = new Set<string>();
+    for (const plan of plans) {
+      if (targets.has(plan.targetPath)) {
+        throw new Error(`历史操作会产生重复阶段文件名：${plan.targetPath}`);
+      }
+      targets.add(plan.targetPath);
+      if (plan.sourcePath === plan.targetPath) continue;
+      if (sources.has(plan.targetPath)) {
+        throw new Error(`历史操作形成阶段路径交换，已停止：${plan.targetPath}`);
+      }
+      if (await this.repository.read(plan.targetPath)) {
+        throw new Error(`历史操作的阶段文件名目标已被占用：${plan.targetPath}`);
+      }
+      if (plan.currentContent !== null) {
+        const before = await this.repository.read(plan.sourcePath);
+        if (!before || before.hash !== stableHash(plan.currentContent)) {
+          throw new Error(`阶段 Markdown 已变化，不能移动后应用历史：${plan.sourcePath}`);
+        }
+        this.assertHistoryStageIdentity(before.content, plan.transition);
+        plan.before = before;
+      }
+    }
+    const targetCanvasContent = this.historyCanvasWithStagePaths(
+      originalTargetCanvas,
+      plans,
+    );
+    const moved: Array<{ before: VaultRevision; after: VaultRevision }> = [];
+    try {
+      for (const plan of moves) {
+        const after = await this.repository.renameIfUnchanged(plan.before!, plan.targetPath);
+        moved.push({ before: plan.before!, after });
+      }
+      for (const plan of plans) plan.transition.path = plan.targetPath;
+      if (canvasSide === "before") entry.canvasBeforeContent = targetCanvasContent;
+      else entry.canvasAfterContent = targetCanvasContent;
+      await this.applyHistoryEntry(entry, direction);
+    } catch (error) {
+      if (this.recoveryIssue) throw error;
+      const rollbackErrors: string[] = [];
+      for (const move of [...moved].reverse()) {
+        try {
+          const current = await this.repository.read(move.after.path);
+          if (!current || current.hash !== move.before.hash) {
+            throw new Error(`阶段文件已变化：${move.after.path}`);
+          }
+          await this.repository.renameIfUnchanged(current, move.before.path);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError instanceof Error
+            ? rollbackError.message
+            : String(rollbackError));
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        const message = `历史操作失败且阶段文件名回滚遇到竞争：${rollbackErrors.join("；")}`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
+      for (const [transition, path] of originalPaths) transition.path = path;
+      if (canvasSide === "before") entry.canvasBeforeContent = originalTargetCanvas;
+      else entry.canvasAfterContent = originalTargetCanvas;
+      throw error;
+    }
+  }
+
+  /** 只更新目标历史镜像中的 Stage 路径摘要，保留其余 Canvas 字段。 */
+  private historyCanvasWithStagePaths(
+    content: string,
+    plans: readonly {
+      transition: ProjectWorkspaceHistoryFileTransition;
+      targetContent: string;
+      sourcePath: string;
+      targetPath: string;
+    }[],
+  ): string {
+    if (plans.every((plan) => plan.sourcePath === plan.targetPath)) return content;
+    let document: CanvasDocument;
+    try {
+      document = JSON.parse(content) as CanvasDocument;
+    } catch {
+      throw new Error("历史 Canvas 不是有效 JSON，不能同步阶段文件名");
+    }
+    if (!Array.isArray(document.nodes) || !Array.isArray(document.edges)) {
+      throw new Error("历史 Canvas 缺少 nodes 或 edges，不能同步阶段文件名");
+    }
+    for (const plan of plans) {
+      if (plan.sourcePath === plan.targetPath) continue;
+      const frontmatter = frontmatterFromContent(plan.targetContent);
+      const status = stageStatusFromFrontmatter(frontmatter?.["helix-status"]);
+      const stageCode = managedFrontmatterString(plan.targetContent, "helix-stage-code").value;
+      const heading = /^#\s+(.+?)\s*$/m.exec(plan.targetContent)?.[1]?.trim();
+      if (!status || !stageCode || !heading) {
+        throw new Error(`历史阶段元数据不完整：${plan.targetPath}`);
+      }
+      updateManagedNodeSummary(
+        document,
+        { kind: "cycle", entityId: plan.transition.entityId },
+        plan.targetPath,
+        stageTitleFromHeading(heading, stageCode),
+        stageStatusText(status),
+      );
+    }
+    return JSON.stringify(document, null, 2);
   }
 
   async recoverPendingWorkspaceHistory(): Promise<StageDeletionRecoveryResult> {
@@ -2143,6 +2525,106 @@ export class ProjectWorkspaceService {
     return this.ensureCanvasFromSnapshot(snapshot, { allowWrite: true });
   }
 
+  /**
+   * 按 Stage 一级标题收口文件名。
+   * 稳定 ID 决定身份，内容哈希与 Canvas 哈希只用于阻止并发覆盖。
+   */
+  async reconcileStageFileNames(
+    snapshot: ProjectWorkspaceSnapshot,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const generation = this.beginOperation();
+    if (snapshot.migrationRequired) {
+      throw new Error("检测到旧项目数据。请先完成既有迁移，再重命名阶段文件。");
+    }
+    const plans: Array<{
+      project: ProjectWorkspaceProject;
+      cycle: ProjectWorkspaceCycle;
+      before: VaultRevision;
+      targetPath: string;
+    }> = [];
+    for (const project of snapshot.projects) {
+      for (const cycle of project.cycles) {
+        const before = await this.repository.read(cycle.notePath);
+        if (!before || before.hash !== snapshot.managedMarkdownRevisionHashes[cycle.notePath]) {
+          throw new Error(`阶段 Markdown 在文件名核对期间已经变化：${cycle.notePath}`);
+        }
+        assertManagedStageIdentity(before.content, cycle.id, project.id);
+        const targetPath = canonicalStageNotePath(cycle.notePath, before.content);
+        if (targetPath !== normalizePath(cycle.notePath)) {
+          plans.push({ project, cycle, before, targetPath });
+        }
+      }
+    }
+    if (plans.length === 0) return snapshot;
+    const targets = new Set<string>();
+    const sources = new Set(plans.map((plan) => normalizePath(plan.before.path)));
+    for (const plan of plans) {
+      if (targets.has(plan.targetPath)) {
+        throw new Error(`多个阶段会得到同一文件名：${plan.targetPath}`);
+      }
+      targets.add(plan.targetPath);
+      if (sources.has(plan.targetPath)) {
+        throw new Error(`阶段文件名迁移形成路径交换，已停止自动处理：${plan.targetPath}`);
+      }
+      if (await this.repository.read(plan.targetPath)) {
+        throw new Error(`阶段文件名目标已被占用：${plan.targetPath}`);
+      }
+    }
+    const canvas = await this.readCanvas(false, generation);
+    if (!canvas.revision || canvas.revision.hash !== snapshot.canvasRevisionHash) {
+      throw new Error("Canvas 在阶段文件名核对期间已经变化");
+    }
+    for (const plan of plans) {
+      updateManagedNodeSummary(
+        canvas.document,
+        { kind: "cycle", entityId: plan.cycle.id },
+        plan.targetPath,
+        plan.cycle.title,
+        stageStatusText(plan.cycle.status),
+      );
+    }
+    const moved: Array<{ before: VaultRevision; after: VaultRevision }> = [];
+    try {
+      for (const plan of plans) {
+        this.assertActive(generation);
+        const after = await this.repository.renameIfUnchanged(
+          plan.before,
+          plan.targetPath,
+          () => this.assertActive(generation),
+        );
+        if (after.content !== plan.before.content || after.hash !== plan.before.hash) {
+          throw new Error(`阶段文件重命名改变了 Markdown 内容：${plan.before.path}`);
+        }
+        moved.push({ before: plan.before, after });
+      }
+      this.assertActive(generation);
+      await this.repository.compareAndWrite(
+        canvas.revision,
+        JSON.stringify(canvas.document, null, 2),
+        () => this.assertActive(generation),
+      );
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      for (const move of moved.reverse()) {
+        try {
+          await this.repository.renameIfUnchanged(move.after, move.before.path);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError instanceof Error
+            ? rollbackError.message
+            : String(rollbackError));
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        const message = `阶段文件名迁移失败且回滚遇到竞争：${rollbackErrors.join("；")}`;
+        this.freezePendingStageDeletion(message);
+        throw new Error(message);
+      }
+      throw error;
+    }
+    this.invalidateHistory();
+    return this.snapshot();
+  }
+
   private async ensureCanvasFromSnapshot(
     snapshot: ProjectWorkspaceSnapshot,
     options: { allowWrite: boolean },
@@ -2628,10 +3110,11 @@ export class ProjectWorkspaceService {
       `阶段 ${cycle.stageCode} · ${normalizedTitle}`,
       "阶段",
     );
+    const targetPath = canonicalStageNotePath(cycle.notePath, afterContent);
     updateManagedNodeSummary(
       canvas.document,
       { kind: "cycle", entityId: cycle.id },
-      cycle.notePath,
+      targetPath,
       normalizedTitle,
       stageStatusText(cycle.status),
     );
@@ -2642,7 +3125,9 @@ export class ProjectWorkspaceService {
           ? {
               ...candidate,
               cycles: candidate.cycles.map((item) =>
-                item.id === cycle.id ? { ...item, title: normalizedTitle } : item),
+                item.id === cycle.id
+                  ? { ...item, title: normalizedTitle, notePath: targetPath }
+                  : item),
             }
           : candidate),
     };
@@ -2653,6 +3138,9 @@ export class ProjectWorkspaceService {
       renamedSnapshot,
       snapshot.relations,
       downstreamIds,
+      new Map([[cycle.id, cycle.notePath]]),
+      new Map([[cycle.id, cycle]]),
+      new Set([cycle.id]),
     );
     this.assertActive(generation);
     return this.applyAtomicWorkspaceChange({
@@ -2661,7 +3149,7 @@ export class ProjectWorkspaceService {
       canvasAfterContent: JSON.stringify(canvas.document, null, 2),
       markdownUpdates: [
         {
-          path: cycle.notePath,
+          path: revision.path,
           kind: "stage",
           entityId: cycle.id,
           projectId: project.id,
@@ -4399,7 +4887,10 @@ export class ProjectWorkspaceService {
     const folderName = sanitizeFileName(normalizedTitle);
     const folder = normalizePath(`${this.rootFolder()}/Projects/${folderName}`);
     const projectPath = normalizePath(`${folder}/Project.md`);
-    const cyclePath = normalizePath(`${folder}/Stage-01.md`);
+    const cyclePath = canonicalStageNotePathForHeading(
+      folder,
+      `阶段 1 · ${normalizedStageTitle}`,
+    );
     if (await this.repository.read(projectPath)) {
       throw new Error(`项目已经存在：${projectPath}`);
     }
@@ -4683,14 +5174,16 @@ export class ProjectWorkspaceService {
     }
     const specs = Array.from({ length: createCount }, (_, index) => {
       const sequence = firstSequence + index;
-      const name = `Stage-${String(sequence).padStart(2, "0")}`;
+      const resolvedStageTitle = index === 1 ? secondaryStageTitle! : stageTitle;
       return {
         id: crypto.randomUUID(),
         sequence,
         stageCode: stageCodes[index]!,
-        name,
-        path: normalizePath(`${folder}/${name}.md`),
-        stageTitle: index === 1 ? secondaryStageTitle! : stageTitle,
+        path: canonicalStageNotePathForHeading(
+          folder,
+          `阶段 ${stageCodes[index]!} · ${resolvedStageTitle}`,
+        ),
+        stageTitle: resolvedStageTitle,
       };
     });
     for (const spec of specs) {
@@ -5051,7 +5544,13 @@ function isProjectWorkspaceFocusState(value: unknown): value is ProjectWorkspace
     const item = checkpoint as Partial<ProjectWorkspaceFocusCheckpoint>;
     if (item.key !== key || !text(item.sourceId) || !text(item.targetId) ||
       !text(item.sourcePath) || !text(item.targetPath) || !text(item.baseContent) ||
-      !text(item.baseHash) || focusContentHash(item.baseContent) !== item.baseHash) return false;
+      !text(item.baseHash) || focusContentHash(item.baseContent) !== item.baseHash ||
+      (item.sourceTitle !== undefined && !text(item.sourceTitle)) ||
+      (item.expectedDerivedHash !== undefined &&
+        !/^[0-9a-f]{64}$/.test(item.expectedDerivedHash)) ||
+      (item.presentationSourcePath !== undefined && !text(item.presentationSourcePath)) ||
+      (item.presentationSourceTitle !== undefined && !text(item.presentationSourceTitle)) ||
+      (item.presentationChanged !== undefined && item.presentationChanged !== true)) return false;
   }
   const validConflict = (candidate: unknown): candidate is ProjectWorkspaceFocusConflict => {
     if (!candidate || typeof candidate !== "object") return false;
@@ -5078,7 +5577,13 @@ function isProjectWorkspaceFocusState(value: unknown): value is ProjectWorkspace
     const item = checkpoint as Partial<ProjectWorkspaceFocusCheckpoint>;
     if (item.key !== key || !text(item.sourceId) || !text(item.targetId) ||
       !text(item.sourcePath) || !text(item.targetPath) || !text(item.baseContent) ||
-      !text(item.baseHash) || focusContentHash(item.baseContent) !== item.baseHash) return false;
+      !text(item.baseHash) || focusContentHash(item.baseContent) !== item.baseHash ||
+      (item.sourceTitle !== undefined && !text(item.sourceTitle)) ||
+      (item.expectedDerivedHash !== undefined &&
+        !/^[0-9a-f]{64}$/.test(item.expectedDerivedHash)) ||
+      (item.presentationSourcePath !== undefined && !text(item.presentationSourcePath)) ||
+      (item.presentationSourceTitle !== undefined && !text(item.presentationSourceTitle)) ||
+      (item.presentationChanged !== undefined && item.presentationChanged !== true)) return false;
   }
   return true;
 }
@@ -5489,8 +5994,38 @@ function stageStatusText(status: ProjectWorkspaceCycle["status"]): string {
   }[status];
 }
 
-function sanitizeFileName(value: string): string {
-  return value.replace(/[\\/:*?"<>|#^[\]]/g, "-").trim() || "未命名项目";
+function sanitizeFileName(value: string, fallback = "未命名项目"): string {
+  return value
+    .replace(/[\u0000-\u001F\u007F\\/:*?"<>|#^[\]]/g, "-")
+    .trim()
+    .replace(/[. ]+$/g, "") || fallback;
+}
+
+/** 从当前正文的一级标题派生同目录目标路径；正文自身不会在此被改写。 */
+function canonicalStageNotePath(currentPath: string, content: string): string {
+  const heading = /^#\s+(.+?)\s*$/m.exec(content)?.[1]?.trim();
+  if (!heading) throw new Error(`阶段 Markdown 缺少一级标题：${currentPath}`);
+  return canonicalStageNotePathForHeading(parentPath(currentPath), heading);
+}
+
+/** 将完整一级标题变成跨桌面文件系统可接受的 Markdown 文件名。 */
+function canonicalStageNotePathForHeading(folder: string, heading: string): string {
+  const fileName = sanitizeFileName(heading, "未命名阶段");
+  if (new TextEncoder().encode(`${fileName}.md`).byteLength > 240) {
+    throw new Error(`阶段一级标题过长，无法安全作为文件名：${heading}`);
+  }
+  return normalizePath(`${folder}/${fileName}.md`);
+}
+
+/** 旧版仅使用物理 sequence 生成 Stage/Cycle-XX 文件名；只枚举这两个已知合同。 */
+function legacyStageNotePaths(currentPath: string, sequence: number | undefined): string[] {
+  if (!currentPath || !Number.isInteger(sequence) || Number(sequence) < 1) return [];
+  const token = String(sequence).padStart(2, "0");
+  const folder = parentPath(currentPath);
+  return [
+    normalizePath(`${folder}/Stage-${token}.md`),
+    normalizePath(`${folder}/Cycle-${token}.md`),
+  ];
 }
 
 function assertSingleLineTitle(value: string, label: string): void {

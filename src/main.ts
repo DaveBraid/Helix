@@ -534,8 +534,11 @@ export default class HelixPlugin extends Plugin {
         await this.store.resolveRecoveryIssuesAfterValidation(staleFocusBridgeIssues);
       }
       if (!this.recoveryMode) {
-        await this.projectWorkspace.initializeFocusBridgeState();
         let snapshot = await this.projectWorkspace.loadStableWorkspace();
+        snapshot = await this.reconcileProjectStageFileNames(snapshot);
+        // 稳定 ID 先完成路径重绑定，聚焦桥再用新路径观察旧展示。
+        await this.projectWorkspace.initializeFocusBridgeState();
+        snapshot = await this.projectWorkspace.loadStableWorkspace();
         await this.repairDerivedProjectCanvasCache(snapshot);
         let localTasks = await this.localProjectTasks.snapshot(
           snapshot,
@@ -2019,12 +2022,24 @@ export default class HelixPlugin extends Plugin {
         // 进而形成无限刷新。真正的 Markdown/Canvas 写入仍由各 mutation
         // 或 repairDerivedProjectCanvasCache 单独进入 quiet-window。
         if (observeCanvas) await this.projectWorkspace.observeCanvasChange();
-        if (!this.recoveryMode && markdownPaths.length > 0) {
-          await this.projectWorkspace.observeFocusBridgeChanges(markdownPaths);
-        }
         if (!this.recoveryMode) {
           // 本轮只读取一次稳定工作区，供 Canvas 派生修复和任务派生共同使用。
           let snapshot = await this.projectWorkspace.loadStableWorkspace();
+          const beforeStagePaths = new Map(snapshot.projects.flatMap((project) =>
+            project.cycles.map((stage) => [stage.id, stage.notePath] as const)));
+          snapshot = await this.reconcileProjectStageFileNames(snapshot);
+          if (markdownPaths.length > 0) {
+            const focusPaths = new Set(markdownPaths.map((path) => normalizePath(path)));
+            for (const stage of snapshot.projects.flatMap((project) => project.cycles)) {
+              const beforePath = beforeStagePaths.get(stage.id);
+              if (beforePath && beforePath !== stage.notePath) {
+                focusPaths.add(beforePath);
+                focusPaths.add(stage.notePath);
+              }
+            }
+            await this.projectWorkspace.observeFocusBridgeChanges([...focusPaths]);
+            snapshot = await this.projectWorkspace.loadStableWorkspace();
+          }
           await this.repairDerivedProjectCanvasCache(snapshot);
           let localTasks = await this.localProjectTasks.snapshot(
             snapshot,
@@ -2083,6 +2098,25 @@ export default class HelixPlugin extends Plugin {
     element.addEventListener("focusout", listener, true);
     this.deferredProjectEditorBlurListeners.set(element, listener);
     return true;
+  }
+
+  /** 已持有 projectMutationRunner；只对可重建派生字段开启自写事件批次。 */
+  private async reconcileProjectStageFileNames(
+    snapshot: ProjectWorkspaceSnapshot,
+  ): Promise<ProjectWorkspaceSnapshot> {
+    const beforePaths = snapshot.projects.flatMap((project) =>
+      project.cycles.map((cycle) => `${cycle.id}\u0000${cycle.notePath}`)).sort();
+    this.projectRefreshBatch.begin();
+    try {
+      const reconciled = await this.projectWorkspace.reconcileStageFileNames(snapshot);
+      const afterPaths = reconciled.projects.flatMap((project) =>
+        project.cycles.map((cycle) => `${cycle.id}\u0000${cycle.notePath}`)).sort();
+      if (JSON.stringify(beforePaths) === JSON.stringify(afterPaths)) return reconciled;
+      await this.projectWorkspace.initializeFocusBridgeState();
+      return this.projectWorkspace.loadStableWorkspace();
+    } finally {
+      this.projectRefreshBatch.end();
+    }
   }
 
   /** 已持有 projectMutationRunner；只对可重建派生字段开启自写事件批次。 */

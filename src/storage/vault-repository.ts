@@ -104,6 +104,55 @@ export class HelixVaultRepository {
   }
 
   /**
+   * 仅移动与调用方快照一致的文件。
+   * 写前、写后各核对一次；若移动期间出现外部编辑，优先把最新内容移回原路径。
+   */
+  async renameIfUnchanged(
+    revision: VaultRevision,
+    targetPath: string,
+    beforeWrite?: () => void,
+  ): Promise<VaultRevision> {
+    const source = normalizePath(revision.path);
+    const target = normalizePath(targetPath);
+    if (source === target) return revision;
+    const current = await this.read(source);
+    if (!current || current.hash !== revision.hash) {
+      throw new VaultWriteConflictError(
+        source,
+        revision.hash,
+        current?.hash ?? "<missing>",
+      );
+    }
+    if (await this.pathExists(target)) throw new Error(`重命名目标已经存在：${target}`);
+    await this.ensureParent(target, beforeWrite);
+    const file = this.resolveFile(source);
+    const adapter = this.vault.adapter;
+    if (!(file instanceof TFile) && !adapter) throw new Error(`重命名源不是文件：${source}`);
+    beforeWrite?.();
+    if (file instanceof TFile) await this.vault.rename(file, target);
+    else await adapter!.rename(source, target);
+    const accepted = await this.read(target);
+    const sourceAfter = await this.read(source);
+    if (!accepted || accepted.hash !== revision.hash || sourceAfter) {
+      if (accepted && !sourceAfter) {
+        try {
+          // 移动间隙发生的用户编辑也必须保留，并恢复到用户原先看到的路径。
+          await this.renameIfUnchanged(accepted, source);
+        } catch (rollbackError) {
+          throw new Error(`文件重命名验证失败且无法安全回滚：${target}；${
+            rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      throw new VaultWriteConflictError(
+        target,
+        revision.hash,
+        accepted?.hash ?? "<missing>",
+      );
+    }
+    return accepted;
+  }
+
+  /**
    * `.transactions` 下三份 JSON 是 Helix 独占的内部状态，不是用户笔记，也不会
    * 稳定进入 Obsidian 的 TFile 索引。它们仍需执行双读 fence；此适配器路径绝不
    * 对普通 Markdown、Canvas 或任意其他隐藏文件开放。

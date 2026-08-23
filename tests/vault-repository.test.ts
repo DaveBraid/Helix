@@ -52,6 +52,88 @@ describe("HelixVaultRepository", () => {
     expect(written.hash).not.toBe(revision!.hash);
   });
 
+  it("renames only an unchanged file and preserves its exact bytes", async () => {
+    const file = new TFile();
+    const source = "Helix/Projects/Alpha/Stage-02.md";
+    const target = "Helix/Projects/Alpha/阶段 2 · 验证.md";
+    let currentPath = source;
+    const content = "阶段内容\r\n保留原始换行";
+    const repository = new HelixVaultRepository({
+      getFileByPath: (path: string) => path === currentPath ? file : null,
+      getAbstractFileByPath: (path: string) => path === currentPath ? file : null,
+      read: async () => content,
+      rename: async (_file: TFile, path: string) => {
+        currentPath = path;
+      },
+      adapter: {
+        exists: async (path: string) =>
+          path === currentPath || path === "Helix" || path === "Helix/Projects" ||
+          path === "Helix/Projects/Alpha",
+      },
+    } as never);
+    const revision = await repository.read(source);
+
+    const renamed = await repository.renameIfUnchanged(revision!, target);
+
+    expect(renamed).toMatchObject({ path: target, content, hash: revision!.hash });
+    await expect(repository.read(source)).resolves.toBeNull();
+  });
+
+  it("does not rename when the target path is occupied", async () => {
+    const sourceFile = new TFile();
+    const targetFile = new TFile();
+    const source = "Helix/Projects/Alpha/Stage-02.md";
+    const target = "Helix/Projects/Alpha/阶段 2 · 验证.md";
+    let renamed = false;
+    const repository = new HelixVaultRepository({
+      getFileByPath: (path: string) => path === source ? sourceFile : null,
+      getAbstractFileByPath: (path: string) =>
+        path === source ? sourceFile : path === target ? targetFile : null,
+      read: async () => "阶段内容",
+      rename: async () => {
+        renamed = true;
+      },
+    } as never);
+    const revision = await repository.read(source);
+
+    await expect(repository.renameIfUnchanged(revision!, target))
+      .rejects.toThrow(/目标已经存在/);
+    expect(renamed).toBe(false);
+  });
+
+  it("restores the source path when content changes during the rename window", async () => {
+    const file = new TFile();
+    const source = "Helix/Projects/Alpha/Stage-02.md";
+    const target = "Helix/Projects/Alpha/阶段 2 · 验证.md";
+    let currentPath = source;
+    let content = "移动前内容";
+    const repository = new HelixVaultRepository({
+      getFileByPath: (path: string) => path === currentPath ? file : null,
+      getAbstractFileByPath: (path: string) => path === currentPath ? file : null,
+      read: async () => content,
+      rename: async (_file: TFile, path: string) => {
+        currentPath = path;
+        if (path === target) content = "移动间隙的用户编辑";
+      },
+      adapter: {
+        exists: async (path: string) =>
+          path === currentPath || path === "Helix" || path === "Helix/Projects" ||
+          path === "Helix/Projects/Alpha",
+      },
+    } as never);
+    const revision = await repository.read(source);
+
+    await expect(repository.renameIfUnchanged(revision!, target))
+      .rejects.toThrow(/写入前发生变化/);
+
+    expect(currentPath).toBe(source);
+    await expect(repository.read(source)).resolves.toMatchObject({
+      path: source,
+      content: "移动间隙的用户编辑",
+    });
+    await expect(repository.read(target)).resolves.toBeNull();
+  });
+
   it("moves unchanged files to the vault-local trash after the write fence", async () => {
     const file = new TFile();
     let content = "阶段内容";

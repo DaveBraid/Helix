@@ -42,6 +42,7 @@ export interface FocusSource {
   notePath: string;
   title: string;
   stageCode?: string;
+  sequence?: number;
   markdown: string;
 }
 
@@ -114,6 +115,10 @@ export function coordinateStageFocusBridge(input: {
   source: FocusSource;
   targetMarkdown: string;
   baseContent: string;
+  /** 文件名／标题迁移前持久化的展示哈希；只凭 Markdown 内可编辑 marker 不授权覆盖。 */
+  expectedPresentationHashes?: ReadonlySet<string>;
+  /** 显式改名时重绘展示；纯文件迁移保持目标 Markdown 字节不变。 */
+  rewritePresentation?: boolean;
 }): FocusBridgeCoordination {
   const parsed = parseFocusBridgeEnvelope(input.targetMarkdown);
   if (parsed.kind !== "present") {
@@ -154,8 +159,13 @@ export function coordinateStageFocusBridge(input: {
   } as const;
   const derivedStructureChanged =
     !canonicalDerivedHashes(canonicalInput).has(block.currentDerivedHash);
+  const safePresentationChange = derivedStructureChanged &&
+    input.expectedPresentationHashes?.has(block.currentDerivedHash) === true &&
+    !derivedVisibleChanged &&
+    !derivedBodyChanged;
 
-  if (derivedStructureChanged || (derivedBodyChanged && !derivedVisibleChanged)) {
+  if ((derivedStructureChanged && !safePresentationChange) ||
+    (derivedBodyChanged && !derivedVisibleChanged)) {
     return focusBridgeConflict(
       block,
       baseContent,
@@ -166,6 +176,27 @@ export function coordinateStageFocusBridge(input: {
   }
   if (!derivedBodyChanged && derivedVisibleChanged) {
     throw corrupt(`来源 ${block.sourceId} 的 derivedHash 与 canonical 展示不一致`);
+  }
+
+  if (safePresentationChange && !sourceChanged) {
+    if (input.rewritePresentation !== true) {
+      // 纯文件名迁移承诺 Markdown 原文不变；等来源正文或显式名称变化时再重绘展示。
+      return { action: "noop", sourceId: block.sourceId };
+    }
+    const replacement = renderBlock({
+      sourceId: input.source.id,
+      notePath: input.source.notePath,
+      title: input.source.title,
+      content: block.content,
+      baseHash: block.baseHash,
+      sourceHash: block.sourceHash,
+      state: "synced",
+    });
+    return {
+      action: "update-derived",
+      sourceId: block.sourceId,
+      targetMarkdown: replaceFocusBridgeBlock(input.targetMarkdown, block, replacement),
+    };
   }
 
   if (!sourceChanged && !derivedBodyChanged) {
@@ -541,6 +572,10 @@ export function planStageFocusBridge(
   sourceIds: readonly string[],
   sources: ReadonlyMap<string, FocusSource>,
   targetMarkdown = `# ${FOCUS_TARGET_HEADING}\n`,
+  options: {
+    validationSources?: ReadonlyMap<string, FocusSource>;
+    expectedPresentationHashes?: ReadonlyMap<string, ReadonlySet<string>>;
+  } = {},
 ): FocusPlan {
   assertUniqueSourceIds(sourceIds);
   const parsed = parseFocusBridgeEnvelope(targetMarkdown);
@@ -554,7 +589,11 @@ export function planStageFocusBridge(
     if (parsed.kind === "absent") {
       return { action: "noop", sourceIds: [], content: "", markdown: targetMarkdown };
     }
-    assertEnvelopeSafeToReplace(parsed, sources);
+    assertEnvelopeSafeToReplace(
+      parsed,
+      options.validationSources ?? sources,
+      options.expectedPresentationHashes,
+    );
     return {
       action: "remove",
       sourceIds: [],
@@ -562,7 +601,13 @@ export function planStageFocusBridge(
       markdown: replaceFocusBridgeEnvelope(targetMarkdown, null),
     };
   }
-  if (parsed.kind === "present") assertEnvelopeSafeToReplace(parsed, sources);
+  if (parsed.kind === "present") {
+    assertEnvelopeSafeToReplace(
+      parsed,
+      options.validationSources ?? sources,
+      options.expectedPresentationHashes,
+    );
+  }
   const content = renderFocusBridgeEnvelope(selected);
   const markdown = replaceFocusBridgeEnvelope(targetMarkdown, content);
   return {
@@ -576,6 +621,7 @@ export function planStageFocusBridge(
 function assertEnvelopeSafeToReplace(
   parsed: Extract<ParsedFocusEnvelope, { kind: "present" }>,
   sources: ReadonlyMap<string, FocusSource>,
+  expectedPresentationHashes: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
 ): void {
   for (const block of parsed.blocks) {
     if (block.state === "conflict") {
@@ -606,13 +652,54 @@ function assertEnvelopeSafeToReplace(
       sourceHash: block.sourceHash,
       state: block.state,
     } as const;
-    if (!canonicalDerivedHashes(canonicalInput).has(block.currentDerivedHash)) {
+    const canonical = canonicalDerivedHashes(canonicalInput).has(block.currentDerivedHash);
+    const checkpointMatched = expectedPresentationHashes
+      .get(block.sourceId)?.has(block.currentDerivedHash) === true;
+    if (!canonical && !checkpointMatched) {
       throw new FocusBridgeError(
         "managed-edit-would-be-lost",
         `来源 ${block.sourceId} 的引用结构或链接已变化，拒绝覆盖或移除`,
       );
     }
   }
+}
+
+/** 计算一份完整受管展示的 canonical 哈希，供文件改名前的持久检查点使用。 */
+export function focusPresentationHash(
+  source: Pick<FocusSource, "id" | "notePath" | "title">,
+  content: string,
+  baseHash = focusContentHash(content),
+  sourceHash = baseHash,
+  state: FocusBridgeState = "synced",
+): string {
+  return renderedBlockDerivedHash(renderBlock({
+    sourceId: source.id,
+    notePath: source.notePath,
+    title: source.title,
+    content: normalizeFocusHashContent(content),
+    baseHash,
+    sourceHash,
+    state,
+  }));
+}
+
+/** Obsidian 将 WikiLink 的 `.md` 视为可省略；旧展示授权必须同时覆盖两种 canonical 形式。 */
+export function focusPresentationHashes(
+  source: Pick<FocusSource, "id" | "notePath" | "title">,
+  content: string,
+  baseHash = focusContentHash(content),
+  sourceHash = baseHash,
+  state: FocusBridgeState = "synced",
+): ReadonlySet<string> {
+  return canonicalDerivedHashes({
+    sourceId: source.id,
+    notePath: source.notePath,
+    title: source.title,
+    content: normalizeFocusHashContent(content),
+    baseHash,
+    sourceHash,
+    state,
+  });
 }
 
 /**

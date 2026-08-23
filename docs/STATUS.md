@@ -1,41 +1,46 @@
 # 当前开发状态
 
 最后更新：2026-08-23
-父提交：`c1450fe fix: resume retained project projection safely`
-工作树状态：本状态快照随 Helix 任务同级顺序修复提交更新；提交后应为干净工作树。
-当前阶段：根因、修复与真实界面验证已完成，继续停留在 `dev`，尚未进入发布流程。
+当前基线提交：`d6a84d3 fix: preserve Helix stage action order`
+工作树状态：存在 Helix `2.1.3` 版本号、README、Release 说明和本快照的待提交发布改动。
+当前阶段：`2.1.3` 发布候选已通过完整代码、产物门禁与独立复审，等待提交、合入 `main` 与 GitHub Release。
 
 ## 本轮目标
 
-- 让 Helix 任务树与 Stage Markdown、滴答清单均按任务 1→2→3 展示。
-- 保留 Stage Markdown 作为计划行动顺序的权威源。
-- 非目标：不写入远端 `sortOrder`，不修改用户 Stage 内容，不发布新版本。
+- 发布项目／阶段状态改进、“待记录”流程、子任务顺序修复与项目投影安全恢复。
+- 版本统一为 `2.1.3`，最低 Obsidian 版本保持 `1.12.2`。
+- 非目标：不修改用户 Project／Stage／Canvas，不创建或清理滴答对象，不扩大远端写入能力。
 
-## 根因
+## 发布内容
 
-- Stage-06 Markdown 中的行动顺序为任务 1→2→3。
-- 滴答 API 快照的数组返回顺序为父任务→任务 3→2→1，该数组顺序不等于滴答界面按 `sortOrder` 呈现的顺序。
-- `mergeProjectTaskCollections` 替换已绑定任务的本地字段时，`Map` 仍保留远端数组的插入顺序，任务树因此显示为 3→2→1。
+- 项目状态在关系图容器和横排选单中使用统一图标与颜色。
+- 阶段“想法”显示为“计划中”；所有根行动完成后自动进入“待记录”，由用户手动确认已完成。
+- 滴答子任务创建顺序与 Helix Markdown 行序一致；Helix 任务树也在同父托管槽位内恢复该顺序。
+- 当前版本的停用投影配置可按稳定清单 ID 原位恢复；单个 Stage 冲突不再扩大为全局阻塞。
+- 合法 marker 后遗留可见文本的历史行会安全收口，可见文本保留。
+- `manifest.json`、`package.json`、`package-lock.json`、`versions.json`、README 和 `docs/releases/2.1.3.md` 已准备统一发布版本。
 
-## 本轮改动
+## 发布边界
 
-- 新增纯领域函数 `applyPreferredTaskSiblingOrder`：按权威 ID 顺序重排同父级托管任务。
-- 只复用托管任务原有槽位；普通滴答任务的位置、内容和远端真值保持不变。
-- 完成项仍由现有 `completionLast` 在同级稳定下移。
+- Project／Stage Markdown 与专用 Canvas 继续是项目数据权威源；滴答继续是普通任务、清单、习惯与专注记录权威源。
+- 口令继续只存于 Obsidian SecretStorage；投影配置按 Vault 独立保存。
+- Release 必须包含 BRAT 运行文件、第三方声明与完整许可证附件。
 
-## 验证
+## 发布前证据
 
-- 定向 3 个测试文件、66 项通过；新用例覆盖“远端 3→2→1，本地 1→2→3”、普通任务槽位不动以及 Stage 父任务根级顺序不变。
-- `npm test`：71 个测试文件、1045 项全部通过。
-- `npm run typecheck`、`npm run build`、`git diff --check` 通过。
-- Obsidian CLI 重载最终构建后，Helix DOM 任务标题顺序为“任务 1、任务 2、任务 3”；error 与 warn 均为空。
-- 独立项目主管首轮发现的根级顺序 P2 已修复；复审无剩余 P0/P1/P2。
+- 开发阶段全量门禁：71 个测试文件、1045 项通过；`typecheck`、`build`、`git diff --check` 通过。
+- Obsidian CLI 重载后，Helix DOM 任务顺序为任务 1→2→3，error 与 warn 为空。
+- 项目主管对最终开发基线复审无剩余 P0/P1/P2。
+- `2.1.3` 全量测试、`release:check`、`git diff --check` 与发布元数据独立复审已通过，无剩余 P0/P1/P2；`main` 合并后复查、GitHub 附件上传与哈希核对尚未完成。
 
-## 未关闭问题
+## 已知限制
 
 - Stage-07 与 Stage-09 仍有父任务 conflict，需要用户在冲突中心单独收口；不影响其他 Stage。
+- Stage 之间的任务移动仍未开放；远端结果未知时仍禁止盲目重试。
 
 ## 下一步
 
-1. 形成 Helix 任务同级顺序修复的单一职责提交。
-2. 后续修复继续在 `dev`；只有用户明确要求发布时才合入 `main`。
+1. 提交发布元数据并推送 `dev`。
+2. 快进合入 `main` 并复跑发布门禁。
+3. 创建 `2.1.3` 标签与 GitHub Release，上传并核对 8 个发布附件。
+4. 记录发布事实，再将 `main` 同步回 `dev`。

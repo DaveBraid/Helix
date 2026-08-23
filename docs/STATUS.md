@@ -1,9 +1,9 @@
 # 当前开发状态
 
 最后更新：2026-08-23
-当前基线提交：`d6a84d3 fix: preserve Helix stage action order`
-工作树状态：存在 Helix `2.1.3` 版本号、README、Release 说明和本快照的待提交发布改动。
-当前阶段：`2.1.3` 发布候选已通过完整代码、产物门禁与独立复审，等待提交、合入 `main` 与 GitHub Release。
+当前基线提交：`2b433ff release: prepare Helix 2.1.3`
+工作树状态：仅有本发布基线快照的待提交更新。
+当前阶段：`2.1.3` 发布候选已通过 `dev`、`main` 完整门禁与独立复审，等待推送 `main` 与 GitHub Release。
 
 ## 本轮目标
 
@@ -31,7 +31,8 @@
 - 开发阶段全量门禁：71 个测试文件、1045 项通过；`typecheck`、`build`、`git diff --check` 通过。
 - Obsidian CLI 重载后，Helix DOM 任务顺序为任务 1→2→3，error 与 warn 为空。
 - 项目主管对最终开发基线复审无剩余 P0/P1/P2。
-- `2.1.3` 全量测试、`release:check`、`git diff --check` 与发布元数据独立复审已通过，无剩余 P0/P1/P2；`main` 合并后复查、GitHub 附件上传与哈希核对尚未完成。
+- `2.1.3` 全量测试、`release:check` 与 `git diff --check` 在 `dev` 和快进后的 `main` 均已通过；发布元数据独立复审无剩余 P0/P1/P2。
+- GitHub 标签、Release、附件上传与哈希核对尚未完成，不得宣称 `2.1.3` 已发布。
 
 ## 已知限制
 
@@ -40,7 +41,6 @@
 
 ## 下一步
 
-1. 提交发布元数据并推送 `dev`。
-2. 快进合入 `main` 并复跑发布门禁。
-3. 创建 `2.1.3` 标签与 GitHub Release，上传并核对 8 个发布附件。
-4. 记录发布事实，再将 `main` 同步回 `dev`。
+1. 提交本发布基线快照并推送 `main`。
+2. 创建 `2.1.3` 标签与 GitHub Release，上传并核对 8 个发布附件。
+3. 记录发布事实，再将 `main` 同步回 `dev`。

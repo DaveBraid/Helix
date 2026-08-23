@@ -63,10 +63,10 @@ export function projectionInputFromStage(
     projectId: stage.id,
     projectPath: stage.notePath,
     projectTitle: stage.title,
-    // 待记录仍是远端开放态；只有手动完成 Stage 才完成滴答父任务。
+    // 待记录表示计划行动已经收口；滴答父任务允许完成，Stage 仍由用户手动完成。
     projectStatus: stage.status === "idea"
       ? "planned"
-      : stage.status === "recording" ? "active" : stage.status,
+      : stage.status,
     createWhenMissing: stage.status === "active",
     stages: [{ path: stage.notePath, stageId: stage.id }],
   };

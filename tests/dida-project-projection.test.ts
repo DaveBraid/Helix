@@ -599,7 +599,7 @@ function reconcileAction(entry: ProjectionLedgerEntry) {
 
 function input(overrides: Partial<{
   projectTitle: string;
-  projectStatus: "planned" | "active" | "paused" | "completed" | "terminated";
+  projectStatus: "planned" | "active" | "recording" | "paused" | "completed" | "terminated";
   createWhenMissing: boolean;
 }> = {}) {
   return {
@@ -1174,6 +1174,58 @@ describe("DidaProjectProjectionService with real child tasks", () => {
 
     expect(summary.frozen).toEqual([]);
     expect(harness.state.value.parentCheckpoints).toEqual([]);
+  });
+
+  it("accepts Dida auto-completing a parent when the Stage enters recording", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.tasks.set("remote-1", {
+      ...harness.pipeline.tasks.get("remote-1")!,
+      status: 2,
+      completedTime: "2026-08-05T01:00:00.000Z",
+    });
+    harness.pipeline.tasks.set("remote-2", {
+      ...harness.pipeline.tasks.get("remote-2")!,
+      status: 2,
+      completedTime: "2026-08-05T01:00:00.000Z",
+    });
+
+    const summary = await harness.service.synchronizeProject(input({
+      projectStatus: "recording",
+      createWhenMissing: false,
+    }));
+
+    expect(summary).toMatchObject({ completedActions: 1, frozen: [] });
+    expect(harness.state.value.parentBases).toContainEqual(expect.objectContaining({
+      projectId: "project-1",
+      status: 2,
+    }));
+    expect(harness.markdown.content("Stage.md")).toContain("[x] 行动");
+  });
+
+  it("clears a ghost parent conflict after a recording Stage parent auto-completes", async () => {
+    const harness = makeHarness(true);
+    await harness.service.synchronizeProject(input());
+    harness.pipeline.tasks.set("remote-1", {
+      ...harness.pipeline.tasks.get("remote-1")!,
+      status: 2,
+      completedTime: "2026-08-05T01:00:00.000Z",
+    });
+    harness.state.value.parentCheckpoints = [{
+      projectId: "project-1",
+      remoteId: "remote-1",
+      marker: "helix-project-projection:project-1",
+      frozen: "conflict",
+    }];
+
+    const summary = await harness.service.synchronizeProject(input({
+      projectStatus: "recording",
+      createWhenMissing: false,
+    }));
+
+    expect(summary.frozen).toEqual([]);
+    expect(harness.state.value.parentCheckpoints).toEqual([]);
+    expect(harness.state.value.parentBases).toContainEqual(expect.objectContaining({ status: 2 }));
   });
 
   it("shares one target catalog snapshot across a multi-Stage synchronization batch", async () => {

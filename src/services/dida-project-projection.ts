@@ -339,7 +339,7 @@ export interface ProjectionProjectInput {
   projectId: string;
   projectPath: string;
   projectTitle: string;
-  projectStatus: "planned" | "active" | "paused" | "completed" | "terminated";
+  projectStatus: "planned" | "active" | "recording" | "paused" | "completed" | "terminated";
   createWhenMissing: boolean;
   stages: Array<{ path: string; stageId: string }>;
 }
@@ -728,7 +728,7 @@ export class DidaProjectProjectionService {
       assertReceiptMatchesProof(inspection.receipt, cleanupProof);
     }
     const remote = await this.pipeline.rereadTask(current.target.targetProjectId, remoteId);
-    const desiredStatus = input.status === "completed" ? 2 : 0;
+    const desiredStatus = projectionParentStatus(input.status);
     if (!remote || !this.sameParentIdentity(remote, input.projectId, remoteId, current.target) ||
       remote.title !== input.title || remote.status !== desiredStatus) {
       throw new Error("父任务精确复读身份仍不一致，保持冻结");
@@ -1057,7 +1057,7 @@ export class DidaProjectProjectionService {
     let parentOutboundBlocked = false;
     if (projectIdentity.parentTaskId && storedParent?.frozen) {
       const remoteParent = catalog.tasks?.find((task) => task.id === projectIdentity.parentTaskId);
-      const desiredStatus = input.projectStatus === "completed" ? 2 : 0;
+      const desiredStatus = projectionParentStatus(input.projectStatus);
       const conflictAlreadySettled = storedParent.frozen === "conflict" && remoteParent &&
         this.sameParentIdentity(remoteParent, projectIdentity.projectId, projectIdentity.parentTaskId, initialState.target) &&
         remoteParent.title === input.projectTitle && remoteParent.status === desiredStatus;
@@ -1808,7 +1808,7 @@ export class DidaProjectProjectionService {
   ): Promise<boolean> {
     const target = state.target!;
     const marker = `helix-project-projection:${projectId}`;
-    const desiredStatus = projectStatus === "completed" ? 2 : 0;
+    const desiredStatus = projectionParentStatus(projectStatus);
     const remote = await this.pipeline.rereadTask(target.targetProjectId, remoteId);
     if (!remote || !this.sameParentIdentity(remote, projectId, remoteId, target)) {
       await this.freezeParent(state, projectId, marker, remoteId, "identity-mismatch");
@@ -2600,6 +2600,11 @@ function freezeEntry(
     conflictId: receipt?.conflictId ?? entry.conflictId,
   };
   return entries.some((item) => item.uuid === entry.uuid) ? replaceEntry(entries, frozen) : [...entries, frozen];
+}
+
+/** 待记录代表计划行动已收口；远端父任务完成不等于 Stage 已手动完成。 */
+function projectionParentStatus(status: ProjectionProjectInput["projectStatus"]): 0 | 2 {
+  return status === "recording" || status === "completed" ? 2 : 0;
 }
 
 function emptyProjectionSyncSummary(): ProjectionSyncSummary {

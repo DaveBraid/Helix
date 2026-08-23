@@ -18,11 +18,13 @@ describe("项目与阶段状态", () => {
     expect(projectStatusFromFrontmatter("archived")).toBe("terminated");
     expect(stageStatusFromFrontmatter("planned")).toBe("idea");
     expect(stageStatusFromFrontmatter("closed")).toBe("completed");
+    expect(stageStatusFromFrontmatter("recording")).toBe("recording");
     expect(projectStatusFromFrontmatter("unknown")).toBeNull();
     expect(stageStatusFromFrontmatter("unknown")).toBeNull();
     expect(isProjectStatus("terminated")).toBe(true);
     expect(isProjectStatus("archived")).toBe(false);
     expect(isStageStatus("completed")).toBe(true);
+    expect(isStageStatus("recording")).toBe(true);
     expect(isStageStatus("closed")).toBe(false);
   });
 });

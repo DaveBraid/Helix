@@ -175,8 +175,10 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toContain("const completionIsDerived = Boolean(stageParent || (localTask && tree?.hasChildren))");
     expect(view).toContain("if (completionIsDerived) check.disabled = true");
     expect(view).toContain("子任务全部完成后自动完成主任务");
+    expect(view).toContain("计划任务全部完成后自动进入待记录；阶段完成请手动设置");
     expect(view).toContain("localTaskDetailCapabilities(children.length > 0)");
-    expect(view).toContain("localTaskDetailCapabilities(true)");
+    expect(view).toContain('statusOptions: ["idea", "active", "recording", "completed", "paused", "terminated"]');
+    expect(view).toContain("text: STAGE_STATUS_LABELS[stageParent.stageStatus]");
     expect(unifiedTaskEditor).toContain("capabilities.completionDerivedFromSubtasks");
     expect(unifiedTaskEditor).toContain("主任务将在全部子任务完成后自动完成");
     expect(view).toContain('attr: { "data-task-id": task.id }');
@@ -233,6 +235,8 @@ describe("workbench layout and navigation structure", () => {
       "utf8",
     );
     expect(lineage).toMatch(/helix-lineage-card-top[\s\S]*helix-lineage-status-button/);
+    expect(lineage).toMatch(/helix-lineage-project-choice-status[\s\S]*PROJECT_STATUS_ICONS/);
+    expect(lineage).toMatch(/helix-lineage-project-container-status[\s\S]*helix-lineage-project-status-icon/);
     expect(lineage).not.toMatch(/helix-lineage-status-button[\s\S]{0,180}createEl\("select"/);
     expect(lineage).toMatch(/openStatusPopover[\s\S]*onEditProjectStatus[\s\S]*onEditCycleStatus/);
     expect(lineage).toMatch(/helix-lineage-status-popover[\s\S]*pointerdown[\s\S]*Escape/);
@@ -243,6 +247,8 @@ describe("workbench layout and navigation structure", () => {
     expect(css).toMatch(/\.helix-lineage-card-actions[\s\S]*grid-template-columns: repeat\(4/);
     expect(css).toMatch(/\.helix-lineage-card:hover \.helix-lineage-card-relations[\s\S]*opacity: 0/);
     expect(css).toMatch(/\.helix-lineage-status-popover \{[\s\S]*position: fixed;[\s\S]*z-index: 10000;[\s\S]*gap: 4px/);
+    expect(css).toMatch(/\.helix-lineage-project-choice-status\.is-active[\s\S]*#6668d9/);
+    expect(css).toMatch(/\.helix-lineage-status-button\.is-recording[\s\S]*#2f8793/);
     expect(lineage).toMatch(/pointerenter[\s\S]*hoveredStageId = node\.entityId[\s\S]*updateLineageHoverFocus/);
     expect(lineage).toMatch(/pointerleave[\s\S]*hoveredStageId = null[\s\S]*updateLineageHoverFocus/);
     expect(lineage).toMatch(/data-source-id[\s\S]*data-target-id[\s\S]*is-lineage-dimmed/);
@@ -454,13 +460,14 @@ describe("workbench layout and navigation structure", () => {
     expect(userReachableDiagnostics).toContain("尚未交由 Helix 管理");
   });
 
-  it("keeps the five-column stage board isolated, horizontally scrollable and write-gated", () => {
+  it("keeps the six-column stage board isolated, horizontally scrollable and write-gated", () => {
     const lineage = readFileSync(resolve(process.cwd(), "src/ui/project-lineage-workbench.ts"), "utf8");
     expect(lineage).toMatch(/STAGE_BOARD_COLUMNS/);
     expect(lineage).toMatch(/boardStageNodes\(\)[\s\S]*snapshot\.projects/);
     expect(lineage).toMatch(/requestCycleStatusChange\(drag\.cycleId, drag\.sourceStatus, targetStatus\)/);
     expect(lineage).toMatch(/pointercancel[\s\S]*lostpointercapture[\s\S]*is-dragging/);
-    expect(css).toMatch(/\.helix-lineage-kanban \{[\s\S]*grid-template-columns: repeat\(5, minmax\(244px, 1fr\)\);[\s\S]*overflow-x: auto;/);
+    expect(css).toMatch(/\.helix-lineage-kanban \{[\s\S]*grid-template-columns: repeat\(6, minmax\(244px, 1fr\)\);[\s\S]*overflow-x: auto;/);
+    expect(css).toMatch(/@media \(max-width: 900px\)[\s\S]*\.helix-lineage-kanban \{ grid-template-columns: repeat\(6, 260px\); \}/);
     expect(css).toMatch(/\.helix-lineage-kanban \{[\s\S]*overflow-y: hidden;/);
     expect(css).toMatch(/\.helix-lineage-column-list \{[\s\S]*min-height: 0;[\s\S]*overflow-y: auto;/);
     expect(css).toMatch(/\.helix-lineage-card\.is-kanban\.is-dragging \{[\s\S]*pointer-events: none;/);

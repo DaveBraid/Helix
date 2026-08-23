@@ -11,8 +11,9 @@ import {
 } from "../domain/task-detail";
 
 const STATUS_LABELS: Record<TaskDetailStatus, string> = {
-  idea: "想法",
+  idea: "计划中",
   active: "进行中",
+  recording: "待记录",
   completed: "已完成",
   paused: "已暂停",
   terminated: "已终止",
@@ -97,7 +98,11 @@ export class UnifiedTaskDetailModal extends Modal {
     const statusField = property("状态", "circle-dot");
     const status = statusField.createEl("select", { attr: { "aria-label": "任务状态" } });
     for (const value of capabilities.statusOptions) {
-      const option = status.createEl("option", { value, text: STATUS_LABELS[value] });
+      // 行动任务继续使用“想法”；Stage 的同一底层值展示为“计划中”。
+      const label = value === "idea" && draft.source === "stage-action"
+        ? "想法"
+        : STATUS_LABELS[value];
+      const option = status.createEl("option", { value, text: label });
       if (value === "completed" && capabilities.completionDerivedFromSubtasks) {
         option.disabled = true;
       }

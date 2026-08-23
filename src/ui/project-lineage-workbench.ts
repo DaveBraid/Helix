@@ -1553,10 +1553,15 @@ export class ProjectLineageWorkbench {
         },
       });
       button.createSpan({ cls: "helix-lineage-project-name", text: project.title });
-      button.createEl("small", {
-        text: `${PROJECT_STATUS_LABELS[project.status]} · ${
-          project.cycles.filter((cycle) => cycle.status === "active").length
-        } 个进行中阶段`,
+      const status = button.createEl("small", {
+        cls: `helix-lineage-project-choice-status is-${project.status}`,
+      });
+      const statusIcon = status.createSpan({ cls: "helix-lineage-project-status-icon" });
+      setIcon(statusIcon, PROJECT_STATUS_ICONS[project.status]);
+      status.createSpan({ text: PROJECT_STATUS_LABELS[project.status] });
+      status.createSpan({
+        cls: "helix-lineage-project-choice-stage-count",
+        text: `· ${project.cycles.filter((cycle) => cycle.status === "active").length} 个进行中阶段`,
       });
       button.addEventListener("click", () => this.options.onSelectProject(project.id));
     }
@@ -1850,7 +1855,6 @@ export class ProjectLineageWorkbench {
       });
       const status = header.createEl("button", {
         cls: `helix-lineage-project-container-status is-${project.status}`,
-        text: PROJECT_STATUS_LABELS[project.status],
         attr: {
           "aria-label": `修改 ${project.title} 的项目状态，当前${
             PROJECT_STATUS_LABELS[project.status]
@@ -1858,6 +1862,9 @@ export class ProjectLineageWorkbench {
           title: "修改项目状态",
         },
       });
+      const statusIcon = status.createSpan({ cls: "helix-lineage-project-status-icon" });
+      setIcon(statusIcon, PROJECT_STATUS_ICONS[project.status]);
+      status.createSpan({ text: PROJECT_STATUS_LABELS[project.status] });
       status.addEventListener("pointerdown", (event) => event.stopPropagation());
       status.addEventListener("click", (event) => {
         event.preventDefault();
@@ -2156,7 +2163,6 @@ export class ProjectLineageWorkbench {
     if (node.kind === "project") {
       const status = meta.createEl("button", {
         cls: `helix-lineage-status-button is-project is-${owner.status}`,
-        text: PROJECT_STATUS_LABELS[owner.status],
         attr: {
           "aria-label": `修改 ${owner.title} 的项目状态，当前${
             PROJECT_STATUS_LABELS[owner.status]
@@ -2164,6 +2170,9 @@ export class ProjectLineageWorkbench {
           title: "修改项目状态",
         },
       });
+      const statusIcon = status.createSpan({ cls: "helix-lineage-status-icon" });
+      setIcon(statusIcon, PROJECT_STATUS_ICONS[owner.status]);
+      status.createSpan({ text: PROJECT_STATUS_LABELS[owner.status] });
       status.addEventListener("pointerdown", (event) => event.stopPropagation());
       status.addEventListener("click", (event) => {
         event.preventDefault();

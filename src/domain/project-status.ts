@@ -9,6 +9,7 @@ export type HelixProjectStatus =
 export type HelixStageStatus =
   | "idea"
   | "active"
+  | "recording"
   | "completed"
   | "paused"
   | "terminated";
@@ -22,7 +23,7 @@ export function projectStatusFromFrontmatter(value: unknown): HelixProjectStatus
 export function stageStatusFromFrontmatter(value: unknown): HelixStageStatus | null {
   if (value === "planned") return "idea";
   if (value === "closed") return "completed";
-  return value === "idea" || value === "active" || value === "completed" ||
+  return value === "idea" || value === "active" || value === "recording" || value === "completed" ||
     value === "paused" || value === "terminated" ? value : null;
 }
 
@@ -43,8 +44,9 @@ export const PROJECT_STATUS_LABELS: Record<HelixProjectStatus, string> = {
 };
 
 export const STAGE_STATUS_LABELS: Record<HelixStageStatus, string> = {
-  idea: "想法",
+  idea: "计划中",
   active: "进行中",
+  recording: "待记录",
   completed: "已完成",
   paused: "已暂停",
   terminated: "已终止",

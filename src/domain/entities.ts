@@ -169,7 +169,7 @@ export interface HelixCycle {
   projectId: string;
   sequence: number;
   stageCode?: string;
-  status: "idea" | "active" | "completed" | "paused" | "terminated";
+  status: "idea" | "active" | "recording" | "completed" | "paused" | "terminated";
   predecessorCycleId?: string;
   startedAt?: string;
   closedAt?: string;

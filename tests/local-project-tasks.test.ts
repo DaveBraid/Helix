@@ -319,7 +319,10 @@ describe("LocalProjectTaskService", () => {
     const actions = parseManagedPlanActions(reconciled).actions;
     expect(actions.find((action) => action.title === "中")?.state).toBe("completed");
     expect(actions.find((action) => action.title === "根")?.state).toBe("completed");
-    expect(derivedLocalProjectStageStatus("active", actions.filter((action) => !action.parentUuid))).toBe("completed");
+    expect(derivedLocalProjectStageStatus("active", actions.filter((action) => !action.parentUuid))).toBe("recording");
+    expect(derivedLocalProjectStageStatus("recording", [{ state: "completed" }])).toBeUndefined();
+    expect(derivedLocalProjectStageStatus("recording", [{ state: "idea" }])).toBe("idea");
+    expect(derivedLocalProjectStageStatus("completed", [{ state: "completed" }])).toBeUndefined();
     expect(derivedLocalProjectStageStatus("completed", [{ state: "idea" }])).toBe("idea");
     expect(derivedLocalProjectStageStatus("active", [{ state: "terminated" }])).toBeUndefined();
     expect(derivedLocalProjectStageStatus("paused", [{ state: "completed" }])).toBeUndefined();

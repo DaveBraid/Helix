@@ -10,10 +10,11 @@ import {
 } from "../src/domain/stage-board";
 
 describe("阶段看板领域合同", () => {
-  it("uses one fixed five-state column order and shared presentation", () => {
-    expect(STAGE_BOARD_COLUMNS).toEqual(["idea", "active", "completed", "paused", "terminated"]);
+  it("uses one fixed six-state column order and shared presentation", () => {
+    expect(STAGE_BOARD_COLUMNS).toEqual(["idea", "active", "recording", "completed", "paused", "terminated"]);
     expect(STAGE_BOARD_COLUMNS.map((status) => STAGE_STATUS_PRESENTATION[status].label))
-      .toEqual(["想法", "进行中", "已完成", "已暂停", "已终止"]);
+      .toEqual(["计划中", "进行中", "待记录", "已完成", "已暂停", "已终止"]);
+    expect(STAGE_STATUS_PRESENTATION.recording.icon).toBe("notebook-pen");
   });
 
   it("does not submit same-column or pending moves", () => {

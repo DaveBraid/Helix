@@ -62,7 +62,12 @@ export interface LocalProjectTaskSnapshot {
     projectId: string;
     projectTitle: string;
     projectColor?: string;
-    stages: Array<{ stageId: string; stageTitle: string; stageCode: string; status: string }>;
+    stages: Array<{
+      stageId: string;
+      stageTitle: string;
+      stageCode: string;
+      status: ProjectWorkspaceCycleStatus;
+    }>;
   }>;
 }
 
@@ -77,7 +82,7 @@ export interface LocalProjectStageTaskParent {
   stageId: string;
   stageTitle: string;
   stageCode: string;
-  stageStatus: string;
+  stageStatus: ProjectWorkspaceCycleStatus;
   notePath: string;
 }
 
@@ -226,16 +231,16 @@ export function reconcileLocalPlanParentCompletion(markdown: string): string {
   throw new Error("本地父子任务完成状态无法稳定收敛");
 }
 
-/** Stage 父任务只在存在根行动时派生完成；暂停和终止仍由用户显式控制。 */
+/** Stage 父任务在根行动全部完成后进入待记录；完成、暂停和终止仍由用户显式控制。 */
 export function derivedLocalProjectStageStatus(
   current: ProjectWorkspaceCycleStatus,
   roots: readonly Pick<LocalProjectTask, "state">[],
 ): ProjectWorkspaceCycleStatus | undefined {
   if (roots.length === 0 || current === "paused" || current === "terminated") return undefined;
   if (roots.every((task) => isCompletedActionState(task.state))) {
-    return current === "completed" ? undefined : "completed";
+    return current === "recording" || current === "completed" ? undefined : "recording";
   }
-  if (current !== "completed") return undefined;
+  if (current !== "recording" && current !== "completed") return undefined;
   return roots.some((task) => task.state !== "idea") ? "active" : "idea";
 }
 

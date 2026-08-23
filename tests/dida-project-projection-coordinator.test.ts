@@ -94,6 +94,9 @@ describe("project projection application coordinator", () => {
     ]);
     expect(projectionInputFromStage(project, second).projectStatus).toBe("completed");
     expect(projectionInputFromStage(project, second).createWhenMissing).toBe(false);
+    const recording = { ...second, status: "recording" as const };
+    expect(projectionInputFromStage(project, recording).projectStatus).toBe("active");
+    expect(projectionInputFromStage(project, recording).createWhenMissing).toBe(false);
     expect(projectionInputFromStage(project, project.cycles[0]!).createWhenMissing).toBe(true);
   });
 });

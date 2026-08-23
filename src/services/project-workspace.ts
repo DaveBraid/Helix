@@ -5480,8 +5480,9 @@ function projectStatusText(status: ProjectWorkspaceProject["status"]): string {
 
 function stageStatusText(status: ProjectWorkspaceCycle["status"]): string {
   return {
-    idea: "想法",
+    idea: "计划中",
     active: "进行中",
+    recording: "待记录",
     completed: "已完成",
     paused: "已暂停",
     terminated: "已终止",

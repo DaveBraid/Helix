@@ -5,6 +5,7 @@ import { STAGE_STATUS_LABELS } from "./project-status";
 export const STAGE_BOARD_COLUMNS: ReadonlyArray<HelixStageStatus> = [
   "idea",
   "active",
+  "recording",
   "completed",
   "paused",
   "terminated",
@@ -12,11 +13,12 @@ export const STAGE_BOARD_COLUMNS: ReadonlyArray<HelixStageStatus> = [
 
 export const STAGE_STATUS_PRESENTATION: Record<HelixStageStatus, {
   label: string;
-  icon: "lightbulb" | "play" | "circle-check-big" | "pause" | "circle-x";
-  tone: "idea" | "active" | "completed" | "paused" | "terminated";
+  icon: "lightbulb" | "play" | "notebook-pen" | "circle-check-big" | "pause" | "circle-x";
+  tone: HelixStageStatus;
 }> = {
   idea: { label: STAGE_STATUS_LABELS.idea, icon: "lightbulb", tone: "idea" },
   active: { label: STAGE_STATUS_LABELS.active, icon: "play", tone: "active" },
+  recording: { label: STAGE_STATUS_LABELS.recording, icon: "notebook-pen", tone: "recording" },
   completed: { label: STAGE_STATUS_LABELS.completed, icon: "circle-check-big", tone: "completed" },
   paused: { label: STAGE_STATUS_LABELS.paused, icon: "pause", tone: "paused" },
   terminated: { label: STAGE_STATUS_LABELS.terminated, icon: "circle-x", tone: "terminated" },

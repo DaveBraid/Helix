@@ -100,6 +100,7 @@ import {
 } from "../domain/task-tree";
 import { stableHash } from "../domain/stable";
 import { requestStageBoardStatusChange } from "../domain/stage-board";
+import { STAGE_STATUS_LABELS } from "../domain/project-status";
 import type {
   ProjectionProjectReadModel,
 } from "../services/dida-project-projection";
@@ -190,8 +191,9 @@ export const CYCLE_STATUS_OPTIONS: Array<{
   value: ProjectWorkspaceCycleStatus;
   label: string;
 }> = [
-  { value: "idea", label: "想法" },
+  { value: "idea", label: "计划中" },
   { value: "active", label: "进行中" },
+  { value: "recording", label: "待记录" },
   { value: "completed", label: "已完成" },
   { value: "paused", label: "已暂停" },
   { value: "terminated", label: "已终止" },
@@ -900,12 +902,16 @@ export class HelixView extends ItemView {
       cls: `${tree?.hasChildren ? "helix-task-tree-progress" : "helix-task-check"}${completed ? " is-completed" : ""}`,
       attr: {
         "aria-label": completionIsDerived
-          ? `${task.title}：完成状态由子任务自动决定`
+          ? stageParent
+            ? `${task.title}：计划任务全部完成后自动进入待记录，阶段完成需手动设置`
+            : `${task.title}：完成状态由子任务自动决定`
           : tree?.hasChildren
             ? `${task.title}：直属子任务完成 ${tree.completedDirectChildCount}/${tree.directChildCount}；${completed ? "重新打开父任务" : "完成父任务"}`
           : completed ? `重新打开 ${task.title}` : `完成 ${task.title}`,
         title: completionIsDerived
-          ? "子任务全部完成后自动完成主任务"
+          ? stageParent
+            ? "计划任务全部完成后自动进入待记录；阶段完成请手动设置"
+            : "子任务全部完成后自动完成主任务"
           : tree?.hasChildren
             ? `直属子任务 ${tree.completedDirectChildCount}/${tree.directChildCount}；点击只切换父任务本身`
           : completed ? "重新打开任务" : "完成任务",
@@ -959,7 +965,7 @@ export class HelixView extends ItemView {
       meta.createSpan({ text: `阶段 ${stageParent.stageCode} · ${stageParent.stageTitle}` });
       meta.createSpan({
         cls: `helix-chip is-soft is-${stageParent.stageStatus}`,
-        text: localTaskStateLabel(stageParent.stageStatus as ProjectionActionState),
+        text: STAGE_STATUS_LABELS[stageParent.stageStatus],
       });
     } else {
       meta.createSpan({ text: `滴答 · ${project?.name ?? "未归档清单"}` });
@@ -5166,7 +5172,8 @@ function localTaskDetailCapabilities(completionDerivedFromSubtasks = false): Tas
 
 function stageTaskDetailCapabilities(): TaskDetailCapabilities {
   return {
-    ...localTaskDetailCapabilities(true),
+    ...localTaskDetailCapabilities(),
+    statusOptions: ["idea", "active", "recording", "completed", "paused", "terminated"],
     delete: false,
     editPriority: false,
     editSchedule: false,
@@ -5205,7 +5212,7 @@ function localTaskDraftFromDetail(draft: TaskDetailDraft, content = ""): LocalPr
     date && time ? wallDateTimeToInstant(`${date}T${time}`, timeZone) ?? undefined : undefined;
   return {
     title: draft.title.trim(),
-    state: draft.status,
+    state: projectionActionStateFromDetail(draft.status),
     content,
     startDate: draft.date && draft.timeMode !== "none"
       ? instant(draft.date, draft.startTime || draft.endTime)
@@ -5222,13 +5229,19 @@ function localTaskDraftFromDetail(draft: TaskDetailDraft, content = ""): LocalPr
     children: draft.subtasks.map((child) => ({
       uuid: child.id.startsWith("new:") ? undefined : child.id,
       title: child.title.trim(),
-      state: child.status,
+      state: projectionActionStateFromDetail(child.status),
       startDate: instant(child.date, child.startTime || child.endTime),
       dueDate: instant(child.date, child.endTime || child.startTime),
       timeZone: child.date && (child.startTime || child.endTime) ? timeZone : undefined,
       priority: child.priority,
     })),
   };
+}
+
+function projectionActionStateFromDetail(status: TaskDetailStatus): ProjectionActionState {
+  // `recording` 只属于 Stage，禁止通过共享详情模型写进行动标记。
+  if (status === "recording") throw new Error("行动任务不支持待记录状态");
+  return status;
 }
 
 function didaTaskEditableSnapshot(task: DidaTask): Record<string, unknown> {

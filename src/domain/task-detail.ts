@@ -1,6 +1,6 @@
 export type TaskDetailSource = "dida" | "stage-action" | "stage-projection" | "preview";
 
-export type TaskDetailStatus = "idea" | "active" | "completed" | "paused" | "terminated";
+export type TaskDetailStatus = "idea" | "active" | "recording" | "completed" | "paused" | "terminated";
 
 export type TaskDetailPriority = 0 | 1 | 3 | 5;
 

@@ -184,6 +184,7 @@ describe("workbench layout and navigation structure", () => {
     expect(view).toContain('attr: { "data-task-id": task.id }');
     expect(view).toContain("collapsedTaskTreeIds");
     expect(view).toContain("taskTreeRows");
+    expect(view).toMatch(/mergeProjectTaskCollections[\s\S]*applyPreferredTaskSiblingOrder\([\s\S]*localTasks\.filter\(\(task\) => task\.parentId\)[\s\S]*\.map\(\(task\) => task\.id\)/);
   });
 
   it("uses one compact editor shell for all task sources", () => {

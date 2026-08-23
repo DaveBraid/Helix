@@ -91,6 +91,7 @@ import {
 } from "../domain/task-views";
 import { homeGreeting } from "../domain/home-dashboard";
 import {
+  applyPreferredTaskSiblingOrder,
   canReparentTask,
   completionLast,
   flattenTaskTree,
@@ -5415,7 +5416,11 @@ function mergeProjectTaskCollections(remoteTasks: DidaTask[], localTasks: DidaTa
       ...(remote.childIds !== undefined ? { childIds: remote.childIds } : {}),
     } : local);
   }
-  return [...tasks.values()];
+  // 远端数组顺序不代表 Stage 行序；只在同级托管任务槽位内恢复 Markdown 权威顺序。
+  return applyPreferredTaskSiblingOrder(
+    [...tasks.values()],
+    localTasks.filter((task) => task.parentId).map((task) => task.id),
+  );
 }
 
 function localTaskDestinationValue(projectId: string, stageId: string): string {

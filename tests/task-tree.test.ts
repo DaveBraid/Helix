@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DidaTask } from "../src/domain/entities";
 import {
+  applyPreferredTaskSiblingOrder,
   canReparentTask,
   completionLast,
   flattenTaskTree,
@@ -19,6 +20,58 @@ describe("task tree presentation", () => {
   it("keeps open tasks before completed tasks without disturbing relative order", () => {
     expect(completionLast([task("done-a", 2), task("open-a"), task("done-b", 2), task("open-b")])
       .map((item) => item.id)).toEqual(["open-a", "open-b", "done-a", "done-b"]);
+  });
+
+  it("restores managed sibling order without moving foreign task slots", () => {
+    const tasks = [
+      task("parent"),
+      task("managed-3", 0, "parent"),
+      task("foreign", 0, "parent"),
+      task("managed-2", 0, "parent"),
+      task("managed-1", 0, "parent"),
+    ];
+
+    const ordered = applyPreferredTaskSiblingOrder(tasks, [
+      "parent",
+      "managed-1",
+      "managed-2",
+      "managed-3",
+    ]);
+
+    expect(ordered.map((item) => item.id)).toEqual([
+      "parent",
+      "managed-1",
+      "foreign",
+      "managed-2",
+      "managed-3",
+    ]);
+    expect(flattenTaskTree(ordered).map((row) => row.task.id)).toEqual([
+      "parent",
+      "managed-1",
+      "foreign",
+      "managed-2",
+      "managed-3",
+    ]);
+  });
+
+  it("keeps remote Stage parent root order when only action children are preferred", () => {
+    const tasks = [
+      task("stage-parent-2"),
+      task("foreign-root"),
+      task("stage-parent-1"),
+      task("action-2", 0, "stage-parent-1"),
+      task("action-1", 0, "stage-parent-1"),
+    ];
+
+    const ordered = applyPreferredTaskSiblingOrder(tasks, ["action-1", "action-2"]);
+
+    expect(ordered.map((item) => item.id)).toEqual([
+      "stage-parent-2",
+      "foreign-root",
+      "stage-parent-1",
+      "action-1",
+      "action-2",
+    ]);
   });
 
   it("renders real parentId children indented and keeps completed siblings last", () => {

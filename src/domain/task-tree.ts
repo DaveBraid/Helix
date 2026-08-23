@@ -29,6 +29,34 @@ export function completionLast(tasks: readonly DidaTask[]): DidaTask[] {
 }
 
 /**
+ * 让指定任务在各自同级内采用权威顺序，同时保留普通远端任务所在槽位。
+ * preferredIds 可跨多个父任务；不同父级之间不会互相移动。
+ */
+export function applyPreferredTaskSiblingOrder(
+  tasks: readonly DidaTask[],
+  preferredIds: readonly string[],
+): DidaTask[] {
+  const rank = new Map(preferredIds.map((id, index) => [id, index]));
+  const result = [...tasks];
+  const slotsByParent = new Map<string, Array<{ index: number; task: DidaTask }>>();
+  for (const [index, task] of tasks.entries()) {
+    if (!rank.has(task.id)) continue;
+    const parentKey = task.parentId ? `parent:${task.parentId}` : "root";
+    const slots = slotsByParent.get(parentKey) ?? [];
+    slots.push({ index, task });
+    slotsByParent.set(parentKey, slots);
+  }
+  for (const slots of slotsByParent.values()) {
+    const ordered = [...slots].sort((left, right) =>
+      rank.get(left.task.id)! - rank.get(right.task.id)!);
+    slots.forEach((slot, index) => {
+      result[slot.index] = ordered[index]!.task;
+    });
+  }
+  return result;
+}
+
+/**
  * 按真实 parentId 展开任务树。父任务不在当前筛选结果中时，子任务作为根展示；
  * 循环或损坏关系不会丢任务，而是降级为根节点。
  */

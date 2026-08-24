@@ -5,6 +5,7 @@ import {
   confirmProjectionActivation,
   projectionInputsFromProject,
   projectionInputFromStage,
+  projectionStageByProjectionId,
   projectionStageInProject,
   type ProjectionApplicationPort,
 } from "../src/services/dida-project-projection-coordinator";
@@ -72,6 +73,17 @@ describe("project projection application coordinator", () => {
     expect(projectionStageInProject(snapshot, "project-1", "stage-1").notePath).toBe("Stage-1.md");
     expect(() => projectionStageInProject(snapshot, "project-1", "stage-2"))
       .toThrow(/指定项目中的阶段/);
+  });
+
+  it("resolves a frozen Stage projection back to its unique local owner", () => {
+    const snapshot = workspace();
+    const resolved = projectionStageByProjectionId(snapshot, "stage-2", "stage-2");
+    expect(resolved.project.id).toBe("project-2");
+    expect(resolved.stage.notePath).toBe("Stage-2.md");
+    expect(() => projectionStageByProjectionId(snapshot, "project-2", "stage-2"))
+      .toThrow(/同步身份/);
+    expect(() => projectionStageByProjectionId(snapshot, "missing", "missing"))
+      .toThrow(/唯一的阶段同步/);
   });
 
   it("projects every stage as one parent task with only that stage's actions", () => {

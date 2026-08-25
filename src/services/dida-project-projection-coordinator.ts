@@ -87,20 +87,6 @@ export function projectionStageInProject(
   return stage;
 }
 
-/** 冲突读模型以 Stage ID 作为远端父任务身份；据此反查唯一的本地所属项目。 */
-export function projectionStageByProjectionId(
-  snapshot: ProjectWorkspaceSnapshot,
-  projectionProjectId: string,
-  stageId: string,
-): { project: ProjectWorkspaceProject; stage: ProjectWorkspaceProject["cycles"][number] } {
-  if (projectionProjectId !== stageId) throw new Error("阶段同步身份与阶段 ID 不一致");
-  const matches = snapshot.projects.flatMap((project) => project.cycles
-    .filter((stage) => stage.id === stageId)
-    .map((stage) => ({ project, stage })));
-  if (matches.length !== 1) throw new Error("找不到唯一的阶段同步所属项目");
-  return matches[0]!;
-}
-
 export async function projectionCounts(
   snapshot: ProjectWorkspaceSnapshot,
   projection: Pick<ProjectionApplicationPort, "readProject">,

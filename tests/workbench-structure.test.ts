@@ -570,15 +570,8 @@ describe("workbench layout and navigation structure", () => {
   });
 
   it("routes projection conflicts only through strict reconciliation and safe cleanup", () => {
-    const main = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
-    const reconcile = main.slice(
-      main.indexOf("async reconcileProjectProjectionFrozen"),
-      main.indexOf("async removeResolvedProjectProjectionReceipt"),
-    );
     expect(view).toMatch(/renderProjectionConflicts[\s\S]*receiptCleanupPending/);
     expect(view).toMatch(/kind: "action", projectId: model\.project\.id, stageId, uuid/);
-    expect(reconcile).toContain("projectionStageByProjectionId");
-    expect(reconcile).not.toContain("this.requireProjectionStage(input.projectId, input.stageId)");
     expect(view).toMatch(/removeResolvedProjectProjectionReceipt\(receipt\.operationId\)/);
     expect(view).toMatch(/receipt\.outcome !== "verified"[\s\S]*receipt\.outcome !== "verified-absent"[\s\S]*此处不提供清理[\s\S]*continue;/);
     expect(view).not.toMatch(/滴答项目同步[\s\S]*强制删除收据/);

@@ -108,7 +108,6 @@ import {
   projectionInputFromProject,
   projectionInputsFromProject,
   projectionInputFromStage,
-  projectionStageByProjectionId,
   projectionStageInProject,
 } from "./services/dida-project-projection-coordinator";
 import { stableHash } from "./domain/stable";
@@ -1244,13 +1243,12 @@ export default class HelixPlugin extends Plugin {
     this.assertProjectProjectionAvailable();
     await this.withWritableProjectMutation(async () => {
       const snapshot = await this.projectWorkspace.snapshot();
-      const { project, stage } = projectionStageByProjectionId(
-        snapshot,
-        input.projectId,
-        input.stageId,
-      );
+      const project = snapshot.projects.find((candidate) => candidate.id === input.projectId);
+      const stage = project?.cycles.find((candidate) => candidate.id === input.stageId);
+      if (!project || !stage) throw new Error("找不到要复核的阶段任务");
       const projectionInput = projectionInputFromStage(project, stage);
       if (input.kind === "action") {
+        const stage = await this.requireProjectionStage(input.projectId, input.stageId);
         await this.projectProjection.reconcileFrozen({
           kind: "action",
           projectId: input.projectId,
